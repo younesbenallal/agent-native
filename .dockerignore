@@ -1,0 +1,12 @@
+node_modules
+**/node_modules
+**/.output
+**/dist
+**/target
+**/.turbo
+.git
+.DS_Store
+templates/clips/data
+templates/clips/desktop/src-tauri/target
+templates/clips/chrome-extension/dist
+templates/clips/chrome-extension/package
