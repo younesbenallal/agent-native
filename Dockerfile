@@ -17,6 +17,8 @@ ENV NODE_ENV=production
 ENV PORT=3000
 
 COPY --from=build /app/templates/clips/.output .output
+RUN corepack enable \
+  && pnpm add yjs@13.6.27 --config.minimumReleaseAge=0
 RUN mkdir -p /app/data
 
 EXPOSE 3000
