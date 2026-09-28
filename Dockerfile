@@ -18,7 +18,7 @@ ENV PORT=3000
 
 COPY --from=build /app/templates/clips/.output .output
 RUN corepack enable \
-  && pnpm add yjs@13.6.27 --config.minimumReleaseAge=0
+  && pnpm add react@19.2.7 react-dom@19.2.7 yjs@13.6.27 --config.minimumReleaseAge=0
 RUN mkdir -p /app/data
 
 EXPOSE 3000
