@@ -11,9 +11,6 @@ import {
 } from "./index.js";
 import { McpClientManager } from "./manager.js";
 
-// Reuse the stdio/client fakes from manager.spec.ts so the ActionEntry
-// wrapper can exercise a real McpClientManager end-to-end.
-
 const serverFixtures: Record<
   string,
   {
@@ -100,7 +97,6 @@ describe("mcpToolsToActionEntries", () => {
       "mcp__x__pong",
     ]);
     for (const entry of Object.values(entries)) {
-      // MCP tools must never be auto-exposed as HTTP endpoints.
       expect(entry.http).toBe(false);
       expect(typeof entry.run).toBe("function");
       expect(typeof entry.planMode?.effect).toBe("function");
@@ -198,6 +194,30 @@ describe("mcpToolsToActionEntries", () => {
     expect(entries["mcp__x__mutate"].readOnly).toBeUndefined();
   });
 
+  it("decorates discovered MCP actions with app-provided approval metadata", async () => {
+    serverFixtures["x-bin"] = {
+      tools: [{ name: "mutate", description: "Mutate state" }],
+      callImpl: () => ({ content: [{ type: "text", text: "ok" }] }),
+    };
+    const mgr = new McpClientManager({
+      servers: { x: { command: "x-bin" } },
+    });
+    await mgr.start();
+    const needsApproval = (args: Record<string, unknown>) =>
+      args.confirmed !== true;
+
+    const entries = mcpToolsToActionEntries(mgr, {
+      resolveActionEntry: (tool) => {
+        expect(tool.name).toBe("mcp__x__mutate");
+        expect(tool.originalName).toBe("mutate");
+        return { needsApproval, allowPersistentApproval: false };
+      },
+    });
+
+    expect(entries["mcp__x__mutate"].needsApproval).toBe(needsApproval);
+    expect(entries["mcp__x__mutate"].allowPersistentApproval).toBe(false);
+  });
+
   it("updates existing MCP ActionEntry metadata when the manager tool set changes", () => {
     const target: Record<string, ActionEntry> = {
       mcp__x__inspect: {
@@ -229,7 +249,12 @@ describe("mcpToolsToActionEntries", () => {
       readResourceForTool: vi.fn(),
     } as unknown as McpClientManager;
 
-    syncMcpActionEntries(manager, target);
+    syncMcpActionEntries(manager, target, {
+      resolveActionEntry: () => ({
+        needsApproval: true,
+        allowPersistentApproval: false,
+      }),
+    });
 
     expect(target["mcp__x__inspect"].tool).toEqual({
       description: "New description",
@@ -240,6 +265,8 @@ describe("mcpToolsToActionEntries", () => {
       },
     });
     expect(target["mcp__x__inspect"].readOnly).toBe(true);
+    expect(target["mcp__x__inspect"].needsApproval).toBe(true);
+    expect(target["mcp__x__inspect"].allowPersistentApproval).toBe(false);
   });
 
   it("prefixes error-flagged results with 'Error:'", async () => {

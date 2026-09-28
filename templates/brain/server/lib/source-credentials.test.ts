@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   grants: [] as Array<Record<string, unknown>>,
   secrets: new Map<string, string>(),
   localCredential: undefined as string | undefined,
+  currentUserEmail: "owner@example.test",
 }));
 
 vi.mock("@agent-native/core/workspace-connections", () => ({
@@ -55,6 +56,73 @@ vi.mock("@agent-native/core/workspace-connections", () => ({
   ),
   listWorkspaceConnections: vi.fn(async () => mocks.connections),
   listWorkspaceConnectionGrants: vi.fn(async () => mocks.grants),
+  resolveWorkspaceConnectionForApp: vi.fn(
+    async ({
+      connectionId,
+      appId,
+    }: {
+      connectionId: string;
+      appId: string;
+    }) => {
+      const connection = mocks.connections.find(
+        (entry) => entry.id === connectionId,
+      );
+      if (!connection) {
+        return {
+          available: false,
+          connection: null,
+          appAccess: null,
+          reason: `Workspace connection "${connectionId}" was not found in the current request scope.`,
+        };
+      }
+      const allowedApps = (connection as Record<string, any>).allowedApps ?? [];
+      const allowedUsers =
+        (connection as Record<string, any>).allowedUsers ?? [];
+      const status = (connection as Record<string, any>).status;
+      const grant = (mocks.grants as Array<Record<string, any>>).find(
+        (entry) =>
+          entry.connectionId === connectionId &&
+          (entry.appId === appId || entry.appId === "*"),
+      );
+      const appAllowed =
+        allowedApps.length === 0 ||
+        allowedApps.includes(appId) ||
+        Boolean(grant);
+      const userAllowed =
+        allowedUsers.length === 0 ||
+        allowedUsers.includes(mocks.currentUserEmail);
+      const healthy = status === "connected";
+      const available = healthy && appAllowed && userAllowed;
+      return {
+        available,
+        reason: available
+          ? "Connection is available to the current request scope."
+          : healthy
+            ? "Connection is restricted to different workspace members."
+            : "Connection is not connected.",
+        connection: available ? connection : null,
+        appAccess: {
+          appId,
+          available,
+          mode: !appAllowed
+            ? "unavailable"
+            : allowedUsers.length > 0 && !userAllowed
+              ? "unavailable"
+              : grant
+                ? "explicit-grant"
+                : "all-apps",
+          reason: available
+            ? "Connection is available to the current request scope."
+            : !healthy
+              ? "Connection is not connected."
+              : !appAllowed
+                ? `Grant ${appId} access before this connection can be reused by the app.`
+                : "Connection is restricted to different workspace members.",
+          grantId: grant?.id ?? null,
+        },
+      };
+    },
+  ),
 }));
 
 vi.mock("@agent-native/core/secrets", () => ({
@@ -65,12 +133,23 @@ vi.mock("@agent-native/core/secrets", () => ({
 }));
 
 vi.mock("@agent-native/core/credentials", () => ({
-  resolveCredential: vi.fn(async () => mocks.localCredential),
+  resolveCredentialDetailed: vi.fn(
+    async (_key: string, ctx: { userEmail: string }) =>
+      mocks.localCredential
+        ? {
+            value: mocks.localCredential,
+            scope: "user",
+            scopeId: ctx.userEmail,
+          }
+        : undefined,
+  ),
 }));
 
 import {
+  assertSourceCredentialAvailable,
   inspectSourceCredentialAvailability,
   resolveSourceCredential,
+  resolveSourceCredentialWithProvenance,
 } from "./source-credentials.js";
 
 describe("resolveSourceCredential", () => {
@@ -79,6 +158,7 @@ describe("resolveSourceCredential", () => {
     mocks.grants = [];
     mocks.secrets.clear();
     mocks.localCredential = undefined;
+    mocks.currentUserEmail = "owner@example.test";
   });
 
   it("prefers granted workspace connection credentials without exposing values in availability", async () => {
@@ -131,6 +211,7 @@ describe("resolveSourceCredential", () => {
         grantId: "grant-1",
         appAccessMode: "explicit-grant",
         scope: "org",
+        scopeId: "org-1",
       },
       missingMessage: null,
     });
@@ -148,6 +229,20 @@ describe("resolveSourceCredential", () => {
         ctx: { userEmail: "owner@example.test", orgId: "org-1" },
       }),
     ).resolves.toBe("brain-local-token");
+    await expect(
+      resolveSourceCredentialWithProvenance({
+        provider: "github",
+        key: "GITHUB_TOKEN",
+        ctx: { userEmail: "owner@example.test", orgId: "org-1" },
+      }),
+    ).resolves.toMatchObject({
+      value: "brain-local-token",
+      provenance: {
+        source: "brain_local",
+        scope: "user",
+        scopeId: "owner@example.test",
+      },
+    });
 
     mocks.localCredential = undefined;
     mocks.secrets.set("org:org-1:GITHUB_TOKEN", "registered-token");
@@ -158,6 +253,20 @@ describe("resolveSourceCredential", () => {
         ctx: { userEmail: "owner@example.test", orgId: "org-1" },
       }),
     ).resolves.toBe("registered-token");
+    await expect(
+      resolveSourceCredentialWithProvenance({
+        provider: "github",
+        key: "GITHUB_TOKEN",
+        ctx: { userEmail: "owner@example.test", orgId: "org-1" },
+      }),
+    ).resolves.toMatchObject({
+      value: "registered-token",
+      provenance: {
+        source: "registered_secret",
+        scope: "org",
+        scopeId: "org-1",
+      },
+    });
   });
 
   it("does not fall back to deploy env credentials for source credentials", async () => {
@@ -324,6 +433,89 @@ describe("resolveSourceCredential", () => {
         source: "workspace_connection",
         status: "not_granted",
         connectionId: "bound-calendar",
+      }),
+    ]);
+  });
+
+  it("rejects a connected source when its referenced credential is missing", async () => {
+    mocks.connections = [
+      {
+        id: "conn-slack",
+        label: "Builder Slack",
+        provider: "slack",
+        status: "connected",
+        allowedApps: ["brain"],
+        credentialRefs: [{ key: "SLACK_BOT_TOKEN", scope: "org" }],
+      },
+    ];
+
+    await expect(
+      assertSourceCredentialAvailable({
+        provider: "slack",
+        workspaceConnectionId: "conn-slack",
+        ctx: { userEmail: "owner@example.test", orgId: "org-1" },
+      }),
+    ).rejects.toThrow(/SLACK_BOT_TOKEN.*missing/i);
+  });
+
+  it("allows source setup when the selected credential resolves", async () => {
+    mocks.connections = [
+      {
+        id: "conn-slack",
+        label: "Builder Slack",
+        provider: "slack",
+        status: "connected",
+        allowedApps: ["brain"],
+        credentialRefs: [{ key: "SLACK_BOT_TOKEN", scope: "org" }],
+      },
+    ];
+    mocks.secrets.set("org:org-1:SLACK_BOT_TOKEN", "slack-token");
+
+    await expect(
+      assertSourceCredentialAvailable({
+        provider: "slack",
+        workspaceConnectionId: "conn-slack",
+        ctx: { userEmail: "owner@example.test", orgId: "org-1" },
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("rejects a restricted workspace connection for a non-allowed user", async () => {
+    mocks.connections = [
+      {
+        id: "conn-slack",
+        label: "Restricted Slack",
+        provider: "slack",
+        status: "connected",
+        allowedApps: ["brain"],
+        allowedUsers: ["owner@example.test"],
+        credentialRefs: [{ key: "SLACK_BOT_TOKEN", scope: "org" }],
+      },
+    ];
+    mocks.secrets.set("org:org-1:SLACK_BOT_TOKEN", "slack-token");
+    mocks.currentUserEmail = "teammate@example.test";
+
+    await expect(
+      assertSourceCredentialAvailable({
+        provider: "slack",
+        workspaceConnectionId: "conn-slack",
+        ctx: { userEmail: "teammate@example.test", orgId: "org-1" },
+      }),
+    ).rejects.toThrow(/not granted to Brain/i);
+
+    const availability = await inspectSourceCredentialAvailability({
+      provider: "slack",
+      key: "SLACK_BOT_TOKEN",
+      workspaceConnectionId: "conn-slack",
+      ctx: { userEmail: "teammate@example.test", orgId: "org-1" },
+    });
+
+    expect(availability.available).toBe(false);
+    expect(availability.checked).toEqual([
+      expect.objectContaining({
+        source: "workspace_connection",
+        status: "not_granted",
+        connectionId: "conn-slack",
       }),
     ]);
   });

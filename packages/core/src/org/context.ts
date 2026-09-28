@@ -1,16 +1,30 @@
+import { createHash } from "node:crypto";
+
 import type { H3Event } from "h3";
 
 import { warnAgent } from "../agent/action-warnings.js";
+import { getAppConfig } from "../app-config/index.js";
+import { appStatePut } from "../application-state/store.js";
 import { getDbExec, isTransientDatabaseError } from "../db/client.js";
 import { getSession } from "../server/auth.js";
+import { shouldWriteFirstRunOnboardingEligibility } from "../server/first-run-onboarding-build-mode.js";
+import {
+  getRequestContext,
+  hasExplicitPersonalOrgScope,
+} from "../server/request-context.js";
 import { getSetting } from "../settings/store.js";
 import { getUserSetting } from "../settings/user-settings.js";
+import { FIRST_RUN_ONBOARDING_ELIGIBLE_KEY } from "../shared/first-run-onboarding.js";
 import { setActiveOrgId } from "./active-org.js";
 import { autoJoinDomainMatchingOrgs } from "./auto-join-domain.js";
+import { isFreeEmailProvider } from "./free-email-providers.js";
 import {
-  invalidateRequestMemberOrgIds,
+  cachedMemberships,
+  invalidateMemberOrgCaches,
   requestMemberOrgIds,
 } from "./request-org-cache.js";
+import { implicitServiceOrgRole } from "./service-identity.js";
+import { isBootstrapAdmin } from "./signup-admission.js";
 import type { OrgContext, OrgRole } from "./types.js";
 
 const EMPTY_CONTEXT: OrgContext = {
@@ -20,20 +34,6 @@ const EMPTY_CONTEXT: OrgContext = {
   role: null,
 };
 
-/**
- * The single way to read `org_members`, so no two call sites can pick opposite
- * defaults for the same failure. A transient database failure is NOT an answer
- * and propagates: a caller that turns it into "no memberships" silently drops
- * org scope, which hides every org-scoped credential behind a
- * permanent-sounding "not configured".
- *
- * `null` is every non-transient failure, not only the intended one (org tables
- * absent on a fresh install before migrations). A permanently unreadable table
- * — a role without SELECT, say — still reports as "no rows" here. Narrowing
- * that further means classifying "no database configured" as readable-absent,
- * which is load-bearing for CLI/script/test contexts that legitimately run
- * without a store; see `assertCredentialStoreReadable`.
- */
 export async function queryOrgMembers(query: {
   sql: string;
   args: unknown[];
@@ -57,12 +57,6 @@ function emailDomainOf(email: string): string | null {
   return email.split("@")[1]?.toLowerCase() || null;
 }
 
-/**
- * A workspace the user owns that nobody else has joined is a default/personal
- * workspace whatever it happens to be named, so moving the user into their
- * company org is safe. An org with other members is a team they deliberately
- * belong to — join the domain org in the background but leave them there.
- */
 async function isSoloOwnedWorkspace(
   exec: ReturnType<typeof getDbExec>,
   orgId: string,
@@ -72,7 +66,8 @@ async function isSoloOwnedWorkspace(
   if (!membership || membership.role !== "owner") return false;
   try {
     const { rows } = await exec.execute({
-      sql: `SELECT COUNT(*) AS "memberCount" FROM org_members WHERE org_id = ?`,
+      sql: `SELECT COUNT(*) AS "memberCount" FROM org_members
+            WHERE org_id = ? AND federation_removal_pending_at IS NULL`,
       args: [orgId],
     });
     const row = rows[0] as any;
@@ -83,37 +78,18 @@ async function isSoloOwnedWorkspace(
 }
 
 function autoCreateDefaultOrgEnabled(): boolean {
-  const raw = process.env.AUTO_CREATE_DEFAULT_ORG;
-  if (raw === undefined || raw.trim() === "") return true;
-  return !["0", "false", "no", "off"].includes(raw.trim().toLowerCase());
+  const access = getAppConfig().access;
+  return access.orgCreation === "open" && access.autoCreateDefaultOrg;
 }
 
 const nanoid = (): string =>
   globalThis.crypto?.randomUUID?.().replace(/-/g, "") ??
   Math.random().toString(36).slice(2) + Date.now().toString(36);
 
-/**
- * Resolve the current user's organization context from their session.
- *
- * - Honors the user's `active-org-id` setting, including an explicit Personal
- *   context represented by `{ orgId: null }`.
- * - Falls back to the user's first membership.
- * - When the authenticated user has zero memberships, provisions a default org
- *   named after the user ({name}'s workspace, falling back to the email
- *   local-part). Set `AUTO_CREATE_DEFAULT_ORG=0` to opt out.
- *
- * Per-request memoized on `event.context` — mirrors the `getSession`
- * pattern so multiple callers in the same request (e.g. ssr-handler +
- * a loader) share a single org_members round trip.
- */
 export async function getOrgContext(event: H3Event): Promise<OrgContext> {
-  // Per-request memoization. Multiple call sites per request (action wrappers,
-  // SSR handler, loaders) must not each pay a separate org_members query.
   const ctx = event.context as {
     __anOrgContextCache?: Promise<OrgContext>;
   };
-  // Evict on failure. A memoized failure would otherwise answer every later
-  // caller in this request with the wrong org.
   return (ctx.__anOrgContextCache ??= resolveOrgContextUncached(event).catch(
     (err) => {
       delete ctx.__anOrgContextCache;
@@ -122,15 +98,75 @@ export async function getOrgContext(event: H3Event): Promise<OrgContext> {
   ));
 }
 
-type MembershipRow = {
+export type OrgMembership = {
   orgId: string;
   role: OrgRole;
   orgName: string;
   allowedDomain: string | null;
+  identityAuthority: string | null;
+  identityId: string | null;
 };
+
+type MembershipRow = OrgMembership;
+
+async function refreshFederatedMemberships(
+  event: H3Event,
+  email: string,
+  memberships: MembershipRow[],
+  selectedOrgId: string | null,
+): Promise<MembershipRow[]> {
+  const selected = selectedOrgId
+    ? memberships.find((membership) => membership.orgId === selectedOrgId)
+    : undefined;
+  if (!selected || (!selected.identityAuthority && !selected.identityId)) {
+    return memberships;
+  }
+  const { validateFederatedOrganizationMembership } =
+    await import("./federation.js");
+  const result = await validateFederatedOrganizationMembership(event, {
+    orgId: selected.orgId,
+    email,
+  });
+  if (!result.active) {
+    return memberships.filter((item) => item.orgId !== selected.orgId);
+  }
+  if (result.role === selected.role) {
+    return memberships;
+  }
+  return memberships.map((item) =>
+    item.orgId === selected.orgId ? { ...item, role: result.role } : item,
+  );
+}
 
 const MEMBERSHIPS_CACHE_KEY = "__anOrgMembershipsCache";
 const ACTIVE_ORG_SETTING_CACHE_KEY = "__anActiveOrgSettingCache";
+const FEDERATION_MEMBERSHIP_VALIDATED_KEY = "__anFederationMembershipValidated";
+
+export function isFederationMembershipValidatedForEvent(
+  event: H3Event,
+  email: string | undefined,
+  orgId: string | undefined,
+): boolean {
+  const marker = (event.context as Record<string, unknown>)[
+    FEDERATION_MEMBERSHIP_VALIDATED_KEY
+  ] as { email?: unknown; orgId?: unknown } | undefined;
+  return (
+    typeof email === "string" &&
+    typeof orgId === "string" &&
+    marker?.email === email.trim().toLowerCase() &&
+    marker?.orgId === orgId
+  );
+}
+
+function markFederationMembershipValidated(
+  event: H3Event,
+  email: string,
+  orgId: string,
+): void {
+  (event.context as Record<string, unknown>)[
+    FEDERATION_MEMBERSHIP_VALIDATED_KEY
+  ] = { email: email.trim().toLowerCase(), orgId };
+}
 
 type ActiveOrgSetting = { orgId: string | null } | null;
 
@@ -159,12 +195,6 @@ function loadActiveOrgSettingForEvent(
   return promise;
 }
 
-/**
- * Per-request memoization of the org_members lookup, keyed by email on
- * `event.context`. Both the session org backfill (inside `getSession`) and
- * `getOrgContext` need the membership rows; without sharing, every request
- * whose session lacks an orgId pays the query twice.
- */
 function loadMembershipsForEvent(
   event: H3Event,
   email: string,
@@ -179,8 +209,6 @@ function loadMembershipsForEvent(
     >())) as Map<string, Promise<MembershipRow[] | null>>;
   let promise = cache.get(email);
   if (!promise) {
-    // A failed read is evicted rather than memoized: caching it would make one
-    // transient error answer every later lookup in this request.
     promise = loadMemberships(email).catch((err) => {
       cache.delete(email);
       throw err;
@@ -206,17 +234,35 @@ async function resolveOrgContextUncached(event: H3Event): Promise<OrgContext> {
   const session = await getSession(event);
   const email = session?.email;
   if (!email) return EMPTY_CONTEXT;
+  if (hasExplicitPersonalOrgScope(event)) {
+    return { email, orgId: null, orgName: null, role: null };
+  }
   const sessionOrgId =
     typeof session.orgId === "string" && session.orgId.trim()
       ? session.orgId.trim()
       : null;
   const sessionOrgRole = normalizeOrgRole(session.orgRole);
 
+  const requestContext = getRequestContext();
+  const serviceRole = implicitServiceOrgRole({
+    email,
+    orgId: sessionOrgId,
+    requestOrgId:
+      requestContext?.orgScope === "personal"
+        ? null
+        : (requestContext?.orgId ?? sessionOrgId),
+  });
+  if (serviceRole && sessionOrgId) {
+    return {
+      email,
+      orgId: sessionOrgId,
+      orgName: null,
+      role: serviceRole,
+    };
+  }
+
   const exec = getDbExec();
 
-  // Started before the memberships await so the two round trips overlap; the
-  // `catch` only covers the early returns below, the later `await` still
-  // propagates a real failure.
   const activeOrgSettingPromise = loadActiveOrgSettingForEvent(event, email);
   activeOrgSettingPromise.catch(() => {});
 
@@ -250,15 +296,48 @@ async function resolveOrgContextUncached(event: H3Event): Promise<OrgContext> {
 
   const activeOrgSetting = await activeOrgSettingPromise;
   const explicitPersonal = activeOrgSetting?.orgId === null;
+  const selectedMembership = explicitPersonal
+    ? undefined
+    : ((activeOrgSetting?.orgId
+        ? memberships.find(
+            (membership) => membership.orgId === activeOrgSetting.orgId,
+          )
+        : undefined) ??
+      (sessionOrgId
+        ? memberships.find((membership) => membership.orgId === sessionOrgId)
+        : undefined) ??
+      memberships[0]);
+  const selectedOrgId = selectedMembership?.orgId ?? null;
+  const selectedWasFederated = Boolean(
+    selectedMembership?.identityAuthority || selectedMembership?.identityId,
+  );
+  const refreshedMemberships = await refreshFederatedMemberships(
+    event,
+    email,
+    memberships,
+    selectedOrgId,
+  );
+  if (refreshedMemberships !== memberships) {
+    memberships = refreshedMemberships;
+    updateMembershipsForEvent(event, email, memberships);
+  }
+  if (
+    selectedWasFederated &&
+    selectedOrgId &&
+    !memberships.some((membership) => membership.orgId === selectedOrgId)
+  ) {
+    return { email, orgId: null, orgName: null, role: null };
+  }
+  if (selectedOrgId && memberships.some((m) => m.orgId === selectedOrgId)) {
+    markFederationMembershipValidated(event, email, selectedOrgId);
+  }
 
   const emailDomain = emailDomainOf(email);
-  // Membership in a domain-matched org is the only durable "already joined"
-  // signal. Recognizing the personal workspace by its *name* instead breaks the
-  // moment the provider display name or the workspace name changes, which
-  // strands an existing user in Personal with no way into their company org.
   const shouldTryDomainAutoJoin =
     !explicitPersonal &&
+    session.emailVerified === true &&
     emailDomain !== null &&
+    !isFreeEmailProvider(emailDomain) &&
     !memberships.some((m) => m.allowedDomain?.toLowerCase() === emailDomain);
 
   if (
@@ -350,12 +429,17 @@ async function resolveOrgContextUncached(event: H3Event): Promise<OrgContext> {
         role: active.role,
       };
     }
-    return {
-      email,
-      orgId: sessionOrgId,
-      orgName: null,
-      role: sessionOrgRole,
-    };
+    const pending = await exec.execute({
+      sql: `SELECT 1 FROM org_members
+            WHERE org_id = ? AND LOWER(email) = ?
+              AND federation_removal_pending_at IS NOT NULL
+            LIMIT 1`,
+      args: [sessionOrgId, email.toLowerCase()],
+    });
+    if (pending.rows.length > 0) {
+      return { email, orgId: null, orgName: null, role: null };
+    }
+    return { email, orgId: null, orgName: null, role: null };
   }
 
   if (memberships.length === 0 && autoCreateDefaultOrgEnabled()) {
@@ -377,23 +461,56 @@ async function resolveOrgContextUncached(event: H3Event): Promise<OrgContext> {
   };
 }
 
-/**
- * Ordering for every membership lookup that falls back to "first membership".
- * Without it the fallback is whatever order the plan happens to return, so a
- * multi-org user's active org can change between two identical requests — and
- * `getSession` then freezes that arbitrary answer into `session.orgId`.
- * `org_id` breaks ties so two memberships joined in the same millisecond still
- * resolve identically.
- */
 const MEMBERSHIP_FALLBACK_ORDER_BY = `ORDER BY joined_at ASC, org_id ASC`;
 
 async function loadMemberships(email: string): Promise<MembershipRow[] | null> {
+  return cachedMemberships(email, () => loadMembershipsUncached(email));
+}
+
+export async function listOrgMemberships(
+  email: string,
+): Promise<OrgMembership[] | null> {
+  return loadMemberships(email);
+}
+
+export async function listOrgMembershipsForEvent(
+  event: H3Event,
+  email: string,
+  selectedOrgId: string | null,
+): Promise<OrgMembership[] | null> {
+  const memberships = await loadMembershipsForEvent(event, email);
+  if (memberships === null) return null;
+  const refreshed = await refreshFederatedMemberships(
+    event,
+    email,
+    memberships,
+    selectedOrgId,
+  );
+  if (refreshed !== memberships) {
+    updateMembershipsForEvent(event, email, refreshed);
+  }
+  return refreshed;
+}
+
+export async function getActiveOrgSettingForEvent(
+  event: H3Event,
+  email: string,
+): Promise<{ orgId: string | null } | null> {
+  return loadActiveOrgSettingForEvent(event, email);
+}
+
+async function loadMembershipsUncached(
+  email: string,
+): Promise<MembershipRow[] | null> {
   const rows = await queryOrgMembers({
     sql: `SELECT m.org_id AS "orgId", m.role AS role, o.name AS "orgName",
-                 o.allowed_domain AS "allowedDomain"
+                 o.allowed_domain AS "allowedDomain",
+                 o.identity_authority AS "identityAuthority",
+                 o.identity_id AS "identityId"
           FROM org_members m
           INNER JOIN organizations o ON m.org_id = o.id
           WHERE LOWER(m.email) = ?
+            AND m.federation_removal_pending_at IS NULL
           ${MEMBERSHIP_FALLBACK_ORDER_BY}`,
     args: [email.toLowerCase()],
   });
@@ -405,32 +522,29 @@ async function loadMemberships(email: string): Promise<MembershipRow[] | null> {
         role: String(r.role) as OrgRole,
         orgName: String(r.orgName ?? r.org_name),
         allowedDomain: domain ? String(domain) : null,
+        identityAuthority:
+          String(r.identityAuthority ?? r.identity_authority ?? "").trim() ||
+          null,
+        identityId: String(r.identityId ?? r.identity_id ?? "").trim() || null,
       };
     }) ?? null
   );
 }
 
-/**
- * Resolve the active org ID for a given email — for non-HTTP contexts like
- * the integration webhook handler where we have an email but no event/session.
- * Picks the user's active-org-id setting if set, including explicit Personal,
- * otherwise the oldest membership.
- * Returns null if the user has no memberships.
- */
 export async function resolveOrgIdForEmail(
   email: string,
 ): Promise<string | null> {
+  if (getRequestContext()?.orgScope === "personal") return null;
   const idsPromise = requestMemberOrgIds(email, async () => {
     const rows = await queryOrgMembers({
-      sql: `SELECT org_id FROM org_members WHERE LOWER(email) = ?
+      sql: `SELECT org_id FROM org_members
+            WHERE LOWER(email) = ?
+              AND federation_removal_pending_at IS NULL
             ${MEMBERSHIP_FALLBACK_ORDER_BY}`,
       args: [email.toLowerCase()],
     });
     return rows?.map((r: any) => String(r.org_id)) ?? null;
   });
-  // Both reads depend only on the email, so they overlap instead of queueing.
-  // The `catch` only keeps the early return below from surfacing an unhandled
-  // rejection; the `await` further down still propagates the failure.
   const settingPromise = getUserSetting(
     email,
     "active-org-id",
@@ -447,18 +561,11 @@ export async function resolveOrgIdForEmail(
   return ids[0];
 }
 
-/**
- * Event-aware variant of `resolveOrgIdForEmail` for HTTP request paths.
- * Shares the per-request membership lookup with `getOrgContext`, so the
- * session org backfill inside `getSession` and a later `getOrgContext` call
- * in the same request pay ONE org_members round trip, not two.
- */
 export async function resolveOrgIdForEmailViaEvent(
   event: H3Event,
   email: string,
 ): Promise<string | null> {
-  // Overlapped, not queued: each is a separate round trip and this pair runs
-  // on the session-backfill path of every authenticated request.
+  if (getRequestContext()?.orgScope === "personal") return null;
   const settingPromise = loadActiveOrgSettingForEvent(event, email);
   settingPromise.catch(() => {});
   const memberships = await loadMembershipsForEvent(event, email);
@@ -474,17 +581,15 @@ export async function resolveOrgIdForEmailViaEvent(
   return memberships[0].orgId;
 }
 
-/**
- * Create a new organization and add the caller as a member with the given
- * role. Generates a per-org A2A secret for cross-app delegation and writes
- * the caller's `active-org-id` user-setting so the new org is immediately
- * active.
- *
- */
 export async function createOrganization(
   name: string,
   email: string,
   role: OrgRole = "owner",
+  options: {
+    id?: string;
+    identityAuthority?: string;
+    identityId?: string;
+  } = {},
 ): Promise<{
   id: string;
   name: string;
@@ -494,21 +599,33 @@ export async function createOrganization(
 }> {
   const trimmedName = name.trim();
   const exec = getDbExec();
-  const id = nanoid();
+  const id = options.id ?? nanoid();
+  if (Boolean(options.identityAuthority) !== Boolean(options.identityId)) {
+    throw new Error(
+      "Organization identity authority and identity id must be provided together.",
+    );
+  }
   const createdAt = Date.now();
   const { randomBytes } = await import("node:crypto");
   const a2aSecret = randomBytes(32).toString("base64url");
+  const identityColumns = options.identityAuthority
+    ? ", identity_authority, identity_id"
+    : "";
+  const identityPlaceholders = options.identityAuthority ? ", ?, ?" : "";
+  const identityArgs = options.identityAuthority
+    ? [options.identityAuthority, options.identityId]
+    : [];
 
   await exec.execute({
-    sql: `INSERT INTO organizations (id, name, created_by, created_at, a2a_secret) VALUES (?, ?, ?, ?, ?)`,
-    args: [id, trimmedName, email, createdAt, a2aSecret],
+    sql: `INSERT INTO organizations (id, name, created_by, created_at, a2a_secret${identityColumns}) VALUES (?, ?, ?, ?, ?${identityPlaceholders})`,
+    args: [id, trimmedName, email, createdAt, a2aSecret, ...identityArgs],
   });
 
   await exec.execute({
     sql: `INSERT INTO org_members (id, org_id, email, role, joined_at) VALUES (?, ?, ?, ?, ?)`,
     args: [nanoid(), id, email, role, createdAt],
   });
-  invalidateRequestMemberOrgIds();
+  invalidateMemberOrgCaches();
 
   await warnOnAdditionalOrganization(exec, email, id, trimmedName);
 
@@ -517,15 +634,57 @@ export async function createOrganization(
   return { id, name: trimmedName, role, a2aSecret, createdAt };
 }
 
-/**
- * A second organization is the single most expensive accident in this codebase:
- * vault credentials are scoped per organization, so creating one and activating
- * it orphans every key synced under the previous org, and the only symptom is a
- * missing-env-var error somewhere else entirely. The UI warns humans before
- * they click (`org.createOrgVaultNotice`); this covers the path that actually
- * did the damage — app code or a migration action calling `createOrganization`
- * directly, where no notice is ever rendered.
- */
+export async function bootstrapAdminOrganization(
+  rawEmail: string,
+): Promise<boolean> {
+  const email = rawEmail.trim().toLowerCase();
+  if (!email || !isBootstrapAdmin(email)) return false;
+
+  const exec = getDbExec();
+  const orgs = await exec.execute({
+    sql: `SELECT id FROM organizations
+          ORDER BY created_at ASC, id ASC
+          LIMIT 2`,
+    args: [],
+  });
+  if (orgs.rows.length > 1) {
+    console.warn(
+      "[org] bootstrap admin could not choose among multiple organizations",
+    );
+    return false;
+  }
+
+  if (orgs.rows.length === 0) {
+    const config = getAppConfig();
+    const name = config.app.name ?? config.app.id ?? "Agent-Native";
+    const identity = config.app.workspaceId ?? config.app.id ?? name;
+    const id = `bootstrap-${createHash("sha256").update(identity).digest("hex").slice(0, 24)}`;
+    try {
+      await createOrganization(name, email, "owner", { id });
+      return true;
+    } catch (error) {
+      const existing = await exec.execute({
+        sql: `SELECT id FROM organizations WHERE id = ? LIMIT 1`,
+        args: [id],
+      });
+      if (existing.rows.length === 0) throw error;
+      orgs.rows.push(existing.rows[0]);
+    }
+  }
+
+  const orgId = String((orgs.rows[0] as any).id);
+  const now = Date.now();
+  await exec.execute({
+    sql: `INSERT INTO org_members (id, org_id, email, role, joined_at)
+          VALUES (?, ?, ?, 'owner', ?)
+          ON CONFLICT (org_id, LOWER(email)) DO UPDATE SET role = 'owner'`,
+    args: [nanoid(), orgId, email, now],
+  });
+  invalidateMemberOrgCaches();
+  await setActiveOrgId(email, orgId, "bootstrap admin organization access");
+  return true;
+}
+
 async function warnOnAdditionalOrganization(
   exec: ReturnType<typeof getDbExec>,
   email: string,
@@ -534,13 +693,14 @@ async function warnOnAdditionalOrganization(
 ): Promise<void> {
   try {
     const { rows } = await exec.execute({
-      sql: `SELECT 1 FROM org_members WHERE LOWER(email) = ? AND org_id <> ? LIMIT 1`,
+      sql: `SELECT 1 FROM org_members
+            WHERE LOWER(email) = ? AND org_id <> ?
+              AND federation_removal_pending_at IS NULL
+            LIMIT 1`,
       args: [email.toLowerCase(), newOrgId],
     });
     if (rows.length === 0) return;
   } catch {
-    // "Couldn't tell" is not "it didn't" — swallowing the failed probe here made
-    // the function whose entire job is to not be silent, silent.
     warnAgent({
       severity: "critical",
       code: "org-additional-org-membership-unreadable",
@@ -586,12 +746,6 @@ function defaultOrgName(
   return `${titled}'s workspace`;
 }
 
-/**
- * Check whether the user has a pending invitation. If so, auto-create
- * MUST be skipped — otherwise we'd provision a personal org for them
- * before they ever see the inviter's org in the invitation banner, and they'd
- * never join the team that invited them.
- */
 async function hasPendingInvitation(
   exec: ReturnType<typeof getDbExec>,
   email: string,
@@ -603,8 +757,6 @@ async function hasPendingInvitation(
     });
     return rows.length > 0;
   } catch {
-    // If we can't tell, err on the side of NOT auto-creating — the
-    // invitation banner or team UI can surface the situation.
     return true;
   }
 }
@@ -626,40 +778,13 @@ async function hasDomainMatch(
   }
 }
 
-/** Stale-claim threshold. A claim row this old is treated as abandoned
- *  (process crashed, DELETE failed, etc.) and a new caller may take it
- *  over. Long enough that two genuine concurrent first-loads don't
- *  trample each other (those settle in milliseconds), short enough that
- *  a stuck user recovers on their next navigation. */
 const CLAIM_TTL_MS = 5 * 60 * 1000;
 
-/**
- * Attempt to provision a default org + owner membership for a user with
- * zero memberships.
- *
- * Race protection: claims the user's auto-create slot via an atomic
- * INSERT into the framework `settings` table (PRIMARY KEY (key) — so
- * concurrent inserts for the same key throw uniqueness violations on
- * both SQLite and Postgres). Only the request that wins the claim
- * proceeds to create the org; losers bail. By the time a losing
- * request retries on a subsequent navigation, the winner's org is in
- * `org_members` and the auto-create branch is skipped entirely.
- *
- * Stuck-state recovery: a stale claim (held longer than CLAIM_TTL_MS)
- * is reclaimed automatically. So even if the DELETE on the failure
- * path fails (network blip, DB error), the user isn't stranded — the
- * next request after the TTL elapses retries cleanly.
- *
- * Returns null on any failure so the caller can fall back to the
- * empty-context / client-guard path.
- */
 async function tryCreateDefaultOrg(
   exec: ReturnType<typeof getDbExec>,
   email: string,
   session: { name?: string } | null,
 ): Promise<OrgContext | null> {
-  // Make sure the framework `settings` table exists before we use it as
-  // a claim primitive. getSetting() ensures the table on first call.
   await getSetting("__init").catch(() => null);
 
   const claimKey = `u:${email.toLowerCase()}:auto-create-claim`;
@@ -693,9 +818,27 @@ async function tryCreateDefaultOrg(
       sql: `INSERT INTO org_members (id, org_id, email, role, joined_at) VALUES (?, ?, ?, ?, ?)`,
       args: [nanoid(), orgId, email, "owner", now],
     });
-    invalidateRequestMemberOrgIds();
+    invalidateMemberOrgCaches();
 
     await setActiveOrgId(email, orgId, "auto-created default organization");
+    if (shouldWriteFirstRunOnboardingEligibility()) {
+      try {
+        await appStatePut(
+          email,
+          FIRST_RUN_ONBOARDING_ELIGIBLE_KEY,
+          { orgId, at: new Date(now).toISOString() },
+          { requestSource: "org-auto-create" },
+        );
+      } catch (error) {
+        warnAgent({
+          severity: "advisory",
+          code: "first-run-onboarding-eligibility-unreadable",
+          message:
+            `Auto-created organization ${orgId} for ${email}, but could not persist ` +
+            `the first-run onboarding eligibility marker: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    }
 
     return { email, orgId, orgName, role: "owner" };
   } catch {
@@ -716,18 +859,6 @@ async function acquireClaim(
     });
     return true;
   } catch {
-    // Conflict — someone else's claim is already in the row. If it's
-    // stale (older than CLAIM_TTL_MS) we take it over.
-    //
-    // CRITICAL: this MUST be a single atomic UPDATE guarded on
-    // `updated_at <= staleThreshold`. A read-then-DELETE-then-INSERT
-    // sequence lets two concurrent reclaimers each observe the stale
-    // timestamp, delete each other's fresh claim, and both think they
-    // won — duplicating org creation. The conditional UPDATE matches
-    // each stale row at most once: only the first writer sees
-    // rowsAffected === 1; the row's updated_at is now `now`, so any
-    // subsequent UPDATE no longer satisfies `updated_at <= staleThreshold`
-    // and matches zero rows.
     const staleThreshold = now - CLAIM_TTL_MS;
     const result = (await exec.execute({
       sql: `UPDATE settings SET value = ?, updated_at = ? WHERE key = ? AND updated_at <= ?`,
@@ -741,19 +872,11 @@ async function releaseClaim(
   exec: ReturnType<typeof getDbExec>,
   claimKey: string,
 ): Promise<void> {
-  // Best-effort. If this fails (transient network/DB error), the
-  // CLAIM_TTL_MS-based takeover in acquireClaim recovers automatically
-  // on a future request — no permanent stuck state.
   await exec
     .execute({ sql: `DELETE FROM settings WHERE key = ?`, args: [claimKey] })
     .catch(() => {});
 }
 
-/**
- * Look up the `allowed_domain` for an org by its ID.
- * Used when making outbound A2A calls so the JWT includes the
- * caller's org domain for cross-app org resolution.
- */
 export async function getOrgDomain(orgId: string): Promise<string | null> {
   try {
     const exec = getDbExec();
@@ -769,11 +892,6 @@ export async function getOrgDomain(orgId: string): Promise<string | null> {
   }
 }
 
-/**
- * Look up the org's A2A secret by org ID.
- * Used when making outbound A2A calls so the JWT is signed with the
- * org-specific secret rather than the global A2A_SECRET env var.
- */
 export async function getOrgA2ASecret(orgId: string): Promise<string | null> {
   try {
     const exec = getDbExec();
@@ -789,12 +907,6 @@ export async function getOrgA2ASecret(orgId: string): Promise<string | null> {
   }
 }
 
-/**
- * Look up an org's A2A secret by its `allowed_domain`.
- * Used on the A2A receiving side: the caller's JWT includes `org_domain`,
- * and the receiver looks up which local org matches that domain to find
- * the secret used to verify the JWT signature.
- */
 export async function getA2ASecretByDomain(
   domain: string,
 ): Promise<string | null> {
@@ -812,11 +924,6 @@ export async function getA2ASecretByDomain(
   }
 }
 
-/**
- * Resolve a local org by its `allowed_domain`.
- * Used on the A2A receiving side: the caller sends `org_domain` in the JWT,
- * and the receiver looks up which local org matches that domain.
- */
 export async function resolveOrgByDomain(
   domain: string,
 ): Promise<{ orgId: string; orgName: string } | null> {
@@ -833,5 +940,23 @@ export async function resolveOrgByDomain(
     };
   } catch {
     return null;
+  }
+}
+
+export async function isSoleOrgDomain(domain: string): Promise<boolean> {
+  try {
+    const exec = getDbExec();
+    const { rows } = await exec.execute({
+      sql: `SELECT allowed_domain FROM organizations LIMIT 2`,
+      args: [],
+    });
+    if (rows.length !== 1) return false;
+    return (
+      String((rows[0] as any).allowed_domain || "").toLowerCase() ===
+      domain.trim().toLowerCase()
+    );
+  } catch {
+    // coercion-ok: an unreadable org registry denies legacy global-secret compatibility.
+    return false;
   }
 }

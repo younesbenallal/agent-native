@@ -6,15 +6,20 @@ import {
   useAgentChatHomeHandoff,
   useAgentChatHomeHandoffLinks,
 } from "@agent-native/core/client/agent-chat";
+import { useFeatureFlagState } from "@agent-native/core/client/feature-flags";
 import { getBrowserTabId } from "@agent-native/core/client/hooks";
 import { isEmbedAuthActive } from "@agent-native/core/client/host";
 import { useT } from "@agent-native/core/client/i18n";
 import { InvitationBanner } from "@agent-native/core/client/org";
+import { SETTINGS_REDESIGN_FLAG } from "@agent-native/core/feature-flags/registry";
 import {
   EMBED_MODE_QUERY_PARAM,
   EMBED_TOKEN_QUERY_PARAM,
 } from "@agent-native/core/shared";
-import { CreativeContextComposerChip } from "@agent-native/creative-context/client";
+import {
+  CreativeContextComposerChip,
+  useCreativeContextLab,
+} from "@agent-native/creative-context/client";
 import { HeaderActionsProvider } from "@agent-native/toolkit/app-shell";
 import { IconMenu2 } from "@tabler/icons-react";
 import { useState, useEffect } from "react";
@@ -57,10 +62,12 @@ export function Layout({ children }: LayoutProps) {
   const location = useLocation();
   const navigate = useNavigate();
   const t = useT();
+  const creativeContextEnabled = useCreativeContextLab();
   const imageModelMenu = useImageModelMenu();
+  const settingsRedesign = useFeatureFlagState(SETTINGS_REDESIGN_FLAG.key);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const isCreateRoute =
-    location.pathname === "/" || location.pathname.startsWith("/chat/");
+    location.pathname === "/home" || location.pathname.startsWith("/chat/");
   const chatHomeHandoffActive = useAgentChatHomeHandoff({
     storageKey: ASSETS_CHAT_STORAGE_KEY,
     activePath: location.pathname,
@@ -71,9 +78,8 @@ export function Layout({ children }: LayoutProps) {
   );
   useAgentChatHomeHandoffLinks({
     storageKey: ASSETS_CHAT_STORAGE_KEY,
-    isChatPath: (pathname) => pathname === "/" || pathname.startsWith("/chat/"),
-    // Only preserve the transition when chat activity has recorded an active
-    // handoff; an empty home chat should keep the destination sidebar closed.
+    isChatPath: (pathname) =>
+      pathname === "/home" || pathname.startsWith("/chat/"),
     requireActiveHandoff: true,
   });
 
@@ -104,7 +110,21 @@ export function Layout({ children }: LayoutProps) {
     );
   }
 
-  const appFrame = (
+  // The redesigned Settings shell brings its own nav, back link, and agent
+  // toggle, so the app's sidebar and header would double them. While the flag
+  // loads the page shows the shell's skeleton, which needs the same frame.
+  const settingsFullBleed =
+    (settingsRedesign.enabled || settingsRedesign.status === "loading") &&
+    (location.pathname === "/settings" ||
+      location.pathname.startsWith("/settings/"));
+
+  const appFrame = settingsFullBleed ? (
+    <div className="agent-layout-shell flex h-screen w-full overflow-hidden bg-background text-foreground">
+      <main className="agent-native-app-main min-h-0 min-w-0 flex-1 overflow-hidden">
+        {children}
+      </main>
+    </div>
+  ) : (
     <div className="agent-layout-shell flex h-screen w-full overflow-hidden bg-background text-foreground">
       {mobileSidebarOpen && (
         <div
@@ -151,7 +171,7 @@ export function Layout({ children }: LayoutProps) {
 
   function openCreateChatFullscreen() {
     focusAgentChat();
-    navigateWithAgentChatViewTransition(navigate, "/");
+    navigateWithAgentChatViewTransition(navigate, "/home");
   }
 
   return (
@@ -165,7 +185,7 @@ export function Layout({ children }: LayoutProps) {
         openOnChatRunning={chatHomeHandoffActive}
         onFullscreenRequest={openCreateChatFullscreen}
         emptyStateText={t("chat.emptyState")}
-        agentPageHref="/agent"
+        agentPageHref="/settings/agent"
         suggestions={[
           t("chat.suggestionBlogHeroes"),
           t("chat.suggestionProductVideo"),
@@ -175,7 +195,9 @@ export function Layout({ children }: LayoutProps) {
           <GenerationResults threadId={threadId} />
         )}
         imageModelMenu={imageModelMenu}
-        composerSlot={<CreativeContextComposerChip />}
+        composerSlot={
+          creativeContextEnabled ? <CreativeContextComposerChip /> : undefined
+        }
       >
         {appFrame}
       </AgentSidebar>

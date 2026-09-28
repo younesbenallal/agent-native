@@ -42,13 +42,14 @@ export function WorkspaceFileWidget({
   result: WorkspaceFileResult;
 }) {
   const t = useT();
-  const { formatNumber } = useFormatters();
+  const formatters = useFormatters();
+  const formatNumber = formatters.formatNumber.bind(formatters);
   const { file } = result;
   const FileIcon = fileIcon(file.contentType);
   const href = resourceDownloadUrl(file.resourceId);
 
   return (
-    <div className="flex items-center gap-3">
+    <div className="flex items-center gap-3 rounded-lg border border-border bg-card p-3 text-card-foreground shadow-sm">
       <div className="flex size-10 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
         <FileIcon className="size-5" aria-hidden="true" />
       </div>

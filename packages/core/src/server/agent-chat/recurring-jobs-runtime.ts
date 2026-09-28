@@ -1,20 +1,20 @@
-// ---------------------------------------------------------------------------
-// Recurring-jobs runtime gating: decide whether this process should run the
-// local recurring-job scheduler loop (disabled by default on hosted runtimes
-// that already run a dedicated sweep, enabled by default for local/dev).
-// ---------------------------------------------------------------------------
-
 type RecurringJobsRuntimeEnvKey =
+  | "AGENT_NATIVE_BUILD_RECURRING_JOBS"
   | "AGENT_NATIVE_DISABLE_RECURRING_JOBS"
   | "AGENT_NATIVE_ENABLE_LOCAL_RECURRING_JOBS"
   | "APP_URL"
   | "BETTER_AUTH_URL"
+  | "CF_PAGES"
   | "DEPLOY_URL"
+  | "AWS_EXECUTION_ENV"
+  | "AWS_LAMBDA_FUNCTION_NAME"
   | "NETLIFY"
   | "NETLIFY_LOCAL"
+  | "NITRO_PRESET"
   | "NODE_ENV"
   | "SITE_ID"
   | "URL"
+  | "VERCEL"
   | "VITE_APP_URL"
   | "VITE_WORKSPACE_GATEWAY_URL"
   | "WORKSPACE_GATEWAY_URL";
@@ -54,10 +54,26 @@ function isLoopbackAppUrl(value: string | undefined): boolean {
   return false;
 }
 
+function isServerlessRecurringJobsRuntime(
+  env: RecurringJobsRuntimeEnv,
+): boolean {
+  return (
+    env.NETLIFY_LOCAL !== "true" &&
+    (isTruthyEnv(env.NETLIFY) ||
+      env.NITRO_PRESET === "netlify" ||
+      Boolean(env.AWS_LAMBDA_FUNCTION_NAME) ||
+      env.AWS_EXECUTION_ENV?.startsWith("AWS_Lambda") === true ||
+      isTruthyEnv(env.CF_PAGES) ||
+      isTruthyEnv(env.VERCEL))
+  );
+}
+
 export function shouldDisableRecurringJobsRuntime(
   env: RecurringJobsRuntimeEnv = process.env,
 ): boolean {
   if (isTruthyEnv(env.AGENT_NATIVE_DISABLE_RECURRING_JOBS)) return true;
+
+  if (isServerlessRecurringJobsRuntime(env)) return true;
 
   const isLocalRuntime =
     env.NODE_ENV === "development" ||
@@ -82,15 +98,77 @@ export function shouldDisableRecurringJobsRuntime(
   return isLocalRuntime;
 }
 
-/**
- * Hosted Netlify deploys get a durable scheduled sweep emitted by the build.
- * The in-process timer must stay off there: a scale-to-zero recycle destroys
- * that timer, which is exactly the failure mode the emitted sweep fixes.
- */
 export function isNetlifyRecurringJobsRuntime(
   env: RecurringJobsRuntimeEnv = process.env,
 ): boolean {
   if (env.NETLIFY_LOCAL === "true") return false;
   if (env.NETLIFY === "false") return false;
   return Boolean((env.NETLIFY && env.NETLIFY !== "false") || env.SITE_ID);
+}
+
+export type RecurringJobsBuildMarker = "enabled" | "disabled";
+
+export const RECURRING_JOBS_BUILD_MARKER_ENV_VAR =
+  "AGENT_NATIVE_BUILD_RECURRING_JOBS";
+
+export function resolveRecurringJobsBuildMarker(
+  env: RecurringJobsRuntimeEnv = process.env,
+): RecurringJobsBuildMarker {
+  return isTruthyEnv(env.AGENT_NATIVE_DISABLE_RECURRING_JOBS)
+    ? "disabled"
+    : "enabled";
+}
+
+function readRecurringJobsBuildMarker(
+  env: RecurringJobsRuntimeEnv,
+): RecurringJobsBuildMarker | undefined {
+  const raw =
+    env.AGENT_NATIVE_BUILD_RECURRING_JOBS ??
+    // config-ok: this value is INLINED at build time by Vite's `define` /
+    // Nitro's `replace`, which rewrite the literal `process.env.<NAME>` member
+    // expression and nothing else. A declared app-config field is read at
+    // runtime from the deployed environment, which is precisely the scope that
+    // cannot see the build's decision — the bug this marker exists to fix.
+    // Reading through the aliased `env` parameter would also survive the build
+    // unreplaced, so the literal form is load-bearing.
+    process.env.AGENT_NATIVE_BUILD_RECURRING_JOBS;
+  const value = raw?.trim();
+  return value === "enabled" || value === "disabled" ? value : undefined;
+}
+
+export type ScheduledTriggerAvailability =
+  | { available: true; driver: "netlify-scheduled-function" | "in-process" }
+  | {
+      available: false;
+      reason: "disabled-by-env" | "no-platform-scheduler" | "local-development";
+    };
+
+export function scheduledTriggerAvailability(
+  env: RecurringJobsRuntimeEnv = process.env,
+): ScheduledTriggerAvailability {
+  const buildMarker = readRecurringJobsBuildMarker(env);
+
+  if (isNetlifyRecurringJobsRuntime(env)) {
+    if (buildMarker === "disabled") {
+      return { available: false, reason: "disabled-by-env" };
+    }
+    if (buildMarker === "enabled") {
+      return { available: true, driver: "netlify-scheduled-function" };
+    }
+    return isTruthyEnv(env.AGENT_NATIVE_DISABLE_RECURRING_JOBS)
+      ? { available: false, reason: "disabled-by-env" }
+      : { available: true, driver: "netlify-scheduled-function" };
+  }
+
+  if (isTruthyEnv(env.AGENT_NATIVE_DISABLE_RECURRING_JOBS)) {
+    return { available: false, reason: "disabled-by-env" };
+  }
+
+  if (isServerlessRecurringJobsRuntime(env)) {
+    return { available: false, reason: "no-platform-scheduler" };
+  }
+
+  return shouldDisableRecurringJobsRuntime(env)
+    ? { available: false, reason: "local-development" }
+    : { available: true, driver: "in-process" };
 }

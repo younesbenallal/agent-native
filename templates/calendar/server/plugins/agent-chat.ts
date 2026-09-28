@@ -1,5 +1,7 @@
 import { registerEvent } from "@agent-native/core/event-bus";
 import { getOrgContext } from "@agent-native/core/org";
+
+import "../onboarding.js";
 import {
   createAgentChatPlugin,
   loadActionsFromStaticRegistry,
@@ -15,9 +17,6 @@ import { z } from "zod";
 import actionsRegistry from "../../.generated/actions-registry.js";
 import { CALENDAR_CONNECTOR_CATALOG } from "../lib/calendar-connector-catalog.js";
 
-// ---------------------------------------------------------------------------
-// Register calendar event-bus events
-// ---------------------------------------------------------------------------
 registerEvent({
   name: "calendar.event.created",
   description: "A new calendar event was created.",
@@ -60,6 +59,7 @@ registerEvent({
 
 const INITIAL_TOOL_NAMES = [
   "view-screen",
+  "list-google-calendars",
   "list-events",
   "search-events",
   "get-event",
@@ -83,11 +83,9 @@ const INITIAL_TOOL_NAMES = [
 
 export default createAgentChatPlugin({
   appId: "calendar",
+  durableBackgroundRuns: true,
   initialToolNames: INITIAL_TOOL_NAMES,
-  connectorCatalog: [...CALENDAR_CONNECTOR_CATALOG],
-  // Enable sandboxed JavaScript execution so Calendar agents can fetch,
-  // paginate, and reduce provider data through providerFetch() without us
-  // hardcoding one action per Google Calendar / CRM endpoint.
+  mcp: { connectorCatalog: [...CALENDAR_CONNECTOR_CATALOG] },
   codeExecution: { production: "sandboxed" },
   resolveOrgId: async (event) => {
     const ctx = await getOrgContext(event);
@@ -100,16 +98,17 @@ Some less-common tool schemas are loaded on demand. Use tool-search with a speci
 
 ## Critical: Use Actions And Provider APIs, Not Raw SQL
 
-Google Calendar events are NOT stored in the local database. They are fetched live from Google Calendar API via actions. Never use db-query or db-exec for calendar operations.
+Google Calendar events are NOT stored in the app's PostgreSQL database. They are fetched live from Google Calendar API via actions. Never use db-query or db-exec for calendar operations.
 
 Provider-specific Calendar actions are shortcuts, not limits. If a first-class action cannot express the exact Google Calendar/CRM endpoint, calendar id, filter, request body, pagination mode, attendee search, recurrence field, or API version needed, call \`provider-api-catalog\` and \`provider-api-docs\` as needed, then call \`provider-api-request\` against the provider's real HTTP API. Use this raw provider API escape hatch instead of weakening the answer, broadening filters, or claiming Calendar cannot do something the underlying API can do.
 
 - \`pnpm action view-screen\` — See the visible UI state (current view, date, selected event). Use it for questions about what the user is looking at, not as a prerequisite for deterministic schedule reads.
+- \`pnpm action list-google-calendars\` — Discover the primary and shared calendars available through every connected Google account. Pass returned opaque \`sourceKey\` values to \`list-events --calendarSourceKeys '[...]'\`; shared calendars are view-only and excluded from booking availability.
 - \`pnpm action list-events --from YYYY-MM-DD --to YYYY-MM-DD\` — List events from Google Calendar. The --to date is exclusive, so use tomorrow for today's events.
 - \`pnpm action search-events --query "term" --from YYYY-MM-DD --to YYYY-MM-DD\` — Convenience bounded search by title, attendees, organizer, location, or description. For relationship history, all-calendar discovery, exact attendee/domain search, or custom pagination, prefer provider-api-request with provider=google_calendar.
 - \`pnpm action provider-api-catalog\` / \`provider-api-docs\` / \`provider-api-request\` — Inspect and call the real Google Calendar, Apollo, Gong, HubSpot, and Pylon APIs directly. For Google Calendar events.list pagination use provider=google_calendar, path=/calendars/primary/events, query={...}, fetchAllPages={cursorPath:"nextPageToken",cursorParam:"pageToken",itemsPath:"items"}. For large relationship-history scans, pass stageAs and pagination={nextCursorPath:"nextPageToken",cursorParam:"pageToken",maxPages:N} with itemsPath="items", then use query-staged-dataset.
 - \`pnpm action create-event --title "..." --start "ISO" --end "ISO"\` — Create a new event. Use \`--eventType outOfOffice\` for OOO, \`--eventType focusTime\` for focus time, \`--eventType workingLocation\` for working location, \`--transparency transparent\` to show as Free, \`--visibility private\` for private events, \`--startTimeZone America/Los_Angeles\` for timezone anchoring, \`--colorId 9\` for Google event color, \`--reminders '[{"method":"popup","minutes":10}]'\` for alerts, and \`--attachments '[{"fileUrl":"https://...","title":"Agenda"}]'\` for Drive/HTTPS file links.
-- \`pnpm action update-event --id "google-..." --transparency opaque|transparent --visibility default|public|private --reminderMinutes 10 --addAttendees "alice@example.com" --scope single|all\` — Update event availability, visibility, reminders, timezone, color, attachments, recurrence, guests, or generated video links. Use \`addAttendees\` when inviting more people so existing RSVP metadata is preserved. Pass attendee objects with \`optional:true\` to mark optional guests. Use \`--scope all\` to update an entire recurring series from one occurrence.
+- \`pnpm action update-event --id "google-..." --transparency opaque|transparent --visibility default|public|private --reminderMinutes 10 --addAttendees "alice@example.com" --scope single|all\` — Update event availability, visibility, reminders, timezone, color, attachments, recurrence, guests, generated video links, or move an existing event between connected account calendars with \`--accountEmail <current> --targetAccountEmail <destination>\`. A move recreates the event on the destination and removes the source; do not combine it with other event field changes. Use \`addAttendees\` when inviting more people so existing RSVP metadata is preserved. Pass attendee objects with \`optional:true\` to mark optional guests. Use \`--scope all\` to update an entire recurring series from one occurrence, but use \`scope: single\` when moving an event.
 - \`pnpm action navigate --view=calendar --calendarViewMode=day\` — Navigate the UI (day/week/month views, dates)
 - \`pnpm action navigate --view=calendar --date=YYYY-MM-DD\` — Navigate to a specific date
 - \`pnpm action navigate --view=availability\` — Show availability settings
@@ -150,7 +149,6 @@ When the user says "show me", "go to", "open", or "switch to" a view or date, AL
         icon: "email",
         search: async (query: string) => {
           const db = getDb();
-          // bookings has no ownerEmail — scope via booking-links the caller can access
           const ownedLinks = await db
             .select({ slug: bookingLinks.slug })
             .from(bookingLinks)

@@ -4,6 +4,8 @@ import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { useCallback, useEffect, useMemo, useRef } from "react";
 
 import { callAppBundleIdsForJoinUrl } from "../lib/meeting-call-app";
+import { stopMeetingBeforeTranscriptFlush } from "../lib/meeting-stop";
+import { subscribeAutoStop } from "../lib/silence-events";
 import {
   appendFinalTranscript,
   onFinalTranscript,
@@ -19,43 +21,31 @@ import {
 } from "../lib/transcription-engine";
 import { normalizeServerUrl } from "../lib/url";
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
 export interface MeetingTranscriptionPayload {
   meetingId: string;
   joinUrl?: string | null;
-  reason?: "user" | "calendar-auto" | string;
+  reason?: "user" | "calendar-auto" | (string & {});
   scheduledStart?: string | null;
   includeFromMeetingStart?: boolean;
 }
 
 interface MeetingTranscriptionSession {
   meetingId: string;
-  recordingId: string;
+  recordingId: string | null;
   lines: TranscriptLine[];
   unlisten: Array<() => void>;
   flushTimer: ReturnType<typeof setTimeout> | null;
   stopping: boolean;
   paused: boolean;
   engine: TranscriptionEngine;
-  /** Offset local live-engine timestamps onto the scheduled meeting timeline. */
+  audioTransitionInFlight: Promise<void> | null;
   liveTimelineOffsetMs: number;
   historyInFlight: Promise<void> | null;
-  // Single-flight flush bookkeeping (M3): `flushInFlight` is the promise of
-  // the currently-running save-browser-transcript call (or null). `flushSeq`
-  // is bumped every time flushTranscript is invoked; `dirtySeq` records the
-  // seq of the most recent *request* to flush. A completed flush only clears
-  // its own dirty marker if no newer flush was requested while it was in
-  // flight — otherwise it re-flushes with the latest snapshot.
   flushInFlight: Promise<void> | null;
   flushSeq: number;
   dirtySeq: number;
 }
 
-/** What the pill overlay needs to render a line: text, side, and timestamp.
- *  The verbatim segments stay behind in the session. */
 interface PillTranscriptLine {
   text: string;
   source: "mic" | "system";
@@ -81,23 +71,36 @@ interface Props {
   serverUrl: string;
   selectedMicId: string | null;
   selectedMicLabel: string | null;
+  enabled: boolean;
 }
 
-// ---------------------------------------------------------------------------
-// Hook
-// ---------------------------------------------------------------------------
+const MEETING_START_CANCELLED = Symbol("meeting-start-cancelled");
+const MEETING_ENDED_POLL_MS = 30_000;
+
+function unlistenAll(unlisteners: Array<() => void>): void {
+  for (const unlisten of unlisteners) {
+    try {
+      unlisten();
+    } catch {
+      continue;
+    }
+  }
+}
 
 export function useMeetingTranscription({
   callClipsAction,
   serverUrl,
   selectedMicId,
   selectedMicLabel,
+  enabled,
 }: Props): void {
   const sessionRef = useRef<MeetingTranscriptionSession | null>(null);
   const pendingPillInitRef = useRef<{
     meetingId: string;
     initialNotes: string;
+    title?: string;
     preloadedLines?: PillTranscriptLine[];
+    starting?: boolean;
   } | null>(null);
 
   const normalizedServerUrl = useMemo(
@@ -105,24 +108,12 @@ export function useMeetingTranscription({
     [serverUrl],
   );
 
-  // -------------------------------------------------------------------------
-  // Transcript flush
-  // -------------------------------------------------------------------------
-
-  // Coalescing single-flight flush (M3): only ever one save-browser-transcript
-  // request in flight per session. A flush requested while one is already
-  // outstanding marks the session dirty and re-runs after the in-flight call
-  // settles, using whatever lines/segments are current at that later time —
-  // this prevents a stale, smaller snapshot from a slower request landing
-  // after (and clobbering) a newer, larger one.
   const flushTranscript = useCallback(async (): Promise<void> => {
     const session = sessionRef.current;
     if (!session) return;
+    if (!session.recordingId) return;
     session.dirtySeq = session.flushSeq + 1;
     if (session.flushInFlight) {
-      // A flush is already outstanding — wait for it (and any chained
-      // re-flush it triggers for our own dirty marker) instead of firing a
-      // second overlapping request.
       await session.flushInFlight;
       return;
     }
@@ -142,10 +133,6 @@ export function useMeetingTranscription({
         meetingId: session.meetingId,
         ts: Date.now(),
       }).catch(() => {});
-      // Newer content arrived while this request was in flight — chain a
-      // re-flush with the latest snapshot before this call resolves, so
-      // every awaiter (including the coalesced branch above) sees the
-      // definitive result.
       if (session.dirtySeq > seq) {
         session.flushInFlight = null;
         await flushTranscript();
@@ -159,13 +146,6 @@ export function useMeetingTranscription({
     }
   }, [callClipsAction]);
 
-  // -------------------------------------------------------------------------
-  // Stop
-  // -------------------------------------------------------------------------
-
-  // Promise of the currently-running teardown, so a second stop request
-  // (e.g. app-quit arriving during a silence-stop) waits for the in-flight
-  // teardown to finish instead of returning before the final flush landed.
   const stopInFlightRef = useRef<Promise<void> | null>(null);
 
   const stopTranscription = useCallback(
@@ -182,31 +162,36 @@ export function useMeetingTranscription({
           window.clearTimeout(session.flushTimer);
           session.flushTimer = null;
         }
+        await session.audioTransitionInFlight?.catch(() => {});
         try {
           await stopTranscriptionEngine(session.engine);
         } catch (err) {
           console.warn("[clips-popover] meeting audio stop failed:", err);
         }
-        session.unlisten.splice(0).forEach((unlisten) => {
-          try {
-            unlisten();
-          } catch {
-            // ignore
-          }
-        });
+        unlistenAll(session.unlisten.splice(0));
         await invoke("silence_detector_stop").catch(() => {});
-        if (reason !== "app-quit") {
-          await session.historyInFlight?.catch(() => {});
-        }
-        // Final flush waits for any in-flight flush first (flushTranscript's
-        // single-flight coalescing) then sends the definitive snapshot.
-        await flushTranscript().catch((err) => {
-          console.warn("[clips-popover] meeting transcript save failed:", err);
-        });
-        await callClipsAction("stop-meeting-recording", {
-          meetingId: session.meetingId,
-        }).catch((err) => {
-          console.warn("[clips-popover] stop meeting action failed:", err);
+        await stopMeetingBeforeTranscriptFlush({
+          stopRecording: async () => {
+            await callClipsAction("stop-meeting-recording", {
+              meetingId: session.meetingId,
+              reason,
+            }).catch((err) => {
+              console.warn("[clips-popover] stop meeting action failed:", err);
+            });
+          },
+          waitForHistory: async () => {
+            if (reason !== "app-quit") {
+              await session.historyInFlight?.catch(() => {});
+            }
+          },
+          flushTranscript: async () => {
+            await flushTranscript().catch((err) => {
+              console.warn(
+                "[clips-popover] meeting transcript save failed:",
+                err,
+              );
+            });
+          },
         });
         if (session.lines.length) {
           const finalizePromise = callClipsAction("finalize-meeting", {
@@ -214,10 +199,6 @@ export function useMeetingTranscription({
           }).catch((err) => {
             console.warn("[clips-popover] finalize meeting failed:", err);
           });
-          // App-quit teardown must not block on the network round-trip — the
-          // server completes finalize independently, and the web app's
-          // auto-finalize effect is the fallback if this fire-and-forget call
-          // never lands.
           if (reason !== "app-quit") await finalizePromise;
         }
         // Keep completed notes in Clips instead of interrupting the user by
@@ -253,12 +234,14 @@ export function useMeetingTranscription({
     [callClipsAction, flushTranscript, normalizedServerUrl],
   );
 
-  // -------------------------------------------------------------------------
-  // Start
-  // -------------------------------------------------------------------------
+  useEffect(() => {
+    if (enabled) return;
+    stopTranscription("lab-disabled").catch(() => {});
+  }, [enabled, stopTranscription]);
 
-  const startTranscription = useCallback(
+  const runStartTranscription = useCallback(
     async (payload: MeetingTranscriptionPayload) => {
+      if (!enabled) return;
       const meetingId = payload.meetingId;
       if (!meetingId) return;
 
@@ -276,13 +259,27 @@ export function useMeetingTranscription({
           emit("meetings:hide-notification", { meetingId }).catch(() => {});
           return;
         }
-        // Always await the existing teardown before starting a new session,
-        // even if it is already stopping. stopTranscription coalesces through
-        // stopInFlightRef, so awaiting an already-stopping session joins the
-        // in-flight promise instead of running teardown twice.
         await stopTranscription("replaced");
       }
 
+      pendingPillInitRef.current = {
+        meetingId,
+        initialNotes: "",
+        starting: true,
+      };
+      invoke("recording_pill_show", { meetingId, mode: "meeting" }).catch(
+        () => {},
+      );
+      emit("clips:pill-context", {
+        meetingId,
+        mode: "meeting",
+        starting: true,
+      }).catch(() => {});
+      emit("meetings:hide-notification", { meetingId }).catch(() => {});
+
+      let engineStarting: Promise<TranscriptionEngine> | null = null;
+      let liveEngine: TranscriptionEngine | null = null;
+      let startedSession: MeetingTranscriptionSession | null = null;
       let historyPreparedRef: {
         current: {
           token: string;
@@ -290,8 +287,27 @@ export function useMeetingTranscription({
           capturedUntil: string;
         } | null;
       } = { current: null };
+      let includeFromMeetingStart = payload.includeFromMeetingStart === true;
       try {
-        if (payload.includeFromMeetingStart) {
+        if (
+          !includeFromMeetingStart &&
+          payload.reason === "user" &&
+          payload.scheduledStart
+        ) {
+          try {
+            const historyStatus = await invoke<{ available: boolean }>(
+              "rewind_meeting_history_status",
+              { scheduledStart: payload.scheduledStart },
+            );
+            includeFromMeetingStart = historyStatus.available === true;
+          } catch (error) {
+            console.warn(
+              "[clips-popover] Rewind meeting history status unavailable:",
+              error,
+            );
+          }
+        }
+        if (includeFromMeetingStart) {
           if (payload.reason !== "user" || !payload.scheduledStart) {
             throw new Error(
               "Include from meeting start is only available when you manually start a scheduled meeting.",
@@ -306,33 +322,16 @@ export function useMeetingTranscription({
           });
         }
 
-        const result = await callClipsAction<{
-          meetingId?: string;
-          scheduledEnd?: string | null;
-          recording?: { id?: string | null } | null;
-        }>("start-meeting-recording", { meetingId });
-        const resolvedMeetingId = result.meetingId ?? meetingId;
-        const recordingId = result.recording?.id;
-        if (!recordingId) {
-          throw new Error("Could not create a transcript session.");
-        }
-
-        const parsedScheduledEndMs = result.scheduledEnd
-          ? Date.parse(result.scheduledEnd)
-          : Number.NaN;
-        const scheduledEndMs = Number.isFinite(parsedScheduledEndMs)
-          ? parsedScheduledEndMs
-          : null;
-
         const session: MeetingTranscriptionSession = {
-          meetingId: resolvedMeetingId,
-          recordingId,
+          meetingId,
+          recordingId: null,
           lines: [],
           unlisten: [],
           flushTimer: null,
           stopping: false,
           paused: false,
           engine: "whisper",
+          audioTransitionInFlight: null,
           liveTimelineOffsetMs: 0,
           historyInFlight: null,
           flushInFlight: null,
@@ -340,6 +339,9 @@ export function useMeetingTranscription({
           dirtySeq: 0,
         };
         sessionRef.current = session;
+        startedSession = session;
+        const sessionIsActive = () =>
+          sessionRef.current === session && !session.stopping;
 
         const scheduleFlush = () => {
           if (session.flushTimer) window.clearTimeout(session.flushTimer);
@@ -390,11 +392,6 @@ export function useMeetingTranscription({
           }),
         );
         addUnlisten(
-          // Rust only emits this at app-quit while MeetingActive is true (see
-          // lib.rs's ExitRequested handler). Run the graceful teardown, then
-          // tell Rust we're done so it can let the process exit — a 3s
-          // watchdog on the Rust side forces exit regardless if this never
-          // fires (dead webview, hung network call).
           listen("meetings:quit-requested", () => {
             stopTranscription("app-quit")
               .catch((err) => {
@@ -405,39 +402,62 @@ export function useMeetingTranscription({
               });
           }),
         );
-        addUnlisten(
-          listen("meetings:silence-stop", () => {
-            stopTranscription("silence").catch(() => {});
-          }),
-        );
-        addUnlisten(
-          listen("meetings:sleep-stop", () => {
-            stopTranscription("sleep").catch(() => {});
-          }),
-        );
-        addUnlisten(
-          listen("meetings:call-ended", () => {
-            stopTranscription("call-ended").catch(() => {});
-          }),
-        );
+        const autoStopUnlisten = await subscribeAutoStop((reason) => {
+          stopTranscription(reason).catch(() => {});
+        });
+        if (sessionRef.current !== session || session.stopping) {
+          autoStopUnlisten();
+          throw MEETING_START_CANCELLED;
+        }
+        session.unlisten.push(autoStopUnlisten);
+
+        if (includeFromMeetingStart && payload.scheduledStart) {
+          session.liveTimelineOffsetMs = Math.max(
+            0,
+            Date.now() - Date.parse(payload.scheduledStart),
+          );
+        }
+        const enginePromise = startTranscriptionEngine({
+          mic: { deviceId: selectedMicId, label: selectedMicLabel },
+          voiceProcessing: false,
+        });
+        engineStarting = enginePromise;
+
+        const result = await callClipsAction<{
+          meetingId?: string;
+          scheduledEnd?: string | null;
+          recording?: { id?: string | null } | null;
+        }>("start-meeting-recording", { meetingId });
+        const resolvedMeetingId = result.meetingId ?? meetingId;
+        const recordingId = result.recording?.id;
+        session.meetingId = resolvedMeetingId;
+        session.recordingId = recordingId ?? null;
+        if (!sessionIsActive()) throw MEETING_START_CANCELLED;
+        if (!recordingId) {
+          throw new Error("Could not create a transcript session.");
+        }
+
+        const parsedScheduledEndMs = result.scheduledEnd
+          ? Date.parse(result.scheduledEnd)
+          : Number.NaN;
+        const scheduledEndMs = Number.isFinite(parsedScheduledEndMs)
+          ? parsedScheduledEndMs
+          : null;
 
         const silenceDetectorConfig = {
           silenceThreshold: 0.05,
           silenceMs: 15 * 60 * 1000,
-          callEndedMs: 2 * 60 * 1000,
+          callEndedMs: 30 * 1000,
           callAppBundleIds: callAppBundleIdsForJoinUrl(payload.joinUrl),
           scheduledEndMs,
           watchSleep: true,
           watchCallEnded: true,
         };
 
-        // Resume the engine that initial start settled on (no fallback here —
-        // the engine choice was already made below). Rust prefers one combined
-        // SCK stream and uses bypassed VoiceProcessingIO only for legacy/failure
-        // fallback, so the transcript stays live without changing call volume.
-        const startAudio = async () => {
+        const startAudio = async (): Promise<TranscriptionEngine> => {
+          const engine = session.engine;
           await restartTranscriptionEngine(
-            session.engine,
+            engine,
             {
               deviceId: selectedMicId,
               label: selectedMicLabel,
@@ -445,9 +465,16 @@ export function useMeetingTranscription({
             true,
             false,
           );
+          return engine;
         };
 
-        // Pause/resume state machine — see app.tsx for full explanation.
+        const stopStaleAudioTransition = async () => {
+          if (sessionRef.current !== session) return;
+          await stopTranscriptionEngine(session.engine).catch(() => {});
+          if (sessionRef.current !== session) return;
+          await invoke("silence_detector_stop").catch(() => {});
+        };
+
         let desiredPaused = false;
         let applyingTransition = false;
 
@@ -456,54 +483,72 @@ export function useMeetingTranscription({
           if (sessionRef.current !== session || session.stopping) return;
           if (desiredPaused === session.paused) return;
           applyingTransition = true;
-          try {
-            if (desiredPaused) {
-              if (session.flushTimer) {
-                window.clearTimeout(session.flushTimer);
-                session.flushTimer = null;
-              }
-              await invoke("silence_detector_stop").catch(() => {});
-              try {
-                await stopTranscriptionEngine(session.engine);
-              } catch (err) {
-                console.warn(
-                  "[clips-popover] meeting audio pause failed; staying live:",
-                  err,
-                );
-                desiredPaused = false;
+          const transition = (async () => {
+            try {
+              if (desiredPaused) {
+                if (session.flushTimer) {
+                  window.clearTimeout(session.flushTimer);
+                  session.flushTimer = null;
+                }
+                await invoke("silence_detector_stop").catch(() => {});
+                if (!sessionIsActive()) return;
+                try {
+                  await stopTranscriptionEngine(session.engine);
+                } catch (err) {
+                  if (!sessionIsActive()) return;
+                  console.warn(
+                    "[clips-popover] meeting audio pause failed; staying live:",
+                    err,
+                  );
+                  desiredPaused = false;
+                  session.paused = false;
+                  await invoke("silence_detector_start", {
+                    config: silenceDetectorConfig,
+                  }).catch(() => {});
+                  if (!sessionIsActive()) await stopStaleAudioTransition();
+                  return;
+                }
+                if (!sessionIsActive()) return;
+                await flushTranscript().catch(() => {});
+                if (!sessionIsActive()) return;
+                session.paused = true;
+              } else {
+                let resumedEngine: TranscriptionEngine;
+                try {
+                  resumedEngine = await startAudio();
+                } catch (err) {
+                  console.warn(
+                    "[clips-popover] meeting audio resume failed; staying paused:",
+                    err,
+                  );
+                  if (!sessionIsActive()) return;
+                  desiredPaused = true;
+                  session.paused = true;
+                  return;
+                }
+                if (!sessionIsActive()) {
+                  await stopTranscriptionEngine(resumedEngine).catch(() => {});
+                  await stopStaleAudioTransition();
+                  return;
+                }
                 session.paused = false;
                 await invoke("silence_detector_start", {
                   config: silenceDetectorConfig,
                 }).catch(() => {});
-                return;
+                if (!sessionIsActive()) await stopStaleAudioTransition();
               }
-              await flushTranscript().catch(() => {});
-              session.paused = true;
-            } else {
-              try {
-                await startAudio();
-              } catch (err) {
-                console.warn(
-                  "[clips-popover] meeting audio resume failed; staying paused:",
-                  err,
-                );
-                desiredPaused = true;
-                session.paused = true;
-                return;
-              }
-              session.paused = false;
-              await invoke("silence_detector_start", {
-                config: silenceDetectorConfig,
-              }).catch(() => {});
+            } finally {
+              applyingTransition = false;
             }
+          })();
+          session.audioTransitionInFlight = transition;
+          try {
+            await transition;
           } finally {
-            applyingTransition = false;
-            // Re-check for any desiredPaused change queued while this
-            // transition was in flight — including the two early-return
-            // error-recovery branches above, which otherwise skipped this
-            // reconvergence and could leave a queued pause/resume request
-            // unapplied until another external event happened to fire.
-            void applyAudioState();
+            if (session.audioTransitionInFlight === transition) {
+              session.audioTransitionInFlight = null;
+              void applyAudioState();
+            }
           }
         };
 
@@ -523,37 +568,39 @@ export function useMeetingTranscription({
           }),
         );
 
-        // Prepare the pill payload before live audio starts, but don't show a
-        // recording indicator or publish an active meeting until the engine
-        // has actually acquired its audio source. This keeps "Recording"
-        // truthful when model/capture startup fails.
         pendingPillInitRef.current = {
           meetingId: resolvedMeetingId,
           initialNotes: "",
+          starting: true,
         };
 
         callClipsAction<{
-          meeting?: { userNotesMd?: string };
+          meeting?: { userNotesMd?: string; title?: string | null };
           transcript?: { segmentsJson?: string | null } | null;
         }>("get-meeting", { id: resolvedMeetingId }, { method: "GET" })
           .then((data) => {
-            // Guard: if the session changed while the fetch was in-flight
-            // (user switched meetings), don't overwrite the new meeting's
-            // pending context with stale data.
             if (pendingPillInitRef.current?.meetingId !== resolvedMeetingId)
               return;
             const initialNotes = data?.meeting?.userNotesMd ?? "";
+            const title = data?.meeting?.title ?? undefined;
             pendingPillInitRef.current = {
+              ...pendingPillInitRef.current,
               meetingId: resolvedMeetingId,
               initialNotes,
+              title,
               preloadedLines: pillTranscriptLines(session.lines),
             };
+            emit("clips:pill-context", {
+              meetingId: resolvedMeetingId,
+              mode: "meeting",
+              title,
+              starting: pendingPillInitRef.current.starting,
+            }).catch(() => {});
             emit("clips:meeting-notes-init", {
               meetingId: resolvedMeetingId,
               initialNotes,
             }).catch(() => {});
 
-            // Preload any existing transcript segments into the pill and session.
             const segmentsJson = data?.transcript?.segmentsJson;
             if (segmentsJson && sessionRef.current === session) {
               try {
@@ -574,8 +621,6 @@ export function useMeetingTranscription({
                   );
                   session.lines = [...storedLines, ...session.lines];
                   const preloadedLines = pillTranscriptLines(session.lines);
-                  // Store in ref so clips:pill-ready can re-emit if the
-                  // pill window mounts after this fetch resolves.
                   if (
                     pendingPillInitRef.current?.meetingId === resolvedMeetingId
                   ) {
@@ -595,45 +640,60 @@ export function useMeetingTranscription({
           })
           .catch(() => {});
 
-        // The local index may need a moment after the fragment fence. Anchor
-        // the live engine where it actually begins, not at the earlier click,
-        // so every stored segment remains on one honest meeting timeline.
-        if (payload.includeFromMeetingStart && payload.scheduledStart) {
-          session.liveTimelineOffsetMs = Math.max(
-            0,
-            Date.now() - Date.parse(payload.scheduledStart),
-          );
+        const startedEngine = await enginePromise;
+        engineStarting = null;
+        liveEngine = startedEngine;
+        if (!sessionIsActive()) {
+          await stopTranscriptionEngine(startedEngine).catch(() => {});
+          liveEngine = null;
+          if (historyPreparedRef.current) {
+            invoke("rewind_meeting_history_cancel", {
+              token: historyPreparedRef.current.token,
+            }).catch(() => {});
+          }
+          if (session.recordingId) {
+            await callClipsAction("stop-meeting-recording", {
+              meetingId: session.meetingId,
+              reason: "superseded",
+            }).catch((err) => {
+              console.warn(
+                "[clips-popover] could not close a superseded meeting row:",
+                err,
+              );
+            });
+          }
+          return;
         }
-        session.engine = await startTranscriptionEngine({
-          mic: { deviceId: selectedMicId, label: selectedMicLabel },
-          // macOS 15+ uses ScreenCaptureKit's independent microphone output.
-          // Rust upgrades only the legacy/failure fallback to bypassed VPIO so
-          // call apps cannot starve Clips of mic buffers or lose call volume.
-          voiceProcessing: false,
-        });
+        session.engine = startedEngine;
+        if (session.lines.length) scheduleFlush();
 
-        await invoke("set_recording_state", { active: true }).catch(() => {});
-        await invoke("set_meeting_active", {
-          active: true,
-          meetingId: resolvedMeetingId,
-        }).catch(() => {});
-        await invoke("recording_pill_show", {
-          meetingId: resolvedMeetingId,
-          mode: "meeting",
-        });
-        // Immediate emit covers the reused-window case (pill already mounted).
+        await Promise.all([
+          invoke("set_recording_state", { active: true }).catch(() => {}),
+          invoke("set_meeting_active", {
+            active: true,
+            meetingId: resolvedMeetingId,
+          }).catch(() => {}),
+          invoke("recording_pill_show", {
+            meetingId: resolvedMeetingId,
+            mode: "meeting",
+          }),
+        ]);
+        if (!sessionIsActive()) throw MEETING_START_CANCELLED;
+        if (pendingPillInitRef.current?.meetingId === resolvedMeetingId) {
+          pendingPillInitRef.current = {
+            ...pendingPillInitRef.current,
+            starting: false,
+          };
+        }
         emit("clips:pill-context", {
           meetingId: resolvedMeetingId,
           mode: "meeting",
+          starting: false,
         }).catch(() => {});
         emit("meetings:transcription-started", {
           meetingId: resolvedMeetingId,
         }).catch(() => {});
 
-        // Indexing the fenced local fragment can take tens of seconds. It runs
-        // after live capture is active, then prepends its bounded rows into the
-        // same canonical session. A local-index failure is visible but never
-        // tears down notes that are already recording.
         if (historyPreparedRef.current) {
           const prepared = historyPreparedRef.current;
           const historyPromise = invoke<{
@@ -682,9 +742,16 @@ export function useMeetingTranscription({
           session.historyInFlight = historyPromise;
         }
 
+        if (!sessionIsActive()) throw MEETING_START_CANCELLED;
         await invoke("silence_detector_start", {
           config: silenceDetectorConfig,
         }).catch(() => {});
+        if (!sessionIsActive()) {
+          if (sessionRef.current === session) {
+            await invoke("silence_detector_stop").catch(() => {});
+          }
+          throw MEETING_START_CANCELLED;
+        }
 
         if (payload.joinUrl && payload.reason !== "user") {
           emit("meetings:open-join-url", {
@@ -694,28 +761,55 @@ export function useMeetingTranscription({
 
         emit("meetings:hide-notification", { meetingId }).catch(() => {});
       } catch (err) {
+        if (startedSession) {
+          startedSession.stopping = true;
+          unlistenAll(startedSession.unlisten.splice(0));
+        }
+        if (liveEngine) {
+          await stopTranscriptionEngine(liveEngine).catch(() => {});
+        } else if (engineStarting) {
+          // coercion-ok: an engine that never started has nothing to tear
+          // down, and null is distinguishable from a started one below. The
+          // start failure itself is already being reported by this catch.
+          const engine = await engineStarting.catch(() => null);
+          if (engine) await stopTranscriptionEngine(engine).catch(() => {});
+        }
         if (historyPreparedRef.current) {
           invoke("rewind_meeting_history_cancel", {
             token: historyPreparedRef.current.token,
           }).catch(() => {});
         }
-        const failedSession = sessionRef.current;
-        sessionRef.current = null;
-        if (failedSession?.meetingId) {
+        const superseded =
+          sessionRef.current !== null && sessionRef.current !== startedSession;
+        if (!superseded) {
+          const failedSession = startedSession;
+          sessionRef.current = null;
+          if (failedSession?.meetingId) {
+            await callClipsAction("stop-meeting-recording", {
+              meetingId: failedSession.meetingId,
+              reason: "start-failed",
+            }).catch(() => {});
+          }
+          pendingPillInitRef.current = null;
+          await invoke("recording_pill_hide").catch(() => {});
+          await invoke("set_recording_state", { active: false }).catch(
+            () => {},
+          );
+          await invoke("set_meeting_active", { active: false }).catch(() => {});
+        } else if (startedSession?.meetingId) {
           await callClipsAction("stop-meeting-recording", {
-            meetingId: failedSession.meetingId,
+            meetingId: startedSession.meetingId,
+            reason: "superseded",
           }).catch(() => {});
         }
-        pendingPillInitRef.current = null;
-        await invoke("recording_pill_hide").catch(() => {});
-        await invoke("set_recording_state", { active: false }).catch(() => {});
-        await invoke("set_meeting_active", { active: false }).catch(() => {});
-        const message =
-          err instanceof Error ? err.message : "Could not start notes.";
-        emit("meetings:transcription-error", {
-          meetingId,
-          error: message,
-        }).catch(() => {});
+        if (err !== MEETING_START_CANCELLED) {
+          const message =
+            err instanceof Error ? err.message : "Could not start notes.";
+          emit("meetings:transcription-error", {
+            meetingId,
+            error: message,
+          }).catch(() => {});
+        }
       }
     },
     [
@@ -724,14 +818,28 @@ export function useMeetingTranscription({
       selectedMicId,
       selectedMicLabel,
       stopTranscription,
+      enabled,
     ],
   );
 
-  // -------------------------------------------------------------------------
-  // Event listeners
-  // -------------------------------------------------------------------------
+  const startInFlightRef = useRef<Promise<void> | null>(null);
+  const startTranscription = useCallback(
+    async (payload: MeetingTranscriptionPayload) => {
+      const run = (startInFlightRef.current ?? Promise.resolve())
+        .catch(() => {})
+        .then(() => runStartTranscription(payload));
+      startInFlightRef.current = run;
+      try {
+        await run;
+      } finally {
+        if (startInFlightRef.current === run) startInFlightRef.current = null;
+      }
+    },
+    [runStartTranscription],
+  );
 
   useEffect(() => {
+    if (!enabled) return;
     const unlisteners: Array<() => void> = [];
     let stopped = false;
     const track = (promise: Promise<() => void>) => {
@@ -766,9 +874,33 @@ export function useMeetingTranscription({
       });
       unlisteners.length = 0;
     };
-  }, [startTranscription]);
+  }, [enabled, startTranscription]);
 
   useEffect(() => {
+    if (!enabled) return;
+    const timer = window.setInterval(() => {
+      const session = sessionRef.current;
+      if (!session || session.stopping) return;
+      callClipsAction<{ meeting?: { actualEnd?: string | null } }>(
+        "get-meeting",
+        { id: session.meetingId },
+        { method: "GET" },
+      )
+        .then((data) => {
+          if (sessionRef.current !== session || session.stopping) return;
+          if (!data?.meeting?.actualEnd) return;
+          stopTranscription("server-ended").catch(() => {});
+        })
+        .catch(() => {
+          // Best-effort — a failed poll just waits for the next tick or the
+          // native detector.
+        });
+    }, MEETING_ENDED_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [callClipsAction, enabled, stopTranscription]);
+
+  useEffect(() => {
+    if (!enabled) return;
     let stopped = false;
     const unlistens: Array<Promise<() => void>> = [];
 
@@ -808,6 +940,8 @@ export function useMeetingTranscription({
         emit("clips:pill-context", {
           meetingId: pending.meetingId,
           mode: "meeting",
+          title: pending.title,
+          starting: pending.starting === true,
         }).catch(() => {});
         emit("clips:meeting-notes-init", {
           meetingId: pending.meetingId,
@@ -853,5 +987,5 @@ export function useMeetingTranscription({
           .catch(() => {}),
       );
     };
-  }, [callClipsAction, normalizedServerUrl]);
+  }, [callClipsAction, enabled, normalizedServerUrl]);
 }

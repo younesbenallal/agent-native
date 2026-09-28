@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
 
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
 import { assertAccess } from "@agent-native/core/sharing";
 import { and, eq, ne } from "drizzle-orm";
 import { z } from "zod";
 
 import { getDb, schema } from "../server/db/index.js";
+import { bodyRevisionForContent } from "../server/lib/document-body-revision.js";
 import { resolveContentSpaceAccess } from "./_content-space-access.js";
 import { LOCAL_FOLDER_SOURCE_TYPE } from "./_local-folder-source.js";
 
@@ -227,7 +228,7 @@ export default defineAction({
           .select({
             sourceDisplayKey: schema.contentDatabaseSourceRows.sourceDisplayKey,
             sourceValuesJson: schema.contentDatabaseSourceRows.sourceValuesJson,
-            sourceName: schema.contentDatabaseSources.sourceName,
+            sourceTable: schema.contentDatabaseSources.sourceTable,
           })
           .from(schema.contentDatabaseSourceRows)
           .innerJoin(
@@ -267,7 +268,7 @@ export default defineAction({
                   sourceMode: "local-files",
                   sourceKind: "file",
                   sourcePath: remainingPath ?? null,
-                  sourceRootPath: remainingLocalRow.sourceName,
+                  sourceRootPath: remainingLocalRow.sourceTable,
                   sourceUpdatedAt: now,
                   updatedAt: now,
                 }
@@ -324,26 +325,35 @@ export default defineAction({
         )
           ? (metadata.icon ?? null)
           : (currentDocument.icon ?? null);
+        const versionId = `content_document_version_${createHash("sha256")
+          .update(
+            `${currentDocument.id}:${currentDocument.updatedAt}:${proposedHash}`,
+          )
+          .digest("hex")
+          .slice(0, 32)}`;
         await tx
           .insert(schema.documentVersions)
           .values({
-            id: `content_document_version_${createHash("sha256")
-              .update(
-                `${currentDocument.id}:${currentDocument.updatedAt}:${proposedHash}`,
-              )
-              .digest("hex")
-              .slice(0, 32)}`,
+            id: versionId,
             ownerEmail: currentDocument.ownerEmail,
             documentId: currentDocument.id,
             title: currentDocument.title,
             content: currentDocument.content,
+            groupId: versionId,
+            groupKind: "operation",
+            actorKind: "system",
+            origin: "local-folder-conflict",
+            operation: "accept-source",
+            checkpointKind: "before",
             createdAt: now,
+            updatedAt: now,
           })
           .onConflictDoNothing();
         await tx
           .update(schema.documents)
           .set({
             content: sourceContent!,
+            bodyRevision: bodyRevisionForContent(sourceContent!),
             ...(Object.prototype.hasOwnProperty.call(metadata, "title")
               ? { title: metadata.title ?? "" }
               : {}),

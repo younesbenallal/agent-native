@@ -1,7 +1,14 @@
 import { ChangelogDialog } from "@agent-native/core/client/changelog";
+import { useFeatureFlagState } from "@agent-native/core/client/feature-flags";
 import { callAction, useChangeVersions } from "@agent-native/core/client/hooks";
-import { LanguagePicker, useT } from "@agent-native/core/client/i18n";
+import { useT } from "@agent-native/core/client/i18n";
+import {
+  getSettingsShortcutHint,
+  openSettingsPage,
+} from "@agent-native/core/client/navigation";
 import { useOrgRole } from "@agent-native/core/client/org";
+import type { SettingsPageContext } from "@agent-native/core/client/settings";
+import { SETTINGS_REDESIGN_FLAG } from "@agent-native/core/feature-flags/registry";
 import {
   IconFlask,
   IconTool,
@@ -11,7 +18,6 @@ import {
   IconMoon,
   IconHistory,
   IconHierarchy2,
-  IconLanguage,
   IconRefresh,
   IconSettings,
 } from "@tabler/icons-react";
@@ -33,22 +39,19 @@ import {
 } from "react";
 import { useNavigate } from "react-router";
 
+import { useAuth } from "@/components/auth/AuthProvider";
 import {
   CommandDialog,
   CommandInput,
   CommandList,
   CommandGroup,
   CommandItem,
+  CommandShortcut,
 } from "@/components/ui/command";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useReplayStorageStatus } from "@/hooks/use-replay-storage-status";
+import { dashboardCacheScope } from "@/lib/prefetch-keys";
+import { isMacPlatform } from "@/lib/utils";
 import { dashboards } from "@/pages/adhoc/registry";
 import {
   buildAnalyticsGeneralSettingsSearchEntries,
@@ -256,10 +259,11 @@ function persistThemePreference(theme: "light" | "dark") {
 
 export function CommandPalette() {
   const t = useT();
-  const { canManageOrg } = useOrgRole();
+  const { canManageOrg, isOwner, org, role } = useOrgRole();
+  const { auth } = useAuth();
+  const dashboardScope = dashboardCacheScope(auth);
   const [open, setOpen] = useState(false);
   const [changelogOpen, setChangelogOpen] = useState(false);
-  const [languageOpen, setLanguageOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedCommand, setSelectedCommand] = useState("");
   const commandListRef = useRef<HTMLDivElement>(null);
@@ -267,13 +271,38 @@ export function CommandPalette() {
   const { resolvedTheme, setTheme } = useTheme();
   const isDark = resolvedTheme === "dark";
   const replayStorageStatus = useReplayStorageStatus({ enabled: open });
+  const settingsRedesign = useFeatureFlagState(
+    SETTINGS_REDESIGN_FLAG.key,
+  ).enabled;
+  const settingsPageContext = useMemo<SettingsPageContext>(
+    () => ({
+      role,
+      isOwner,
+      isAdmin: canManageOrg,
+      hasOrganization: org ? Boolean(org.orgId) : null,
+      soloDeploymentAdmin: org?.soloDeploymentAdmin === true,
+      appId: null,
+      labs: {},
+      flags: {},
+    }),
+    [canManageOrg, isOwner, org, role],
+  );
   const settingsCommands = useMemo(() => {
     const generalEntries = buildAnalyticsGeneralSettingsSearchEntries(
       t,
       !!replayStorageStatus.data?.configured,
     );
-    return buildAnalyticsSettingsCommandItems(t, generalEntries);
-  }, [replayStorageStatus.data?.configured, t]);
+    return buildAnalyticsSettingsCommandItems(t, generalEntries, {
+      redesign: settingsRedesign,
+      pageContext: settingsPageContext,
+    });
+  }, [
+    replayStorageStatus.data?.configured,
+    settingsPageContext,
+    settingsRedesign,
+    t,
+  ]);
+  const settingsLabel = t("settingsShortcut.command"); // i18n-key-ignore shared framework catalog
 
   const savedChartsQuery = useQuery({
     queryKey: ["explorer-configs-palette"],
@@ -285,19 +314,17 @@ export function CommandPalette() {
   const dashboardsSync = useChangeVersions(["dashboards", "action"]);
 
   const explorerDashboardsQuery = useQuery({
-    queryKey: ["explorer-dashboards-palette", dashboardsSync],
+    queryKey: ["explorer-dashboards-palette", dashboardScope, dashboardsSync],
     queryFn: fetchExplorerDashboards,
     staleTime: 30_000,
     enabled: open,
-    placeholderData: (prev) => prev,
   });
 
   const sqlDashboardsQuery = useQuery({
-    queryKey: ["sql-dashboards-palette", dashboardsSync],
+    queryKey: ["sql-dashboards-palette", dashboardScope, dashboardsSync],
     queryFn: () => fetchSqlDashboards(t),
     staleTime: 30_000,
     enabled: open,
-    placeholderData: (prev) => prev,
   });
 
   const savedCharts = savedChartsQuery.data ?? [];
@@ -345,7 +372,7 @@ export function CommandPalette() {
 
   const go = useCallback(
     (href: string) => {
-      navigate(href);
+      void navigate(href);
       setOpen(false);
     },
     [navigate],
@@ -511,11 +538,34 @@ export function CommandPalette() {
                 ))}
             </CommandGroup>
 
-            {showHiddenResults && (
-              <CommandGroup key="settings" heading={t("navigation.settings")}>
+            <CommandGroup
+              key="settings"
+              heading={showHiddenResults ? t("navigation.settings") : undefined}
+            >
+              <CommandItem
+                value={`setting:open:${settingsLabel}`}
+                onSelect={() => {
+                  setOpen(false);
+                  openSettingsPage();
+                }}
+                keywords={commandPaletteKeywords(
+                  settingsLabel,
+                  "settings",
+                  "preferences",
+                  "account",
+                  "profile",
+                )}
+              >
+                <IconSettings className="me-2 h-4 w-4 text-muted-foreground" />
+                <span className="truncate">{settingsLabel}</span>
+                <CommandShortcut>
+                  {getSettingsShortcutHint(isMacPlatform())}
+                </CommandShortcut>
+              </CommandItem>
+              {showHiddenResults && !settingsRedesign && (
                 <CommandItem
                   value={`setting:agent-page:${t("settings.agentTitle")}`}
-                  onSelect={() => go("/agent")}
+                  onSelect={() => go("/settings/agent")}
                   keywords={commandPaletteKeywords(
                     t("settings.agentTitle"),
                     "agent",
@@ -529,7 +579,9 @@ export function CommandPalette() {
                   <IconHierarchy2 className="me-2 h-4 w-4 text-muted-foreground" />
                   <span className="truncate">{t("settings.agentTitle")}</span>
                 </CommandItem>
-                {settingsCommands.map((setting) => (
+              )}
+              {showHiddenResults &&
+                settingsCommands.map((setting) => (
                   <CommandItem
                     key={`setting-${setting.id}`}
                     value={`setting:${setting.id}:${setting.label}`}
@@ -544,32 +596,12 @@ export function CommandPalette() {
                     <span className="truncate">{setting.label}</span>
                   </CommandItem>
                 ))}
-              </CommandGroup>
-            )}
+            </CommandGroup>
 
             <CommandGroup
               key="appearance"
               heading={t("commandPalette.groupAppearance")}
             >
-              <CommandItem
-                value={`appearance:language:${t("settings.languageTitle")}`}
-                onSelect={() => {
-                  setOpen(false);
-                  setLanguageOpen(true);
-                }}
-                keywords={commandPaletteKeywords(
-                  t("settings.languageTitle"),
-                  t("settings.languageLabel"),
-                  "language",
-                  "locale",
-                  "translation",
-                  "internationalization",
-                  "i18n",
-                )}
-              >
-                <IconLanguage className="me-2 h-4 w-4 text-muted-foreground" />
-                {t("settings.languageTitle")}
-              </CommandItem>
               <CommandItem
                 value={`appearance:theme:${
                   isDark
@@ -676,17 +708,6 @@ export function CommandPalette() {
         onOpenChange={setChangelogOpen}
         markdown={changelog}
       />
-      <Dialog open={languageOpen} onOpenChange={setLanguageOpen}>
-        <DialogContent className="max-w-sm">
-          <DialogHeader>
-            <DialogTitle>{t("settings.languageTitle")}</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-1.5">
-            <Label>{t("settings.languageLabel")}</Label>
-            <LanguagePicker label={t("settings.languageLabel")} />
-          </div>
-        </DialogContent>
-      </Dialog>
     </>
   );
 }

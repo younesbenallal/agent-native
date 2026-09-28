@@ -1,9 +1,11 @@
 import type { AgentEngine, EngineEvent } from "../agent/engine/types.js";
+import { observabilityConfig } from "../app-config/observability.js";
 import { trackingIdentityProperties } from "./tracking-identity.js";
 import type { ObservabilityConfig } from "./types.js";
-import { DEFAULT_OBSERVABILITY_CONFIG } from "./types.js";
 
-export const DEFAULT_INFERRED_SENTIMENT_MODEL = "gpt-5-6-luna";
+const DEFAULT_INFERRED_SENTIMENT_MODEL =
+  observabilityConfig.shape.inferredSentimentModel.parse(undefined);
+
 export const HOSTED_INFERRED_SENTIMENT_SAMPLE_RATE = 1;
 export const INFERRED_SENTIMENT_MAX_CHARS = 2_000;
 export const INFERRED_SENTIMENT_TIMEOUT_MS = 5_000;
@@ -63,11 +65,6 @@ function parseSampleRate(value: unknown): number | undefined {
   return Math.min(1, Math.max(0, parsed));
 }
 
-/**
- * Resolve inference defaults without making self-hosted apps opt in silently.
- * Explicit opt-out always wins. Otherwise stored app config and deployment
- * env can override the first-party hosted default.
- */
 export function resolveInferredSentimentConfig(
   stored: Partial<ObservabilityConfig> | null | undefined,
   env: SentimentEnv = process.env,
@@ -96,13 +93,10 @@ export function resolveInferredSentimentConfig(
       storedRate ??
       (hosted ? HOSTED_INFERRED_SENTIMENT_SAMPLE_RATE : 0),
     inferredSentimentModel:
-      envModel ||
-      storedModel ||
-      DEFAULT_OBSERVABILITY_CONFIG.inferredSentimentModel,
+      envModel || storedModel || DEFAULT_INFERRED_SENTIMENT_MODEL,
   };
 }
 
-/** Stable deterministic sampling keeps retries for the same run consistent. */
 export function shouldSampleInferredSentiment(
   runId: string,
   sampleRate: number,
@@ -199,12 +193,7 @@ async function classifySentiment(args: {
   }
 }
 
-/**
- * Best-effort classifier + content-free tracking emit. The main chat path
- * awaits this only after the user-visible response has finished streaming.
- */
 export async function inferAndTrackSentiment(args: {
-  /** Test/custom seam. Production intentionally uses the managed Builder engine. */
   engine?: AgentEngine;
   classifierModel: string;
   precedingResponseModel: string;

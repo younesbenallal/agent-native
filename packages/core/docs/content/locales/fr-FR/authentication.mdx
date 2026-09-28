@@ -102,6 +102,14 @@ Quelques drapeaux règlent cela ; tous les détails sont dans le tableau [Envir
 
 </Callout>
 
+## Connexion en développement local {#local-development-sign-in}
+
+Sur un serveur de développement utilisant une adresse de bouclage, la page de connexion partagée affiche d'abord **Continue as local dev**. Elle crée ou réutilise le véritable compte et la session de développement Better Auth, selon le même parcours authentifié que le reste de l'application.
+
+Choisissez **Show full sign in options** pour afficher les options normales d'inscription, de mot de passe, de lien magique et de fournisseurs sociaux. Si la session locale ne peut pas être créée, la page affiche automatiquement ces options afin que vous puissiez continuer avec l'authentification standard.
+
+Cette facilité est disponible uniquement lorsque le navigateur se connecte via `localhost`, `127.0.0.0/8` ou `::1` en développement ou lors des tests. Elle est désactivée pour les aperçus de déploiement et la production hébergée. Il ne s'agit pas d'un contournement de l'authentification. Définissez `AGENT_NATIVE_DISABLE_AUTO_DEV_ACCOUNT=1` pour la désactiver et afficher la page de connexion normale en développement local.
+
 ## Meilleure authentification (par défaut) {#better-auth}
 
 Par défaut, Better Auth gère l'authentification. Il fournit :
@@ -155,8 +163,28 @@ AUTH_SKIP_EMAIL_VERIFICATION=1
 
 Lorsque cet indicateur est défini, l'inscription par e-mail/mot de passe ne nécessite pas d'e-mail
 vérification et l'e-mail de vérification de l'inscription n'est pas envoyé. Utilisez-le uniquement pour le contrôle qualité
-ou prévisualisez les environnements et nommez les comptes de test avec une adresse `+qa`
-(`name+qa@example.com`) pour qu'ils soient faciles à identifier.
+ou prévisualisez les environnements et nommez les comptes de test avec une adresse `+autoz`
+(`name+autoz@example.com`) pour qu'ils soient faciles à identifier.
+
+## Politique de vérification des e-mails {#email-verification-policy}
+
+`AUTH_SKIP_EMAIL_VERIFICATION` est une commodité locale et de contrôle qualité :
+un déploiement hébergé l'ignore. Pour définir la politique dans n'importe quel
+environnement, production comprise, déclarez-la dans la configuration :
+
+```ts
+defineAppConfig({ auth: { requireEmailVerification: false } });
+```
+
+L'alias de déploiement est `AUTH_REQUIRE_EMAIL_VERIFICATION=0`. Une valeur
+déclarée l'emporte à la fois sur `AUTH_SKIP_EMAIL_VERIFICATION` et sur la
+valeur par défaut de chaque environnement.
+
+`false` accepte une adresse non vérifiée comme identifiant de connexion —
+n'importe qui peut revendiquer n'importe quel e-mail — ne l'utilisez donc que
+là où l'inscription est déjà restreinte autrement. `true` sur un déploiement
+sans fournisseur d'e-mail désactive plutôt l'inscription par mot de passe, car
+la vérification ne pourrait jamais être délivrée.
 
 ## Prestataires sociaux {#social-providers}
 
@@ -405,7 +433,7 @@ function SignInCta() {
 
 Les pages normales de l’application utilisent une seule coque SSR impersonnelle et mise en cache publiquement pour tous les visiteurs. `AppProviders` vérifie la session côté client ; sur un chemin privé tel que `/dashboard`, il redirige un visiteur anonyme vers `/sign-in?return=%2Fdashboard` avant de monter l’interface privée. Après connexion, le visiteur revient sur `/dashboard`. Utilisez `isPublicPath` pour les routes publiques/SEO, ou `sessionBypass` pour une surface authentifiée par un autre mécanisme limité, tel qu’un jeton d’intégration MCP.
 
-La durée de mise en cache de cette coque est un paramètre valable pour l’ensemble du déploiement — voir [SSR Caching](/docs/deployment#ssr-caching) pour `AGENT_NATIVE_SSR_CACHE`. Raccourcir ou désactiver le cache ne change que la durée ; le SSR continue de rendre la branche anonyme avec les cookies supprimés.
+La durée de mise en cache de cette coque est un paramètre valable pour l’ensemble du déploiement — voir [SSR Caching](/docs/ssr-caching) pour `AGENT_NATIVE_SSR_CACHE`. Raccourcir ou désactiver le cache ne change que la durée ; le SSR continue de rendre la branche anonyme avec les cookies supprimés.
 
 ### Dans les coulisses : Google OAuth
 
@@ -430,6 +458,7 @@ La route `/_agent-native/google/auth-url` par défaut le fait automatiquement :
 | --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `BETTER_AUTH_SECRET`                    | Clé de signature pour une meilleure authentification (générée automatiquement si elle n'est pas définie)                                                                                                                          |
 | `AUTH_SKIP_EMAIL_VERIFICATION`          | Défini sur `1` dans les environnements QA/preview pour permettre aux inscriptions par e-mail/mot de passe de se dérouler sans vérification ; le développement/test local est ignoré par défaut                                    |
+| `AUTH_REQUIRE_EMAIL_VERIFICATION`       | Défini sur `0` ou `1` pour déclarer la politique de vérification de l'inscription par mot de passe dans n'importe quel environnement, production comprise ; l'emporte sur `AUTH_SKIP_EMAIL_VERIFICATION`                          |
 | `AUTH_DISABLED`                         | Définissez sur `true` ou `1` pour ignorer la connexion/l'inscription ; toutes les requêtes s'exécutent en tant qu'utilisateur partagé (développement/aperçu local uniquement – pas pour la production avec de vrais utilisateurs) |
 | `AGENT_NATIVE_DISABLE_AUTO_DEV_ACCOUNT` | Définissez sur `1` pour désactiver la connexion automatique de localhost sur une nouvelle base de données de développement                                                                                                        |
 | `AUTH_MODE`                             | `local` résout uniquement l'identité de CLI/agent (sous quel utilisateur de développement `pnpm action` s'exécute) ; jamais de contournement de connexion au navigateur                                                           |
@@ -446,3 +475,13 @@ La route `/_agent-native/google/auth-url` par défaut le fait automatiquement :
 | `ACCESS_TOKEN`                          | Repli du support statique pour les clients MCP/connect ; pas l'authentification du navigateur                                                                                                                                     |
 | `ACCESS_TOKENS`                         | Supports statiques de secours séparés par des virgules pour les clients MCP/connect ; pas l'authentification du navigateur                                                                                                        |
 | `A2A_SECRET`                            | Secret partagé pour la vérification de l'identité inter-applications A2A signée par JWT et, le cas échéant, la signature du jeton d'accès MCP OAuth                                                                               |
+
+Le flag Dispatch `desktop.workspace-sso`, désactivé par défaut, ne contrôle que la disponibilité ; les contrôles d’authentification, de signature, de nonce, d’origine, de callback, de session et de révocation restent toujours obligatoires. Si le flag est désactivé ou illisible, Desktop ne modifie ni la connexion, ni la déconnexion, ni les réglages propres à chaque application.
+Le marqueur Canary de l’agent utilisateur est seulement un indice de disponibilité, pas une attestation distante ; l’authentification et l’autorisation ne lui font pas confiance.
+Les navigateurs ordinaires restent sur la connexion propre à chaque application. Les applications auto-hébergées utilisent `AGENT_NATIVE_IDENTITY_HUB_URL` uniquement pour la voie Desktop explicite ou la fédération côté serveur restante.
+Chaque version de Desktop peut initialiser le courtier lorsque la préférence par appareil `desktopSsoEnabled` est vraie (valeur par défaut) ; une valeur persistée explicitement à `false` reste une désactivation volontaire. Le flag Dispatch `desktop.workspace-sso` doit également être activé. Le marqueur Canary de l’agent utilisateur n’est plus un contrôle d’initialisation ; il identifie uniquement le canal de mise à jour.
+La version Canary n’intercepte pas la navigation de connexion anonyme des applications. L’utilisateur doit choisir explicitement la connexion à l’espace de travail dans les paramètres de Desktop pour l’application enregistrée active ; la connexion normale de l’application reste le parcours par défaut.
+
+## Déploiement administré et invitations
+
+Pour un déploiement administré, définissez `AUTH_SIGNUP=invited`, `ORG_CREATION=closed` et `AUTO_CREATE_DEFAULT_ORG=0`. Le [guide des déploiements administrés](/docs/administered-deployments) décrit les administrateurs d’amorçage, les invitations et les domaines autorisés. Les invitations d’adhésion et l’accès par domaine sont deux règles distinctes.

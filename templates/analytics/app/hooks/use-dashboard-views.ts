@@ -1,5 +1,7 @@
-import { callAction } from "@agent-native/core/client/hooks";
+import { callAction, useSession } from "@agent-native/core/client/hooks";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+
+import { dashboardCacheScope } from "@/lib/prefetch-keys";
 
 export interface DashboardView {
   id: string;
@@ -20,7 +22,12 @@ async function loadViews(dashboardId: string): Promise<DashboardView[]> {
 
 export function useDashboardViews(dashboardId: string | undefined) {
   const queryClient = useQueryClient();
-  const queryKey = ["dashboard-views", dashboardId];
+  const { session } = useSession();
+  const queryKey = [
+    "dashboard-views",
+    dashboardId,
+    dashboardCacheScope(session),
+  ];
 
   const viewsQuery = useQuery({
     queryKey,
@@ -44,9 +51,8 @@ export function useDashboardViews(dashboardId: string | undefined) {
       });
     },
     onSettled: () => {
-      queryClient.invalidateQueries({ queryKey });
-      // Also invalidate the sidebar views query
-      queryClient.invalidateQueries({ queryKey: ["all-dashboard-views"] });
+      void queryClient.invalidateQueries({ queryKey });
+      void queryClient.invalidateQueries({ queryKey: ["all-dashboard-views"] });
     },
   });
 
@@ -60,8 +66,8 @@ export function useDashboardViews(dashboardId: string | undefined) {
       );
     },
     onSettled: () => {
-      queryClient.invalidateQueries({ queryKey });
-      queryClient.invalidateQueries({ queryKey: ["all-dashboard-views"] });
+      void queryClient.invalidateQueries({ queryKey });
+      void queryClient.invalidateQueries({ queryKey: ["all-dashboard-views"] });
     },
   });
 
@@ -75,11 +81,6 @@ export function useDashboardViews(dashboardId: string | undefined) {
   };
 }
 
-/**
- * Standalone delete mutation — lets sidebar rows call delete without
- * subscribing to the per-dashboard views query (which would double-fetch
- * what `useAllDashboardViews` already loads).
- */
 export function useDeleteDashboardView() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -97,21 +98,22 @@ export function useDeleteDashboardView() {
       );
     },
     onSettled: (_data, _err, { dashboardId }) => {
-      queryClient.invalidateQueries({
+      void queryClient.invalidateQueries({
         queryKey: ["dashboard-views", dashboardId],
       });
-      queryClient.invalidateQueries({ queryKey: ["all-dashboard-views"] });
+      void queryClient.invalidateQueries({ queryKey: ["all-dashboard-views"] });
     },
   });
 }
 
-/**
- * Fetch views for all dashboards at once (for sidebar).
- * Returns a map of dashboardId -> DashboardView[].
- */
 export function useAllDashboardViews(dashboardIds: string[]) {
+  const { session } = useSession();
   return useQuery({
-    queryKey: ["all-dashboard-views", dashboardIds.join(",")],
+    queryKey: [
+      "all-dashboard-views",
+      dashboardIds.join(","),
+      dashboardCacheScope(session),
+    ],
     queryFn: async (): Promise<Record<string, DashboardView[]>> => {
       const results: Record<string, DashboardView[]> = {};
       await Promise.all(

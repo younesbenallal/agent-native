@@ -1,0 +1,35 @@
+---
+title: "Cloudflare"
+description: "cloudflare_module Nitro preset के साथ agent-native ऐप को Cloudflare Workers पर deploy करें।"
+---
+
+# Cloudflare
+
+## Cloudflare Workers {#cloudflare-workers}
+
+Cloudflare Worker के लिए Nitro का native module output उपयोग करें। यह SSR
+सक्षम रखता है और Worker entry point के साथ static assets `.output/server` और
+`.output/public` के अंतर्गत emit करता है:
+
+```ts filename="vite.config.ts"
+export default defineConfig({
+  plugins: [agentNative({ nitro: { preset: "cloudflare_module" } })],
+});
+```
+
+Wrangler के साथ generated Worker को build और deploy करें:
+
+```bash
+pnpm build
+npx wrangler deploy --config .output/server/wrangler.json
+```
+
+आप `NITRO_PRESET=cloudflare_module` के साथ preset को स्पष्ट रूप से भी चुन सकते हैं।
+Deploy करने से पहले एक durable external PostgreSQL database configure करें। Worker
+filesystem persistent application store नहीं है।
+
+## आगे क्या है
+
+- [**Deployment**](/docs/deployment) — अपने पहले production deploy से पहले persistent database और preset चुनें
+- [**Workspace Deployment**](/docs/workspace-deployment) — Netlify या Vercel के साथ workspace के हर ऐप को एक origin पर deploy करें
+- [**Node.js**](/docs/node-js), [**Docker**](/docs/docker), [**Vercel**](/docs/vercel), [**Netlify**](/docs/netlify), [**AWS Lambda**](/docs/aws-lambda), और [**Deno Deploy**](/docs/deno-deploy) — अन्य Nitro presets

@@ -42,7 +42,7 @@ type PanelTimeScope =
 type PanelConfig = Record<string, unknown> & {
   /** Use "dashboard" for AI-generated first-party panels by default. */
   timeScope?: PanelTimeScope;
-  /** Fixed bar width in pixels for bar charts. */
+  /** Renderer options only; keep panel fields at the panel level. */
 };
 
 type PanelPatch = {
@@ -135,6 +135,9 @@ export const DASHBOARD_MUTATION_EXAMPLES = [
   'dashboard.insertPanel({"id":"pipeline-widget","title":"Pipeline Widget","chartType":"extension","width":3,"config":{"extensionId":"<extension-id>"}}).atBottom();',
   'dashboard.insertPanel({"id":"personal-widget-slot","title":"Personal Widget Slot","chartType":"extension","width":3,"config":{"extensionSlotId":"analytics.dashboard.<dashboard-id>.panel.personal-widget-slot"}}).atBottom();',
 ] as const;
+
+export const MAX_DASHBOARD_MUTATION_CODE_LENGTH = 12_000;
+export const MAX_DASHBOARD_MUTATION_OPERATIONS = 100;
 
 export type DashboardMutationOperation =
   | {
@@ -1494,8 +1497,10 @@ export function parseDashboardMutationScript(
   config: Record<string, unknown>,
   code: string,
 ): DashboardMutationOperation[] {
-  if (code.length > 12_000) {
-    throw new Error("mutation script is too large; keep it under 12000 chars");
+  if (code.length > MAX_DASHBOARD_MUTATION_CODE_LENGTH) {
+    throw new Error(
+      `mutation script is too large; keep it under ${MAX_DASHBOARD_MUTATION_CODE_LENGTH} chars or use structured operations/compose-dashboard`,
+    );
   }
   if (hasTemplateLiteralSyntax(code)) {
     throw new Error("mutation script does not support template literals");

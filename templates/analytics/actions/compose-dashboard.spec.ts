@@ -1,11 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-/**
- * Tests for compose-dashboard. The metric catalog and the first-party SQL
- * validator run for real; only the store + collab layers are mocked so we can
- * assert on the assembled config without a database.
- */
-
 interface SavedDashboard {
   config: Record<string, unknown>;
 }
@@ -21,15 +15,6 @@ const mocks = vi.hoisted(() => ({
   seedFromText: vi.fn(async () => undefined),
 }));
 
-/**
- * Default passthrough: fetch via the mocked `getDashboard` (backed by the
- * in-memory `store` Map below), run the action's mutate callback once, then
- * forward to the mocked `upsertDashboard` (preserving every existing
- * `store`/`.mock.calls` assertion below) and return a DashboardRecord-shaped
- * result carrying the mutated config. The interleave test overrides this with
- * `mockImplementationOnce` to simulate a lost race and prove append recomputes
- * from fresh state on retry.
- */
 function defaultUpsertDashboardWithRetry(
   id: string,
   ctx: unknown,
@@ -93,7 +78,8 @@ vi.mock("../server/lib/dashboards-store", () => ({
 }));
 
 const { default: composeDashboard } = await import("./compose-dashboard");
-const { buildPanel } = await import("../server/lib/first-party-metric-catalog");
+const { buildPanel, FIRST_PARTY_TEMPLATE_NAMES, listMetricKeys } =
+  await import("../server/lib/first-party-metric-catalog");
 
 const LARGE_METRICS = [
   "total-signups",
@@ -134,12 +120,10 @@ beforeEach(() => {
   store.clear();
   vi.clearAllMocks();
   mocks.hasCollabState.mockResolvedValue(false);
-  // Read returns whatever is currently in the in-memory store (or null).
   mocks.getDashboard.mockImplementation(async (id: string) => {
     const saved = store.get(id);
     return saved ? { kind: "sql", config: saved.config } : null;
   });
-  // Write captures the saved config so a subsequent read sees it.
   mocks.upsertDashboard.mockImplementation(
     async (id: string, _kind: string, config: Record<string, unknown>) => {
       store.set(id, { config });
@@ -166,7 +150,6 @@ describe("compose-dashboard", () => {
       { userEmail: "alice@example.com", orgId: null, caller: "tool" },
     );
 
-    // ONE store write, not one-per-panel.
     expect(mocks.upsertDashboard).toHaveBeenCalledTimes(1);
 
     expect(result.panelCount).toBe(LARGE_METRICS.length);
@@ -183,9 +166,9 @@ describe("compose-dashboard", () => {
         id: "emailFilter",
         default: "exclude_builder",
       }),
+      expect.objectContaining({ id: "appFilter", default: "all" }),
     ]);
 
-    // Each panel has the canonical first-party shape.
     for (const panel of panels) {
       expect(panel.source).toBe("first-party");
       expect(typeof panel.sql).toBe("string");
@@ -195,7 +178,6 @@ describe("compose-dashboard", () => {
       expect(typeof panel.chartType).toBe("string");
     }
 
-    // Spot-check verbatim catalog SQL came through.
     const totalSignups = panels.find((p) => p.id === "total-signups")!;
     expect(totalSignups.sql).toContain("SELECT COUNT(*) AS signups");
     expect(totalSignups.sql).toContain("{{timeRange}}");
@@ -228,7 +210,6 @@ describe("compose-dashboard", () => {
     expect(topReferrers.sql).toContain("split_part");
     expect(topReferrers.sql).toContain("chr(63)");
     expect(topReferrers.sql).not.toContain("$1");
-    // Windowed metric retains its default 30d window when none requested.
     const referred = panels.find((p) => p.id === "referred-signups-30d")!;
     expect(referred.sql).toContain(
       "event_date >= to_char(CURRENT_DATE - INTERVAL '30 days'",
@@ -283,6 +264,44 @@ describe("compose-dashboard", () => {
     }
   });
 
+  it("builds the Agent-Native funnel panels with shared filters", () => {
+    for (const metric of [
+      "activation-funnel",
+      "signup-method-conversion",
+      "onboarding-step-dropoff",
+      "sharing-actions-by-app",
+    ]) {
+      const panel = buildPanel(metric)!;
+      expect(panel.sql).toContain("analytics_events");
+      expect(panel.sql).toContain("{{timeRange}}");
+      expect(panel.sql).toContain("{{emailFilter}}");
+      expect(panel.sql).toContain("{{appFilter}}");
+    }
+  });
+
+  it("applies the shared App filter to every catalog panel", () => {
+    for (const metric of listMetricKeys()) {
+      expect(buildPanel(metric)?.sql).toContain("{{appFilter}}");
+    }
+  });
+
+  it("keeps pre-signup and standalone panels outside the signup cohort", () => {
+    const activationSql = buildPanel("activation-funnel")!.sql;
+    expect(activationSql).toContain("FROM funnel_users");
+    expect(activationSql).toContain("FROM funnel_events e");
+    expect(activationSql).toContain("FROM cohort_events e");
+
+    for (const metric of [
+      "signup-method-conversion",
+      "sharing-actions-by-app",
+    ]) {
+      expect(buildPanel(metric)!.sql).toContain("FROM funnel_events");
+    }
+    const onboardingSql = buildPanel("onboarding-step-dropoff")!.sql;
+    expect(onboardingSql).toContain("FROM onboarding_events");
+    expect(onboardingSql).not.toContain("cohort_events");
+  });
+
   it("groups the recurring bar panel into Monday-based weekly buckets", () => {
     const panel = buildPanel("recurring-users-by-template-bar")!;
     expect(panel.sql).toContain("date_trunc('week', event_date::date)");
@@ -309,6 +328,35 @@ describe("compose-dashboard", () => {
     }
   });
 
+  it("keeps template-facing catalog metrics on the first-party allow-list", () => {
+    const allowList = FIRST_PARTY_TEMPLATE_NAMES.map(
+      (name) => `'${name}'`,
+    ).join(", ");
+    for (const metric of [
+      "total-signups",
+      "signups-over-time",
+      "signups-by-template",
+      "total-template-clicks",
+      "total-demo-clicks",
+      "total-cli-copies",
+      "template-interest-over-time",
+      "demo-clicks-over-time",
+      "cli-copies-over-time",
+      "pageviews-over-time",
+      "sessions-by-app",
+      "repeat-users",
+      "recurring-users-by-template",
+      "recurring-users-by-template-bar",
+      "retention-over-time",
+      "one-day-retention-by-template",
+      "seven-day-retention-by-template",
+      "dau-over-time",
+      "wau-over-time",
+    ]) {
+      expect(buildPanel(metric)!.sql).toContain(`IN (${allowList})`);
+    }
+  });
+
   it("excludes unassigned telemetry from per-template activity panels", () => {
     for (const metric of [
       "dau-over-time",
@@ -324,12 +372,15 @@ describe("compose-dashboard", () => {
   it("counts retention and active-user panels from signed-in session activity", () => {
     for (const metric of SIGNED_IN_ACTIVITY_METRICS) {
       const panel = buildPanel(metric)!;
-      expect(panel.sql).toContain("event_name = 'session status'");
+      expect(panel.sql).toContain(
+        "event_name IN ('session status', 'session_status')",
+      );
+      expect(panel.sql).toContain("event_name = 'app_entered'");
       expect(panel.sql).toContain("signed_in = 'true'");
       expect(panel.sql).not.toContain(
         "COALESCE(NULLIF(user_id, ''), NULLIF(anonymous_id, ''))",
       );
-      expect(panel.sql).not.toContain("NULLIF(user_id, '') IS NOT NULL");
+      expect(panel.sql).toContain("NULLIF(user_id, '') IS NOT NULL");
       expect(panel.sql).toContain("NULLIF(user_key");
       expect(panel.sql).toContain("lower(COALESCE");
       expect(panel.sql).toContain("<> 'docs'");
@@ -390,6 +441,7 @@ describe("compose-dashboard", () => {
       { id: "region", label: "Region", type: "text" },
       expect.objectContaining({ id: "timeRange" }),
       expect.objectContaining({ id: "emailFilter" }),
+      expect.objectContaining({ id: "appFilter" }),
     ]);
   });
 
@@ -433,12 +485,10 @@ describe("compose-dashboard", () => {
       "made-up-metric",
       "another-bogus-key",
     ]);
-    // Still saved the valid panels.
     expect(mocks.upsertDashboard).toHaveBeenCalledTimes(1);
   });
 
   it("appends to an existing dashboard by default, skipping ids already present", async () => {
-    // First compose creates the dashboard.
     await composeDashboard.run(
       {
         dashboardId: "growth",
@@ -449,7 +499,6 @@ describe("compose-dashboard", () => {
     );
     expect((store.get("growth")!.config.panels as unknown[]).length).toBe(2);
 
-    // Second compose appends new panels + skips the one already present.
     const result: any = await composeDashboard.run(
       {
         dashboardId: "growth",
@@ -458,7 +507,7 @@ describe("compose-dashboard", () => {
       { userEmail: "alice@example.com", orgId: null, caller: "tool" },
     );
 
-    expect(result.panelCount).toBe(4); // 2 existing + 2 new
+    expect(result.panelCount).toBe(4);
     expect(result.skippedExistingIds).toEqual(["total-signups"]);
     const ids = (
       store.get("growth")!.config.panels as Array<{ id: string }>
@@ -469,16 +518,63 @@ describe("compose-dashboard", () => {
       "sessions-by-app",
       "signed-in-vs-anon",
     ]);
-    // Original name preserved on append.
     expect(store.get("growth")!.config.name).toBe("Growth");
   });
 
+  it("refreshes matching catalog panels in place without replacing unrelated panels", async () => {
+    store.set("refreshable", {
+      config: {
+        name: "Refreshable",
+        panels: [
+          {
+            id: "unrelated",
+            title: "Keep me",
+            chartType: "metric",
+            source: "first-party",
+            width: 1,
+            sql: "SELECT 1 AS value FROM analytics_events WHERE event_date >= '2020-01-01'",
+            config: {},
+          },
+          {
+            id: "pageviews-over-time",
+            title: "Stale pageviews",
+            chartType: "area",
+            source: "first-party",
+            width: 2,
+            sql: "SELECT 'stale' AS template",
+            config: { description: "stale" },
+          },
+        ],
+      },
+    });
+
+    const result: any = await composeDashboard.run(
+      {
+        dashboardId: "refreshable",
+        metrics: ["pageviews-over-time", "sessions-by-app"],
+        refreshExisting: true,
+      },
+      { userEmail: "alice@example.com", orgId: null, caller: "tool" },
+    );
+
+    expect(result.saved).toBe(true);
+    expect(result.refreshedExistingIds).toEqual(["pageviews-over-time"]);
+    expect(result.skippedExistingIds).toEqual([]);
+    expect(result.panelCount).toBe(3);
+    const panels = store.get("refreshable")!.config.panels as Array<
+      Record<string, any>
+    >;
+    expect(panels.map((panel) => panel.id)).toEqual([
+      "unrelated",
+      "pageviews-over-time",
+      "sessions-by-app",
+    ]);
+    expect(panels[0].title).toBe("Keep me");
+    expect(panels[1].sql).toContain("event_name = 'pageview'");
+    expect(panels[1].sql).toContain("{{timeRange}}");
+  });
+
   it("recomputes the append against fresh state on retry so a concurrent writer's panel is never dropped", async () => {
-    // Simulates two interleaved writers: this call appends "sessions-by-app",
-    // but its first fenced write is lost because a concurrent writer already
-    // appended a different panel ("signed-in-vs-anon") in between. A correct
-    // retry re-reads that winning save and re-merges on top of it, so both
-    // appends land instead of the second writer clobbering the first's.
     store.set("interleaved", {
       config: {
         name: "Interleaved",
@@ -516,12 +612,12 @@ describe("compose-dashboard", () => {
     mocks.upsertDashboardWithRetry.mockImplementationOnce(
       async (id: string, ctx: unknown, mutate: (existing: any) => any) => {
         mutateCallCount += 1;
-        await mutate({ kind: "sql", config: beforeConcurrentWrite }); // attempt 1: lost to the race
+        await mutate({ kind: "sql", config: beforeConcurrentWrite });
         mutateCallCount += 1;
         const { kind, body } = await mutate({
           kind: "sql",
           config: afterConcurrentWrite,
-        }); // retry: recomputes against the concurrent writer's saved state
+        });
         await mocks.upsertDashboard(id, kind, body, ctx);
         return { kind, config: body };
       },
@@ -595,6 +691,7 @@ describe("compose-dashboard", () => {
       { userEmail: "alice@example.com", orgId: null, caller: "tool" },
     );
     expect(result.panelCount).toBe(2);
+    expect(result.changed).toBe(false);
     expect(result.skippedExistingIds).toEqual([
       "total-signups",
       "sessions-by-app",
@@ -622,7 +719,6 @@ describe("compose-dashboard", () => {
     expect(referred.sql).not.toContain("interval '30 days'");
 
     const k = panels.find((p) => p.id === "viral-coefficient-90d")!;
-    // "all" window strips the time clause.
     expect(k.sql).not.toContain("interval '90 days'");
   });
 });

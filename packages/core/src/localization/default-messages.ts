@@ -1,15 +1,17 @@
-// Canonical English catalog used by core UI for translation fallbacks.
-// Lives under src/ so tsc emits it to dist/*.js and Node's strict ESM resolver
-// can load it during SSR. Do not import core runtime code from src/templates:
-// templates ship as verbatim copy-only scaffolding (.ts), so their compiled
-// .js never exists in dist.
+import { PASSWORD_MIN_LENGTH_MESSAGE } from "../shared/password-policy.js";
+import { environmentBadgeMessages } from "./core-messages/supplemental/en-US.js";
+import { ICON_PICKER_MESSAGES } from "./icon-picker-messages.js";
+
 const messages = {
+  iconPicker: ICON_PICKER_MESSAGES["en-US"],
+  environmentBadge: environmentBadgeMessages,
   workspaceFile: {
     download: "Download",
   },
   composer: {
     sendMessage: "Send message",
     queueMessage: "Queue message",
+    connectBuilder: "Connect Builder.io",
   },
   home: {
     settingsTitle: "Settings",
@@ -22,6 +24,47 @@ const messages = {
     docsDescription: "Learn the framework",
     themeTitle: "Theme",
     themeDescription: "Toggle dark / light",
+  },
+  common: {
+    cancel: "Cancel",
+    confirmDisconnect: "Confirm disconnect",
+    disconnect: "Disconnect",
+    disconnecting: "Disconnecting…",
+  },
+  routeTitles: {
+    agentObservability: "Agent observability navigation",
+  },
+  onboarding: {
+    back: "Back",
+    chooseRole: "Choose your role",
+    customizeRole: "Let’s customize this for you.",
+    roleQuestion: "What best describes your role?",
+    roleHelperText: "This helps us personalize your experience",
+    roleProduct: "Product Manager",
+    roleDesign: "Designer",
+    roleDeveloper: "Developer",
+    roleMarketing: "Marketing",
+    roleSales: "Sales",
+    roleOps: "Ops",
+    roleIndividual: "Individual",
+    roleOther: "Other",
+    roleOtherInputLabel: "Describe your role",
+    skipForNow: "Skip for now",
+    saveRoleError: "Could not save your role.",
+    builderReadyWithCodeChanges:
+      "AI credits and cloud code changes are ready to use.",
+    builderReadyCreditsOnly:
+      "AI credits are ready to use. Cloud code edits require a Builder project in Background Agent settings.",
+    openBackgroundAgentSettings: "Open Background Agent settings",
+    fileStorage: {
+      title: "Connect storage to upload files",
+      description:
+        "Connect Builder.io (free) or configure your own S3-compatible object storage.",
+      reconnectBuilder: "Reconnect Builder.io",
+      custom: "Use custom keys",
+      customDescription:
+        "Configure an S3-compatible bucket with a stable public URL.",
+    },
   },
   settings: {
     title: "Settings",
@@ -40,10 +83,33 @@ const messages = {
     openTeamSettings: "Open team settings",
     openResourceSettings: "Open resource settings",
     backHome: "Back to home",
+    builderConnection: {
+      manage: "Manage Builder.io connection",
+    },
     mcpConnectionsTitle: "Agent integrations",
     mcpConnectionsDescription:
       "Connect tools and services so the agent can use them.",
     openMcpConnections: "Open integrations",
+    mcpTitle: "MCP",
+    mcpDescription:
+      "Connect this app to Claude, ChatGPT, Cursor, Codex, or another MCP host.",
+    mcpUrlLabel: "MCP server URL",
+    mcpUrlHint:
+      "Copy this URL into the AI host you want to use. The canonical path is /mcp.",
+    mcpOpenDocs: "Open MCP connection docs",
+    a2aAgentCard: "A2A agent card",
+    a2aOpenDocs: "Open A2A documentation",
+    mcpClientSetup: "Connect an AI host",
+    mcpClientSetupDescription:
+      "Choose a host for step-by-step setup, or paste the URL into any MCP-compatible client.",
+    mcpChooseAssistant: "Choose your AI assistant",
+    mcpCommand: "Command",
+    mcpConfig: "MCP config",
+    mcpCopy: "Copy",
+    mcpCopied: "Copied",
+    mcpStaticTokenDescription:
+      "Open the full connect page to create a token for clients that cannot complete OAuth.",
+    mcpOpenConnectPage: "Open full connect page",
     profileTitle: "Account",
     profileDescription: "Your name, profile photo, and signed-in identity.",
     profileLoading: "Loading...",
@@ -53,6 +119,7 @@ const messages = {
     profileUploading: "Uploading...",
     profileChangePhoto: "Change photo",
     profileNameLabel: "Name",
+    profileNameEdit: "Edit name",
     profileNamePlaceholder: "Your name",
     profileNameDescription:
       "This name is used when referring to you across Agent-Native apps.",
@@ -60,6 +127,14 @@ const messages = {
     profileSaving: "Saving...",
     profileSaved: "Profile updated",
     profileSaveError: "Could not update profile",
+    emailTitle: "Email",
+    emailChange: "Change email",
+    emailChanging: "Sending...",
+    emailChangeSent:
+      "Check your email for instructions to confirm this change.",
+    emailChangeError: "Could not send confirmation.",
+    emailNewLabel: "New email",
+    emailNewPlaceholder: "Enter new email",
     passwordTitle: "Password",
     passwordDescription:
       "Add a password for an alternative way to sign in to your account.",
@@ -70,12 +145,49 @@ const messages = {
     passwordNewLabel: "New password",
     passwordConfirmLabel: "Confirm new password",
     passwordPlaceholder: "Enter password",
-    passwordMinLength: "Password must be at least 8 characters",
+    passwordMinLength: PASSWORD_MIN_LENGTH_MESSAGE,
     passwordMismatch: "Passwords do not match",
     passwordSave: "Save password",
     passwordSaving: "Saving...",
     passwordSaved: "Password updated",
     passwordSaveError: "Could not update password",
+    twoFactorTitle: "Two-factor authentication",
+    twoFactorDescription:
+      "Use an authenticator app to add a second sign-in step to your account.",
+    twoFactorManage: "Manage",
+    twoFactorEnable: "Set up two-factor",
+    twoFactorEnabled: "Two-factor authentication is enabled.",
+    twoFactorSetupTitle:
+      "Scan this QR code with your authenticator app, then enter the code it gives you.",
+    twoFactorQrLabel: "Two-factor setup QR code",
+    twoFactorCodeLabel: "Authenticator code",
+    twoFactorVerify: "Verify and enable",
+    twoFactorSaved: "Two-factor authentication enabled",
+    twoFactorBackupCodes:
+      "Save these backup codes somewhere safe. Each one can be used once if you lose access to your authenticator.",
+    twoFactorDisable: "Turn off two-factor",
+    twoFactorLoadError: "Could not load two-factor settings",
+    twoFactorSetupError: "Could not update two-factor settings",
+    twoFactorDisableError: "Could not turn off two-factor authentication",
+    twoFactorCodeError: "Enter the six-digit code from your authenticator app.",
+    privacyTitle: "Privacy & data",
+    privacyDescription:
+      "Request a copy of your data or ask for your personal data to be deleted.",
+    privacyManage: "Manage",
+    privacyRightsTitle: "Your data rights",
+    privacyRightsDescription:
+      "Requests are recorded for review by a workspace administrator, who will verify your identity and follow up.",
+    privacyRequestCopy: "Request a copy",
+    privacyRequestDeletion: "Request deletion",
+    privacyRequesting: "Recording request...",
+    privacyRequestRecorded:
+      "Request recorded. An administrator will follow up.",
+    privacyRequestRecordedShort: "Request recorded",
+    privacyRequestError: "Could not record your request. Please try again.",
+    privacyDeletionTitle: "Request deletion of your data?",
+    privacyDeletionDescription:
+      "This records a deletion request; it does not delete data immediately. An administrator will verify your identity and complete the request under the deployment's retention and legal obligations.",
+    privacyDocsLink: "Read privacy and data rights",
     profileMenuItem: "Profile",
     manageAgentMenuItem: "Manage agent",
     timezoneLabel: "Timezone",
@@ -95,6 +207,36 @@ const messages = {
       "Only your own signed-in sessions use this key. Integration, webhook, scheduled job, automation, and agent-to-agent runs sign in as their owner rather than as you, so they cannot read it.",
     scopeWorkspaceDescription:
       "Everyone in this workspace uses this key, including integration, webhook, scheduled job, automation, and agent-to-agent runs.",
+    sourceVault: "Vault",
+    sourceWorkspace: "Workspace",
+    sourceEnvironment: "Environment",
+    statusUnavailable: "Unavailable",
+    managedInVault:
+      "Managed in the workspace Vault. Every app in this workspace uses this value.",
+    openVault: "Open Vault",
+    managedByOwner: "Managed in {{owner}}",
+    removeCredentials: "Remove credentials",
+    confirmRemove: "Remove",
+    sharedKeysKept:
+      "Some shared keys were not removed. Only workspace admins can remove them.",
+    setForWorkspace: "Set for everyone in this workspace.",
+    fromEnvironment: "Provided by the deployment environment.",
+    usePersonalKey: "Use a personal key instead",
+    overridesVault:
+      "This personal key overrides the workspace Vault value. Remove it to use the Vault key.",
+    overridesWorkspace:
+      "This personal key overrides the workspace value. Remove it to use the shared key.",
+    newKey: "New",
+    searchKeys: "Search keys...",
+    noKeysFound: "No keys found.",
+    chooseKey: "Choose a key",
+    required: "Required",
+    customKey: "Custom key",
+    customKeyHint: "Add any key by name",
+    addCustomKeyNamed: "Add “{{name}}” as a custom key",
+    emptyTitle: "No keys yet.",
+    emptyHint: "Add a key to use your own accounts.",
+    emptyMore: "and {{count}} more under New, or add any custom key",
   },
   agentResources: {
     openDocs: "Open {{section}} documentation",
@@ -278,6 +420,35 @@ const messages = {
       status: "Status",
       opens: "Opens",
       lastEvent: "Last event",
+      app: "App",
+      sendLogTitle: "Send log",
+      sendLogTemplate: "Template",
+      sendLogProvider: "Provider",
+      sendLogResponseStatus: "Response status",
+      sendLogError: "Error",
+      sendLogTo: "To",
+      sendLogFrom: "From",
+      sendLogContainsOperator: "contains",
+      sendLogExcludeOperator: "exclude",
+      sendLogContainsPlaceholder: "e.g. name@example.com",
+      sendLogExcludePlaceholder: "e.g. @builder.io",
+      sendLogAddressFilterLabel: "{{dimension}} {{operator}}",
+      sendLogRemoveAddressFilter: "Remove {{filter}}",
+      sendLogAllTemplates: "All templates",
+      sendLogSearchTemplates: "Search templates…",
+      sendLogNoTemplatesFound: "No templates found.",
+      sendLogAllStatuses: "All statuses",
+      sendLogSent: "Sent",
+      sendLogFailed: "Failed",
+      sendLogAllProviders: "All providers",
+      sendLogClearFilters: "Clear filters",
+      sendLogEmpty: "No sends match these filters in this date range.",
+      sendLogTimestamp: "Timestamp",
+      sendLogPrevious: "Previous",
+      sendLogNext: "Next",
+      sendLogBodyHtml: "HTML",
+      sendLogBodyText: "Text",
+      sendLogBodyFrameTitle: "Sent email body",
     },
     pages: {
       appsDescription:
@@ -350,7 +521,7 @@ const messages = {
       appBuildingSuffix:
         "after its branch is merged and the workspace deploy finishes.",
       branch: "Branch: {{branch}}",
-      openBuilderBranch: "Open Builder branch",
+      openBuilderBranch: "Open in Builder",
       openingApp: "Opening {{name}}",
       redirectingTo: "Redirecting to",
       openApp: "Open app",
@@ -358,6 +529,8 @@ const messages = {
         " a Dispatch tab or a workspace app in this workspace.",
       agentsDescription:
         "Dispatch can delegate to the built-in app suite over A2A by default. Add extra agents here only if you want to route work to apps outside that built-in set.",
+      simpleAgentsDescription:
+        "Create reusable agents in minutes, or import a setup you already made in Claude or another agent tool.",
       mcpAccessUpdated: "Agent integration access updated",
       selectAppForMcp: "Select at least one app, or expose all apps.",
       mcpUrlCopied: "Agent integration URL copied",
@@ -377,6 +550,18 @@ const messages = {
         "Workspace-wide Builder.io credit spend, chat volume, user activity, and app access.",
       metricsDescriptionLlm:
         "Workspace-wide LLM spend, chat volume, user activity, and app access.",
+      appAdoption: "App adoption",
+      appAdoptionFor: "{{name}} adoption",
+      yourAppActivity: "Your app activity",
+      appAdoptionDefinition:
+        "Active means a tracked action. App opens and views are not included.",
+      ownerUnavailable: "Owner unavailable",
+      dailyActiveUsers: "Daily active",
+      weeklyActiveUsers: "Weekly active",
+      trackedActions: "Tracked actions",
+      trackedActionBreakdown: "Tracked action breakdown",
+      noTrackedActions: "No tracked actions in this window.",
+      viewAppMetrics: "View app metrics",
       llmCalls: "LLM calls",
       activeUsers: "Active users",
       workspaceAppsStat: "Workspace apps",
@@ -431,7 +616,7 @@ const messages = {
       threadDebugRefreshFailures: "Refresh failed runs",
       threadDebugNoFailures: "No failed runs found.",
       threadDebugCurrentDatabase: "Current Dispatch DB",
-      threadDebugSearchPlaceholder: "Search title, preview, messages, tools",
+      threadDebugSearchPlaceholder: "Search threads or email",
       threadDebugSearch: "Search",
       threadDebugLookupPlaceholder: "Paste thread or request/run ID",
       threadDebugInspect: "Inspect",
@@ -460,6 +645,9 @@ const messages = {
       browserConnectFailed: "The browser extension did not connect.",
     },
   },
+  settingsShortcut: {
+    command: "Settings",
+  },
   agentPanel: {
     uiError: {
       title: "Agent panel hit a glitch",
@@ -470,18 +658,24 @@ const messages = {
     useBuilder: "Use Builder",
     openDesktopToEditCode: "Open Desktop to edit code",
     codeUnavailableDescription:
-      "Source-code changes and CLI access are available in the Agent Native Desktop app.",
+      "Source-code changes and CLI access are available in the Agent-Native Desktop app.",
     downloadDesktop: "Download Desktop",
     chatMode: "Chat mode",
     chat: "Chat",
+    mode: "Mode",
+    uiMode: "UI",
     cliTerminalMode: "CLI terminal mode",
     cli: "CLI",
     workspaceMode: "Files, agents, skills, and tasks",
     workspace: "Resources",
     newChat: "New chat",
     newTerminal: "New terminal",
+    loadingTerminal: "Loading terminal...",
     panelOptions: "Agent panel options",
+    integrations: "Integrations",
     collapseSidebar: "Collapse sidebar",
+    widenChat: "Widen chat",
+    returnChatToLayout: "Return chat to layout",
     expandSidebar: "Expand sidebar",
     hideChats: "Hide chats",
     allChats: "All chats",
@@ -502,13 +696,63 @@ const messages = {
     askAgentTitle: "Ask the agent",
     askAgentPlaceholder: "Tell the agent what you want to do…",
     connectAi: "Connect AI",
-    builderOrOwnKeys:
-      "Use Builder.io free credits, or add your own provider keys.",
+    builderOrOwnKeys: "Choose Builder.io or custom keys.",
     connectBuilderIo: "Connect Builder.io",
     connectingBuilder: "Connecting Builder.io…",
     builderModelCredits: "Free credits for Claude, OpenAI & Gemini",
-    addOwnKeys: "Add your own keys",
-    configureProviderKeys: "Configure Anthropic, OpenAI, or another provider",
+    addOwnKeys: "Custom keys",
+    configureProviderKeys: "Choose a provider.",
+    chooseProvider: "Choose a provider",
+    searchProviders: "Search providers...",
+    noProvidersFound: "No providers found.",
+    availableProviders: "Available providers",
+    configured: "Configured",
+    apiKey: "API key",
+    localRuntime: "Local",
+    keyScope: "Key scope",
+    personalKeyScope: "Personal",
+    organizationKeyScope: "Organization",
+    personalKeyInEffect: "Your personal key is in effect.",
+    organizationKeyInEffect: "Organization key is in effect.",
+    sharedKeyInEffect: "A shared key is in effect.",
+    useOrganizationKey: "Use organization key",
+    keyStatusUnavailable: "Key status is unavailable.",
+    saveScopeRoleUnavailable:
+      "Couldn't load your organization role, so keys can't be saved yet.",
+    chatgptSubscriptionPopupBlocked:
+      "Allow pop-ups for this site, then try again.",
+    chatgptSubscriptionTitle: "ChatGPT subscription",
+    chatgptSubscriptionDescription:
+      "Experimental Codex access through your ChatGPT subscription.",
+    chatgptSubscriptionInUse: "In use",
+    chatgptSubscriptionConnected: "Connected",
+    chatgptSubscriptionConnecting: "Connecting…",
+    chatgptSubscriptionReconnect: "Reconnect",
+    chatgptSubscriptionConnect: "Connect ChatGPT",
+    chatgptSubscriptionUse: "Use in chat",
+    chatgptSubscriptionDisconnect: "Disconnect",
+    enterApiKey: "Enter your {{provider}} API key.",
+    providerSetupFailed: "Could not configure this provider.",
+    noApiKeyNeeded: "No API key required.",
+    modelId: "Model ID",
+    endpointUrl: "Endpoint URL",
+    optional: "Optional",
+    compatibleEndpointHint:
+      "Use this for LiteLLM or another OpenAI-compatible gateway.",
+    findModels: "Find models",
+    ollamaModelsChecking: "Checking installed models…",
+    ollamaModelsFound_one: "Found {{count}} installed model.",
+    ollamaModelsFound_other: "Found {{count}} installed models.",
+    ollamaModelsNone:
+      "Connected, but no models are pulled yet — run `ollama pull llama3.1`.",
+    ollamaModelsError: "{{error}} Showing example model names below.",
+    ollamaModelsPrompt:
+      'Click "Find models" above to list what your Ollama server actually has installed.',
+    savingProvider: "Saving...",
+    providerSaved: "Connected",
+    useProvider: "Use {{provider}}",
+    saveAndUseProvider: "Save and use {{provider}}",
+    getApiKey: "Get an API key",
     checkingAiConnection: "Checking AI connection...",
     delegatedAgent: {
       asking: "Asking {{name}}...",
@@ -525,10 +769,10 @@ const messages = {
       setupDescription:
         "Connect Builder.io to use managed voice with free credits, or add your own keys.",
       connectBuilder: "Connect Builder.io",
-      useOpenAiKey: "Add your own keys",
+      useOpenAiKey: "Custom keys",
       startWithOpenAiKey: "Start with OpenAI key",
-      start: "Real-time voice",
-      keepDictating: "Dictate",
+      start: "Start voice chat",
+      keepDictating: "Dictate a message",
       rememberPreference: "Remember my preference",
       showChat: "Show chat",
       hideChat: "Hide chat",
@@ -647,17 +891,17 @@ const messages = {
     timezone: "Timezone",
     pageTitle: "Automations",
     pageDescription:
-      "Manage agent tasks that run on a schedule or in response to events.",
+      "Manage agent tasks that run on a schedule, in response to events, or from webhooks.",
     personalDescription:
-      "Scheduled and event-triggered automations that run for you.",
+      "Scheduled, event-triggered, and webhook-triggered automations that run for you.",
     organizationDescription:
-      "Scheduled and event-triggered automations shared with this organization.",
+      "Scheduled, event-triggered, and webhook-triggered automations shared with this organization.",
     organizationMemberNote: "You can manage automations you created.",
     loading: "Loading…",
     loadError: "Could not load all automations.",
     organizationEmptyTitle: "No organization automations yet",
     organizationEmptyDescription:
-      "Describe a scheduled or event-triggered automation for this organization.",
+      "Describe a scheduled, event-triggered, or webhook-triggered automation for this organization.",
     organizationPrompt:
       "Create a shared organization automation that does this: ",
     enabled: "Enabled",
@@ -682,14 +926,37 @@ const messages = {
     editScheduleTitle: "Edit schedule — {{name}}",
     editScheduleDescription:
       "The clock time below is read in the timezone you pick, so 8:00 means 8:00 there.",
+    repeat: "Repeat",
+    repeatEvery: "Repeat every",
+    scheduleUnit: "Unit",
+    hours: "hour(s)",
+    days: "day(s)",
+    day: "day",
+    weeks: "week(s)",
+    months: "month(s)",
+    atMinute: "At minute",
+    onDay: "On",
+    dayOfMonth: "Day of month",
+    atTime: "At",
+    weeklyIntervalAdvanced:
+      "Every few weeks needs the Advanced cron editor below.",
+    dailyIntervalAdvanced:
+      "Every few days needs the Advanced cron editor below.",
+    schedulePreview: "Runs {{time}}.",
+    advancedSchedule: "Advanced - cron expression",
+    show: "Show",
+    hide: "Hide",
     cronExpression: "Cron expression",
     cronFormatHint: "minute hour day-of-month month day-of-week",
     cronFieldCount: "A cron expression needs exactly 5 fields.",
     saveSchedule: "Save schedule",
     details: "Details",
+    viewDetails: "View details",
     pause: "Pause",
     resume: "Resume",
     delete: "Delete",
+    deleting: "Deleting…",
+    running: "Running…",
     updateError: "Could not update automation.",
     automationsEmptyTitle: "No automations yet",
     automationsEmptyDescription: "Describe what should happen and when.",
@@ -700,8 +967,24 @@ const messages = {
     instructions: "Instructions",
     mcpTools: "Connected agent tools",
     automationEventTrigger: "On {{event}}",
+    webhook: "Webhook",
+    automationWebhookDetails: "Runs when a webhook is received.",
+    automationWebhookTrigger: "On webhook",
+    schedulePreset: {
+      hourly: "Every hour",
+      dailyMidnight: "Every day at midnight",
+      dailyNoon: "Every day at noon",
+      weekdays: "Every weekday",
+      weekly: "Every week",
+      custom: "Custom",
+      customDetail: "Set your own repeat pattern",
+    },
     scheduledTrigger: "Scheduled",
     eventTrigger: "Event-triggered",
+    webhookTrigger: "Webhook-triggered",
+    webhookUrl: "Webhook URL",
+    webhookUrlHint:
+      "Paste this URL into a service that sends HTTP POST webhooks.",
     deleteAutomationTitle: "Delete automation?",
     deleteAutomationDescription:
       "This permanently removes the automation and cannot be undone.",
@@ -715,8 +998,29 @@ const messages = {
     personal: "Personal",
     organization: "Organization",
     settingsSummary:
-      "Manage scheduled and event-triggered agent tasks together from the Automations page.",
+      "Manage scheduled, event-triggered, and webhook-triggered agent tasks together from the Automations page.",
     openAutomations: "Open Automations",
+    nextRunNeverScheduler: "Never — no scheduler in this deploy",
+    nextRunSchedulerUnknown:
+      "{{date}} — unconfirmed, the scheduler check failed",
+    nextRunSchedulerUnknownNoDate: "Unknown — the scheduler check failed",
+    scheduleUnknownTitle: "Couldn't check whether schedules run here",
+    scheduleUnknownDetail:
+      "The scheduler status check failed, so the next run times below are unconfirmed. Reload to check again.",
+    scheduleUnavailableTitle: "Schedules won't run in this deploy",
+    scheduleUnavailableLocalTitle: "Schedules don't run in local development",
+    scheduleUnavailableDisabled:
+      "This app was built with recurring jobs turned off, so no scheduled automation will fire. Event- and webhook-triggered automations and Run now still work.",
+    scheduleUnavailableNoScheduler:
+      "This hosting target has no durable scheduler, so no scheduled automation will fire. Event- and webhook-triggered automations and Run now still work.",
+    scheduleUnavailableLocal:
+      "Schedules stay off on a dev machine unless you opt in. Event- and webhook-triggered automations and Run now still work.",
+    scheduleUnavailableDisabledFix:
+      "To enable recurring jobs, set AGENT_NATIVE_DISABLE_RECURRING_JOBS=false in the build environment.",
+    scheduleUnavailableLocalFix:
+      "Set AGENT_NATIVE_ENABLE_LOCAL_RECURRING_JOBS=true to run schedules on this machine.",
+    scheduleUnavailableFixLabel: "Show more",
+    scheduleUnavailableFixLabelOpen: "Show less",
   },
   share: {
     titleWithResource: 'Share "{{title}}"',
@@ -724,6 +1028,8 @@ const messages = {
     owner: "Owner: {{name}}",
     close: "Close",
     shareOptions: "Share options",
+    people: "People",
+    agents: "Agents",
     link: "Link",
     invite: "Invite",
     embed: "Embed",
@@ -732,6 +1038,10 @@ const messages = {
     shareLink: "Share link",
     addPeopleByEmail: "Add people by email",
     notifyPeople: "Notify people",
+    message: "Message",
+    addMessage: "Add a message",
+    hideMessage: "Hide message",
+    messagePlaceholder: "Add a short note (optional)",
     peopleWithAccess: "People with access",
     ownerRole: "Owner",
     remove: "Remove",
@@ -739,6 +1049,7 @@ const messages = {
     embedUrl: "Embed URL",
     embedCode: "Embed code",
     copy: "Copy",
+    copied: "Copied",
     role: "Role",
     private: "Private",
     privateDescription: "Only people with access can view",
@@ -748,6 +1059,8 @@ const messages = {
     publicDescription: "Anyone signed in with the link can view",
     viewer: "Viewer",
     viewerDescription: "Can view",
+    commenter: "Commenter",
+    commenterDescription: "Can view and add comments",
     editor: "Editor",
     editorDescription: "Can edit",
     admin: "Admin",
@@ -777,6 +1090,9 @@ const messages = {
     statusDone: "Done",
     statusFailed: "Failed",
     statusStopped: "Stopped",
+    statusNeedsApproval: "Needs approval",
+    statusNeedsInput: "Needs input",
+    statusPaused: "Paused",
     updatedJustNow: "Updated just now",
     finishedJustNow: "Finished just now",
     updatedMinutes: "Updated {{count}}m ago",
@@ -787,8 +1103,8 @@ const messages = {
     finishedDate: "Finished {{date}}",
   },
   agentTask: {
-    backgroundTask: "Background task",
-    stop: "Stop background task",
+    spawnedAgent: "Spawned agent",
+    stop: "Stop spawned agent",
     openThread: "Open task thread",
   },
   codeRequired: {
@@ -801,7 +1117,7 @@ const messages = {
       '"{{feature}}" creates or modifies source code, which needs Desktop or Builder from this surface.',
     subtitle:
       "This action creates or modifies source code, which needs Desktop or Builder from this surface.",
-    desktopTitle: "Use Agent Native Desktop",
+    desktopTitle: "Use Agent-Native Desktop",
     desktopDescription:
       "Open the project in the desktop app to enable source edits and CLI access.",
     builderAgentTitle: "Use Builder.io Agent",
@@ -903,6 +1219,21 @@ const messages = {
     retry: "Retry",
   },
   org: {
+    askAdminTitle: "Ask your administrator",
+    askAdminDescription:
+      "Ask an administrator for an invitation to join this workspace.",
+    appPermissions: "App permissions",
+    applications: "Applications",
+    applicationsEmpty: "No workspace applications are registered yet.",
+    applicationsLoadFailed: "Couldn't load workspace applications.",
+    applicationAccess: "Access for {{name}}",
+    applicationAccessAll: "All members",
+    applicationAccessRestricted: "Restricted",
+    applicationAccessDisabled: "Disabled",
+    appRolesOptional: "App roles",
+    noAppRolesFound: "No roles found.",
+    notAssigned: "Not assigned",
+    resetToDefaults: "Reset to defaults",
     createTitle: "Create your organization",
     createDescription:
       "This app organizes your content by team. Create an organization to continue - you can invite teammates afterward.",
@@ -916,12 +1247,27 @@ const messages = {
     yourOrganization: "Your organization",
     joinYourTeam: "Join your team",
     openToDomainEmails: "Open to @{{domain}} emails",
+    enableDomainJoin: "Enable for @{{domain}}",
     joinOrg: "Join {{name}}",
     pendingInvitations: "Pending invitations",
     invitedBy: "from {{name}}",
     accept: "Accept",
     createSeparate: "or create a separate organization",
     organizationName: "Organization name",
+    workspaceIcon: "Workspace icon",
+    icons: "Icons",
+    emoji: "Emoji",
+    upload: "Upload",
+    searchIcons: "Search icons",
+    noIconsFound: "No icons found",
+    recentIcons: "Recent icons",
+    iconColors: "Colors",
+    defaultColor: "Default",
+    removeIcon: "Remove icon",
+    uploadIcon: "Upload icon",
+    uploadingIcon: "Uploading…",
+    workspaceIconSyncPending:
+      "Saved here. Other apps may take longer to update.",
     organizationPlaceholder: "Acme Inc.",
     createOrganization: "Create organization",
     create: "Create",
@@ -944,6 +1290,11 @@ const messages = {
     owner: "Owner",
     admin: "Admin",
     member: "Member",
+    workspaceAppsDefaultPrivacy: "New app privacy",
+    workspaceAppsDefaultPrivacyDescription:
+      "Choose whether new workspace apps start private to their creator or visible to the organization.",
+    workspaceAppsOrganization: "Organization",
+    workspaceAppsCreatorOnly: "Creator only",
     members: "Members",
     inviteMembers: "Invite members",
     invited: "Invited",
@@ -953,9 +1304,39 @@ const messages = {
     noMembers: "No members yet.",
     memberCount_one: "{{count}} member",
     memberCount_other: "{{count}} members",
+    memberPagination: "Member list pagination",
+    previousMemberPage: "Go to previous member page",
+    nextMemberPage: "Go to next member page",
+    memberPageStatus: "Page {{page}} of {{totalPages}}",
     youAreRole: "You are {{role}}",
+    editGroup: "Edit group",
+    createGroup: "Create group",
+    groupName: "Group name",
+    groupMembers: "People",
+    searchPeople: "Search people",
+    loadingPeople: "Loading people…",
+    noPeopleFound: "No people found",
+    loadMorePeople: "Load more",
+    saveGroup: "Save group",
+    groups: "Groups",
+    newGroup: "New group",
+    editGroupAria: "Edit group {{name}}",
+    deleteGroupAria: "Delete group {{name}}",
+    deleteGroup: "Delete group?",
+    deleteGroupConfirm: "Type {{name}} to confirm.",
+    deleting: "Deleting…",
+    delete: "Delete",
+    noGroups: "No groups yet",
+    selectPage: "Select page",
+    selectedMembers: "Selected members ({{count}})",
+    selectMembers: "Select members",
+    addToGroup: "Add to group",
+    removeFromGroup: "Remove from group",
+    clearSelection: "Clear",
+    createGroupForBulk: "Create group",
     changeRole: "Change role",
     removeMember: "Remove member",
+    transferTo: "Transfer ownership to",
     cancel: "Cancel",
     remove: "Remove",
     save: "Save",
@@ -968,8 +1349,65 @@ const messages = {
     deleteOrgConfirmPlaceholder: "Organization name",
     deleteOrgConfirmCta: "Delete organization",
     deleteOrgPending: "Deleting…",
+    sso: {
+      signIn: "Organization sign-in",
+      signInHelp: "Choose the sign-in provider members must use.",
+      requiredProvider: "Required sign-in provider",
+      optional: "Optional",
+      google: "Google",
+      title: "Single sign-on",
+      description: "Connect an OIDC or SAML identity provider.",
+      verified: "Verified",
+      verifyRequired: "Verification required",
+      verify: "Verify",
+      remove: "Remove",
+      type: "Identity provider type",
+      providerId: "Provider ID",
+      issuer: "Issuer URL",
+      domain: "Organization domain",
+      noDomain: "No domain configured",
+      clientId: "Client ID",
+      clientSecret: "Client secret",
+      discoveryEndpoint: "Discovery endpoint (optional)",
+      entryPoint: "SAML entry point URL",
+      entityId: "IdP entity ID",
+      metadata: "Paste IdP metadata XML",
+      certificate: "Signing certificate (optional)",
+      domainHelp:
+        "The domain must match the organization's verified domain. Submitted secrets and metadata are cleared from this form.",
+      saveProvider: "Save provider",
+      cancel: "Cancel",
+      addProvider: "Add provider",
+    },
+    scim: {
+      title: "Directory provisioning",
+      description: "Manage SCIM connections for this organization.",
+      revoke: "Revoke",
+      copyTokenOnce: "Copy this token now. It will not be shown again.",
+      dismissToken: "Dismiss token",
+      createConnection: "Create SCIM connection",
+    },
+    ssoSetup: {
+      idpSetup: "Identity provider setup",
+      redirectUri: "Redirect URI",
+      spMetadataUrl: "Service provider metadata URL",
+      dnsRecordName: "DNS TXT record name",
+      dnsRecordValue: "DNS TXT record value",
+      dnsPropagation: "Allow DNS changes to propagate before verifying.",
+    },
+    ssoConfirm: {
+      title: "Require this sign-in provider?",
+      description:
+        "Members will need to use this provider the next time they sign in. Current sessions may be revoked.",
+      confirm: "Require provider",
+    },
   },
   integrations: {
+    subtitle: "Connect the tools your agent can use.",
+    recommended: "Recommended",
+    manage: "Manage",
+    connectedSection: "Connected",
+    availableSection: "Available integrations",
     webhookUrl: "Webhook URL",
     copyWebhookUrl: "Copy webhook URL",
     webhookUrlLocalOnly:
@@ -1002,6 +1440,10 @@ const messages = {
       "For a central Slack or Telegram entrypoint that can route work across multiple apps, use the",
     sharedMessaging:
       "Need one shared messaging surface for your workspace? Connect Slack or Telegram to a dispatch app and let it delegate to other agents over A2A.",
+    lookingForApiKeys: "Looking for an API key instead?",
+    goToApiKeys: "Go to API keys",
+    lookingForProviders: "Looking for OAuth or MCP providers?",
+    goToIntegrations: "Go to Integrations",
   },
   mcpIntegrations: {
     menuLabel: "Integrations",
@@ -1020,7 +1462,12 @@ const messages = {
     configure: "Configure",
     connect: "Connect",
     connectWithOAuth: "Connect",
+    connecting: "Connecting…",
     useApiToken: "Use API token",
+    customOAuthDefault: "Sign in with OAuth",
+    customHeadersMode: "Use an API key",
+    useApiKeyInstead: "Use an API key instead",
+    useOAuthInstead: "Use OAuth instead",
     connectSuggestion: "Connect {{name}} to use it in chat",
     connectSuggestionWithApiToken:
       "Connect {{name}} with an API token to use it in chat",
@@ -1036,8 +1483,34 @@ const messages = {
       "Paste a Streamable HTTP or SSE endpoint and optional headers.",
     oauthNotice:
       "This provider usually requires an OAuth setup. Follow the provider docs, or add an Authorization header if your endpoint supports token-based access.",
+    providerSetupRequired: "Provider setup required",
+    providerSetupDescription:
+      "Complete the required setup in {{name}} first. Then return here to connect your account.",
+    providerSetupFormDescription:
+      "Complete provider setup before connecting your account.",
+    continueToConnect: "Connect my account",
+    setupTitle: "Connect {{name}}",
     personal: "Personal",
+    personalConnection: "Personal connection",
     organization: "Organization",
+    scopeQuestion: "Who should be able to use this connection?",
+    scopeChoiceTitle: "Who should use this?",
+    scopeChoiceDescription: "Choose where this connection is available.",
+    connectForMe: "Connect for me",
+    setUpForWorkspace: "Set up for workspace",
+    workspaceAdminRequired: "Workspace owner or admin required.",
+    workspaceJoinRequired: "Join a workspace first.",
+    personalOnlyDescription:
+      "Only personal connections are supported for this integration.",
+    workspaceOnlyDescription:
+      "This integration connects once for the whole workspace, so it cannot be connected to just your account. A workspace owner or admin can set it up.",
+    loadingScopeMetadata: "Loading connection scope…",
+    retry: "Retry",
+    retrying: "Retrying…",
+    personalDescription: "Only you can use this connection.",
+    sharedWithWorkspace: "Shared with workspace",
+    organizationDescription:
+      "Permitted workspace members can use this connection. Provider permissions still apply.",
     serverNameRequired:
       "Enter an integration name before connecting with OAuth.",
     serverName: "Integration name",
@@ -1049,8 +1522,9 @@ const messages = {
     descriptionPlaceholder: "Description (optional)",
     headersPlaceholder: "Authorization: Bearer <token>",
     openSetupDocs: "Open setup docs",
-    viewSetup: "View setup",
+    viewSetup: "Open setup guide",
     test: "Test",
+    testing: "Testing…",
     toolsAvailable_one: "{{count}} tool available",
     toolsAvailable_other: "{{count}} tools available",
     failed: "Failed",
@@ -1072,6 +1546,20 @@ const messages = {
         setupNote:
           "FullStory MCP is currently beta and requires StoryAI features plus the Model Context Protocol toggle to be enabled by a FullStory organization admin.",
       },
+      amplitude: {
+        description: "Read and work with Amplitude product analytics.",
+        useCase: "Product analytics, charts, dashboards, cohorts, experiments",
+        setupNote:
+          "Amplitude MCP uses OAuth over streaming HTTP. The default endpoint is for US data residency; use Amplitude's EU endpoint when the account requires EU residency.",
+      },
+      sigma: {
+        description:
+          "Search, explore, and analyze Sigma workbooks and dashboards.",
+        useCase:
+          "Analytics, dashboards, workbooks, data exploration, business intelligence",
+        setupNote:
+          "Sigma's MCP URL is organization-specific. In Sigma, open Profile > Integrations > Connect Sigma to AI tools, copy the URL, and paste it here. Sigma MCP currently supports search, metadata exploration, and analysis; dashboard or workbook creation and import are not exposed by this connection.",
+      },
       notion: {
         description: "Search pages and team knowledge.",
         useCase: "Documentation, knowledge management, notes, content creation",
@@ -1085,6 +1573,13 @@ const messages = {
         setupNote:
           "The Granola integration uses browser OAuth. Authorize the signed-in Granola account and review which meeting notes and transcripts the agent can access.",
       },
+      gong: {
+        description:
+          "Search Gong calls and generate account and deal insights.",
+        useCase: "Sales calls, transcripts, deal insights, account summaries",
+        setupNote:
+          "Gong requires a tech admin to create an MCP integration and choose personal or shared authorization. The generated client ID and secret must be configured before connecting.",
+      },
       semgrep: {
         description: "Scan code for security findings.",
         useCase: "Security scanning, vulnerability detection, code analysis",
@@ -1092,6 +1587,26 @@ const messages = {
       linear: {
         description: "Read and write Linear issues.",
         useCase: "Project management, issue tracking, planning, bug reports",
+      },
+      apollo: {
+        description: "Search, enrich, and manage Apollo GTM data.",
+        useCase:
+          "Prospecting, enrichment, contacts, sequences, account research",
+        setupNote:
+          "Apollo MCP uses user OAuth and does not require an Apollo API key. Apollo plan permissions, credits, and the provider's model-training restrictions still apply.",
+      },
+      commonRoom: {
+        description: "Research buyer signals, contacts, and organizations.",
+        useCase:
+          "Buyer intelligence, product signals, intent, contact enrichment",
+        setupNote:
+          "Common Room MCP uses per-user OAuth and respects the authorized user's workspace role. An administrator may need to enable the MCP connection for the instance.",
+      },
+      exa: {
+        description: "Search the web and fetch pages with Exa.",
+        useCase: "Web search, research, code search, page fetching",
+        setupNote:
+          "Exa's remote MCP endpoint supports basic free usage without a key. Add an Exa API key through the provider's header configuration when higher limits or additional tools are needed.",
       },
       supabase: {
         description: "Manage data, auth, and backend services.",
@@ -1110,7 +1625,7 @@ const messages = {
         useCase:
           "Project management, issue tracking, documentation, team collaboration",
         setupNote:
-          "Atlassian admins manage the allowed AI domains and Rovo integration permissions. Use the current Streamable HTTP endpoint, /v1/mcp, and reconnect after policy changes.",
+          "Ask your Atlassian admin to allow the Clips app domain and enable Rovo/MCP with Read, Write, and Search permissions for your Jira site.",
       },
       cloudflare: {
         description:
@@ -1119,6 +1634,13 @@ const messages = {
           "DNS, Workers, domains, security, observability, platform APIs",
         setupNote:
           "Cloudflare's managed integration directory contains product-specific integrations as well as the broad API integration. Review the scopes and choose the narrowest endpoint that fits your workflow.",
+      },
+      grafana: {
+        description:
+          "Query Grafana Cloud metrics, logs, and observability data.",
+        useCase: "Observability, metrics, logs, traces, dashboards",
+        setupNote:
+          "Grafana Cloud MCP is in public preview and requires Grafana Cloud Assistant MCP access. It is hosted Grafana Cloud only; self-hosted Grafana needs the local MCP server.",
       },
       gitlab: {
         description:
@@ -1132,7 +1654,7 @@ const messages = {
           "Bring Figma design context and canvas actions into an agent.",
         useCase: "Design files, components, variables, design systems, canvas",
         setupNote:
-          "The Figma integration only allows clients listed in Figma's integration catalog, so this remote endpoint cannot connect from Agent Native yet. Use the Figma REST API fallback with a personal access token for reading file and node context; canvas actions remain unavailable until Figma approves Agent Native.",
+          "The Figma integration only allows clients listed in Figma's integration catalog, so this remote endpoint cannot connect from Agent-Native yet. Use the Figma REST API fallback with a personal access token for reading file and node context; canvas actions remain unavailable until Figma approves Agent-Native.",
       },
       canva: {
         description: "Search, create, and update Canva designs and assets.",
@@ -1146,7 +1668,7 @@ const messages = {
           "Search Vercel docs and inspect projects, deployments, and logs.",
         useCase: "Deployments, projects, logs, domains, hosting, documentation",
         setupNote:
-          "The Vercel integration only accepts reviewed and approved AI clients. Agent Native must be added to Vercel's supported-client list before a generic framework connection will work.",
+          "The Vercel integration only accepts reviewed and approved AI clients. Agent-Native must be added to Vercel's supported-client list before a generic framework connection will work.",
       },
       github: {
         description:
@@ -1154,14 +1676,14 @@ const messages = {
         useCase:
           "Repositories, issues, pull requests, code, engineering analytics",
         setupNote:
-          "GitHub does not use a Figma-style vendor client allowlist. Its hosted endpoint is tied to GitHub Copilot integrations; clients need a registered OAuth app, and organizations may enforce OAuth App Access Policies.",
+          "GitHub's sign-in provider does not let apps register themselves, so the Connect button cannot complete OAuth. Connect with a GitHub personal access token instead, and note that organizations may enforce OAuth App Access Policies.",
       },
       slack: {
         description:
           "Search Slack conversations and take workspace actions through its integration.",
         useCase: "Messages, channels, people, company memory, workflows",
         setupNote:
-          "The Slack integration requires a registered Slack app with a fixed app ID. Dynamic client registration is not supported, and only Slack Marketplace or internal apps may connect. Use Slack's managed messaging OAuth flow for Agent Native workflows.",
+          "The Slack integration requires a registered Slack app with a fixed app ID. Dynamic client registration is not supported, and only Slack Marketplace or internal apps may connect. Use Slack's managed messaging OAuth flow for Agent-Native workflows.",
       },
       asana: {
         description:
@@ -1175,7 +1697,13 @@ const messages = {
           "Search and update HubSpot CRM records through its integration.",
         useCase: "CRM, contacts, companies, deals, tickets, customer analytics",
         setupNote:
-          "The HubSpot integration requires a HubSpot Auth App and PKCE. Create the app in the HubSpot Developer Platform before connecting; the existing HubSpot OAuth connector remains available to app actions.",
+          "When a workspace-managed HubSpot MCP Auth App is configured, any member can connect a personal HubSpot account with OAuth and PKCE. Otherwise, create the app in the HubSpot Developer Platform before connecting; the existing HubSpot OAuth connector remains available to app actions.",
+      },
+      pylon: {
+        description: "Search and update Pylon support data.",
+        useCase: "Customer support, issues, accounts, contacts, conversations",
+        setupNote:
+          "Enable Pylon MCP access for the relevant users and turn on the MCP server in Pylon before connecting. Pylon requires a Member or Admin seat and uses user OAuth only.",
       },
       intercom: {
         description: "Search conversations and customer support knowledge.",
@@ -1200,13 +1728,19 @@ const messages = {
         description: "Work with PayPal payments, invoices, and commerce data.",
         useCase: "Payments, invoices, transactions, merchant operations",
         setupNote:
-          "PayPal exposes OAuth discovery and login for its remote agent integration. Agent Native uses the currently live /sse endpoint; review the merchant permissions before authorizing.",
+          "PayPal exposes OAuth discovery and login for its remote agent integration. Agent-Native uses the currently live /sse endpoint; review the merchant permissions before authorizing.",
       },
       box: {
         description: "Search and manage files and folders in Box.",
         useCase: "Files, folders, enterprise content, search, collaboration",
         setupNote:
           "The Box integration is beta and requires an administrator to enable it. Custom clients also need Box Integration Credentials, a redirect URI, and approved scopes.",
+      },
+      builder: {
+        description: "Search Builder Publish and Hybrid Space content.",
+        useCase: "Content models, pages, entries, Publish and Hybrid Spaces",
+        setupNote:
+          "Builder CMS MCP uses OAuth with dynamic client registration. It only connects to Publish or Hybrid Spaces, and the authorization flow asks you to select the Space.",
       },
       netlify: {
         description: "Inspect and operate Netlify sites and deployments.",
@@ -1254,6 +1788,13 @@ const messages = {
     time: "Time",
     failedCount: "({{count}} failed)",
     backToList: "Back to list",
+    input: "Input",
+    output: "Output",
+    error: "Error",
+    metadata: "Metadata",
+    notCaptured: "Not captured",
+    openFullConversation: "Open full conversation",
+    learnAboutTab: "Learn about this tab",
     spans: "Spans",
     type: "Type",
     name: "Name",
@@ -1281,6 +1822,54 @@ const messages = {
     frustration: "Frustration",
     thumbsUpRate: "Thumbs up rate",
     categories: "Categories",
+    review: "Human review",
+    reviewDescription:
+      "Review the ask and answer, record feedback, and draft an instruction update.",
+    ask: "What was asked",
+    answer: "What the agent answered",
+    reviewFeedback: "Feedback",
+    reviewOutput: "Review output",
+    reviewPreview: "Preview output",
+    reviewPreviewUnavailable: "Preview unavailable",
+    closePreview: "Hide preview",
+    addFeedback: "Add feedback",
+    draftInstruction: "Draft instruction",
+    closeReview: "Close",
+    notReviewed: "Not reviewed",
+    noteSaved: "Note saved",
+    looksGood: "Looks good",
+    needsChange: "Needs change",
+    feedbackNote: "Feedback note",
+    feedbackPlaceholder: "What should change or stay the same?",
+    saveFeedback: "Save feedback",
+    updateInstructions: "Update instructions",
+    draftNotice: "Draft only - nothing changes automatically.",
+    instructionTarget: "Instruction target",
+    agentTarget: "Agent",
+    developerTarget: "Developer",
+    skillTarget: "Skill",
+    instructionPlaceholder:
+      "Write the instruction change for a human to review.",
+    saveUpdate: "Save draft update",
+    draftSaved: "Draft saved",
+    noReviews: "No agent outputs to review yet",
+    summarizeWithAgent: "Summarize with agent",
+    regenerateSummary: "Regenerate summary",
+    summarizeWithAgentHelp:
+      "Ask the agent to read this thread, summarize the ask and outcome, and link only verified artifacts.",
+    regenerateSummaryHelp:
+      "Ask the agent to refresh this summary from the latest thread and verified artifacts.",
+    searchReviews: "Search prompts, outcomes, people, or artifacts",
+    allArtifactTypes: "All types",
+    summarySending: "Sending request to agent…",
+    summaryQueued:
+      "Request queued. The summary will appear here after the agent saves it.",
+    summaryFailed: "Could not send the request. Try again.",
+    summaryExpired:
+      "No summary has appeared yet. You can retry, but the agent may still be working.",
+    readOnlyTenant: "Cross-organization review is read-only.",
+    showReviewDetails: "Show review details",
+    hideReviewDetails: "Hide review details",
   },
   error: {
     genericTitle: "Something went wrong",
@@ -1290,6 +1879,17 @@ const messages = {
       "This page doesn't exist. It may have been moved or deleted.",
     statusTitle: "{{status}} Error",
     goHome: "Go home",
+  },
+  runtimeConfig: {
+    issue_one: "{{count}} issue",
+    issue_other: "{{count}} issues",
+    errorTitle: "Configuration error",
+    warningTitle: "Configuration warning",
+    showDetails: "Show details",
+    hideDetails: "Hide details",
+    copyPrompt: "Copy prompt",
+    copied: "Copied",
+    copyFailed: "Copy failed",
   },
 };
 

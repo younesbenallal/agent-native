@@ -89,6 +89,23 @@ describe("inferAutoLayoutSuggestion", () => {
     });
   });
 
+  it("suggests column flow for a stack of rows wider than the stack is tall", () => {
+    const suggestion = inferAutoLayoutSuggestion({
+      container: { id: "container", x: 0, y: 0, width: 424, height: 176 },
+      children: [
+        { id: "a", x: 12, y: 12, width: 400, height: 40 },
+        { id: "b", x: 12, y: 64, width: 400, height: 40 },
+        { id: "c", x: 12, y: 116, width: 400, height: 40 },
+      ],
+    });
+    expect(suggestion).toMatchObject({
+      direction: "column",
+      orderedChildIds: ["a", "b", "c"],
+      gap: 12,
+      safeToApply: true,
+    });
+  });
+
   it("returns no proposal for an empty container", () => {
     expect(
       inferAutoLayoutSuggestion({
@@ -155,8 +172,6 @@ describe("applyAutoLayoutSuggestion", () => {
     expect(history).toHaveLength(1);
     expect(history[0]?.before).toBe(html);
     expect(history[0]?.after).toBe(result.content);
-    // The one entry is exactly what editor undo/redo consumes in each
-    // direction, so the complete reorder/layout/sizing proposal is atomic.
     expect(history[0]?.before).not.toBe(history[0]?.after);
   });
 

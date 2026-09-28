@@ -15,7 +15,7 @@ import { track } from "@agent-native/core/tracking";
 track(
   "order.completed",
   { total: 49.99, items: 3 },
-  { userId: "steve@builder.io" },
+  { userId: "user@example.com" },
 );
 ```
 
@@ -116,7 +116,7 @@ used as a fallback for it.
 
 ## API {#api}
 
-### `track(name, properties?, meta?)` {#track}
+### `track(name, properties?, source?)` {#track}
 
 Fire an analytics event. Fans out to all registered providers.
 
@@ -126,9 +126,22 @@ import { track } from "@agent-native/core/tracking";
 track(
   "meal.logged",
   { mealName: "Salad", calories: 350 },
-  { userId: "steve@builder.io" },
+  { userId: "user@example.com" },
 );
 ```
+
+`source` is either an action's `ctx`, passed straight through, or a
+`{ userId, anonymousId, sessionId }` meta object for callers that have no `ctx`.
+
+The browser session is not something the caller has to supply: it comes from the
+ambient request context (`RequestContext.browserSessionId`, set from the
+`X-Agent-Native-Session-Id` header the action client, chat, and client `track()`
+all send), so the same visit correlates whether the UI or the agent triggered the
+event. Each provider maps it to its own session field — `$session_id` for
+PostHog, which joins the event to session replay; a `session_id` property for
+Mixpanel and Amplitude; a top-level `sessionId` for webhooks and Agent-Native
+Analytics. It is absent for callers with no browser (cron, CLI, MCP, A2A), and a
+`sessionId` in the meta object overrides it.
 
 ### `identify(userId, traits?)` {#identify}
 
@@ -137,7 +150,7 @@ Identify a user with traits. Forwarded to providers that support it (PostHog, Mi
 ```ts
 import { identify } from "@agent-native/core/tracking";
 
-identify("steve@builder.io", { plan: "pro", company: "Builder.io" });
+identify("user@example.com", { plan: "pro", company: "Builder.io" });
 ```
 
 Need a custom backend, the provider-registry API, or the batching/singleton internals? See [Advanced: custom providers & internals](#advanced) at the end.
@@ -166,7 +179,9 @@ export default defineAction({
       .values({ name, template })
       .returning();
 
-    track("project.created", { name, template }, { userId: ctx?.userEmail });
+    // Pass ctx straight through: the event is attributed to ctx.userEmail and
+    // joins the browser session the call came from.
+    track("project.created", { name, template }, ctx);
 
     return { ok: true, projectId: project.id };
   },
@@ -212,11 +227,11 @@ Key differences from the [server `track()`](#track):
 - **Fire-and-forget.** It never blocks the UI, never throws, and swallows network errors.
 - **Authenticated, first-party only.** The route requires a session and a same-origin/CSRF marker (set automatically by the helper), so it can't be used as an open analytics relay. `name` is capped at 200 characters and `properties` at ~16KB; oversized or malformed payloads are rejected.
 
-This is distinct from the framework's internal browser telemetry (`trackEvent()` / automatic pageviews — see [Browser defaults](#browser-defaults) below), which powers Agent Native's own product analytics. Use `track()` for your app's own analytics events that should reach your configured providers.
+This is distinct from the framework's internal browser telemetry (`trackEvent()` / automatic pageviews — see [Browser defaults](#browser-defaults) below), which powers Agent-Native's own product analytics. Use `track()` for your app's own analytics events that should reach your configured providers.
 
 ## Session replay {#session-replay}
 
-Agent Native apps can opt into first-party browser session replay without adding a second analytics SDK. Call `configureTracking()` once in the browser root and pass the Analytics public key plus collector endpoint:
+Agent-Native apps can opt into first-party browser session replay without adding a second analytics SDK. Call `configureTracking()` once in the browser root and pass the Analytics public key plus collector endpoint:
 
 ```ts
 import { configureTracking } from "@agent-native/core/client/analytics";
@@ -237,7 +252,7 @@ configureTracking({
 
 When `sessionReplay.enabled` is truthy, the client dynamically imports `@rrweb/record` after startup and posts replay chunks to the replay endpoint. If `endpoint` ends in `/api/analytics/track` or `/track`, the replay endpoint is derived automatically as `/api/analytics/replay`. Override it explicitly with `sessionReplay.endpoint` when the replay collector lives somewhere else.
 
-Agent Native template roots already call `configureTracking()`. Hosted template deployments can turn replay on with Vite/Netlify environment variables, while library consumers should prefer the explicit `configureTracking({ key, endpoint, sessionReplay })` form above:
+Agent-Native template roots already call `configureTracking()`. Hosted template deployments can turn replay on with Vite/Netlify environment variables, while library consumers should prefer the explicit `configureTracking({ key, endpoint, sessionReplay })` form above:
 
 ```bash
 VITE_AGENT_NATIVE_ANALYTICS_PUBLIC_KEY=anpk_...
@@ -246,7 +261,7 @@ VITE_AGENT_NATIVE_SESSION_REPLAY_ENABLED=true
 VITE_AGENT_NATIVE_SESSION_REPLAY_SAMPLE_RATE=1
 ```
 
-The browser helper also performs a best-effort, non-blocking read of the current Agent Native auth session. Replay is signed-in-only by default: when `sessionReplay` is enabled, recording does not start unless the session resolves to a user email address. Signed-in replays include email-backed `userId`/`userEmail` plus `orgId`.
+The browser helper also performs a best-effort, non-blocking read of the current Agent-Native auth session. Replay is signed-in-only by default: when `sessionReplay` is enabled, recording does not start unless the session resolves to a user email address. Signed-in replays include email-backed `userId`/`userEmail` plus `orgId`.
 
 Set `sessionReplay.requireSignedInUser: false` or `VITE_AGENT_NATIVE_SESSION_REPLAY_REQUIRE_AUTH=false` only for an intentional anonymous replay deployment. When auth gating is disabled, anonymous recordings remain queryable by anonymous visitor, session, app/template, hostname, and path.
 
@@ -375,6 +390,6 @@ The framework also tracks `builder connect clicked` from Connect Builder CTAs, a
 
 ## What's next
 
-- [**Actions**](/docs/actions) — where most tracking calls originate
-- [**Server Plugins**](/docs/server#server-plugins) — `registerBuiltinProviders()` runs in the core-routes plugin at startup
+- [**Actions**](/docs/actions-overview) — where most tracking calls originate
+- [**Server Plugins**](/docs/server-plugins) — `registerBuiltinProviders()` runs in the core-routes plugin at startup
 - [**Security — Secrets Management**](/docs/security#secrets) — manage API keys for tracking providers

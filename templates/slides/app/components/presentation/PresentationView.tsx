@@ -1,13 +1,17 @@
+import { trackEvent } from "@agent-native/core/client/analytics";
 import { useT } from "@agent-native/core/client/i18n";
 import {
   IconChevronLeft,
   IconChevronRight,
+  IconFileTypePdf,
+  IconLoader2,
   IconMaximize,
   IconNotes,
   IconX,
 } from "@tabler/icons-react";
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useNavigate } from "react-router";
+import { toast } from "sonner";
 
 import SlideRenderer from "@/components/deck/SlideRenderer";
 import type {
@@ -15,12 +19,17 @@ import type {
   SlideAnimation,
   AnimationType,
 } from "@/context/DeckContext";
-import type { AspectRatio } from "@/lib/aspect-ratios";
+import { getAspectRatioDims, type AspectRatio } from "@/lib/aspect-ratios";
+import { exportDeckAsPdf } from "@/lib/export-pdf-client";
 import {
+  expandByParagraphAnimations,
   findLegacyAnimationContainer,
-  resolveSlideAnimationElement,
+  getElementAnimationValue,
+  getPersistedElementPath,
+  resolveSlideAnimationTargets,
 } from "@/lib/slide-animation-elements";
 
+import type { DesignSystemData } from "../../../shared/api";
 import { openPresentChannel, type PresentMessage } from "./present-channel";
 
 interface PresentationViewProps {
@@ -28,21 +37,74 @@ interface PresentationViewProps {
   deckId: string;
   startIndex?: number;
   aspectRatio?: AspectRatio;
+  designSystem?: DesignSystemData;
+  pdfExportTitle?: string;
+  pdfExportToken?: string;
 }
 
-// ─── Element animation helpers ────────────────────────────────────────────────
+function PdfExportStage({
+  slides,
+  aspectRatio,
+  designSystem,
+}: Pick<PresentationViewProps, "slides" | "aspectRatio" | "designSystem">) {
+  const dims = getAspectRatioDims(aspectRatio);
 
-/**
- * Get the effective animation steps for a slide.
- * Uses slide.animations if defined, falls back to splitByParagraph auto-detection.
- */
+  return (
+    <div
+      aria-hidden="true"
+      className="pointer-events-none fixed top-0"
+      data-pdf-export-stage="true"
+      style={{ left: "-10000px", width: dims.width }}
+    >
+      {slides.map((slide) => (
+        <div key={slide.id} style={{ width: dims.width, height: dims.height }}>
+          <SlideRenderer
+            slide={slide}
+            thumbnail={false}
+            aspectRatio={aspectRatio}
+            designSystem={designSystem}
+          />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function getAnimationSteps(slide: Slide): SlideAnimation[] | null {
-  if (slide.animations && slide.animations.length > 0) return slide.animations;
-  // Legacy splitByParagraph: auto-detect and create steps
+  if (slide.animations && slide.animations.length > 0) {
+    const doc = new DOMParser().parseFromString(slide.content, "text/html");
+    const root = doc.querySelector(".fmd-slide");
+    return root ? expandByParagraphAnimations(root, slide.animations) : null;
+  }
   if (slide.splitByParagraph) {
     const doc = new DOMParser().parseFromString(slide.content, "text/html");
     const root = doc.querySelector(".fmd-slide");
     if (!root) return null;
+
+    const paragraphs = Array.from(
+      root.querySelectorAll(".fmd-pptx-text p[data-pptx-paragraph]"),
+    ).filter((paragraph) => {
+      const textBox = paragraph.closest(".fmd-pptx-text");
+      return (
+        (textBox?.querySelectorAll("p[data-pptx-paragraph]").length ?? 0) > 1
+      );
+    });
+    if (paragraphs.length > 1) {
+      return paragraphs.flatMap((paragraph, index) => {
+        const elementPath = getPersistedElementPath(root, paragraph);
+        return elementPath
+          ? [
+              {
+                id: `auto-paragraph-${index}`,
+                elementIndex: index,
+                elementPath,
+                type: "slide-up" as AnimationType,
+              },
+            ]
+          : [];
+      });
+    }
+
     const container = findLegacyAnimationContainer(root);
     if (!container) return null;
     return Array.from(container.children).map((_, i) => ({
@@ -54,26 +116,6 @@ function getAnimationSteps(slide: Slide): SlideAnimation[] | null {
   return null;
 }
 
-/** CSS animation string for a given element animation type (for the newly-revealed item). */
-function getElemAnimCss(type: AnimationType): string {
-  switch (type) {
-    case "appear":
-      return "animation: elem-appear 100ms ease both;";
-    case "fade":
-      return "animation: elem-appear 400ms ease both;";
-    case "slide-up":
-      return "animation: elem-slide-up 300ms cubic-bezier(0.25,0.46,0.45,0.94) both;";
-    case "zoom":
-      return "animation: elem-zoom 300ms cubic-bezier(0.25,0.46,0.45,0.94) both;";
-  }
-}
-
-/**
- * Return a modified HTML string where content-container children have
- * data-pstep attributes and an injected <style> controls visibility.
- * Uses per-element animation types from the animations array.
- * Items already revealed jump to end state; the newly revealed item animates.
- */
 function annotateStepsForPresentation(
   html: string,
   steps: SlideAnimation[],
@@ -83,31 +125,28 @@ function annotateStepsForPresentation(
   const root = doc.querySelector(".fmd-slide");
   if (!root) return html;
 
-  // Annotate each step element with data-pstep
-  steps.forEach((anim, stepIdx) => {
-    const el = resolveSlideAnimationElement(root, anim);
-    if (el) el.setAttribute("data-pstep", String(stepIdx));
+  const resolvedSteps = resolveSlideAnimationTargets(root, steps);
+  if (!resolvedSteps) return html;
+
+  resolvedSteps.forEach(({ element }, stepIdx) => {
+    element.setAttribute("data-pstep", String(stepIdx));
   });
 
-  const styleLines = steps
-    .map((anim, stepIdx) => {
+  const styleLines = resolvedSteps
+    .map(({ target }, stepIdx) => {
       if (stepIdx >= currentStep) {
         return `[data-pstep="${stepIdx}"] { opacity: 0; pointer-events: none; }`;
       } else if (stepIdx < currentStep - 1) {
-        // Already revealed — snap to end state
         return `[data-pstep="${stepIdx}"] { opacity: 1; pointer-events: auto; animation: elem-appear 1ms both; }`;
       } else {
-        // Newly revealed — animate with its type
-        return `[data-pstep="${stepIdx}"] { opacity: 1; pointer-events: auto; ${getElemAnimCss(anim.type)} }`;
+        return `[data-pstep="${stepIdx}"] { opacity: 1; pointer-events: auto; animation: ${getElementAnimationValue(target.type)}; }`;
       }
     })
     .join("\n");
 
-  const styleTag = `<style>[data-pstep] { opacity: 0; pointer-events: none; }\n${styleLines}</style>`;
+  const styleTag = `<style>[data-pstep] { opacity: 0; pointer-events: none; visibility: visible !important; }\n${styleLines}</style>`;
   return styleTag + doc.body.innerHTML;
 }
-
-// ─── Animation class helpers ──────────────────────────────────────────────────
 
 function isInstant(t: Slide["transition"]): boolean {
   return !t || t === "instant" || t === "none";
@@ -149,19 +188,20 @@ function getExitClass(
   }
 }
 
-// ─── Component ────────────────────────────────────────────────────────────────
-
 export default function PresentationView({
   slides,
   deckId,
   startIndex = 0,
   aspectRatio,
+  designSystem,
+  pdfExportTitle,
+  pdfExportToken,
 }: PresentationViewProps) {
   const t = useT();
   const safeSlides = useMemo(
     () =>
       (Array.isArray(slides) ? slides : [])
-        .filter(Boolean)
+        .filter((slide): slide is Slide => Boolean(slide) && !slide.skipped)
         .map((slide, index) => ({
           ...slide,
           id: slide.id || `slide-${index}`,
@@ -171,6 +211,22 @@ export default function PresentationView({
         })),
     [slides],
   );
+  const initialIndex = useMemo(() => {
+    const rawSlides = (Array.isArray(slides) ? slides : []).filter(Boolean);
+    if (rawSlides.length === 0) return 0;
+    const clampedRaw = Math.max(0, Math.min(startIndex, rawSlides.length - 1));
+    for (let i = clampedRaw; i < rawSlides.length; i++) {
+      if (!rawSlides[i]?.skipped) {
+        return rawSlides.slice(0, i).filter((s) => !s?.skipped).length;
+      }
+    }
+    for (let i = clampedRaw - 1; i >= 0; i--) {
+      if (!rawSlides[i]?.skipped) {
+        return rawSlides.slice(0, i).filter((s) => !s?.skipped).length;
+      }
+    }
+    return 0;
+  }, [slides, startIndex]);
   const clampIndex = useCallback(
     (index: number) => {
       if (safeSlides.length === 0) return 0;
@@ -180,7 +236,7 @@ export default function PresentationView({
     [safeSlides.length],
   );
   const [currentIndex, setCurrentIndex] = useState(() =>
-    clampIndex(startIndex),
+    clampIndex(initialIndex),
   );
   const [prevIndex, setPrevIndex] = useState<number | null>(null);
   const [direction, setDirection] = useState<"next" | "prev">("next");
@@ -189,21 +245,114 @@ export default function PresentationView({
   const [showControls, setShowControls] = useState(false);
   const [cursorVisible, setCursorVisible] = useState(true);
   const [needsFullscreenGesture, setNeedsFullscreenGesture] = useState(false);
+  const [pdfExportRequest, setPdfExportRequest] = useState<{
+    deckId: string;
+    title: string;
+    slides: Slide[];
+    aspectRatio?: AspectRatio;
+    shareToken?: string;
+  } | null>(null);
+  const pdfExporting = pdfExportRequest !== null;
   const enteredFullscreenRef = useRef(false);
+  const transitionTimerRef = useRef<number | null>(null);
+  const queuedNavigationRef = useRef<"next" | "prev" | null>(null);
+  const goNextRef = useRef<() => void>(() => {});
+  const goPrevRef = useRef<() => void>(() => {});
   const navigate = useNavigate();
 
   const isShared = deckId.startsWith("__shared__/");
 
+  const trackedDeckRef = useRef<string | null>(null);
   useEffect(() => {
-    setCurrentIndex((prev) => clampIndex(prev));
+    if (trackedDeckRef.current === deckId) return;
+    trackedDeckRef.current = deckId;
+    trackEvent("presented", {
+      ...(isShared ? {} : { output_id: deckId }),
+      output_type: "deck",
+      slide_count: safeSlides.length,
+      is_shared: isShared,
+    });
+  }, [deckId, isShared, safeSlides.length]);
+
+  const visibleRawIndices = useMemo(() => {
+    const rawSlides = (Array.isArray(slides) ? slides : []).filter(Boolean);
+    const rawIndices: number[] = [];
+    rawSlides.forEach((slide, i) => {
+      if (!slide?.skipped) rawIndices.push(i);
+    });
+    return rawIndices;
+  }, [slides]);
+  const toRawIndex = useCallback(
+    (filteredIndex: number) =>
+      visibleRawIndices[filteredIndex] ?? filteredIndex,
+    [visibleRawIndices],
+  );
+
+  const currentIndexRef = useRef(currentIndex);
+  currentIndexRef.current = currentIndex;
+  const visibleRawIndicesRef = useRef(visibleRawIndices);
+  visibleRawIndicesRef.current = visibleRawIndices;
+  const deckIdRef = useRef(deckId);
+  deckIdRef.current = deckId;
+  const isSharedRef = useRef(isShared);
+  isSharedRef.current = isShared;
+
+  const clearTransitionTimer = useCallback(() => {
+    if (transitionTimerRef.current !== null) {
+      window.clearTimeout(transitionTimerRef.current);
+      transitionTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => clearTransitionTimer, [clearTransitionTimer]);
+
+  // One atomic effect handles both cases so they can't race each other:
+  // - A genuine deep link or deck switch (startIndex/deckId changed) reseeds
+  //   from initialIndex. This component is reused across deck navigation
+  //   (see the exit-handler refs above), so a new deck at the same `?slide=`
+  //   must still reset instead of inheriting the previous deck's position.
+  // - Otherwise, a skip toggle or reorder changed safeSlides without a new
+  //   deep link. A length-only clamp would silently swap in a different
+  //   slide at the same index, so follow the previously-shown slide's id to
+  //   its new position, falling back to a raw clamp only when it's gone.
+  const prevDeepLinkKeyRef = useRef({ startIndex, deckId });
+  const prevSafeSlideIdsRef = useRef<string[]>(safeSlides.map((s) => s.id));
+  useEffect(() => {
+    const prevKey = prevDeepLinkKeyRef.current;
+    const isDeepLinkChange =
+      prevKey.startIndex !== startIndex || prevKey.deckId !== deckId;
+    prevDeepLinkKeyRef.current = { startIndex, deckId };
+
+    if (isDeepLinkChange) {
+      prevSafeSlideIdsRef.current = safeSlides.map((s) => s.id);
+      clearTransitionTimer();
+      queuedNavigationRef.current = null;
+      setCurrentIndex(clampIndex(initialIndex));
+      setCurrentStep(0);
+      setPrevIndex(null);
+      setAnimating(false);
+      return;
+    }
+
+    const activeId = prevSafeSlideIdsRef.current[currentIndexRef.current];
+    const newIds = safeSlides.map((s) => s.id);
+    const followedIndex = activeId ? newIds.indexOf(activeId) : -1;
+    prevSafeSlideIdsRef.current = newIds;
+    setCurrentIndex(
+      followedIndex >= 0 ? followedIndex : clampIndex(currentIndexRef.current),
+    );
     setPrevIndex((prev) =>
       prev !== null && prev >= safeSlides.length ? null : prev,
     );
-  }, [clampIndex, safeSlides.length]);
-
-  useEffect(() => {
-    setCurrentIndex(clampIndex(startIndex));
-  }, [clampIndex, startIndex]);
+    if (followedIndex < 0) {
+      clearTransitionTimer();
+      queuedNavigationRef.current = null;
+      setCurrentStep(0);
+      setPrevIndex(null);
+      setAnimating(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [safeSlides, startIndex, deckId]);
 
   const currentSlide = safeSlides[currentIndex];
   const animSteps = currentSlide ? getAnimationSteps(currentSlide) : null;
@@ -213,12 +362,15 @@ export default function PresentationView({
     (newIndex: number, dir: "next" | "prev") => {
       const incoming = safeSlides[newIndex];
       const t = incoming?.transition;
-      // Going backward → fully revealed; forward → start at 0
       const incomingSteps = incoming ? getAnimationSteps(incoming) : null;
       const initialStep =
         dir === "prev" ? (incomingSteps ? incomingSteps.length : 0) : 0;
 
+      clearTransitionTimer();
+      queuedNavigationRef.current = null;
       if (isInstant(t)) {
+        setPrevIndex(null);
+        setAnimating(false);
         setCurrentIndex(newIndex);
         setCurrentStep(initialStep);
         return;
@@ -230,17 +382,28 @@ export default function PresentationView({
       setCurrentIndex(newIndex);
       setCurrentStep(initialStep);
 
-      setTimeout(() => {
+      transitionTimerRef.current = window.setTimeout(() => {
+        transitionTimerRef.current = null;
         setPrevIndex(null);
         setAnimating(false);
+        const queued = queuedNavigationRef.current;
+        queuedNavigationRef.current = null;
+        if (queued) {
+          window.setTimeout(() => {
+            if (queued === "next") goNextRef.current();
+            else goPrevRef.current();
+          }, 0);
+        }
       }, 400);
     },
-    [currentIndex, safeSlides],
+    [clearTransitionTimer, currentIndex, safeSlides],
   );
 
   const goNext = useCallback(() => {
-    if (animating) return;
-    // Reveal next paragraph step if enabled
+    if (animating) {
+      queuedNavigationRef.current = "next";
+      return;
+    }
     if (maxSteps > 0 && currentStep < maxSteps /* i18n-ignore */) {
       setCurrentStep((prev) => prev + 1);
       return;
@@ -257,7 +420,10 @@ export default function PresentationView({
   ]);
 
   const goPrev = useCallback(() => {
-    if (animating) return;
+    if (animating) {
+      queuedNavigationRef.current = "prev";
+      return;
+    }
     if (currentIndex <= 0) return;
     startTransition(currentIndex - 1, "prev");
   }, [animating, currentIndex, startTransition]);
@@ -268,18 +434,16 @@ export default function PresentationView({
     }
     if (isShared) {
       const token = deckId.replace("__shared__/", "");
-      navigate(`/share/${token}`);
+      void navigate(`/share/${token}`);
     } else {
-      navigate(`/deck/${deckId}`);
+      const rawIndex =
+        visibleRawIndicesRef.current[currentIndexRef.current] ??
+        currentIndexRef.current;
+      void navigate(`/deck/${deckId}?slide=${rawIndex + 1}`);
     }
   }, [navigate, deckId, isShared]);
 
-  // Presenter window: it owns no navigation state of its own, it just sends
-  // commands and mirrors whatever we echo back — so build steps stay
-  // authoritative here.
   const channelRef = useRef<BroadcastChannel | null>(null);
-  const goNextRef = useRef(goNext);
-  const goPrevRef = useRef(goPrev);
   goNextRef.current = goNext;
   goPrevRef.current = goPrev;
 
@@ -318,13 +482,13 @@ export default function PresentationView({
   const openPresenterWindow = useCallback(() => {
     const url = new URL(window.location.href);
     url.searchParams.set("presenter", "1");
-    url.searchParams.set("slide", String(currentIndex + 1));
+    url.searchParams.set("slide", String(toRawIndex(currentIndex) + 1));
     window.open(
       url.toString(),
       `slides-presenter-${deckId}`,
       "width=1200,height=760",
     );
-  }, [currentIndex, deckId]);
+  }, [currentIndex, deckId, toRawIndex]);
 
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
@@ -363,9 +527,6 @@ export default function PresentationView({
     return () => window.removeEventListener("keydown", handleKey);
   }, [goNext, goPrev, exit, openPresenterWindow]);
 
-  // Try to enter fullscreen. Browsers require a user gesture; the click that
-  // navigated to /present often counts, but Safari/Firefox sometimes block
-  // it. If blocked, we surface a "Click to enter fullscreen" overlay.
   const enterFullscreen = useCallback(() => {
     const el = document.documentElement;
     if (!el.requestFullscreen || document.fullscreenElement) {
@@ -380,20 +541,19 @@ export default function PresentationView({
       .catch(() => setNeedsFullscreenGesture(true));
   }, []);
 
-  // Request fullscreen on mount; track exit-by-Escape to navigate back
   useEffect(() => {
     enterFullscreen();
     const handleFullscreenChange = () => {
-      // If the user pressed Escape (browser auto-exits fullscreen), leave
-      // present mode. We only navigate-back when WE successfully entered
-      // fullscreen first — otherwise the gesture-fallback overlay handles it.
       if (enteredFullscreenRef.current && !document.fullscreenElement) {
         enteredFullscreenRef.current = false;
-        if (isShared) {
-          const token = deckId.replace("__shared__/", "");
-          navigate(`/share/${token}`);
+        if (isSharedRef.current) {
+          const token = deckIdRef.current.replace("__shared__/", "");
+          void navigate(`/share/${token}`);
         } else {
-          navigate(`/deck/${deckId}`);
+          const rawIndex =
+            visibleRawIndicesRef.current[currentIndexRef.current] ??
+            currentIndexRef.current;
+          void navigate(`/deck/${deckIdRef.current}?slide=${rawIndex + 1}`);
         }
       }
     };
@@ -407,8 +567,6 @@ export default function PresentationView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Lock the body during present mode: hide scrollbars, mark the body so
-  // external automation/test tooling can detect present mode is active.
   useEffect(() => {
     const html = document.documentElement;
     const body = document.body;
@@ -424,7 +582,6 @@ export default function PresentationView({
     };
   }, []);
 
-  // Auto-hide controls AND cursor after inactivity
   useEffect(() => {
     let timeout: ReturnType<typeof setTimeout>;
     const handleMove = () => {
@@ -444,6 +601,60 @@ export default function PresentationView({
       clearTimeout(timeout);
     };
   }, []);
+
+  const handleDownloadPdf = useCallback(() => {
+    if (!pdfExportTitle || pdfExporting || safeSlides.length === 0) return;
+    setPdfExportRequest({
+      deckId,
+      title: pdfExportTitle,
+      slides: safeSlides,
+      aspectRatio,
+      shareToken: pdfExportToken,
+    });
+  }, [
+    aspectRatio,
+    deckId,
+    pdfExportTitle,
+    pdfExportToken,
+    pdfExporting,
+    safeSlides,
+  ]);
+
+  useEffect(() => {
+    if (!pdfExportRequest) return;
+    if (pdfExportRequest.deckId !== deckId) {
+      setPdfExportRequest(null);
+      return;
+    }
+    let cancelled = false;
+    const abortController = new AbortController();
+
+    const exportPdf = async () => {
+      try {
+        await exportDeckAsPdf(
+          pdfExportRequest.title,
+          pdfExportRequest.slides,
+          pdfExportRequest.aspectRatio,
+          {
+            signal: abortController.signal,
+            shareToken: pdfExportRequest.shareToken,
+          },
+        );
+      } catch (error) {
+        if (cancelled || abortController.signal.aborted) return;
+        console.error("[slides] shared PDF export failed:", error);
+        toast.error(t("deckEditor.pdfRenderFailed"));
+      } finally {
+        if (!cancelled) setPdfExportRequest(null);
+      }
+    };
+
+    void exportPdf();
+    return () => {
+      cancelled = true;
+      abortController.abort();
+    };
+  }, [deckId, pdfExportRequest, t]);
 
   const displaySlide = useMemo(() => {
     if (!currentSlide || !animSteps || animSteps.length === 0)
@@ -488,8 +699,6 @@ export default function PresentationView({
         cursor: cursorVisible ? "default" : "none",
       }}
       onClick={() => {
-        // If fullscreen was blocked by the browser (no user gesture),
-        // any click in the presentation is itself a gesture — retry.
         if (needsFullscreenGesture) {
           enterFullscreen();
           return;
@@ -508,6 +717,7 @@ export default function PresentationView({
             slide={safeSlides[prevIndex]}
             thumbnail={false}
             aspectRatio={aspectRatio}
+            designSystem={designSystem}
           />
         </div>
       )}
@@ -522,6 +732,7 @@ export default function PresentationView({
           slide={displaySlide}
           thumbnail={false}
           aspectRatio={aspectRatio}
+          designSystem={designSystem}
         />
       </div>
 
@@ -562,6 +773,36 @@ export default function PresentationView({
           </div>
 
           <div className="flex items-center gap-2">
+            {pdfExportTitle && (
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  handleDownloadPdf();
+                }}
+                disabled={pdfExporting}
+                aria-busy={pdfExporting}
+                className={
+                  "p-3 sm:p-2 rounded-lg bg-white/10 hover:bg-white/20 disabled:opacity-30 disabled:cursor-not-allowed transition-colors" // guard:allow-raw-color - fixed black presentation surface
+                }
+                aria-label={t("editorExport.exportPdf")}
+                title={t("editorExport.exportPdf")}
+              >
+                {pdfExporting ? (
+                  <IconLoader2
+                    className={
+                      "w-5 h-5 sm:w-4 sm:h-4 animate-spin motion-reduce:animate-none text-white" // guard:allow-raw-color - fixed black presentation surface
+                    }
+                  />
+                ) : (
+                  <IconFileTypePdf
+                    className={
+                      "w-5 h-5 sm:w-4 sm:h-4 text-white" // guard:allow-raw-color - fixed black presentation surface
+                    }
+                  />
+                )}
+              </button>
+            )}
             <button
               onClick={openPresenterWindow}
               className="p-3 sm:p-2 rounded-lg bg-white/10 hover:bg-white/20 transition-colors cursor-pointer"
@@ -609,6 +850,14 @@ export default function PresentationView({
           <IconMaximize className="w-4 h-4" />
           {t("presentation.clickToEnterFullscreen")}
         </button>
+      )}
+
+      {pdfExportRequest && (
+        <PdfExportStage
+          slides={pdfExportRequest.slides}
+          aspectRatio={pdfExportRequest.aspectRatio}
+          designSystem={designSystem}
+        />
       )}
     </div>
   );

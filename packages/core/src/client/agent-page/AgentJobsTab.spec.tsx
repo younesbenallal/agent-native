@@ -14,6 +14,7 @@ const jobMocks = vi.hoisted(() => ({
   useManageAutomation: vi.fn(),
   useManageRecurringJob: vi.fn(),
   useRecurringJobs: vi.fn(),
+  useScheduledTriggerState: vi.fn(),
 }));
 
 vi.mock("./use-jobs.js", () => ({
@@ -22,19 +23,26 @@ vi.mock("./use-jobs.js", () => ({
   useManageRecurringJob: jobMocks.useManageRecurringJob,
   useRecurringJobs: jobMocks.useRecurringJobs,
   useRunAutomationNow: jobMocks.useRunAutomationNow,
+  useScheduledTriggerState: jobMocks.useScheduledTriggerState,
 }));
 
 vi.mock("../AgentAskPopover.js", () => ({
   AgentAskPopover: ({
     context,
+    draftScope,
     label,
     title,
   }: {
     context: string;
+    draftScope?: string;
     label?: string;
     title: string;
   }) => (
-    <button type="button" data-creation-context={context}>
+    <button
+      type="button"
+      data-creation-context={context}
+      data-draft-scope={draftScope}
+    >
       {label ?? title}
     </button>
   ),
@@ -146,6 +154,10 @@ describe("AgentJobsTab organization automations", () => {
     jobMocks.useManageAutomation.mockImplementation((scope: "user" | "org") =>
       mutationResult(jobMocks.manageAutomation[scope]),
     );
+    jobMocks.useScheduledTriggerState.mockReturnValue({
+      kind: "resolved",
+      status: { available: true, driver: "netlify-scheduled-function" },
+    });
   });
 
   afterEach(() => {
@@ -165,9 +177,119 @@ describe("AgentJobsTab organization automations", () => {
     expect(container.textContent).toContain("new lead alert");
     expect(container.textContent).toContain("On lead.created");
     expect(container.textContent).toContain(
-      "Scheduled and event-triggered automations shared with this organization.",
+      "Scheduled, event-triggered, and webhook-triggered automations shared with this organization.",
     );
     expect(container.textContent).not.toContain("personal today");
+  });
+
+  it("scopes organization creation drafts to the active organization", () => {
+    act(() => {
+      root.render(<AgentJobsTab canManageOrg organizationId="org-a" />);
+    });
+
+    expect(
+      container.querySelector(
+        '[data-draft-scope="agent-jobs:organization-create:org-a"]',
+      ),
+    ).not.toBeNull();
+
+    act(() => {
+      root.render(<AgentJobsTab canManageOrg organizationId="org-b" />);
+    });
+
+    expect(
+      container.querySelector(
+        '[data-draft-scope="agent-jobs:organization-create:org-b"]',
+      ),
+    ).not.toBeNull();
+    expect(
+      container.querySelector(
+        '[data-draft-scope="agent-jobs:organization-create:org-a"]',
+      ),
+    ).toBeNull();
+  });
+
+  it("stays quiet about the scheduler when schedules actually fire", () => {
+    act(() => {
+      root.render(<AgentJobsTab canManageOrg />);
+    });
+
+    expect(
+      container.querySelector('[data-testid="scheduled-trigger-notice"]'),
+    ).toBeNull();
+  });
+
+  it("warns that schedules never fire when the build disabled recurring jobs", () => {
+    jobMocks.useScheduledTriggerState.mockReturnValue({
+      kind: "resolved",
+      status: { available: false, reason: "disabled-by-env" },
+    });
+
+    act(() => {
+      root.render(<AgentJobsTab canManageOrg />);
+    });
+
+    const notice = container.querySelector(
+      '[data-testid="scheduled-trigger-notice"]',
+    );
+    expect(notice).not.toBeNull();
+    expect(notice?.getAttribute("data-reason")).toBe("disabled-by-env");
+    expect(notice?.textContent).toContain("Schedules won't run in this deploy");
+    expect(notice?.textContent).toContain(
+      "AGENT_NATIVE_DISABLE_RECURRING_JOBS",
+    );
+  });
+
+  it("names the local opt-in flag instead of blaming the deploy on a dev machine", () => {
+    jobMocks.useScheduledTriggerState.mockReturnValue({
+      kind: "resolved",
+      status: { available: false, reason: "local-development" },
+    });
+
+    act(() => {
+      root.render(<AgentJobsTab canManageOrg />);
+    });
+
+    const notice = container.querySelector(
+      '[data-testid="scheduled-trigger-notice"]',
+    );
+    expect(notice?.textContent).toContain(
+      "Schedules don't run in local development",
+    );
+    expect(notice?.textContent).toContain(
+      "AGENT_NATIVE_ENABLE_LOCAL_RECURRING_JOBS",
+    );
+  });
+
+  it("shows no warning while the scheduler status is still loading", () => {
+    jobMocks.useScheduledTriggerState.mockReturnValue({ kind: "loading" });
+
+    act(() => {
+      root.render(<AgentJobsTab canManageOrg />);
+    });
+
+    expect(
+      container.querySelector('[data-testid="scheduled-trigger-notice"]'),
+    ).toBeNull();
+  });
+
+  it("says the check failed rather than silently vouching for the deploy", () => {
+    jobMocks.useScheduledTriggerState.mockReturnValue({
+      kind: "unknown",
+      error: new Error("403 Forbidden"),
+    });
+
+    act(() => {
+      root.render(<AgentJobsTab canManageOrg />);
+    });
+
+    const notice = container.querySelector(
+      '[data-testid="scheduled-trigger-notice"]',
+    );
+    expect(notice?.getAttribute("data-reason")).toBe("check-failed");
+    expect(notice?.textContent).toContain(
+      "Couldn't check whether schedules run here",
+    );
   });
 
   it("routes organization event updates through the organization mutation", () => {
@@ -178,12 +300,12 @@ describe("AgentJobsTab organization automations", () => {
     const eventRow = Array.from(container.querySelectorAll("article")).find(
       (row) => row.textContent?.includes("new lead alert"),
     );
-    const pauseButton = Array.from(
-      eventRow?.querySelectorAll("button") ?? [],
-    ).find((button) => button.textContent?.includes("Pause"));
+    const toggle =
+      eventRow?.querySelector<HTMLButtonElement>('[role="switch"]');
+    expect(toggle?.getAttribute("aria-checked")).toBe("true");
 
     act(() => {
-      pauseButton?.click();
+      toggle?.click();
     });
 
     expect(jobMocks.manageAutomation.org).toHaveBeenCalledWith(
@@ -196,6 +318,100 @@ describe("AgentJobsTab organization automations", () => {
       undefined,
     );
     expect(jobMocks.manageAutomation.user).not.toHaveBeenCalled();
+  });
+
+  describe("in Settings", () => {
+    it("tells a member which organization automations they manage, and still lets them create one", () => {
+      act(() => {
+        root.render(
+          <AgentJobsTab
+            variant="settings"
+            canManageOrg={false}
+            organizationId="org-a"
+            organizationName="Builder.io"
+          />,
+        );
+      });
+
+      const headings = [...container.querySelectorAll("h2")].map(
+        (heading) => heading.textContent,
+      );
+      expect(headings).toEqual(["Personal", "Builder.io"]);
+      const organizationSection = container.querySelectorAll("section")[1];
+      expect(organizationSection?.lastElementChild?.textContent).toBe(
+        "You can manage automations you created.",
+      );
+      expect(
+        organizationSection?.querySelector(
+          '[data-draft-scope="agent-jobs:organization-create:org-a"]',
+        ),
+      ).not.toBeNull();
+      expect(container.textContent).not.toContain(
+        "Scheduled, event-triggered, and webhook-triggered automations shared with this organization.",
+      );
+      // The Settings header carries New automation, so the body doesn't.
+      expect(
+        container.querySelector(
+          '[data-draft-scope="agent-jobs:compact-create"]',
+        ),
+      ).toBeNull();
+    });
+
+    it("gives a member no controls on someone else's automation", () => {
+      jobMocks.useAutomations.mockImplementation((scope: "user" | "org") =>
+        queryResult(
+          scope === "org"
+            ? [
+                {
+                  id: "someone-elses",
+                  name: "owner-digest",
+                  path: "jobs/owner-digest.md",
+                  scope: "organization",
+                  triggerType: "event",
+                  event: "lead.created",
+                  schedule: null,
+                  scheduleDescription: null,
+                  condition: null,
+                  body: "Send the digest.",
+                  enabled: true,
+                  lastRun: null,
+                  lastStatus: null,
+                  lastError: null,
+                  nextRun: null,
+                  createdBy: "owner@example.com",
+                  canUpdate: false,
+                },
+              ]
+            : [],
+        ),
+      );
+      jobMocks.useRecurringJobs.mockReturnValue(queryResult([]));
+
+      act(() => {
+        root.render(<AgentJobsTab variant="settings" canManageOrg={false} />);
+      });
+
+      const row = [...container.querySelectorAll("article")].find((article) =>
+        article.textContent?.includes("owner digest"),
+      );
+      expect(row?.querySelector('[role="switch"]')).toBeNull();
+      expect(row?.textContent).not.toContain("Pause");
+    });
+
+    it("keeps the note off for owners and admins", () => {
+      act(() => {
+        root.render(
+          <AgentJobsTab
+            variant="settings"
+            canManageOrg
+            organizationName="Acme"
+          />,
+        );
+      });
+      expect(container.textContent).not.toContain(
+        "You can manage automations you created.",
+      );
+    });
   });
 
   it("creates organization automations through the scoped automation tool", () => {

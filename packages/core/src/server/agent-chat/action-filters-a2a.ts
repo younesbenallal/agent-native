@@ -2,10 +2,14 @@ import { getHeader } from "h3";
 
 import {
   appendA2AArtifactLinks,
+  extractA2APersistedMutationReceipts,
   type A2AArtifactResponseOptions,
+  type A2APersistedMutationReceipt,
   type A2AToolResultSummary,
 } from "../../a2a/artifact-response.js";
 import { collectFinalResponseTextFromAgentEvents } from "../../a2a/response-text.js";
+import type { AgentSkill } from "../../a2a/types.js";
+import { isActionExposedToExternalAgents } from "../../action.js";
 import { resolveMainChatMaxOutputTokens } from "../../agent/engine/output-tokens.js";
 import type { EngineTool } from "../../agent/engine/types.js";
 import {
@@ -15,19 +19,17 @@ import {
   type AgentLoopOutcome,
 } from "../../agent/production-agent.js";
 import { runAgentLoopDirectWithSoftTimeout } from "../../agent/run-loop-with-resume.js";
+import { resolveRunSoftTimeoutMs } from "../../agent/run-manager.js";
 import type { AgentChatEvent } from "../../agent/types.js";
+import { getAppConfig } from "../../app-config/index.js";
+import { isFrameworkGroupedAction } from "../../framework-tools.js";
 import {
   isAuthenticatedReadAction,
   isAutoReadExcludedActionName,
 } from "../../mcp/build-server.js";
+import type { ExternalAgentPolicy } from "../../mcp/external-agent-policy.js";
 import { withConfiguredAppBasePath } from "../app-base-path.js";
 import type { AgentChatPluginOptions } from "./plugin-options.js";
-
-// ---------------------------------------------------------------------------
-// Action-visibility filters (read-only / agent-exposed / public-agent-safe)
-// and the A2A (agent-to-agent) final-response assembly + delegated-run
-// helpers that share those filters.
-// ---------------------------------------------------------------------------
 
 export function filterReadOnlyActions(
   actions: Record<string, ActionEntry>,
@@ -37,16 +39,26 @@ export function filterReadOnlyActions(
   );
 }
 
-/** Drop actions that opted out of agent exposure via `agentTool: false`. They
- *  remain callable from the frontend / HTTP (mounted separately from this
- *  agent tool surface — see `httpActions`) but never appear in any agent tool
- *  list (in-app assistant, MCP, A2A, job/trigger runners) or actions prompt.
- *  Default-allow: only an explicit `false` is excluded. */
 export function filterAgentTools(
   actions: Record<string, ActionEntry>,
 ): Record<string, ActionEntry> {
   return Object.fromEntries(
-    Object.entries(actions).filter(([, entry]) => entry.agentTool !== false),
+    Object.entries(actions).filter(
+      ([, entry]) => entry.agentTool !== false && entry.uiOnly !== true,
+    ),
+  );
+}
+
+export function filterMcpOnlyActions(
+  actions: Record<string, ActionEntry>,
+): Record<string, ActionEntry> {
+  return Object.fromEntries(
+    Object.entries(actions).filter(
+      ([, entry]) =>
+        entry.agentTool === false &&
+        entry.mcpTool === true &&
+        entry.uiOnly !== true,
+    ),
   );
 }
 
@@ -66,28 +78,8 @@ export function filterPublicAgentActions(
   );
 }
 
-/**
- * Input fields that unambiguously carry a program the receiver executes.
- *
- * Deliberately excludes `query`: across the templates that field is nearly
- * always natural-language search text (Brain's `search-everything`,
- * `search-knowledge`), and blocking it would break exactly the ask-don't-instruct
- * calls this rule exists to encourage.
- */
 const RAW_QUERY_INPUT_FIELDS = new Set(["sql", "code", "script", "expression"]);
 
-/**
- * True when an action takes a free-form query or program as input — raw SQL, a
- * code body, an arbitrary expression.
- *
- * Such an action must not be sibling-invocable over A2A. The app that owns the
- * data owns its schema, data dictionary, skills, and reference queries; a
- * calling app has none of that, so letting it pass SQL means every caller
- * reimplements the owner's schema knowledge badly and silently rots when the
- * owner's shape changes. Callers ask the owning app a question; the owner
- * forms the query. Set `publicAgent.allowRawQueryInput` to opt a specific
- * action out of this rule.
- */
 export function hasRawQueryInput(entry: ActionEntry): boolean {
   const parameters = entry.tool?.parameters as
     | { properties?: Record<string, { type?: unknown }> }
@@ -104,15 +96,14 @@ export function hasRawQueryInput(entry: ActionEntry): boolean {
   });
 }
 
-/**
- * Direct A2A action calls share the authenticated external-agent policy with
- * MCP, but remain stricter: only explicitly exposed, authenticated read-only
- * actions can skip the receiver's model loop, and never one that takes a raw
- * query the caller wrote.
- */
+export interface A2AExternalAgentSurface {
+  connectorCatalog?: string[];
+  externalAgents?: ExternalAgentPolicy;
+}
+
 export function filterDirectA2AActions(
   actions: Record<string, ActionEntry>,
-  options: Pick<AgentChatPluginOptions, "connectorCatalog" | "externalAgents">,
+  options: A2AExternalAgentSurface,
 ): Record<string, ActionEntry> {
   const catalog = new Set(options.connectorCatalog ?? []);
   const denied = new Set(options.externalAgents?.denyActions ?? []);
@@ -122,6 +113,7 @@ export function filterDirectA2AActions(
     Object.entries(actions).filter(([name, entry]) => {
       const exposure = entry.publicAgent;
       const selected =
+        entry.mcpTool === true ||
         catalog.has(name) ||
         (autoReads &&
           isAuthenticatedReadAction(entry) &&
@@ -132,13 +124,34 @@ export function filterDirectA2AActions(
         selected &&
         rawQueryAllowed &&
         !denied.has(name) &&
-        entry.agentTool !== false &&
+        isActionExposedToExternalAgents(entry) &&
         entry.readOnly === true &&
         exposure?.expose === true &&
         exposure.readOnly === true &&
         exposure.requiresAuth === true &&
         (entry.needsApproval === undefined || entry.needsApproval === false) &&
         exposure.isConsequential !== true
+      );
+    }),
+  );
+}
+
+export function filterDelegatedA2ACapabilityActions(
+  actions: Record<string, ActionEntry>,
+  options: A2AExternalAgentSurface,
+): Record<string, ActionEntry> {
+  const denied = new Set(options.externalAgents?.denyActions ?? []);
+
+  return Object.fromEntries(
+    Object.entries(actions).filter(([name, entry]) => {
+      const exposure = entry.publicAgent;
+      return (
+        !denied.has(name) &&
+        isActionExposedToExternalAgents(entry) &&
+        entry.readOnly !== true &&
+        exposure?.expose === true &&
+        exposure.readOnly === false &&
+        exposure.requiresAuth === true
       );
     }),
   );
@@ -171,56 +184,52 @@ export function buildPublicAgentA2ASkills(
   );
 }
 
-/**
- * Skills for a caller with a verified A2A identity: exactly what
- * `filterDirectA2AActions` will execute. Kept separate from
- * `buildPublicAgentA2ASkills` because the public card may only name actions
- * with `requiresAuth !== true` while direct invocation requires
- * `requiresAuth === true` — advertising the public set alone tells siblings
- * an app has nothing callable when it does.
- */
 export function buildAuthenticatedAgentA2ASkills(
   actions: Record<string, ActionEntry>,
-  options: Pick<AgentChatPluginOptions, "connectorCatalog" | "externalAgents">,
-): Array<{
-  id: string;
-  name: string;
-  description: string;
-  publicAgent: ActionEntry["publicAgent"];
-  inputSchema?: Record<string, unknown>;
-}> {
-  return Object.entries(filterDirectA2AActions(actions, options)).map(
-    ([name, entry]) => ({
+  options: A2AExternalAgentSurface,
+): AgentSkill[] {
+  const directActions = filterDirectA2AActions(actions, options);
+  const delegatedActions = filterDelegatedA2ACapabilityActions(
+    actions,
+    options,
+  );
+
+  return Object.entries(actions).flatMap(([name, entry]) => {
+    const directEntry = directActions[name];
+    const delegatedEntry = delegatedActions[name];
+    if (!directEntry && !delegatedEntry) return [];
+
+    if (directEntry) {
+      return {
+        id: name,
+        name,
+        description: entry.tool.description,
+        publicAgent: entry.publicAgent,
+        readOnly: true,
+        ...(entry.tool.parameters
+          ? {
+              inputSchema: entry.tool.parameters as unknown as Record<
+                string,
+                unknown
+              >,
+            }
+          : {}),
+      };
+    }
+
+    return {
       id: name,
       name,
       description: entry.tool.description,
       publicAgent: entry.publicAgent,
-      // Every action in this set is read-only by construction. Omitting the
-      // flag made discovery label all of them "(mutating)", which pushes a
-      // caller away from invoking them and back into open-ended delegation.
-      readOnly: true,
-      // Naming an action without its parameters is what makes a caller invoke
-      // it with `{}` and fail on a required field.
-      ...(entry.tool.parameters
-        ? {
-            inputSchema: entry.tool.parameters as unknown as Record<
-              string,
-              unknown
-            >,
-          }
-        : {}),
-    }),
-  );
+      readOnly: false,
+    };
+  });
 }
 
-export function resolveArtifactBaseUrl(
-  event: any | undefined,
-): string | undefined {
+export function resolveArtifactBaseUrl(event: any): string | undefined {
   const fromEnv =
-    process.env.APP_URL ||
-    process.env.URL ||
-    process.env.DEPLOY_URL ||
-    process.env.BETTER_AUTH_URL;
+    getAppConfig().app.url ?? process.env.URL ?? process.env.DEPLOY_URL;
   if (fromEnv) return withConfiguredAppBasePath(String(fromEnv));
 
   try {
@@ -239,7 +248,11 @@ export function assembleA2AFinalResponse(
     event?: any;
     outcome?: AgentLoopOutcome;
   } = {},
-): { responseText: string; finalText: string } {
+): {
+  responseText: string;
+  finalText: string;
+  mutationReceipts: A2APersistedMutationReceipt[];
+} {
   const terminalError = options.outcome
     ? terminalErrorFromOutcome(options.outcome)
     : getA2ATerminalErrorEvent(events);
@@ -250,7 +263,18 @@ export function assembleA2AFinalResponse(
     baseUrl: options.baseUrl ?? resolveArtifactBaseUrl(options.event),
     includeReferencedArtifacts: true,
     includePersistedArtifactMarker: true,
+    persistedArtifactSecret: options.persistedArtifactSecret,
+    delegatedTaskId: options.delegatedTaskId,
   });
+  const mutationReceipts = extractA2APersistedMutationReceipts(
+    [...toolResults],
+    options.persistedArtifactSecret
+      ? {
+          persistedArtifactSecrets: [options.persistedArtifactSecret],
+          expectedDelegatedTaskId: options.delegatedTaskId,
+        }
+      : {},
+  );
   if (terminalError) {
     const partialResult = finalText.trim()
       ? `\n\nPartial verified results before the failure:\n${finalText.trim()}`
@@ -262,7 +286,7 @@ export function assembleA2AFinalResponse(
       "Agent completed without a response or verified artifact.\ncode: empty_agent_response",
     );
   }
-  return { responseText, finalText };
+  return { responseText, finalText, mutationReceipts };
 }
 
 function terminalErrorFromOutcome(
@@ -343,18 +367,31 @@ function formatA2ATerminalError(
 
 type A2AAgentLoopRunner = typeof runAgentLoopDirectWithSoftTimeout;
 
-/**
- * Delegated turns should do specialist work with the receiver's own tools,
- * but must return a bounded caller-ready result. Interactive defaults allow
- * extremely deep work (400 iterations / 20M cumulative input tokens), which
- * made healthy Slides -> Analytics calls take 4-13 minutes and consume up to
- * millions of input tokens as tool results accumulated. These defaults leave
- * ample room for multi-source analysis while failing before a delegated turn
- * can silently become an unbounded research session.
- */
 export const DEFAULT_DELEGATED_MAX_ITERATIONS = 80;
-export const DEFAULT_DELEGATED_MAX_RUN_INPUT_TOKENS = 750_000;
+export const DEFAULT_DELEGATED_MAX_RUN_INPUT_TOKENS = 5_000_000;
 export const DEFAULT_DELEGATED_MAX_TOOL_RESULT_CHARS = 20_000;
+
+function delegatedTimeBudgetNote(
+  runSoftTimeoutMs: number | undefined,
+  backgroundFunction: boolean,
+): string {
+  const softTimeoutMs = resolveRunSoftTimeoutMs(runSoftTimeoutMs, {
+    useHostedDefault: true,
+    backgroundFunction,
+  });
+  if (!Number.isFinite(softTimeoutMs) || softTimeoutMs <= 0) return "";
+  const seconds = Math.max(1, Math.round(softTimeoutMs / 1000));
+  return (
+    `\n<delegated-time-budget>\n` +
+    `This step is cut off after about ${seconds} seconds. Scope the work to fit it. ` +
+    `Prefer one decisive action over exploring, and note that a single tool call plus a model ` +
+    `response commonly takes tens of seconds — so plan on completing very few steps, not many. ` +
+    `If the objective cannot be finished in that window, return the best grounded partial answer ` +
+    `and say what is missing. Do not begin work you cannot finish, and do not treat this budget ` +
+    `as a reason to skip verifying what you do report.\n` +
+    `</delegated-time-budget>`
+  );
+}
 
 export const DELEGATED_AGENT_EXECUTION_CONTRACT = `
 <delegated-agent-contract>
@@ -362,6 +399,7 @@ This request was delegated by another app. You are the specialist owner of the w
 - Interpret the caller's natural-language objective using your own instructions, skills, data dictionary, credentials, and tools. Choose providers, schemas, queries, and joins here; never ask the caller to invent SQL or source-specific implementation details for you.
 - Finish the objective autonomously in this delegated turn whenever a safe, reasonable default exists. Do not bounce the work back with UI-navigation requests, implementation questions, or intermediate status. Ask for input only when authorization, missing credentials, or a consequential user choice truly blocks progress.
 - When evidence is incomplete, return the best grounded partial answer with explicit coverage gaps instead of refusing or asking the caller to choose your source, filter, dashboard, or workflow.
+- Reach for your own registered actions first and by name. They are the same actions this app's interactive chat uses and are almost always the shortest path to the answer. Do not rediscover your own capabilities by exploring, and never use a shell, filesystem, or code-execution tool to do what one of your actions already does — that is the difference between answering in seconds and answering in minutes.
 - Minimize round trips. Filter, join, aggregate, paginate, stage, and reduce large datasets inside your own tools rather than returning raw records or transcripts.
 - Return a concise caller-ready result with the answer, source and coverage details, relevant counts or IDs, caveats/partial gaps, and exact artifact URLs. Do not return tool transcripts or large raw payloads.
 </delegated-agent-contract>`;
@@ -400,7 +438,13 @@ async function runDelegatedAgentLoop(
     policy?.maxToolResultChars ?? DEFAULT_DELEGATED_MAX_TOOL_RESULT_CHARS;
   const resolvedRunOptions = {
     ...runOptions,
-    systemPrompt: runOptions.systemPrompt + DELEGATED_AGENT_EXECUTION_CONTRACT,
+    systemPrompt:
+      runOptions.systemPrompt +
+      DELEGATED_AGENT_EXECUTION_CONTRACT +
+      delegatedTimeBudgetNote(
+        pluginOptions.runSoftTimeoutMs,
+        timeoutOptions?.backgroundFunction === true,
+      ),
     // Delegated runs resolve their own model and do not pass through the
     // interactive request handler's output-token setup. Use the same
     // model-aware headroom here so reasoning models (notably GPT-5.x) do
@@ -456,21 +500,11 @@ async function runDelegatedAgentLoop(
       });
     }
   } catch (error) {
-    // Match interactive chat: setup failures fall through, but a failure from
-    // inside an instrumented agent loop is the real run failure and rethrows.
     if (instrumented) throw error;
   }
   return execute();
 }
 
-/**
- * Run an A2A-delegated agent turn with the same final-response guard used by
- * the app's interactive chat surface.
- *
- * Keeping this in one helper prevents delegated calls from silently bypassing
- * template guarantees such as Analytics' requirement to query real data
- * before presenting metrics or exhaustive provider conclusions.
- */
 export function runA2AAgentLoop(
   runOptions: Parameters<A2AAgentLoopRunner>[0],
   pluginOptions: Pick<
@@ -488,11 +522,6 @@ export function runA2AAgentLoop(
   );
 }
 
-/**
- * Run the MCP-local ask_app turn with the same app-level response guard as
- * A2A. Keeping this seam shared prevents hosted MCP callers from bypassing
- * template guarantees when the request cannot use the self-A2A route.
- */
 export function runMCPAgentLoop(
   runOptions: Parameters<A2AAgentLoopRunner>[0],
   pluginOptions: Pick<
@@ -510,25 +539,86 @@ export function runMCPAgentLoop(
   );
 }
 
-/**
- * Keep delegated A2A turns on the same compact initial tool surface as
- * interactive chat. `tool-search` remains in the initial set, while the
- * complete registry is supplied separately so the run loop can load a matched
- * schema after a tool-search result.
- */
 export function createA2AEngineToolSurface(
   availableTools: EngineTool[],
   initialToolNames?: string[],
+  options: {
+    receiverOwnsObjective?: boolean;
+    localCapabilityNames?: string[];
+  } = {},
 ): { tools: EngineTool[]; availableTools: EngineTool[] } {
+  const selectedInitialNames = options.receiverOwnsObjective
+    ? [
+        ...new Set([
+          ...(initialToolNames ?? []),
+          ...(options.localCapabilityNames ?? []),
+        ]),
+      ]
+    : initialToolNames;
+  const initialTools = filterInitialEngineTools(
+    availableTools,
+    selectedInitialNames,
+  );
   return {
-    tools: filterInitialEngineTools(availableTools, initialToolNames),
+    tools: options.receiverOwnsObjective
+      ? initialTools.filter(
+          (tool) =>
+            tool.name !== "describe-workspace-apps" &&
+            tool.name !== "call-agent",
+        )
+      : initialTools,
     availableTools,
   };
+}
+
+export function isSelectedA2AReceiver(
+  selectedReceiverApp: string | undefined,
+  appId: string | undefined,
+): boolean {
+  const normalize = (value: string | undefined) =>
+    value
+      ?.trim()
+      .toLowerCase()
+      .replace(/^agent-native-/, "") ?? "";
+  const selected = normalize(selectedReceiverApp);
+  return selected.length > 0 && selected === normalize(appId);
+}
+
+export function shouldSelectedA2AReceiverOwnObjective(options: {
+  authenticatedCallerEmail: string;
+  enabled: boolean;
+  selectedReceiverApp: string | undefined;
+  appId: string | undefined;
+}): boolean {
+  return (
+    options.authenticatedCallerEmail.trim().length > 0 &&
+    options.enabled &&
+    isSelectedA2AReceiver(options.selectedReceiverApp, options.appId)
+  );
+}
+
+export function buildSelectedA2AReceiverContext(appId: string): string {
+  return `
+<selected-a2a-receiver>
+selectedApp: ${appId}
+The caller already selected this app to own the current objective. Start with this app's declared local capabilities and use tool-search for another local action when needed. A resource name that resembles a different app is not a routing decision. Delegate again only for a genuinely separate subtask; do not substitute another app for loading this app's own actions.
+</selected-a2a-receiver>`;
 }
 
 export function resolveInitialToolNames(
   templateActions: Record<string, ActionEntry>,
   configured?: string[],
 ): string[] {
-  return configured ?? Object.keys(templateActions);
+  const entries = Object.entries(templateActions);
+  const eager = entries
+    .filter(([, entry]) => entry.deferLoading === false)
+    .map(([name]) => name);
+  if (configured) return [...new Set([...configured, ...eager])];
+  if (eager.length > 0) return eager;
+  return entries
+    .filter(
+      ([name, entry]) =>
+        !isFrameworkGroupedAction(name, entry) && entry.deferLoading !== true,
+    )
+    .map(([name]) => name);
 }

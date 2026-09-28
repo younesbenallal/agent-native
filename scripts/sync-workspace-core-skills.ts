@@ -6,14 +6,28 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
+  readlinkSync,
   rmSync,
+  statSync,
 } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { dirname, isAbsolute, join, relative, sep, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import {
+  DEFAULT_WORKSPACE_SKILLS,
+  FRAMEWORK_TEMPLATE_SHARED_SKILLS,
+} from "../packages/core/src/cli/workspace-skill-policy.js";
+import { isRetiredCompatibilityTemplate } from "./template-standard/manifest.ts";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const rootDir = join(scriptDir, "..");
 const sourceDir = join(rootDir, ".agents", "skills");
+const allowedSourceRoots = [
+  realpathSync(sourceDir),
+  realpathSync(join(rootDir, "skills")),
+  realpathSync(join(rootDir, "templates", "content", ".agents", "skills")),
+];
 const targetDir = join(
   rootDir,
   "packages",
@@ -46,131 +60,27 @@ const headlessTemplateSkillsDir = join(
   "skills",
 );
 
-const workspaceSkillIncludes = [
-  "a2a-protocol",
-  "actions",
-  "agent-native-docs",
-  "agent-native-toolkit",
-  "agent-page",
-  "adding-a-feature",
-  "adding-workspace-apps",
-  "address-feedback",
-  "audit-log",
-  "authentication",
-  "automations",
-  "browser-sessions",
-  "capture-learnings",
-  "changelog",
-  "client-methods",
-  "client-side-routing",
-  "composable-mini-apps",
-  "context-awareness",
-  "context-xray",
-  "create-skill",
-  "customizing-agent-native",
-  "data-programs",
-  "delegate-to-agent",
-  "extension-points",
-  "extensions",
-  "external-agents",
-  "frontend-design",
-  "feature-flags",
-  "generative-ui",
-  "harness-agents",
-  "internationalization",
-  "integration-webhooks",
-  "mvp-followup",
-  "native-navigation",
-  "observability",
-  "onboarding",
-  "performance",
-  "portability",
-  "qa",
-  "real-time-collab",
-  "real-time-sync",
-  "recurring-jobs",
-  "reliable-mutations",
-  "secrets",
-  "security",
-  "self-modifying-code",
-  "server-plugins",
-  "shadcn-ui",
-  "sharing",
-  "storing-data",
-  "tracking",
-  "upgrade-agent-native",
-  "visual-answer",
-  "voice-transcription",
-  "workspace-conventions",
-  "writing-agent-instructions",
-];
+const workspaceSkillIncludes = [...DEFAULT_WORKSPACE_SKILLS];
 
-// These are shared framework/best-practice skills that generated/default apps
-// and first-party templates often copy locally. Keep them byte-for-byte
-// canonical so generated apps, workspaces, and this repo do not learn different
-// architectural rules.
-const templateSharedSkillIncludes = [
-  "actions",
-  "agent-native-docs",
-  "agent-native-toolkit",
-  "adding-a-feature",
-  "capture-learnings",
-  "client-methods",
-  "create-skill",
-  "customizing-agent-native",
-  "delegate-to-agent",
-  "frontend-design",
-  "feature-flags",
-  "integration-webhooks",
-  "internationalization",
-  "onboarding",
-  "performance",
-  "real-time-collab",
-  "real-time-sync",
-  "security",
-  "self-modifying-code",
-  "shadcn-ui",
-  "secrets",
-  "storing-data",
-  "sharing",
-  "upgrade-agent-native",
-];
+const templateSharedSkillIncludes = [...DEFAULT_WORKSPACE_SKILLS];
 
 const requiredTemplateSharedSkills: Record<string, string[]> = {
   chat: ["agent-native-docs"],
 };
 
-/** Copied into every first-party template that uses shared skills. */
-const requiredAllTemplateSharedSkills = [
-  "agent-native-docs",
-  "agent-native-toolkit",
-  "customizing-agent-native",
-  "feature-flags",
-  "sharing",
-  "storing-data",
-  "upgrade-agent-native",
-];
+const requiredAllTemplateSharedSkills = [...DEFAULT_WORKSPACE_SKILLS];
 
-const requiredDefaultTemplateSharedSkills = [
-  "agent-native-toolkit",
-  "customizing-agent-native",
-  "feature-flags",
-  "integration-webhooks",
-  "internationalization",
-  "onboarding",
-  "secrets",
-  "upgrade-agent-native",
-];
+const requiredDefaultTemplateSharedSkills = [...DEFAULT_WORKSPACE_SKILLS];
 
 const requiredHeadlessTemplateSharedSkills = [
   "actions",
   "agent-native-docs",
   "agent-native-toolkit",
   "customizing-agent-native",
-  "feature-flags",
-  "integration-webhooks",
+  "delegate-to-agent",
   "secrets",
-  "upgrade-agent-native",
+  "security",
+  "storing-data",
 ];
 
 const actionFirstInstructionFiles = [
@@ -208,25 +118,83 @@ const staleInstructionPatterns = [
   },
 ];
 
-const requiredActionGuidance = [
+const runtimeIntegrationGuidancePattern =
+  /For external integrations, inspect the workspace\/provider connection catalog\s+first(?:\.|;)/;
+
+const interactionResponsivenessInstructionPattern =
+  /^- UI feedback: target 100 ms, never exceed 400 ms; acknowledge before network work\.$/m;
+
+const requiredRuntimeInstructionFiles = [
+  "AGENTS.md",
+  "packages/core/src/templates/default/AGENTS.md",
+  "packages/core/src/templates/headless/AGENTS.md",
+  "packages/core/src/templates/workspace-root/AGENTS.md",
+  "packages/core/src/templates/workspace-core/AGENTS.md",
+  "registry/agent-native-app/AGENTS.md",
+];
+
+const requiredGeneratedGuidance = [
   {
     rel: "packages/core/src/templates/default/AGENTS.md",
     pattern:
       /Do not create `\/api\/\*` routes that only call,\s+repackage, or proxy an action\./,
+    message: "canonical action-first guidance",
+  },
+  {
+    rel: "packages/core/src/templates/default/AGENTS.md",
+    pattern: runtimeIntegrationGuidancePattern,
+    message: "runtime-visible integration preflight",
+  },
+  {
+    rel: "packages/core/src/templates/headless/AGENTS.md",
+    pattern: runtimeIntegrationGuidancePattern,
+    message: "runtime-visible integration preflight",
   },
   {
     rel: "packages/core/src/templates/workspace-root/AGENTS.md",
     pattern: /Normal app data must flow through actions\./,
+    message: "canonical action-first guidance",
   },
   {
     rel: "packages/core/src/templates/workspace-core/AGENTS.md",
     pattern: /Normal app data must flow through actions\./,
+    message: "canonical action-first guidance",
   },
   {
     rel: "registry/agent-native-app/AGENTS.md",
     pattern: /Normal app data must flow through actions\./,
+    message: "canonical action-first guidance",
+  },
+  {
+    rel: "registry/agent-native-app/AGENTS.md",
+    pattern: runtimeIntegrationGuidancePattern,
+    message: "runtime-visible integration preflight",
+  },
+  {
+    rel: "packages/core/src/templates/workspace-root/AGENTS.md",
+    pattern:
+      /Before implementing an app that connects to an external service, inspect the\s+workspace\/provider connection catalog first\./,
+    message: "shared-primitive integration preflight",
+  },
+  {
+    rel: "packages/core/src/templates/workspace-core/AGENTS.md",
+    pattern:
+      /For external integrations, check the provider connection catalog first/,
+    message: "shared-primitive integration preflight",
   },
 ];
+
+const requiredAgentWorkflowGuidance = [
+  "packages/core/src/templates/default/AGENTS.md",
+  "packages/core/src/templates/workspace-root/AGENTS.md",
+  "packages/core/src/templates/workspace-core/AGENTS.md",
+  "registry/agent-native-app/AGENTS.md",
+  "templates/chat/AGENTS.md",
+].map((rel) => ({
+  rel,
+  pattern:
+    /Keep actions deterministic and focused[\s\S]*AgentSidebar[\s\S]*same\s+thread/,
+}));
 
 const requiredToolkitDiscoveryGuidance = [
   "packages/core/src/templates/default/AGENTS.md",
@@ -242,30 +210,46 @@ const requiredRegistryConventionSkills = [
   "customizing-agent-native",
 ];
 
-// Repo-maintenance workflows are useful in this repository, but generated
-// workspaces should not inherit branch/PR shipping behavior from our monorepo.
 const workspaceSkillExcludes = [
-  // Workflow packaging and hosting guidance is for coding agents working in
-  // this repo or the public skills collection, not generated app runtimes.
-  "turn-into-app",
   "babysit-pr",
+  "chat-first-workbench",
   "concurrent-agents",
   "delegating-work",
   "fix-at-the-boundary",
   "multi-frontier-desktop",
   "new-branch",
   "ship",
-  "ship-desktop",
+  "ship-and-monitor",
   "verifying-changes",
+  "content-product-development",
+  "design-exploration",
+  "visual-edit",
+  "visual-plan",
+  "visual-recap",
+  "visualize-repo",
+  "writing-reference-docs",
 ];
 
 const check = process.argv.includes("--check");
-const includeSet = new Set(workspaceSkillIncludes);
 const excludeSet = new Set(workspaceSkillExcludes);
+const staleTemplateSharedSkills = FRAMEWORK_TEMPLATE_SHARED_SKILLS.filter(
+  (skill) => !templateSharedSkillIncludes.includes(skill),
+);
+
+function isDirEntry(dir, entry) {
+  if (entry.isDirectory()) return true;
+  if (!entry.isSymbolicLink()) return false;
+  try {
+    return statSync(join(dir, entry.name)).isDirectory();
+  } catch {
+    // coercion-ok: broken symlink entries are intentionally excluded from generated skill copies.
+    return false; // broken symlink
+  }
+}
 
 function listSkillDirs(dir) {
   return readdirSync(dir, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
+    .filter((entry) => isDirEntry(dir, entry))
     .map((entry) => entry.name)
     .sort();
 }
@@ -275,7 +259,7 @@ function listFiles(dir, base = dir) {
   const files = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const abs = join(dir, entry.name);
-    if (entry.isDirectory()) {
+    if (isDirEntry(dir, entry)) {
       files.push(...listFiles(abs, base));
     } else if (entry.isFile()) {
       files.push(relative(base, abs));
@@ -292,9 +276,6 @@ function relSkillFiles(skillName) {
 
 function assertCategorized() {
   const sourceSkills = listSkillDirs(sourceDir);
-  const unknown = sourceSkills.filter(
-    (skill) => !includeSet.has(skill) && !excludeSet.has(skill),
-  );
   const missing = workspaceSkillIncludes.filter(
     (skill) => !sourceSkills.includes(skill),
   );
@@ -306,11 +287,6 @@ function assertCategorized() {
   );
 
   const errors = [];
-  if (unknown.length > 0) {
-    errors.push(
-      `Uncategorized root skills: ${unknown.join(", ")}. Add each one to workspaceSkillIncludes or workspaceSkillExcludes.`,
-    );
-  }
   if (missing.length > 0) {
     errors.push(
       `Included skills missing from ${sourceDir}: ${missing.join(", ")}`,
@@ -402,12 +378,14 @@ function listTemplateDirs() {
   if (!existsSync(templatesDir)) return [];
   return readdirSync(templatesDir, { withFileTypes: true })
     .filter((entry) => {
-      if (!entry.isDirectory()) return false;
+      if (!isDirEntry(templatesDir, entry)) return false;
       if (entry.name.startsWith(".") || entry.name === "node_modules") {
         return false;
       }
-      // Skip leftover/retired shells that no longer ship a package.json.
-      return existsSync(join(templatesDir, entry.name, "package.json"));
+      return (
+        existsSync(join(templatesDir, entry.name, "package.json")) &&
+        !isRetiredCompatibilityTemplate(entry.name)
+      );
     })
     .map((entry) => entry.name)
     .sort();
@@ -422,6 +400,19 @@ function listInstructionFiles() {
   return files.sort();
 }
 
+function hasInteractionResponsivenessSkill(content) {
+  const match = content.match(
+    /^## Interaction Responsiveness\n\n((?:(?!^## ).)*)/ms,
+  );
+  if (!match) return false;
+  const section = match[1];
+  return (
+    section.includes("100 ms") &&
+    section.includes("400 ms") &&
+    section.includes("network round-trip")
+  );
+}
+
 function checkGeneratedInstructionPhrases() {
   const findings = [];
   for (const file of listInstructionFiles()) {
@@ -433,7 +424,7 @@ function checkGeneratedInstructionPhrases() {
     }
   }
 
-  for (const { rel, pattern } of requiredActionGuidance) {
+  for (const { rel, pattern, message } of requiredGeneratedGuidance) {
     const file = join(rootDir, rel);
     if (!existsSync(file)) {
       findings.push(`${rel}: missing required generated-app guidance file`);
@@ -441,7 +432,69 @@ function checkGeneratedInstructionPhrases() {
     }
     const content = readFileSync(file, "utf-8");
     if (!pattern.test(content)) {
-      findings.push(`${rel}: missing canonical action-first guidance`);
+      findings.push(`${rel}: missing ${message}`);
+    }
+  }
+
+  for (const template of listTemplateDirs()) {
+    const rel = `templates/${template}/AGENTS.md`;
+    const file = join(rootDir, rel);
+    if (!existsSync(file)) {
+      findings.push(`${rel}: missing required generated-app guidance file`);
+      continue;
+    }
+    const content = readFileSync(file, "utf-8");
+    if (!runtimeIntegrationGuidancePattern.test(content)) {
+      findings.push(`${rel}: missing runtime-visible integration preflight`);
+    }
+  }
+
+  const interactionResponsivenessSkillFile = join(
+    sourceDir,
+    "frontend-design",
+    "SKILL.md",
+  );
+  if (
+    !hasInteractionResponsivenessSkill(
+      readFileSync(interactionResponsivenessSkillFile, "utf-8"),
+    )
+  ) {
+    findings.push(
+      ".agents/skills/frontend-design/SKILL.md: missing bounded interaction responsiveness guidance",
+    );
+  }
+
+  for (const rel of [
+    ...requiredRuntimeInstructionFiles,
+    ...listTemplateDirs().map((template) => `templates/${template}/AGENTS.md`),
+  ]) {
+    const file = join(rootDir, rel);
+    if (!existsSync(file)) {
+      findings.push(
+        `${rel}: missing required interaction responsiveness guidance file`,
+      );
+      continue;
+    }
+    if (
+      !interactionResponsivenessInstructionPattern.test(
+        readFileSync(file, "utf-8"),
+      )
+    ) {
+      findings.push(`${rel}: missing interaction responsiveness guidance`);
+    }
+  }
+
+  for (const { rel, pattern } of requiredAgentWorkflowGuidance) {
+    const file = join(rootDir, rel);
+    if (!existsSync(file)) {
+      findings.push(`${rel}: missing required agent-workflow guidance file`);
+      continue;
+    }
+    const content = readFileSync(file, "utf-8");
+    if (!pattern.test(content)) {
+      findings.push(
+        `${rel}: missing deterministic-action versus AgentSidebar guidance`,
+      );
     }
   }
 
@@ -499,7 +552,7 @@ function checkGeneratedInstructionPhrases() {
 
   if (findings.length > 0) {
     throw new Error(
-      `Generated guidance is out of sync.\n\n${findings.join("\n")}`,
+      `Generated app guidance is out of sync.\n\n${findings.join("\n")}`,
     );
   }
 }
@@ -557,18 +610,89 @@ function checkTemplateSharedSkillsInSync() {
   forEachExistingTemplateSharedSkill((label, skill, targetSkillDir) => {
     checkSkillDirInSync(label, skill, targetSkillDir);
   });
+  checkNoStaleTemplateSharedSkills();
+}
+
+function forEachTemplateSkillsDir(fn) {
+  fn(
+    "packages/core/src/templates/default/.agents/skills",
+    defaultTemplateSkillsDir,
+  );
+  fn(
+    "packages/core/src/templates/headless/.agents/skills",
+    headlessTemplateSkillsDir,
+  );
+  for (const template of listTemplateDirs()) {
+    fn(
+      `templates/${template}/.agents/skills`,
+      join(templatesDir, template, ".agents", "skills"),
+    );
+  }
+}
+
+function checkNoStaleTemplateSharedSkills() {
+  const extra = [];
+  forEachTemplateSkillsDir((label, skillsDir) => {
+    for (const skill of staleTemplateSharedSkills) {
+      if (existsSync(join(skillsDir, skill))) {
+        extra.push(`${label}/${skill}`);
+      }
+    }
+  });
+  if (extra.length > 0) {
+    throw new Error(
+      `Optional framework skills are still copied into templates:\n${extra.join(
+        "\n",
+      )}\n\nRun: pnpm sync:workspace-skills`,
+    );
+  }
+}
+
+function isWithin(root, candidate) {
+  const pathFromRoot = relative(root, candidate);
+  return (
+    pathFromRoot === "" ||
+    (pathFromRoot !== ".." &&
+      !pathFromRoot.startsWith(`..${sep}`) &&
+      !isAbsolute(pathFromRoot))
+  );
+}
+
+function isAbsoluteLinkTarget(target) {
+  return isAbsolute(target) || win32.isAbsolute(target);
+}
+
+function resolveSourceSkill(skill) {
+  const sourceSkillDir = realpathSync(join(sourceDir, skill));
+  if (!allowedSourceRoots.some((root) => isWithin(root, sourceSkillDir))) {
+    throw new Error(
+      `Refusing to copy ${skill}: resolved source is outside approved skill roots (${sourceSkillDir})`,
+    );
+  }
+  return sourceSkillDir;
+}
+
+function validateSourceSkills() {
+  for (const skill of new Set([
+    ...workspaceSkillIncludes,
+    ...templateSharedSkillIncludes,
+  ])) {
+    resolveSourceSkill(skill);
+  }
 }
 
 function copySkill(skill, targetSkillDir) {
+  const sourceSkillDir = resolveSourceSkill(skill);
   if (
     existsSync(targetSkillDir) &&
-    lstatSync(targetSkillDir).isSymbolicLink()
+    lstatSync(targetSkillDir).isSymbolicLink() &&
+    !isAbsoluteLinkTarget(readlinkSync(targetSkillDir))
   ) {
     return;
   }
   rmSync(targetSkillDir, { recursive: true, force: true });
   mkdirSync(dirname(targetSkillDir), { recursive: true });
-  cpSync(join(sourceDir, skill), targetSkillDir, { recursive: true });
+  cpSync(sourceSkillDir, targetSkillDir, { recursive: true });
 }
 
 function syncWorkspaceCoreSkills() {
@@ -583,10 +707,16 @@ function syncTemplateSharedSkills() {
   forEachExistingTemplateSharedSkill((_template, skill, targetSkillDir) => {
     copySkill(skill, targetSkillDir);
   });
+  forEachTemplateSkillsDir((_label, skillsDir) => {
+    for (const skill of staleTemplateSharedSkills) {
+      rmSync(join(skillsDir, skill), { recursive: true, force: true });
+    }
+  });
 }
 
 try {
   assertCategorized();
+  validateSourceSkills();
   if (check) {
     checkInSync();
     checkTemplateSharedSkillsInSync();

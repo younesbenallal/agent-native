@@ -1,7 +1,7 @@
 /**
  * Best-effort install-funnel telemetry for the core CLI.
  *
- * Events are POSTed to the first-party Agent Native Analytics endpoint
+ * Events are POSTed to the first-party Agent-Native Analytics endpoint
  * (analytics.agent-native.com/track) using a PUBLIC, write-only key — the same
  * mechanism every agent-native app uses to report client-side events. Nothing
  * here ever blocks or throws into the install flow: sends are fire-and-forget
@@ -19,6 +19,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { canonicalTrackingEvent } from "@agent-native/core/shared";
+
 // Public, write-only analytics key. Safe to embed (revocable from the Analytics
 // settings UI). Override with AGENT_NATIVE_ANALYTICS_PUBLIC_KEY for testing or
 // to point telemetry at a different first-party analytics instance.
@@ -29,7 +31,6 @@ const DEFAULT_ENDPOINT = "https://analytics.agent-native.com/track";
 const FLUSH_TIMEOUT_MS = 1500;
 
 export interface CliTelemetryOptions {
-  /** Stable identifier for the emitting CLI, e.g. "skills-installer". */
   cli: string;
   cliVersion: string;
   command: string;
@@ -88,7 +89,16 @@ function redactExceptionText(value: string): string {
 
 function boundedExceptionText(value: unknown, max: number): string {
   const text =
-    typeof value === "string" ? value : String(value ?? "Unknown error");
+    typeof value === "string"
+      ? value
+      : value == null
+        ? "Unknown error"
+        : typeof value === "number" ||
+            typeof value === "boolean" ||
+            typeof value === "bigint" ||
+            typeof value === "symbol"
+          ? String(value)
+          : (JSON.stringify(value) ?? "Unknown error");
   const safe = redactExceptionText(text);
   return safe.length > max ? safe.slice(0, max) : safe;
 }
@@ -172,11 +182,6 @@ function captureException(
   });
 }
 
-/**
- * Read (or lazily create) a stable per-machine install id, shared across both
- * skills CLIs so one developer counts once. Best-effort: an unwritable home
- * directory just yields an ephemeral id for this run.
- */
 function resolveInstallId(): string {
   try {
     const dir = path.join(os.homedir(), ".agent-native");
@@ -216,24 +221,33 @@ export function createCliTelemetry(options: CliTelemetryOptions): CliTelemetry {
   function track(event: string, properties?: Record<string, unknown>): void {
     if (disabled) return;
     installId ??= resolveInstallId();
-    const body = JSON.stringify({
-      publicKey,
-      event,
-      anonymousId: installId,
-      sessionId: runId,
-      timestamp: new Date().toISOString(),
-      properties: { ...base, installId, ...properties },
-    });
-    const promise = fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-      keepalive: true,
-    })
-      .then(() => undefined)
-      .catch(() => undefined);
-    inFlight.add(promise);
-    void promise.finally(() => inFlight.delete(promise));
+    const legacyProperties = { ...base, installId, ...properties };
+    const events: Array<{
+      name: string;
+      properties: Record<string, unknown>;
+    }> = [{ name: event, properties: legacyProperties }];
+    const canonical = canonicalTrackingEvent(event, legacyProperties);
+    if (canonical) events.push(canonical);
+    for (const emitted of events) {
+      const body = JSON.stringify({
+        publicKey,
+        event: emitted.name,
+        anonymousId: installId,
+        sessionId: runId,
+        timestamp: new Date().toISOString(),
+        properties: emitted.properties,
+      });
+      const promise = fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        keepalive: true,
+      })
+        .then(() => undefined)
+        .catch(() => undefined);
+      inFlight.add(promise);
+      void promise.finally(() => inFlight.delete(promise));
+    }
   }
 
   async function flush(): Promise<void> {

@@ -2,11 +2,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const navigationState: { current: unknown } = { current: null };
 const urlState: { current: unknown } = { current: null };
+const selectedObjectState: { current: unknown } = { current: null };
 
 vi.mock("@agent-native/core/application-state", () => ({
   readAppStateForCurrentTab: vi.fn(async (key: string) => {
     if (key === "navigation") return navigationState.current;
     if (key === "__url__") return urlState.current;
+    if (key === "selected-object") return selectedObjectState.current;
     return null;
   }),
 }));
@@ -38,8 +40,8 @@ vi.mock("../server/lib/error-capture.js", () => ({
   listErrorIssues,
 }));
 
-// The remaining server libs are imported at module load but never exercised by
-// the monitoring branch under test - stub them so the action loads in isolation.
+const getDashboard = vi.fn(async () => null);
+
 vi.mock("../server/lib/analytics-alerts", () => ({
   listAnalyticsAlertRules: vi.fn(async () => []),
 }));
@@ -48,7 +50,7 @@ vi.mock("../server/lib/dashboard-catalog", () => ({
 }));
 vi.mock("../server/lib/dashboards-store", () => ({
   getAnalysis: vi.fn(async () => null),
-  getDashboard: vi.fn(async () => null),
+  getDashboard,
 }));
 vi.mock("../server/lib/first-party-analytics.js", () => ({
   listAnalyticsPublicKeys: vi.fn(async () => []),
@@ -78,7 +80,62 @@ describe("view-screen monitoring status-pages branch", () => {
     listStatusPages.mockReset();
     getStatusPagePreview.mockReset();
     listMonitors.mockClear();
+    getDashboard.mockReset();
+    getDashboard.mockResolvedValue(null);
     userEmail = "user@example.test";
+    selectedObjectState.current = null;
+  });
+
+  it("does not surface a stale dashboard selection on Ask", async () => {
+    selectedObjectState.current = {
+      type: "dashboard",
+      id: "dash-1",
+      title: "Revenue",
+    };
+    setScreen({ view: "adhoc", dashboardId: "dash-1" }, { pathname: "/ask" });
+
+    const out = await runScreen();
+
+    expect(out.selectedObject).toBeUndefined();
+    expect(out.navigation).toEqual({ view: "ask" });
+    expect(out.dashboard).toBeUndefined();
+    expect(getDashboard).not.toHaveBeenCalled();
+  });
+
+  it("does not let stale Ask navigation mask a dashboard URL", async () => {
+    selectedObjectState.current = {
+      type: "dashboard",
+      id: "dash-1",
+      title: "Revenue",
+    };
+    setScreen({ view: "ask" }, { pathname: "/dashboards/dash-1" });
+
+    const out = await runScreen();
+
+    expect(out.pathname).toBe("/dashboards/dash-1");
+    expect(out.navigation).toEqual({
+      view: "adhoc",
+      dashboardId: "dash-1",
+    });
+    expect(out.selectedObject).toEqual(selectedObjectState.current);
+  });
+
+  it("uses the dashboard URL when navigation names a different dashboard", async () => {
+    setScreen(
+      { view: "adhoc", dashboardId: "dash-1" },
+      { pathname: "/dashboards/dash-2" },
+    );
+
+    const out = await runScreen();
+
+    expect(out.navigation).toEqual({
+      view: "adhoc",
+      dashboardId: "dash-2",
+    });
+    expect(getDashboard).toHaveBeenCalledWith("dash-2", {
+      email: "user@example.test",
+      orgId: "org-1",
+    });
   });
 
   it("lists status pages in the monitoring surfaces catalog", async () => {
@@ -118,7 +175,6 @@ describe("view-screen monitoring status-pages branch", () => {
       monitorCount: 2,
       publicUrl: "/status/acme",
     });
-    // The uptime monitors list must not leak into the status-pages sub-view.
     expect(listMonitors).not.toHaveBeenCalled();
   });
 
@@ -200,7 +256,6 @@ describe("view-screen monitoring status-pages branch", () => {
     });
     const out = await runScreen();
     expect(listStatusPages).not.toHaveBeenCalled();
-    // The surfaces catalog is still reported so the agent knows the sub-views.
     expect(out.page).toBe("monitoring");
   });
 });

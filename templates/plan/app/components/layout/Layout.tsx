@@ -1,13 +1,20 @@
 import {
   AgentSidebar,
   isAgentChatHomeHandoffActive,
+  isAssistantChatHistoryVersion,
   useAgentChatHomeHandoff,
   useAgentChatHomeHandoffLinks,
+  type AssistantChatHistoryConfig,
+  type AssistantChatHistoryVersion,
 } from "@agent-native/core/client/agent-chat";
+import { useFeatureFlagState } from "@agent-native/core/client/feature-flags";
+import { useSession } from "@agent-native/core/client/hooks";
 import { useT } from "@agent-native/core/client/i18n";
+import { isSettingsPathname } from "@agent-native/core/client/settings";
+import { SETTINGS_REDESIGN_FLAG } from "@agent-native/core/feature-flags/registry";
 import { HeaderActionsProvider } from "@agent-native/toolkit/app-shell";
 import { IconMenu2 } from "@tabler/icons-react";
-import { useState, useEffect } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useLocation } from "react-router";
 
 import {
@@ -26,27 +33,17 @@ interface LayoutProps {
   children: React.ReactNode;
 }
 
-/**
- * Routes whose page renders its own h-12 toolbar (with title + AgentToggleButton).
- * Layout still wraps these with the left Sidebar and AgentSidebar but skips the
- * global Header so they don't double-stack a header bar.
- */
 function routeOwnsToolbar(pathname: string): boolean {
   return pathname.startsWith("/extensions") || isPlanDetailRoute(pathname);
 }
 
-// Recaps are a kind of plan: `/plans/:id` and `/recaps/:id` both render
-// PlansPage and share the immersive full-screen reader, so the layout must
-// treat them identically (matching `viewForPath` in use-navigation-state.ts).
-// Without `/recaps/` here, recap routes never owned their toolbar and never
-// went immersive — they were stuck in app view and the full-screen toggle did
-// nothing.
 function isPlanDetailRoute(pathname: string): boolean {
   return /^\/(plans|recaps|local-plans)\/[^/]+/.test(pathname);
 }
 
 export function Layout({ children }: LayoutProps) {
   const location = useLocation();
+  const pathname = location.pathname.replace(/\/+$/, "") || "/";
   const t = useT();
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
@@ -87,19 +84,65 @@ export function Layout({ children }: LayoutProps) {
 
   const ownsToolbar = routeOwnsToolbar(location.pathname);
   const planDetailRoute = isPlanDetailRoute(location.pathname);
-  const chatRoute = location.pathname === "/";
+  const chatRoute = pathname === "/chat";
+  const planScope = useMemo(() => {
+    if (!planDetailRoute || pathname.startsWith("/local-plans/")) {
+      return undefined;
+    }
+    const match = pathname.match(/^\/(?:plans|recaps)\/([^/]+)/);
+    return match?.[1] ? { type: "plan" as const, id: match[1] } : undefined;
+  }, [pathname, planDetailRoute]);
+  const planChatHistory = useMemo<
+    AssistantChatHistoryConfig | undefined
+  >(() => {
+    if (!planScope) return undefined;
+    const planId = planScope.id;
+    return {
+      list: {
+        action: "list-plan-versions",
+        args: { planId, limit: 100 },
+        getVersions: (result: unknown) => {
+          const versions =
+            result && typeof result === "object"
+              ? (result as { versions?: unknown }).versions
+              : undefined;
+          return Array.isArray(versions)
+            ? versions.filter(isAssistantChatHistoryVersion)
+            : [];
+        },
+      },
+      restore: {
+        action: "restore-plan-version",
+        args: (version: AssistantChatHistoryVersion) => ({
+          planId,
+          versionId: version.id,
+        }),
+      },
+    };
+  }, [planScope]);
+  const { session, isLoading: sessionLoading } = useSession();
   const chatHomeHandoffActive = useAgentChatHomeHandoff({
     storageKey: "plans",
-    activePath: location.pathname,
+    activePath: pathname,
     enabled: !chatRoute,
   });
   const chatHomeHandoffPending = isAgentChatHomeHandoffActive("plans");
   useAgentChatHomeHandoffLinks({
     storageKey: "plans",
-    chatPath: "/",
+    chatPath: "/chat",
+    isChatPath: (path) => (path.replace(/\/+$/, "") || "/") === "/chat",
     requireActiveHandoff: true,
   });
-  const hideAppNavigation = planDetailRoute && planReaderImmersive;
+  // The redesigned Settings brings its own navigation, header, and agent
+  // toggle, so it renders full width. While the flag loads it shows the
+  // shell's skeleton, which needs the same frame.
+  const settingsRedesign = useFeatureFlagState(SETTINGS_REDESIGN_FLAG.key);
+  const isRedesignedSettingsRoute =
+    isSettingsPathname(pathname) &&
+    (settingsRedesign.enabled || settingsRedesign.status === "loading");
+  const hideAppNavigation =
+    (planDetailRoute && planReaderImmersive) || isRedesignedSettingsRoute;
+  const hideAppHeader = pathname === "/plans" && !sessionLoading && !session;
   const effectiveSidebarCollapsed = chatRoute
     ? chatSidebarCollapsed
     : sidebarCollapsed;
@@ -138,10 +181,6 @@ export function Layout({ children }: LayoutProps) {
       window.removeEventListener(PLAN_READER_VIEW_EVENT, onPlanReaderView);
   }, [planDetailRoute]);
 
-  // Embed mode: render just the reader, flowing — no Sidebar, no AgentSidebar,
-  // no h-screen shell. Those (some in shared core) lock the embed to the iframe
-  // height; bypassing them lets the document flow so the shell sizes to content
-  // (see global.css `html[data-embed]` + frame.ts content-height reporting).
   const embedded = new URLSearchParams(location.search).get("embedded") === "1";
   if (embedded) {
     return (
@@ -155,7 +194,7 @@ export function Layout({ children }: LayoutProps) {
 
   const pageContent = (
     <div className="flex h-full flex-1 flex-col overflow-hidden">
-      {chatRoute ? null : ownsToolbar ? (
+      {chatRoute || isRedesignedSettingsRoute ? null : ownsToolbar ? (
         hideAppNavigation ? null : (
           <div className="flex h-12 items-center border-b border-border px-4 md:hidden shrink-0">
             <button
@@ -168,6 +207,17 @@ export function Layout({ children }: LayoutProps) {
             </button>
           </div>
         )
+      ) : hideAppHeader ? (
+        <div className="flex h-12 items-center border-b border-border px-4 md:hidden shrink-0">
+          <button
+            type="button"
+            onClick={() => setMobileSidebarOpen(true)}
+            aria-label={t("sidebar.openNavigation")}
+            className="flex h-9 w-9 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-accent"
+          >
+            <IconMenu2 className="h-4 w-4" />
+          </button>
+        </div>
       ) : (
         <Header onOpenMobileSidebar={() => setMobileSidebarOpen(true)} />
       )}
@@ -211,7 +261,9 @@ export function Layout({ children }: LayoutProps) {
             chatViewTransitionHandoff={chatHomeHandoffPending}
             storageKey="plans"
             openOnChatRunning={chatHomeHandoffActive}
-            agentPageHref="/agent"
+            scope={planScope}
+            chatHistory={planChatHistory}
+            agentPageHref="/settings/agent"
             emptyStateText={t("agent.emptyState")}
             suggestions={[
               t("agent.suggestionShipped"),

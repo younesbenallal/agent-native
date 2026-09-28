@@ -1,17 +1,3 @@
-/**
- * Two-way navigation sync between the database admin UI and the agent.
- *
- * (a) `useDbAdminAgentSync` writes the current view into application state
- *     under the `navigation` key, so the agent's `<current-screen>` context
- *     knows which table/mode is open. Mirrors the template
- *     `use-navigation-state` write mechanism (PUT to the app-state route with a
- *     request-source header), but talks to the route directly since core has no
- *     template `TAB_ID`.
- *
- * (b) `useNavigateConsumer` short-polls the one-shot `navigate` app-state key.
- *     When the agent sets `{ view: "database", table }`, the consumer invokes
- *     `onNavigate(table)` then DELETEs the key so it fires exactly once.
- */
 import { useEffect, useRef } from "react";
 
 import {
@@ -24,13 +10,8 @@ import {
   readClientAppState,
   setClientAppState,
 } from "../application-state.js";
-
-const NAVIGATION_PATH = agentNativePath(
-  "/_agent-native/application-state/navigation",
-);
-const NAVIGATE_PATH = agentNativePath(
-  "/_agent-native/application-state/navigate",
-);
+import { getBrowserTabId } from "../browser-tab-id.js";
+import { usePollLoop } from "../use-poll-loop.js";
 
 const POLL_INTERVAL_MS = 1500;
 const TABLE_CONTEXT_KEY = "database-selected-table";
@@ -41,23 +22,15 @@ let cachedSource: string | null = null;
 
 function requestSource(): string | undefined {
   if (typeof window === "undefined") return undefined;
-  if (cachedSource) return cachedSource;
-  try {
-    const existing = window.sessionStorage.getItem("agentnative.tabId");
-    if (existing) {
-      cachedSource = existing;
-      return existing;
-    }
-    const generated =
-      typeof crypto !== "undefined" && "randomUUID" in crypto
-        ? crypto.randomUUID()
-        : `tab-${Math.random().toString(36).slice(2)}`;
-    window.sessionStorage.setItem("agentnative.tabId", generated);
-    cachedSource = generated;
-    return generated;
-  } catch {
-    return undefined;
-  }
+  if (!cachedSource) cachedSource = getBrowserTabId();
+  return cachedSource;
+}
+
+function appStatePath(key: string): string {
+  const source = requestSource();
+  return agentNativePath(
+    `/_agent-native/application-state/${key}${source ? `:${source}` : ""}`,
+  );
 }
 
 function headers(extra?: Record<string, string>): Record<string, string> {
@@ -96,11 +69,6 @@ export interface UseDbAdminAgentSyncArgs {
   enabled?: boolean;
 }
 
-/**
- * Write the current database-admin view to application state whenever the
- * selected table or mode changes, so the agent always knows what the user is
- * looking at.
- */
 export function useDbAdminAgentSync({
   table,
   mode,
@@ -109,7 +77,7 @@ export function useDbAdminAgentSync({
   useEffect(() => {
     if (!enabled) return;
     const state: DbAdminNavigationState = { view: "database", table, mode };
-    fetch(NAVIGATION_PATH, {
+    fetch(appStatePath("navigation"), {
       method: "PUT",
       keepalive: true,
       credentials: "include",
@@ -126,7 +94,7 @@ export function useDbAdminAgentSync({
         key: TABLE_CONTEXT_KEY,
         openSidebar: false,
       });
-      deleteSelectedObjectIfOwned(source);
+      void deleteSelectedObjectIfOwned(source);
       return;
     }
 
@@ -157,7 +125,7 @@ export function useDbAdminAgentSync({
         key: TABLE_CONTEXT_KEY,
         openSidebar: false,
       });
-      deleteSelectedObjectIfOwned(source);
+      void deleteSelectedObjectIfOwned(source);
     };
   }, [enabled, table, mode]);
 }
@@ -167,60 +135,51 @@ interface NavigateCommand {
   table?: string | null;
 }
 
-/**
- * Poll the one-shot `navigate` app-state key. When the agent requests a jump to
- * a database table, invoke `onNavigate(table)` then clear the key so it does
- * not replay on the next poll.
- */
 export function useNavigateConsumer(
   onNavigate: (table: string) => void,
   enabled = true,
 ): void {
   const handlerRef = useRef(onNavigate);
   handlerRef.current = onNavigate;
-
+  const mountedRef = useRef(true);
   useEffect(() => {
-    if (!enabled) return;
-    let active = true;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-
-    const tick = async () => {
-      if (!active) return;
-      try {
-        const res = await fetch(NAVIGATE_PATH, {
-          method: "GET",
-          credentials: "include",
-          headers: headers(),
-        });
-        if (active && res.ok) {
-          const data = (await res.json()) as NavigateCommand | null;
-          if (
-            data &&
-            data.view === "database" &&
-            typeof data.table === "string" &&
-            data.table
-          ) {
-            const target = data.table;
-            // Clear the one-shot command before acting so it fires once.
-            fetch(NAVIGATE_PATH, {
-              method: "DELETE",
-              credentials: "include",
-              headers: headers({ "X-Agent-Native-CSRF": "1" }),
-            }).catch(() => {});
-            handlerRef.current(target);
-          }
-        }
-      } catch {
-        // Ignore transient errors; the next tick retries.
-      } finally {
-        if (active) timer = setTimeout(tick, POLL_INTERVAL_MS);
-      }
-    };
-
-    timer = setTimeout(tick, POLL_INTERVAL_MS);
+    mountedRef.current = true;
     return () => {
-      active = false;
-      if (timer) clearTimeout(timer);
+      mountedRef.current = false;
     };
-  }, [enabled]);
+  }, []);
+
+  usePollLoop(
+    async (signal) => {
+      const navigatePath = appStatePath("navigate");
+      const res = await fetch(navigatePath, {
+        method: "GET",
+        credentials: "include",
+        headers: headers(),
+        signal,
+      });
+      if (!mountedRef.current || !res.ok) return;
+      const data = (await res.json()) as NavigateCommand | null;
+      if (
+        data &&
+        data.view === "database" &&
+        typeof data.table === "string" &&
+        data.table
+      ) {
+        const target = data.table;
+        fetch(navigatePath, {
+          method: "DELETE",
+          credentials: "include",
+          headers: headers({ "X-Agent-Native-CSRF": "1" }),
+        }).catch(() => {});
+        handlerRef.current(target);
+      }
+    },
+    {
+      intervalMs: POLL_INTERVAL_MS,
+      leading: false,
+      pauseWhenHidden: true,
+      enabled,
+    },
+  );
 }

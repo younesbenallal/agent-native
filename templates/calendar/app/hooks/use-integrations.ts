@@ -12,9 +12,6 @@ import { appApiPath } from "@/lib/api-path";
 type Provider = "apollo" | "hubspot" | "gong" | "pylon";
 
 function useIntegrationStatus(provider: Provider) {
-  // Refetch on any agent action — covers agent-driven connect/disconnect that
-  // writes the credential server-side. See `use-change-version.ts` in
-  // @agent-native/core.
   const sync = useChangeVersions(["action"]);
   const { data } = useQuery<{ connected: boolean } | null>({
     queryKey: ["integration-status", provider, sync],
@@ -41,8 +38,8 @@ function useIntegrationConnect(provider: Provider) {
       if (!res.ok) throw new Error(`${res.status}`);
     },
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["integration-status", provider] });
-      qc.invalidateQueries({ queryKey: ["integration-data", provider] });
+      void qc.invalidateQueries({ queryKey: ["integration-status", provider] });
+      void qc.invalidateQueries({ queryKey: ["integration-data", provider] });
     },
   });
 }
@@ -56,13 +53,11 @@ function useIntegrationDisconnect(provider: Provider) {
       });
     },
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["integration-status", provider] });
-      qc.invalidateQueries({ queryKey: ["integration-data", provider] });
+      void qc.invalidateQueries({ queryKey: ["integration-status", provider] });
+      void qc.invalidateQueries({ queryKey: ["integration-data", provider] });
     },
   });
 }
-
-// ─── Provider-specific data fetching ────────────────────────────────────────
 
 export function useAllIntegrations() {
   const apollo = useIntegrationStatus("apollo");

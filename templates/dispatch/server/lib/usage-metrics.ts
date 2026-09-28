@@ -4,6 +4,7 @@ import {
   getAgentEngineEntry,
   isAgentEngineSettingConfigured,
   isStoredEngineUsable,
+  readDefaultAgentEngineSetting,
   registerBuiltinEngines,
 } from "@agent-native/core/agent/engine";
 import { getDbExec } from "@agent-native/core/db";
@@ -11,7 +12,6 @@ import {
   getRequestOrgId,
   getRequestUserEmail,
 } from "@agent-native/core/server";
-import { getSetting } from "@agent-native/core/settings";
 import { ForbiddenError } from "@agent-native/core/sharing";
 import {
   getUsageSummary,
@@ -144,7 +144,8 @@ function numberField(row: Record<string, unknown>, key: string): number {
 }
 
 function stringField(row: Record<string, unknown>, key: string): string {
-  return String(row[key] ?? "");
+  const value = row[key];
+  return typeof value === "string" ? value : (JSON.stringify(value) ?? "");
 }
 
 function nullableNumberField(
@@ -186,7 +187,7 @@ function isEnvAdmin(email: string): boolean {
 
 async function detectUsageEngineName(): Promise<string | null> {
   try {
-    const stored = (await getSetting("agent-engine")) as {
+    const stored = (await readDefaultAgentEngineSetting()) as {
       engine?: string;
     } | null;
     if (isAgentEngineSettingConfigured(stored)) {
@@ -226,7 +227,10 @@ async function getViewerOrgRole(
 ): Promise<string | null> {
   if (!orgId) return null;
   const rows = await queryRows<{ role?: string }>(
-    `SELECT role FROM org_members WHERE org_id = ? AND LOWER(email) = ? LIMIT 1`,
+    `SELECT role FROM org_members
+     WHERE org_id = $1 AND LOWER(email) = $2
+       AND federation_removal_pending_at IS NULL
+     LIMIT 1`,
     [orgId, email.toLowerCase()],
   );
   const role = rows[0]?.role;
@@ -236,7 +240,9 @@ async function getViewerOrgRole(
 async function listOrgMembers(orgId: string | null): Promise<MemberRecord[]> {
   if (!orgId) return [];
   const rows = await queryRows<Record<string, unknown>>(
-    `SELECT email, role, joined_at AS joined_at FROM org_members WHERE org_id = ? ORDER BY joined_at ASC`,
+    `SELECT email, role, joined_at AS joined_at FROM org_members
+     WHERE org_id = $1 AND federation_removal_pending_at IS NULL
+     ORDER BY joined_at ASC`,
     [orgId],
   );
   return rows
@@ -257,11 +263,13 @@ function metricScope(
   threadWhere: string;
   threadArgs: unknown[];
 } {
-  const placeholders = memberEmails.map(() => "?").join(", ");
+  const placeholders = memberEmails
+    .map((_, index) => `$${index + 2}`)
+    .join(", ");
   return {
-    usageWhere: `created_at >= ? AND owner_email IN (${placeholders})`,
+    usageWhere: `created_at >= $1 AND owner_email IN (${placeholders})`,
     usageArgs: [sinceMs, ...memberEmails],
-    threadWhere: `updated_at >= ? AND owner_email IN (${placeholders})`,
+    threadWhere: `updated_at >= $1 AND owner_email IN (${placeholders})`,
     threadArgs: [sinceMs, ...memberEmails],
   };
 }
@@ -302,9 +310,9 @@ async function usageBuckets(
         MAX(created_at) AS last_active_at
       FROM token_usage
       WHERE ${where}
-      GROUP BY ${columnExpression}
-      ORDER BY cost_x100 DESC
-      LIMIT ?`,
+        GROUP BY ${columnExpression}
+        ORDER BY cost_x100 DESC
+      LIMIT $${args.length + 1}`,
     [...args, limit],
   );
   return rows.map(bucketFromRow);

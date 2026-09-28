@@ -1,7 +1,29 @@
+export { MemoryRouter as AgentChatMemoryRouter } from "react-router";
+
+export {
+  cancelBackgroundAgentSession,
+  getBackgroundAgentSessionStatus,
+  startBackgroundAgentSession,
+  type BackgroundAgentSessionHandle,
+  type BackgroundAgentSessionReceipt,
+  type BackgroundAgentSessionSnapshot,
+  type BackgroundAgentSessionStartOptions,
+  type BackgroundAgentSessionStatus,
+} from "../background-agent-session.js";
+
 export {
   AgentAskPopover,
   type AgentAskPopoverProps,
 } from "../AgentAskPopover.js";
+export {
+  detectExternalAgentHost,
+  ExternalAgentNudge,
+  getExternalAgentHost,
+  useExternalAgentHost,
+  type ExternalAgentHost,
+  type ExternalAgentHostId,
+  type ExternalAgentHostSignals,
+} from "../external-agent-host.js";
 export {
   addContextToAgentChat,
   appendAgentChatContextToMessage,
@@ -39,28 +61,25 @@ export {
   type AgentComposerReferenceInsertPayload,
 } from "../agent-chat.js";
 export {
+  fetchProviderModels,
   saveAgentEngineApiKey,
   saveAgentEngineProviderSettings,
+  type AgentEngineDefaultModelOutcome,
   type AgentEngineProvider,
+  type FetchProviderModelsOptions,
+  type ProviderModelsCheck,
+  type ProviderModelsCheckCode,
   type SaveAgentEngineApiKeyOptions,
   type SaveAgentEngineProviderSettingsOptions,
+  type SaveAgentEngineProviderSettingsResult,
 } from "../agent-engine-key.js";
 export { useAgentChatGenerating } from "../use-agent-chat.js";
+export { useActiveAgentChatRunId } from "../use-active-agent-chat-run.js";
 export {
   useAgentChatContext,
   type UseAgentChatContextResult,
 } from "../use-agent-chat-context.js";
 export { useCodeMode, useDevMode } from "../use-dev-mode.js";
-export {
-  codeAgentTranscriptEventsToContent,
-  codeAgentTranscriptHasPendingApproval,
-  createCodeAgentChatAdapter,
-  type CodeAgentChatController,
-  type CodeAgentChatControlResult,
-  type CodeAgentChatFollowUpMode,
-  type CodeAgentChatTranscriptEvent,
-  type CreateCodeAgentChatAdapterOptions,
-} from "../code-agent-chat-adapter.js";
 export {
   buildRepositoryFromCodeAgentTranscript,
   type BuildRepositoryFromCodeAgentTranscriptOptions,
@@ -80,8 +99,11 @@ export {
 } from "../../code-agents/transcript-normalizer.js";
 export { useSendToAgentChat } from "../use-send-to-agent-chat.js";
 export {
+  chatModelSelectionStorageKey,
   useChatModels,
   type UseChatModelsResult,
+  type UseChatModelsOptions,
+  type PersistedModelSelection,
   type EngineModelGroup,
 } from "../use-chat-models.js";
 export {
@@ -89,11 +111,20 @@ export {
   type CodeRequiredDialogProps,
 } from "../components/CodeRequiredDialog.js";
 export {
+  ChatFirstAgentActivityPanel,
+  type ChatFirstAgentActivityPanelProps,
+} from "../chat-first-agent-activity.js";
+export { ChatFirstSurfacePanelToggle } from "../chat-first-surface-panel-toggle.js";
+export {
   useAgentEngineConfigured,
   type AgentEngineConfiguredState,
   type UseAgentEngineConfiguredResult,
 } from "../use-agent-engine-configured.js";
-export { BuilderSetupCard } from "../chat/run-recovery.js";
+export {
+  BuilderSetupCard,
+  isMissingLlmProviderRunError,
+  type RunErrorInfo,
+} from "../chat/run-recovery.js";
 export {
   AgentConversation,
   AgentConversationMessageView,
@@ -116,6 +147,7 @@ export { McpAppRenderer } from "../mcp-apps/McpAppRenderer.js";
 export {
   AGENT_NATIVE_MCP_APP_HOST_MESSAGE_TYPES,
   getMcpAppHostContext,
+  initializeMcpAppHost,
   openMcpAppHostLink,
   requestMcpAppDisplayMode,
   sendMcpAppHostMessage,
@@ -126,6 +158,7 @@ export {
   type McpAppHostChatMessage,
   type McpAppHostCapabilities,
   type McpAppHostContext,
+  type McpAppHostInfo,
   type McpAppHostContextSnapshot,
   type McpAppModelContextContentPart,
   type McpAppModelContextUpdate,
@@ -145,18 +178,31 @@ export {
   type AgentDynamicSuggestionsOption,
 } from "../dynamic-suggestions.js";
 export {
-  AssistantChat,
-  clearChatStorage,
-  type AssistantChatProps,
-  type AssistantChatHandle,
-  type AssistantChatAdapterContext,
-} from "../AssistantChat.js";
-export {
-  MultiTabAssistantChat,
-  type MultiTabAssistantChatProps,
-  type MultiTabAssistantChatHeaderProps,
+  AgentKitAssistantChat,
+  AgentKitAssistantChat as AssistantChat,
+  type AgentKitAssistantChatProps,
+} from "../AgentKitAssistantChat.js";
+export { clearChatStorage } from "../chat/storage.js";
+export type {
+  AssistantChatProps,
+  AssistantChatHandle,
+  AssistantChatAdapterContext,
+  AssistantChatSendOptions,
+  AgentChatSurfaceKind,
+} from "../chat/surface-types.js";
+export { isAssistantChatHistoryVersion } from "../chat/assistant-chat-history-version.js";
+export type { AssistantChatHistoryVersion } from "../chat/assistant-chat-history-version.js";
+export type {
+  AssistantChatHistoryConfig,
+  AssistantChatHistoryContext,
+  AssistantChatHistoryMessage,
+  AssistantChatHistoryScope,
+} from "../chat/history-types.js";
+export type {
+  MultiTabAssistantChatProps,
+  MultiTabAssistantChatHeaderProps,
 } from "../MultiTabAssistantChat.js";
-export { RunStuckBanner, type RunStuckBannerProps } from "../RunStuckBanner.js";
+export type { RunStuckBannerProps } from "../RunStuckBanner.js";
 export {
   KeepTabOpenNotice,
   type KeepTabOpenNoticeProps,
@@ -168,12 +214,8 @@ export {
   type UseRunStuckDetectionOptions,
 } from "../use-run-stuck-detection.js";
 export {
-  createAgentChatAdapter,
-  type AgentChatSurfaceKind,
-  type CreateAgentChatAdapterOptions,
-} from "../agent-chat-adapter.js";
-export {
   GuidedQuestionFlow,
+  GuidedQuestionProviderGate,
   useGuidedQuestionFlow,
   askUserQuestion,
   formatGuidedAnswerValue,
@@ -214,16 +256,20 @@ export { AgentChatHome, type AgentChatHomeProps } from "../AgentChatHome.js";
 export {
   AgentChatSurface,
   AgentPanel,
-  AgentSidebar,
-  AgentToggleButton,
-  focusAgentChat,
   type AgentChatSurfaceMode,
   type AgentChatSurfaceProps,
   type AgentPanelProps,
-  type AgentSidebarProps,
 } from "../AgentPanel.js";
 export {
+  AgentSidebar,
+  AgentToggleButton,
+  focusAgentChat,
+  preloadAgentChatSurface,
+  type AgentSidebarProps,
+} from "../AgentSidebar.js";
+export {
   AgentTabsPage,
+  ConnectionsTab,
   type AgentPageExtraTabContext,
   type AgentPageExtraTabFactory,
   type AgentTabsPageProps,
@@ -251,6 +297,12 @@ export {
   type UseAgentChatHomeHandoffOptions,
 } from "../use-agent-chat-home-handoff.js";
 export {
+  AGENT_SIDEBAR_DEFAULT_MAX_WIDTH,
+  AGENT_SIDEBAR_MIN_WIDTH,
+  AGENT_SIDEBAR_WIDE_WIDTH_RATIO,
+  clampAgentSidebarWidth,
+  getAgentSidebarMaxWidth,
+  getAgentSidebarWideWidth,
   requestAgentSidebarOpen,
   SIDEBAR_STATE_CHANGE_EVENT,
   setAgentSidebarOpenPreference,
@@ -277,3 +329,96 @@ export {
 } from "../chat/tool-render-registry.js";
 export * from "../chat/connectors.js";
 export * from "../chat/runtime.js";
+export {
+  createAgentNativeAgentKitTransport,
+  type CreateAgentNativeAgentKitTransportOptions,
+} from "../chat/agentkit-agent-native.js";
+export {
+  AGENT_CHAT_RUNNING_EVENT,
+  dispatchAgentChatRunning,
+  resolveAgentChatRunningThreadId,
+  useAgentChatRunningThreads,
+  type AgentChatPresentationPhase,
+  type AgentChatRunningEventDetail,
+  type AgentChatRunningThreadsState,
+  type UseAgentChatRunningThreadsOptions,
+} from "../use-agent-chat-running-threads.js";
+export {
+  CHAT_FIRST_APP_LAYOUT_STORAGE_KEY,
+  CHAT_FIRST_DEFAULT_APP_IDS,
+  CHAT_FIRST_SURFACE_TABS_STORAGE_KEY,
+  CHAT_FIRST_SURFACE_PANEL_STORAGE_KEY,
+  CHAT_FIRST_SURFACE_WIDTH_DEFAULT,
+  CHAT_FIRST_SURFACE_WIDTH_MIN,
+  clampChatFirstSurfaceWidth,
+  CHAT_FIRST_MODE_STORAGE_KEY,
+  CHAT_FIRST_MODE_CHANGED_EVENT,
+  CHAT_FIRST_OPEN_APP_EVENT,
+  CHAT_FIRST_OPEN_BROWSER_EVENT,
+  CHAT_FIRST_WATCH_SESSION_EVENT,
+  CHAT_FIRST_SURFACE_CATALOG,
+  chatFirstSurfaceTabId,
+  closeChatFirstSessionWatch,
+  emitChatFirstOpenApp,
+  emitChatFirstOpenBrowser,
+  emitChatFirstSessionWatch,
+  getChatFirstSessionWatchStore,
+  getChatFirstSurfaceTabsStore,
+  getChatFirstSurfacePanelStore,
+  orderChatFirstAppIds,
+  readChatFirstAppLayout,
+  resolveChatFirstAppTarget,
+  resolveChatFirstBrowserTarget,
+  resolveChatFirstSessionId,
+  normalizeChatFirstSessionReference,
+  readChatFirstMode,
+  readChatFirstModeState,
+  readChatFirstSurfaceWidth,
+  subscribeChatFirstOpenApp,
+  subscribeChatFirstOpenBrowser,
+  subscribeChatFirstSessionWatch,
+  useChatFirstSessionWatch,
+  useChatFirstSurfaceResize,
+  useChatFirstSurfacePanel,
+  useChatFirstSurfaceTabs,
+  writeChatFirstAppLayout,
+  writeChatFirstMode,
+  writeChatFirstSurfaceWidth,
+  type ChatFirstAppLayoutPreference,
+  type ChatFirstModeReadResult,
+  type ChatFirstAppRegistration,
+  type ChatFirstAppResolution,
+  type ChatFirstAppTarget,
+  type ChatFirstAppSurfacePlacement,
+  type ChatFirstAgentActivity,
+  type ChatFirstAgentActivityStatus,
+  type ChatFirstOpenAppDelivery,
+  type ChatFirstOpenAppDetail,
+  type ChatFirstOpenBrowserDetail,
+  type ChatFirstBrowserResolution,
+  type ChatFirstSessionKind,
+  type ChatFirstSessionReference,
+  type ChatFirstSessionWatchDelivery,
+  type ChatFirstSessionWatchState,
+  type ChatFirstSessionWatchStore,
+  type ChatFirstSurfaceKind,
+  type ChatFirstSurfaceTab,
+  type ChatFirstSurfacePanelState,
+  type ChatFirstSurfacePanelStore,
+  type ChatFirstSurfaceTabsState,
+  type ChatFirstSurfaceTabsStore,
+} from "../chat-first.js";
+export {
+  ThinkingDisplayProvider,
+  getBrowserThinkingDisplay,
+  setBrowserThinkingDisplay,
+  subscribeToBrowserThinkingDisplay,
+  useThinkingDisplay,
+  useThinkingDisplayControl,
+} from "../thinking-display.js";
+export {
+  DEFAULT_THINKING_DISPLAY,
+  THINKING_DISPLAY_MODES,
+  isThinkingDisplay,
+  type ThinkingDisplay,
+} from "../../shared/thinking-display.js";

@@ -20,9 +20,20 @@ const mockShareQuery = vi.hoisted(() => {
   query.where.mockReturnValue(query);
   return query;
 });
-// Unselected `db.select()` means the run reached the player payload queries.
-// It throws unless a test opts in by installing a builder, which keeps the
-// access-gate tests honest about never getting that far.
+const mockTagRows = vi.hoisted(() =>
+  vi.fn(async () => [] as { tag: string }[]),
+);
+const mockTagsQuery = vi.hoisted(() => {
+  const query = {
+    from: vi.fn(),
+    where: vi.fn(),
+    orderBy: vi.fn(),
+  };
+  query.from.mockReturnValue(query);
+  query.where.mockReturnValue(query);
+  query.orderBy.mockImplementation(() => mockTagRows());
+  return query;
+});
 const mockPlayerQuery = vi.hoisted(() => ({
   build: null as null | (() => unknown),
 }));
@@ -34,8 +45,16 @@ const mockDb = vi.hoisted(() => ({
       }
       return mockPlayerQuery.build();
     }
+    if (
+      typeof selection === "object" &&
+      selection !== null &&
+      "tag" in selection
+    ) {
+      return mockTagsQuery;
+    }
     return mockShareQuery;
   }),
+  selectDistinct: vi.fn(() => mockTagsQuery),
 }));
 const mockCountRecordingViews = vi.hoisted(() =>
   vi.fn(async (_recordingId: string) => 0),
@@ -43,6 +62,25 @@ const mockCountRecordingViews = vi.hoisted(() =>
 const mockResolvePlayerVideoUrl = vi.hoisted(() =>
   vi.fn(() => "/api/video/rec-1"),
 );
+const mockResolvePlayerThumbnailUrl = vi.hoisted(() =>
+  vi.fn(
+    (
+      recording: {
+        thumbnailUrl?: string | null;
+        animatedThumbnailUrl?: string | null;
+      },
+      options?: { animated?: boolean },
+    ) => {
+      if (!recording.thumbnailUrl && !recording.animatedThumbnailUrl) {
+        return null;
+      }
+      return options?.animated
+        ? "/api/thumbnail/rec-1?animated=1"
+        : "/api/thumbnail/rec-1";
+    },
+  ),
+);
+const mockIsSeekableRepairPending = vi.hoisted(() => vi.fn());
 
 vi.mock("@agent-native/core", () => ({
   defineAction: (options: unknown) => options,
@@ -103,6 +141,10 @@ vi.mock("../server/db/index.js", () => ({
       recordingId: "recordingCtas.recordingId",
       createdAt: "recordingCtas.createdAt",
     },
+    recordingTags: {
+      recordingId: "recordingTags.recordingId",
+      tag: "recordingTags.tag",
+    },
     recordingBrowserDiagnostics: {
       recordingId: "recordingBrowserDiagnostics.recordingId",
     },
@@ -125,8 +167,18 @@ vi.mock("../server/lib/player-video-url.js", () => ({
     mockResolvePlayerVideoUrl(...args),
 }));
 
+vi.mock("../server/lib/player-thumbnail-url.js", () => ({
+  resolvePlayerThumbnailUrl: (...args: unknown[]) =>
+    mockResolvePlayerThumbnailUrl(...args),
+}));
+
 vi.mock("../server/lib/media-verification-state.js", () => ({
   isMediaVerificationPending: vi.fn(() => false),
+}));
+
+vi.mock("../server/lib/seekable-media-state.js", () => ({
+  isSeekableRepairPending: (...args: unknown[]) =>
+    mockIsSeekableRepairPending(...args),
 }));
 
 vi.mock("../server/lib/recordings.js", () => ({
@@ -166,6 +218,7 @@ describe("get-recording-player-data direct public access", () => {
     mockIsAgentRecordingCaller.mockImplementation(
       (caller: string | undefined) => caller === "tool",
     );
+    mockIsSeekableRepairPending.mockResolvedValue(false);
     mockShareLimit.mockResolvedValue([]);
   });
 
@@ -226,6 +279,8 @@ describe("get-recording-player-data view count", () => {
     mockPlayerQuery.build = emptyPlayerQuery;
     mockCountRecordingViews.mockClear();
     mockCountRecordingViews.mockResolvedValue(0);
+    mockIsSeekableRepairPending.mockClear();
+    mockIsSeekableRepairPending.mockResolvedValue(false);
     mockResolvePlayerVideoUrl.mockClear();
     mockShareLimit.mockResolvedValue([]);
     mockResolveAccess.mockResolvedValue({
@@ -238,6 +293,7 @@ describe("get-recording-player-data view count", () => {
         expiresAt: null,
         status: "ready",
         chaptersJson: "[]",
+        folderId: "folder-1",
         videoUrl: "https://cdn.example.com/rec-1.webm",
         videoSizeBytes: 1234,
       },
@@ -254,9 +310,73 @@ describe("get-recording-player-data view count", () => {
     const result = await action.run({ recordingId: "rec-1" });
 
     expect(result.viewCount).toBe(9);
-    // Going through the shared helper is what keeps this number identical to
-    // list-recordings.viewCount and get-recording-insights.views.
     expect(mockCountRecordingViews).toHaveBeenCalledWith("rec-1");
+  });
+
+  it("returns upload identity only to recording editors", async () => {
+    mockResolveAccess.mockResolvedValue({
+      role: "owner",
+      resource: {
+        id: "rec-1",
+        ownerEmail: "owner@example.com",
+        visibility: "private",
+        password: null,
+        expiresAt: null,
+        status: "processing",
+        chaptersJson: "[]",
+        uploadAttemptId: "attempt-1",
+        uploadGenerationId: "generation-1",
+      },
+    });
+
+    const result = await action.run({ recordingId: "rec-1" });
+
+    expect(result.recording.uploadAttemptId).toBe("attempt-1");
+    expect(result.recording.uploadGenerationId).toBe("generation-1");
+  });
+
+  it("holds the filmstrip back while redactions are pending", async () => {
+    mockShareLimit.mockResolvedValue([{ id: "share-1" }]);
+    mockResolveAccess.mockResolvedValue({
+      role: "viewer",
+      resource: {
+        id: "rec-1",
+        visibility: "public",
+        password: null,
+        expiresAt: null,
+        videoUrl: "https://cdn.example.com/video.mp4",
+        uploadAttemptId: "attempt-1",
+        uploadGenerationId: "generation-1",
+        filmstripUrl: "https://cdn.example.com/strip.jpg",
+        editsJson: JSON.stringify({
+          trims: [],
+          overlays: [
+            {
+              kind: "redact",
+              id: "r1",
+              startMs: 0,
+              endMs: 5_000,
+              keys: [{ atMs: 0, x: 0.1, y: 0.1, w: 0.2, h: 0.2 }],
+            },
+          ],
+        }),
+      },
+    });
+    mockPlayerQuery.build = () => {
+      const query: Record<string, unknown> = {};
+      query.from = () => query;
+      query.where = () => query;
+      query.orderBy = async () => [];
+      query.limit = async () => [];
+      query.then = (resolve: (rows: unknown[]) => unknown) => resolve([]);
+      return query;
+    };
+
+    const result = await action.run({ recordingId: "rec-1" });
+
+    expect(result.recording.filmstripUrl).toBeNull();
+    expect(result.recording.uploadAttemptId).toBeUndefined();
+    expect(result.recording.uploadGenerationId).toBeUndefined();
   });
 
   it("reports zero views without failing the player payload", async () => {
@@ -264,9 +384,83 @@ describe("get-recording-player-data view count", () => {
 
     expect(result.viewCount).toBe(0);
     expect(result.recording.id).toBe("rec-1");
+    expect(result.recording.folderId).toBe("folder-1");
+  });
+
+  it("includes a trashed recording's timestamp in the player payload", async () => {
+    const trashedAt = "2026-09-22T12:00:00.000Z";
+    mockResolveAccess.mockResolvedValue({
+      role: "owner",
+      resource: {
+        id: "rec-1",
+        ownerEmail: "owner@example.com",
+        visibility: "private",
+        password: null,
+        expiresAt: null,
+        status: "ready",
+        chaptersJson: "[]",
+        trashedAt,
+      },
+    });
+
+    const result = await action.run({ recordingId: "rec-1" });
+
+    expect(result.recording.trashedAt).toBe(trashedAt);
+  });
+
+  it("exposes pending seekable repair state to the player", async () => {
+    mockIsSeekableRepairPending.mockResolvedValue(true);
+
+    const result = await action.run({ recordingId: "rec-1" });
+
+    expect(result.recording.seekableRepairPending).toBe(true);
+    expect(mockIsSeekableRepairPending).toHaveBeenCalledWith({
+      ownerEmail: "owner@example.com",
+      recordingId: "rec-1",
+      recordingStatus: "ready",
+      videoUrl: "https://cdn.example.com/rec-1.webm",
+    });
+  });
+
+  it("keeps an owner's expired recording available", async () => {
+    mockResolveAccess.mockResolvedValue({
+      role: "owner",
+      resource: {
+        id: "rec-1",
+        ownerEmail: "owner@example.com",
+        visibility: "private",
+        password: null,
+        expiresAt: "2020-01-01T00:00:00.000Z",
+        status: "ready",
+        chaptersJson: "[]",
+        videoUrl: "https://cdn.example.com/rec-1.webm",
+        videoSizeBytes: 1234,
+      },
+    });
+
+    const result = await action.run({ recordingId: "rec-1" });
+
+    expect(result.recording.id).toBe("rec-1");
   });
 
   it("keeps owner media behind the same-origin video proxy", async () => {
+    mockResolveAccess.mockResolvedValueOnce({
+      role: "owner",
+      resource: {
+        id: "rec-1",
+        ownerEmail: "owner@example.com",
+        visibility: "private",
+        password: null,
+        expiresAt: null,
+        status: "ready",
+        chaptersJson: "[]",
+        videoUrl: "https://cdn.example.com/rec-1.webm",
+        videoSizeBytes: 1234,
+        thumbnailUrl: "https://cdn.example.com/rec-1.jpg",
+        animatedThumbnailUrl: "https://cdn.example.com/preview.gif",
+      },
+    });
+
     const result = await action.run({ recordingId: "rec-1" });
 
     expect(mockResolvePlayerVideoUrl).toHaveBeenCalledWith(
@@ -280,6 +474,23 @@ describe("get-recording-player-data view count", () => {
       },
     );
     expect(result.recording.videoUrl).toBe("/api/video/rec-1");
+    expect(mockResolvePlayerThumbnailUrl).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "rec-1",
+        thumbnailUrl: "https://cdn.example.com/rec-1.jpg",
+      }),
+    );
+    expect(mockResolvePlayerThumbnailUrl).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "rec-1",
+        animatedThumbnailUrl: "https://cdn.example.com/preview.gif",
+      }),
+      { animated: true },
+    );
+    expect(result.recording.thumbnailUrl).toBe("/api/thumbnail/rec-1");
+    expect(result.recording.animatedThumbnailUrl).toBe(
+      "/api/thumbnail/rec-1?animated=1",
+    );
     expect(result.recording.videoSizeBytes).toBe(1234);
   });
 });

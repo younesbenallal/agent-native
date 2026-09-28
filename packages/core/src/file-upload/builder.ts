@@ -8,7 +8,6 @@ import type {
 
 const DEFAULT_BUILDER_APP_HOST = "https://builder.io";
 
-/** Files larger than this are routed through the GCS signed-URL flow. */
 const LARGE_FILE_THRESHOLD_BYTES = 30 * 1024 * 1024;
 const UPLOAD_TIMEOUT_MS = 120_000;
 const SMALL_FILE_RETRY_DELAYS_MS = [600, 1800];
@@ -45,7 +44,6 @@ function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
 }
 
 function setStableUrlQueryParam(url: URL): void {
-  // Stable URLs let Builder compress asynchronously without changing the media URL.
   url.searchParams.set("stableUrl", "true");
 }
 
@@ -67,7 +65,8 @@ async function assertOk(res: Response, label: string): Promise<void> {
 
 async function uploadLargeFileViaSignedUrl(
   input: FileUploadInput,
-  privateKey: string,
+  authorization: string,
+  apiKey: string | undefined,
   bareMimeType: string,
   bytes: Uint8Array,
 ): Promise<FileUploadResult> {
@@ -78,18 +77,16 @@ async function uploadLargeFileViaSignedUrl(
     `[builder-upload] large-file path: ${name} ${mb}MB ${bareMimeType}`,
   );
 
-  // Step 1 — request a signed URL.
   console.log(`[builder-upload] step 1: requesting signed URL`);
   const { uploadUrl, assetId, requiredHeaders } = await requestBuilderSignedUrl(
-    privateKey,
+    authorization,
+    apiKey,
     name,
     bareMimeType,
     bytes.byteLength,
   );
   console.log(`[builder-upload] step 1 ok: assetId=${assetId}`);
 
-  // Step 2 — PUT bytes directly to GCS. Only requiredHeaders; no Authorization
-  // (signed URL carries its own auth — extra signed headers break the signature).
   console.log(`[builder-upload] step 2 [${assetId}]: PUT ${mb}MB to GCS`);
   const step2Res = await fetchWithTimeout(uploadUrl, {
     method: "PUT",
@@ -101,12 +98,12 @@ async function uploadLargeFileViaSignedUrl(
     `[builder-upload] step 2 ok [${assetId}]: GCS ${step2Res.status} etag=${step2Res.headers.get("etag") ?? "none"}`,
   );
 
-  // Step 3 — register the asset and get the CDN URL.
   console.log(
     `[builder-upload] step 3: registering asset - ${assetId}, ${input.filename}`,
   );
   const { url, id } = await completeBuilderUpload(
-    privateKey,
+    authorization,
+    apiKey,
     assetId,
     input.filename,
     {
@@ -119,7 +116,8 @@ async function uploadLargeFileViaSignedUrl(
 }
 
 async function requestBuilderSignedUrl(
-  privateKey: string,
+  authorization: string,
+  apiKey: string | undefined,
   filename: string,
   mimeType: string,
   size: number,
@@ -131,10 +129,11 @@ async function requestBuilderSignedUrl(
 }> {
   const host = builderUploadHost();
   const url = new URL("/api/v1/upload/signed-url", host);
+  if (apiKey) url.searchParams.set("apiKey", apiKey);
   const res = await fetchWithTimeout(url.toString(), {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${privateKey}`,
+      Authorization: authorization,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
@@ -163,13 +162,15 @@ async function requestBuilderSignedUrl(
 }
 
 async function completeBuilderUpload(
-  privateKey: string,
+  authorization: string,
+  apiKey: string | undefined,
   assetId: string,
   filename: string | undefined,
   options?: { stableUrl?: boolean; recordAsset?: boolean },
 ): Promise<{ url: string; id?: string }> {
   const host = builderUploadHost();
   const url = new URL("/api/v1/upload/complete", host);
+  if (apiKey) url.searchParams.set("apiKey", apiKey);
   if (options?.stableUrl) {
     setStableUrlQueryParam(url);
   }
@@ -177,7 +178,7 @@ async function completeBuilderUpload(
   const res = await fetchWithTimeout(url.toString(), {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${privateKey}`,
+      Authorization: authorization,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
@@ -192,9 +193,6 @@ async function completeBuilderUpload(
   return { url: json.url, id: json.id };
 }
 
-// Retry transient 5xx once with backoff. Builder.io's upload service
-// occasionally returns a bodyless 500 ("Internal Error") on the first
-// attempt — usually GCS write hiccups that succeed on retry.
 async function uploadSmallFile(url: URL, init: RequestInit): Promise<Response> {
   let response: Response | null = null;
   let lastErrorBody = "";
@@ -204,7 +202,7 @@ async function uploadSmallFile(url: URL, init: RequestInit): Promise<Response> {
     attempt <= SMALL_FILE_RETRY_DELAYS_MS.length;
     attempt++
   ) {
-    const retryDelay = SMALL_FILE_RETRY_DELAYS_MS[attempt]; // undefined on last attempt
+    const retryDelay = SMALL_FILE_RETRY_DELAYS_MS[attempt];
     try {
       response = await fetchWithTimeout(url.toString(), init);
     } catch (err) {
@@ -226,33 +224,63 @@ async function uploadSmallFile(url: URL, init: RequestInit): Promise<Response> {
   );
 }
 
-/**
- * Built-in Builder.io file upload provider.
- * Uses the same BUILDER_PRIVATE_KEY as the browser/background-agent flows,
- * so connecting Builder once (via the sidebar "Connect Builder" action)
- * automatically enables file uploads.
- *
- * Upload API: https://www.builder.io/c/docs/upload-api
- */
+async function assetAuthorization(): Promise<{
+  authorization: string;
+  apiKey?: string;
+}> {
+  const [auth, { BUILDER_ASSETS_WRITE_SCOPE }] = await Promise.all([
+    import("../server/builder-api-auth.js"),
+    import("../server/builder-oauth.js"),
+  ]);
+  const authorization = await auth.resolveBuilderApiAuthorization(
+    BUILDER_ASSETS_WRITE_SCOPE,
+  );
+  if (!/^Bearer\s+btk-/i.test(authorization)) return { authorization };
+
+  const { resolveBuilderCredentialsDetailed } =
+    await import("../server/credential-provider.js");
+  const credentials = await resolveBuilderCredentialsDetailed();
+  if (credentials.lookupFailed) {
+    throw (
+      credentials.cause ??
+      new Error(
+        "Could not read saved Builder credentials. Try again in a moment.",
+      )
+    );
+  }
+  const privateKey = credentials.privateKey?.trim();
+  const publicKey = credentials.publicKey?.trim();
+  if (!privateKey || !publicKey) {
+    throw new Error(
+      "Builder personal access token connection is missing its space id. Reconnect Builder.io to continue.",
+    );
+  }
+  const authorized = authorization.replace(/^Bearer\s+/i, "").trim();
+  if (privateKey !== authorized) {
+    throw new Error(
+      "Builder credential scope mismatch: the connection holding the upload space is not the one authorized for this request. Reconnect Builder.io to continue.",
+    );
+  }
+  return { authorization, apiKey: publicKey };
+}
+
 export const builderFileUploadProvider: FileUploadProvider = {
   id: "builder",
   name: "Builder.io",
   isConfigured: () => !!process.env.BUILDER_PRIVATE_KEY,
+  isOwnedUrl: (value) => {
+    try {
+      const url = new URL(value);
+      return url.protocol === "https:" && url.hostname === "cdn.builder.io";
+    } catch {
+      // coercion-ok: malformed URLs are an explicit not-owned result.
+      return false;
+    }
+  },
   upload: async (input: FileUploadInput) => {
     const { data, filename, mimeType } = input;
-    const { resolveBuilderPrivateKey } =
-      await import("../server/credential-provider.js");
-    const privateKey = await resolveBuilderPrivateKey();
-    if (!privateKey) {
-      throw new Error("BUILDER_PRIVATE_KEY is not set");
-    }
+    const { authorization, apiKey } = await assetAuthorization();
 
-    // Strip any media-type parameters (e.g. `;codecs=avc1,opus` from
-    // MediaRecorder blobs) — Builder's upload API parses the body as raw
-    // binary only when Content-Type is a bare MIME type. A parameterized
-    // Content-Type falls through to the multipart/base64 paths which look
-    // for an `image` field, and returns "No image specified" when it
-    // doesn't find one.
     const bareMimeType = (mimeType || "application/octet-stream")
       .split(";")[0]
       .trim();
@@ -264,7 +292,8 @@ export const builderFileUploadProvider: FileUploadProvider = {
     if (shouldUseSignedUrlUpload(bytes, bareMimeType)) {
       return uploadLargeFileViaSignedUrl(
         input,
-        privateKey,
+        authorization,
+        apiKey,
         bareMimeType,
         bytes,
       );
@@ -275,6 +304,7 @@ export const builderFileUploadProvider: FileUploadProvider = {
     );
 
     const url = new URL("/api/v1/upload", builderUploadHost());
+    if (apiKey) url.searchParams.set("apiKey", apiKey);
     if (filename) url.searchParams.set("name", filename);
     if (input.stableUrl) {
       setStableUrlQueryParam(url);
@@ -284,7 +314,7 @@ export const builderFileUploadProvider: FileUploadProvider = {
     const response = await uploadSmallFile(url, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${privateKey}`,
+        Authorization: authorization,
         "Content-Type": bareMimeType,
       },
       body: makeBody(bytes, bareMimeType),
@@ -300,19 +330,55 @@ export const builderFileUploadProvider: FileUploadProvider = {
     return { url: json.url, id: json.id, provider: "builder" };
   },
 
+  delete: async ({ url }) => {
+    const assetUrl = new URL(url);
+    if (assetUrl.hostname !== "cdn.builder.io") return false;
+    assetUrl.search = "";
+    assetUrl.hash = "";
+
+    const [auth, { BUILDER_ASSETS_WRITE_SCOPE }] = await Promise.all([
+      import("../server/builder-api-auth.js"),
+      import("../server/builder-oauth.js"),
+    ]);
+    const authorization = await auth.resolveBuilderRequestAuthorization({
+      requiredScope: BUILDER_ASSETS_WRITE_SCOPE,
+    });
+    if (
+      !authorization ||
+      (authorization.source === "legacy" && !authorization.legacyPublicKey)
+    ) {
+      return false;
+    }
+
+    const deleteUrl = new URL(
+      "/api/v1/assets/by-url",
+      "https://cdn.builder.io",
+    );
+    deleteUrl.searchParams.set("url", assetUrl.toString());
+    if (authorization.legacyPublicKey) {
+      deleteUrl.searchParams.set("apiKey", authorization.legacyPublicKey);
+    }
+    const response = await fetchWithTimeout(deleteUrl.toString(), {
+      method: "DELETE",
+      headers: { Authorization: authorization.authorization },
+    });
+    if (response.ok) return true;
+    if (response.status === 404) return false;
+    await assertOk(response, "Builder.io asset delete failed");
+    return false;
+  },
+
   resumable: {
     async startSession(filename, mimeType, maxBytes) {
-      const { resolveBuilderPrivateKey } =
-        await import("../server/credential-provider.js");
-      const privateKey = await resolveBuilderPrivateKey();
-      if (!privateKey) throw new Error("BUILDER_PRIVATE_KEY is not set");
+      const { authorization, apiKey } = await assetAuthorization();
 
       console.log(
         `[builder-resumable] starting session: ${filename} ${mimeType} ${maxBytes} bytes`,
       );
       const { uploadUrl, assetId, requiredHeaders } =
         await requestBuilderSignedUrl(
-          privateKey,
+          authorization,
+          apiKey,
           filename,
           mimeType,
           maxBytes,
@@ -406,15 +472,13 @@ export const builderFileUploadProvider: FileUploadProvider = {
     },
 
     async completeSession(session, filename, options) {
-      const { resolveBuilderPrivateKey } =
-        await import("../server/credential-provider.js");
-      const privateKey = await resolveBuilderPrivateKey();
-      if (!privateKey) throw new Error("BUILDER_PRIVATE_KEY is not set");
+      const { authorization, apiKey } = await assetAuthorization();
 
       const assetId = session.meta.assetId as string;
       console.log(`[builder-resumable] completing upload: assetId=${assetId}`);
       const { url } = await completeBuilderUpload(
-        privateKey,
+        authorization,
+        apiKey,
         assetId,
         filename,
         {
@@ -426,6 +490,26 @@ export const builderFileUploadProvider: FileUploadProvider = {
       );
       console.log(`[builder-resumable] upload complete: ${url}`);
       return url;
+    },
+
+    async abortSession(session) {
+      const response = await fetchWithTimeout(session.sessionId, {
+        method: "DELETE",
+        headers: { "Content-Length": "0" },
+        body: new Uint8Array(0),
+      });
+      if (
+        response.ok ||
+        response.status === 404 ||
+        response.status === 410 ||
+        response.status === 499
+      ) {
+        return;
+      }
+      const body = await response.text();
+      throw new Error(
+        `GCS resumable session cancellation failed (${response.status}): ${body || response.statusText}`,
+      );
     },
   },
 };

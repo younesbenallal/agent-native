@@ -1,0 +1,36 @@
+---
+title: "Cloudflare"
+description: "Déployez une application agent-native sur Cloudflare Workers avec le préréglage Nitro cloudflare_module."
+---
+
+# Cloudflare
+
+## Cloudflare Workers {#cloudflare-workers}
+
+Utilisez la sortie native en module de Nitro pour un Cloudflare Worker. Cela garde
+le SSR activé et émet le point d'entrée du Worker plus les assets statiques sous
+`.output/server` et `.output/public` :
+
+```ts filename="vite.config.ts"
+export default defineConfig({
+  plugins: [agentNative({ nitro: { preset: "cloudflare_module" } })],
+});
+```
+
+Construisez et déployez le Worker généré avec Wrangler :
+
+```bash
+pnpm build
+npx wrangler deploy --config .output/server/wrangler.json
+```
+
+Vous pouvez aussi sélectionner le préréglage explicitement avec
+`NITRO_PRESET=cloudflare_module`. Configurez une base de données PostgreSQL externe
+durable avant de déployer. Un système de fichiers de Worker n'est pas un magasin
+d'application persistant.
+
+## Et ensuite
+
+- [**Déploiement**](/docs/deployment) — choisissez une base de données persistante et un préréglage avant votre premier déploiement en production
+- [**Déploiement de workspace**](/docs/workspace-deployment) — déployez chaque application du workspace sur une seule origine avec Netlify ou Vercel
+- [**Node.js**](/docs/node-js), [**Docker**](/docs/docker), [**Vercel**](/docs/vercel), [**Netlify**](/docs/netlify), [**AWS Lambda**](/docs/aws-lambda) et [**Deno Deploy**](/docs/deno-deploy) — les autres préréglages Nitro

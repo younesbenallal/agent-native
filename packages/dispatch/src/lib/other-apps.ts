@@ -1,8 +1,11 @@
+import { isDefaultWorkspaceAppHiddenId } from "./workspace-apps";
+
 export interface ConnectedAppSummary {
   id: string;
   name: string;
   description?: string;
   url: string;
+  homeUrl?: string;
   color?: string;
   source?: "builtin" | "custom" | "workspace";
 }
@@ -11,6 +14,8 @@ export interface WorkspaceAppId {
   id: string;
   isDispatch?: boolean;
 }
+
+const HIDDEN_OTHER_APP_IDS = new Set(["crm", "research"]);
 
 function isHttpUrl(value: string): boolean {
   try {
@@ -34,8 +39,15 @@ export function filterOtherApps(
   return connectedApps
     .filter((app) => {
       const id = app.id.trim().toLowerCase();
-      if (!id || workspaceAppIds.has(id) || seen.has(id)) return false;
-      if (app.source === "workspace") return false;
+      if (
+        !id ||
+        isDefaultWorkspaceAppHiddenId(id) ||
+        HIDDEN_OTHER_APP_IDS.has(id) ||
+        workspaceAppIds.has(id) ||
+        seen.has(id)
+      )
+        return false;
+      if (app.source !== "custom") return false;
       if (!isHttpUrl(app.url)) return false;
       seen.add(id);
       return true;

@@ -9,14 +9,14 @@
     "bubble",
     "signin",
     "finalizing",
-    "onboarding",
     "meeting-notif",
     "meeting-nub",
     "flow-bar",
     "recording-pill",
     "region-guides",
     "region-guide-editor",
-    "region-record-border"
+    "region-record-border",
+    "monitor-picker-*"
   ],
   "permissions": [
     "core:default",

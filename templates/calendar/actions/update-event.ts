@@ -1,4 +1,7 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction, fail } from "@agent-native/core/action";
+import type { ActionRunContext } from "@agent-native/core/action";
+import { buildDeepLink } from "@agent-native/core/server";
+import { track } from "@agent-native/core/tracking";
 import { z } from "zod";
 
 import {
@@ -8,6 +11,7 @@ import {
 import { prepareZoomMeetingPatch } from "../server/lib/event-video-conferencing.js";
 import * as googleCalendar from "../server/lib/google-calendar.js";
 import type { CalendarEvent } from "../shared/api.js";
+import { isCalendarEventOrganizer } from "../shared/event-permissions.js";
 import {
   availabilityInput,
   attachmentsInput,
@@ -17,13 +21,16 @@ import {
   cliBoolean,
   googleColorIdInput,
   normalizeAttendees,
-  normalizeGoogleEventId,
+  googleEventResultId,
+  normalizeWritableGoogleEventId,
   normalizeRecurrence,
   reminderMethodInput,
   reminderMinutesInput,
   remindersInput,
   requireActionUserEmail,
+  resolveGoogleEventAccountEmail,
   resolveOwnedAccountEmail,
+  validateEventTimeOrder,
   validateStatusEventTiming,
   visibilityInput,
   workingLocationTypeInput,
@@ -67,6 +74,14 @@ function mergeAttendees(
   return Array.from(merged.values());
 }
 
+function namesGuests(value: unknown): boolean {
+  if (typeof value !== "string" && !Array.isArray(value)) return false;
+  return (
+    (normalizeAttendees(value as Parameters<typeof normalizeAttendees>[0])
+      ?.length ?? 0) > 0
+  );
+}
+
 function workingLocationTitle(
   properties: NonNullable<CalendarEvent["workingLocationProperties"]>,
 ): string {
@@ -77,9 +92,22 @@ function workingLocationTitle(
   return properties.customLocation?.label || "Working location";
 }
 
+function eventChange(id: string, title: string) {
+  return {
+    verb: "updated" as const,
+    kind: "calendar-event",
+    title: title.trim().slice(0, 180) || "Event",
+    url: buildDeepLink({
+      app: "calendar",
+      view: "calendar",
+      params: { eventId: id },
+    }),
+  };
+}
+
 export default defineAction({
   description:
-    "Update a Google Calendar event. Supports title, description, location, time, event color, attachments, reminders, and recurrence rules such as RRULE:FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR.",
+    "Update a Google Calendar event. Supports moving an existing event between connected Google account calendars, as well as title, description, location, time, event color, attachments, reminders, and recurrence rules such as RRULE:FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR.",
   schema: z.object({
     id: z
       .string()
@@ -89,6 +117,12 @@ export default defineAction({
       .optional()
       .describe(
         "Connected Google account email from list-events/search-events",
+      ),
+    targetAccountEmail: z
+      .string()
+      .optional()
+      .describe(
+        "Move this event to another connected Google account's primary calendar. Pass accountEmail as the current event account. Moving creates the event on the destination and removes it from the source.",
       ),
     title: z.string().optional().describe("New event title"),
     description: z.string().optional().describe("New event description"),
@@ -146,6 +180,9 @@ export default defineAction({
     addGoogleMeet: cliBoolean
       .optional()
       .describe("Generate and attach a Google Meet link to the event"),
+    removeGoogleMeet: cliBoolean
+      .optional()
+      .describe("Remove an attached Google Meet link from the event"),
     addZoom: cliBoolean
       .optional()
       .describe(
@@ -185,10 +222,25 @@ export default defineAction({
       ),
   }),
   toolCallable: false,
-  run: async (args) => {
+  needsApproval: ({
+    sendUpdates,
+    notificationMessage,
+    targetAccountEmail,
+    addAttendees,
+  }) =>
+    targetAccountEmail !== undefined ||
+    sendUpdates === "all" ||
+    !!notificationMessage?.trim() ||
+    (sendUpdates === undefined && namesGuests(addAttendees)),
+  run: async (args, actionContext?: ActionRunContext) => {
     const ownerEmail = requireActionUserEmail();
     if (args.addGoogleMeet && args.addZoom) {
       throw new Error("Choose either Google Meet or Zoom, not both.");
+    }
+    if (args.addGoogleMeet && args.removeGoogleMeet) {
+      throw new Error(
+        "Choose either adding or removing Google Meet, not both.",
+      );
     }
     if (args.attendees !== undefined && args.addAttendees !== undefined) {
       throw new Error("Use either attendees or addAttendees, not both.");
@@ -200,11 +252,16 @@ export default defineAction({
       );
     }
 
-    const googleEventId = normalizeGoogleEventId(args.id);
     const accountEmail = await resolveOwnedAccountEmail(
-      args.accountEmail,
+      resolveGoogleEventAccountEmail(args.id, args.accountEmail),
       ownerEmail,
     );
+    const googleEventId = normalizeWritableGoogleEventId(args.id);
+    const targetAccountEmail =
+      args.targetAccountEmail !== undefined
+        ? await resolveOwnedAccountEmail(args.targetAccountEmail, ownerEmail)
+        : undefined;
+    const hasAccountMove = targetAccountEmail !== undefined;
     const recurrence = normalizeRecurrence(args.recurrence);
     const guestNotificationMessage = normalizeGuestNotificationMessage(
       args.notificationMessage,
@@ -227,6 +284,7 @@ export default defineAction({
     let attendees = normalizeAttendees(args.attendees);
 
     const hasPatch =
+      hasAccountMove ||
       args.title !== undefined ||
       args.description !== undefined ||
       args.location !== undefined ||
@@ -245,6 +303,7 @@ export default defineAction({
       attendeesToAdd !== undefined ||
       Object.keys(reminderFields).length > 0 ||
       args.addGoogleMeet === true ||
+      args.removeGoogleMeet === true ||
       args.addZoom === true ||
       hasWorkingLocationPatch;
 
@@ -283,6 +342,118 @@ export default defineAction({
       return existingEvent;
     };
 
+    if (hasAccountMove) {
+      if (
+        targetAccountEmail!.trim().toLowerCase() ===
+        accountEmail.trim().toLowerCase()
+      ) {
+        throw new Error(
+          "The destination calendar must be different from the current calendar.",
+        );
+      }
+      if (args.scope === "all") {
+        throw new Error(
+          "Move a recurring event occurrence with scope single; moving an entire recurring series is not supported.",
+        );
+      }
+
+      const existingEvent = await loadExistingEvent();
+      if (!isCalendarEventOrganizer(existingEvent)) {
+        fail("Only the event organizer can move or reschedule this event.");
+      }
+      const hasOtherEventPatch =
+        args.title !== undefined ||
+        args.description !== undefined ||
+        args.location !== undefined ||
+        args.start !== undefined ||
+        args.end !== undefined ||
+        args.startTimeZone !== undefined ||
+        args.endTimeZone !== undefined ||
+        args.allDay !== undefined ||
+        args.transparency !== undefined ||
+        args.visibility !== undefined ||
+        args.status !== undefined ||
+        args.remindersUseDefault !== undefined ||
+        args.reminders !== undefined ||
+        args.attachments !== undefined ||
+        args.colorId !== undefined ||
+        args.reminderMinutes !== undefined ||
+        args.reminderMethod !== undefined ||
+        args.addGoogleMeet !== undefined ||
+        args.removeGoogleMeet !== undefined ||
+        args.addZoom !== undefined ||
+        args.recurrence !== undefined ||
+        args.attendees !== undefined ||
+        args.addAttendees !== undefined ||
+        args.workingLocationType !== undefined ||
+        args.workingLocationLabel !== undefined;
+      if (hasOtherEventPatch) {
+        throw new Error(
+          "Move the event separately from other event field changes.",
+        );
+      }
+
+      const sendUpdates =
+        args.sendUpdates ??
+        (existingEvent.attendees?.some((attendee) => !attendee.self)
+          ? "all"
+          : "none");
+      const result = await googleCalendar.moveEvent(googleEventId, {
+        sourceAccount: { ownerEmail, accountEmail },
+        destinationAccount: {
+          ownerEmail,
+          accountEmail: targetAccountEmail!,
+        },
+        sendUpdates,
+      });
+      if (!result.id) {
+        throw new Error("Google did not return an id for the moved event.");
+      }
+
+      const guestNotification = guestNotificationMessage
+        ? await sendEventGuestNotificationNote({
+            event: {
+              ...existingEvent,
+              id: `google-${result.id}`,
+              googleEventId: result.id,
+              accountEmail: targetAccountEmail,
+              htmlLink: result.htmlLink,
+              hangoutLink: result.meetLink,
+              conferenceData: result.conferenceData,
+            },
+            organizerEmail: ownerEmail,
+            message: guestNotificationMessage,
+            kind: "update",
+          })
+        : undefined;
+
+      track(
+        "event_rescheduled",
+        {
+          app_name: "calendar",
+          template_name: "calendar",
+          event_id: `google-${result.id}`,
+          output_id: `google-${result.id}`,
+          output_type: "calendar_event",
+          change_type: "account_move",
+        },
+        actionContext,
+      );
+      const id = googleEventResultId(args.id, result.id, targetAccountEmail!);
+      return {
+        success: true,
+        id,
+        replacedId: googleEventResultId(args.id, googleEventId, accountEmail),
+        accountEmail: targetAccountEmail,
+        updated: ["accountEmail"],
+        htmlLink: result.htmlLink,
+        hangoutLink: result.meetLink,
+        conferenceData: result.conferenceData,
+        change: eventChange(id, existingEvent.title),
+        ...(guestNotification ? { guestNotification } : {}),
+      };
+    }
+
     if (args.location !== undefined && !hasWorkingLocationPatch) {
       const existingEvent = await loadExistingEvent();
       if (existingEvent.eventType === "workingLocation") {
@@ -294,6 +465,9 @@ export default defineAction({
 
     if (hasTimePatch) {
       const existingEvent = await loadExistingEvent();
+      if (!isCalendarEventOrganizer(existingEvent)) {
+        fail("Only the event organizer can move or reschedule this event.");
+      }
       const existingStatusEventType =
         existingEvent.eventType === "outOfOffice" ||
         existingEvent.eventType === "focusTime" ||
@@ -306,6 +480,12 @@ export default defineAction({
         start: args.start ?? existingEvent.start,
         end: args.end ?? existingEvent.end,
       });
+      validateEventTimeOrder({
+        allDay: args.allDay ?? existingEvent.allDay,
+        start: args.start ?? existingEvent.start,
+        end: args.end ?? existingEvent.end,
+      });
+      updates.allDay = args.allDay ?? existingEvent.allDay;
       if (
         existingEvent.eventType === "workingLocation" &&
         existingEvent.workingLocationProperties
@@ -403,7 +583,7 @@ export default defineAction({
     if (updatedKeys.length === 0 && zoomAlreadyPresent) {
       return {
         success: true,
-        id: `google-${googleEventId}`,
+        id: googleEventResultId(args.id, googleEventId, accountEmail),
         accountEmail,
         updated: [],
         meetingLink: zoomMeetingLink,
@@ -511,6 +691,7 @@ export default defineAction({
             ? "all"
             : undefined),
         addGoogleMeet: args.addGoogleMeet,
+        removeGoogleMeet: args.removeGoogleMeet,
         scope: args.scope,
       });
     }
@@ -546,11 +727,42 @@ export default defineAction({
           })
         : undefined;
 
+    if (hasTimePatch) {
+      track(
+        "event_rescheduled",
+        {
+          app_name: "calendar",
+          template_name: "calendar",
+          event_id: `google-${returnedGoogleEventId}`,
+          output_id: `google-${returnedGoogleEventId}`,
+          output_type: "calendar_event",
+          change_type: "time",
+        },
+        actionContext,
+      );
+    }
+
+    const id = googleEventResultId(
+      args.id,
+      returnedGoogleEventId,
+      accountEmail,
+    );
+    const title =
+      hasWorkingLocationPatch && updates.workingLocationProperties
+        ? workingLocationTitle(updates.workingLocationProperties)
+        : (args.title ?? existingEvent?.title ?? "Event");
+
     return {
       success: true,
-      id: `google-${returnedGoogleEventId}`,
+      id,
       ...(returnedGoogleEventId !== googleEventId
-        ? { replacedId: `google-${googleEventId}` }
+        ? {
+            replacedId: googleEventResultId(
+              args.id,
+              googleEventId,
+              accountEmail,
+            ),
+          }
         : {}),
       accountEmail,
       updated: updatedKeys,
@@ -558,7 +770,9 @@ export default defineAction({
       hangoutLink: result.meetLink,
       meetingLink: zoomMeetingLink,
       conferenceData: result.conferenceData,
+      ...(args.removeGoogleMeet ? { removedGoogleMeet: true } : {}),
       ...returnedPatch,
+      change: eventChange(id, title),
       ...(guestNotification ? { guestNotification } : {}),
     };
   },

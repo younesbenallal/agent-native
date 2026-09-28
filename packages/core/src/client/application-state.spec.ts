@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  compareAndSetClientAppState,
   deleteClientAppState,
   readClientAppState,
   readClientAppStateMany,
@@ -41,6 +42,7 @@ describe("client application-state helpers", () => {
       {
         method: "GET",
         cache: "no-store",
+        headers: { "X-Agent-Native-Browser-Tab": expect.any(String) },
         signal: undefined,
       },
     );
@@ -69,8 +71,6 @@ describe("client application-state helpers", () => {
     expect(navigation).toEqual({ view: "detail" });
     expect(selection).toEqual({ ids: ["a"] });
     expect(duplicate).toEqual({ view: "detail" });
-    // Absent keys still read as `null` through the single-key helper, matching
-    // the pre-batching contract.
     expect(url).toBeNull();
   });
 
@@ -140,6 +140,7 @@ describe("client application-state helpers", () => {
         method: "PUT",
         headers: {
           "Content-Type": "application/json",
+          "X-Agent-Native-Browser-Tab": expect.any(String),
           "X-Request-Source": "tab-1",
         },
         body: JSON.stringify(value),
@@ -211,6 +212,27 @@ describe("client application-state helpers", () => {
       message: "Read application state [navigation] failed: Unauthenticated",
       status: 401,
     });
+  });
+
+  it("compares app state through the atomic server endpoint", async () => {
+    const expected = { submissions: [] };
+    const next = { submissions: [{ id: "submission-1" }] };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ changed: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      compareAndSetClientAppState("agentkit-deferred", expected, next),
+    ).resolves.toBe(true);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/_agent-native/application-state/agentkit-deferred",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ expected, next }),
+      }),
+    );
   });
 
   it("rejects direct writes of undefined values", async () => {

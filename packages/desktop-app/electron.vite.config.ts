@@ -82,7 +82,6 @@ function inlinePreloadChunksPlugin(): Plugin {
   return {
     name: "agent-native:inline-preload-chunks",
     generateBundle(_options, bundle) {
-      // Sandboxed Electron preloads need to be self-contained inside app.asar.
       const preloadBundle = bundle as PreloadOutputBundle;
       const sharedChunks = Object.entries(preloadBundle).flatMap(
         ([fileName, output]) =>
@@ -169,6 +168,11 @@ function resolveSentryDsn(): string {
 }
 
 const desktopSentryDefines = {
+  __AGENT_NATIVE_DESKTOP_RELEASE_CHANNEL__: JSON.stringify(
+    process.env.AGENT_NATIVE_DESKTOP_RELEASE_CHANNEL === "nightly"
+      ? "nightly"
+      : "production",
+  ),
   __AGENT_NATIVE_DESKTOP_SENTRY_DSN__: JSON.stringify(resolveSentryDsn()),
   __AGENT_NATIVE_DESKTOP_SENTRY_ENVIRONMENT__: JSON.stringify(
     firstNonEmpty(
@@ -196,9 +200,18 @@ const desktopSentryDefines = {
   ),
 };
 
+const desktopBuildChannel =
+  firstNonEmpty(process.env.AGENT_NATIVE_DESKTOP_BUILD_CHANNEL) ||
+  (process.env.CI === "true" || process.env.CI === "1" ? "release" : "dev");
+
+const desktopDefines = {
+  ...desktopSentryDefines,
+  __AGENT_NATIVE_DESKTOP_BUILD_CHANNEL__: JSON.stringify(desktopBuildChannel),
+};
+
 export default defineConfig({
   main: {
-    define: desktopSentryDefines,
+    define: desktopDefines,
     plugins: [
       externalizeDepsPlugin({
         exclude: [
@@ -220,7 +233,7 @@ export default defineConfig({
     },
     build: {
       rollupOptions: {
-        external: ["electron", /^electron\/.+/],
+        external: ["electron", /^electron\/.+/, "node-pty"],
         input: {
           index: resolve("src/main/index.ts"),
           "browser-control-host": resolve(
@@ -232,7 +245,7 @@ export default defineConfig({
     },
   },
   preload: {
-    define: desktopSentryDefines,
+    define: desktopDefines,
     plugins: [
       externalizeDepsPlugin({
         exclude: [
@@ -254,6 +267,7 @@ export default defineConfig({
         input: {
           index: resolve("src/preload/index.ts"),
           webview: resolve("src/preload/webview.ts"),
+          "webview-chat": resolve("src/preload/webview-chat.ts"),
         },
         output: {
           format: "cjs",
@@ -263,7 +277,7 @@ export default defineConfig({
     },
   },
   renderer: {
-    define: desktopSentryDefines,
+    define: desktopDefines,
     optimizeDeps: {
       exclude: workspaceRendererPackages,
     },

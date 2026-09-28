@@ -9,7 +9,7 @@ import type {
 } from "@shared/api";
 import { formulaValueText, isComputedPropertyType } from "@shared/properties";
 
-import { calendarDateKey, propertyDateValue } from "./calendar-timeline";
+import { propertyDateValue } from "./calendar-timeline";
 import {
   type ColumnKey,
   type DatabaseConditionMoveDirection,
@@ -578,7 +578,8 @@ function databaseItemFilterCandidateValues(
     property.definition.type === "select" ||
     property.definition.type === "status"
   ) {
-    const id = String(value);
+    const id =
+      typeof value === "string" ? value : (JSON.stringify(value) ?? "");
     const optionName =
       property.definition.options.options?.find((option) => option.id === id)
         ?.name ?? id;
@@ -610,8 +611,11 @@ export function propertyValueText(
   ) {
     return (
       property.definition.options.options?.find(
-        (option) => option.id === String(value),
-      )?.name ?? String(value)
+        (option) =>
+          option.id ===
+          (typeof value === "string" ? value : (JSON.stringify(value) ?? "")),
+      )?.name ??
+      (typeof value === "string" ? value : (JSON.stringify(value) ?? ""))
     );
   }
   if (property.definition.type === "checkbox") {
@@ -654,7 +658,12 @@ export function propertyNumberValue(
   const value =
     typeof property.value === "number"
       ? property.value
-      : Number(String(property.value).trim());
+      : Number(
+          (typeof property.value === "string"
+            ? property.value
+            : (JSON.stringify(property.value) ?? "")
+          ).trim(),
+        );
   return Number.isFinite(value) ? value : Number.NaN;
 }
 

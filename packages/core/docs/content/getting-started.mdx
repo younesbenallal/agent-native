@@ -1,151 +1,214 @@
 ---
 title: "Getting Started"
-description: "Create a Chat app and connect an AI engine so your agent can respond."
+description: "Create an agent with a chat UI and call the same action from the agent and the UI."
 ---
 
 # Getting Started
 
-Agent-Native is for agentic applications: apps where the AI agent and the UI
-share the same [actions](/docs/actions), SQL data, and application state. Start
-with chat so users can talk to the agent immediately, then add the app surfaces
-your workflow earns. New to the concept rather than the code? Read
-[What Is Agent-Native?](/docs/what-is-agent-native) first — this page is the
-hands-on build path.
+<GettingStartedPaths />
 
-The quickest way in is the **Chat template**: a minimal app that gives you a
-working AI chat interface, durable threads, auth, and an `actions/` directory
-ready to extend. This guide is split into four short pages so you can stop at
-any point with a working app.
+Agent-Native is an open-source TypeScript framework for building autonomous
+agents with intuitive UIs. You define each capability once as an
+[action](/docs/actions-overview)—a typed function the agent uses as a tool and
+the UI calls from code.
 
-<Steps>
+In this guide, you'll create an agent with a chat UI and call its included
+`hello` action from the agent and the UI.
 
-### Create a chat app and connect AI
+## Prerequisites
 
-Scaffold the Chat template, install dependencies, start the dev server, and
-connect an AI engine. You'll have a working agent chat in under five minutes.
-**You are here.**
+- [Node.js](https://nodejs.org) 22.22 or later
+- [pnpm](https://pnpm.io) available on your `PATH` (run `corepack enable` in
+  the generated app if it is not)
+- An LLM connection for the agent: Builder.io, an Anthropic or OpenAI API key,
+  or a local Ollama model
 
-### Add an action
+## Create an agent
 
-Define your first typed action — a text analyzer — and register a React
-renderer so the result appears as a bar chart directly inside the chat
-transcript.
-
-### Persist data in SQL
-
-Wire up a database plugin, define a schema, and add read/write actions so the
-agent can save and recall results across conversations.
-
-### Add a page
-
-Build a React route that lists saved analyses, then extend the sidebar so users
-and the agent can navigate to it.
-
-</Steps>
-
-## 1. Create a chat app {#create-your-app}
-
-You'll need [Node.js 22+](https://nodejs.org) and [pnpm](https://pnpm.io).
-
-Open a terminal, go to the directory where you want your Agent Native app, and run:
+In a new directory, start from the Chat template:
 
 ```bash
-npx @agent-native/core@latest create my-app --template chat
+npx --yes @agent-native/core@latest create my-app --standalone --template chat
 cd my-app
+corepack enable
 pnpm install
+```
+
+The template gives your agent a browser UI, authentication, durable
+conversations, live sync, application context, and an `actions/` directory. It
+also includes a small `hello` action that you'll use throughout this guide.
+
+## Start the development server
+
+Start the development server:
+
+```bash
 pnpm dev
 ```
 
-This gives you durable chat threads, auth, live sync, an `actions/` directory,
-standard `view-screen` and `navigate` actions, and a small React app you can
-extend.
-
-The dev server starts and opens `http://localhost:8080` in your browser. You may
-notice a few startup log lines like `NitroViteError: Vite environment "nitro" is
-unavailable`. These are a normal race condition during the initial boot and
-resolve on their own. The app is ready once **VITE ready** displays in the
-terminal output.
-
-When the app starts, you might find yourself on the login screen rather than in the app. In this case, just sign up with a made-up login to satisfy the login screen. For local development, no email verification is actually required.
+The browser UI opens automatically. If it does not, open the local URL printed
+by `pnpm dev`; the port increments when another app is already using 8080.
 
 <Callout tone="info">
 
-**Want to attach a real debugger?** Run `agent-native dev --inspect` (or
-`--inspect-brk[=<port>]`) instead of `pnpm dev` to attach the Node inspector
-to the dev server, on port `9229` by default. Override the dev runner with
-the `NITRO_DEV_RUNNER` env var if your setup needs a different one.
+On the Welcome screen, select **Continue as local dev**. You don't need to
+enter an email or password for local development.
 
 </Callout>
 
-### If you want a different type of app
+## Connect an LLM
 
-This guide uses the Chat template because it is the shortest path
-to an agentic application: the agent can act on day one, and you have a real app
-surface to grow from. However, if you want to create a different kind of app, run `create` with no flags:
+Next, connect an LLM. Select **Connect Builder.io** to use free credits, or
+select **Custom keys**, choose a provider, and enter the requested connection
+details.
 
-```bash
-npx @agent-native/core@latest create my-app
+## Run the action from the agent
+
+An action is a typed function that your React UI can call from code and agents
+can use as a tool. The Chat template includes a simple `hello` action so you
+can try the pattern before writing one yourself.
+
+In the agent panel, ask:
+
+> Call the hello action for Alex.
+
+The agent finds `hello` from its description and input schema, passes `Alex` as
+the `name` input, and responds:
+
+```text
+Hello, Alex!
 ```
 
-The CLI first asks **How do you want to start?** with three choices: **Chat**
-(what this guide uses), **Full template(s)**, or **Headless**. Only picking
-**Full template(s)** takes you to the domain-template multi-select (Mail,
-Calendar, Forms, Analytics, Plan, and more) — Chat and Headless each scaffold a
-single standalone app directly, with no further picker.
+## Inspect the action
 
-## 2. Connect an AI engine {#connect-ai}
+In your local `my-app` directory, open `actions/hello.ts` in your code editor:
 
-The agent chat can't respond until you connect an AI engine. After you're logged in, click the **Connect AI** button and pick one of two paths:
+```ts filename="actions/hello.ts"
+import { defineAction } from "@agent-native/core/action";
+import { z } from "zod";
 
-| Path                   | Steps                                                                                                                                      |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Connect Builder**    | Click **Connect Builder.io** (free tier available), choose the Builder Space, then click **Authorize**. No keys to manage yourself.        |
-| **Bring your own key** | Enter your Anthropic or OpenAI API key in the Setup panel. Get an Anthropic key at [console.anthropic.com](https://console.anthropic.com). |
-
-Alternatively, create a `.env` file in the `my-app/` directory (the same
-directory that contains `package.json`) before running `pnpm dev`:
-
-```bash
-echo "ANTHROPIC_API_KEY=sk-ant-..." >> .env
+// One action powers every app surface: UI, agent, HTTP, MCP, A2A, and CLI.
+export default defineAction({
+  description: "Return a friendly greeting.",
+  schema: z.object({
+    name: z.string().default("world").describe("Name to greet"),
+  }),
+  http: { method: "GET" },
+  run: async ({ name }) => {
+    return { message: `Hello, ${name}!` };
+  },
+});
 ```
 
-Restart the dev server. Once an AI engine is connected, the Setup panel
-hides itself and the agent is ready to chat.
+For now, focus on four parts:
 
-<Callout tone="warning">
+- `description` tells the agent when to use the action.
+- `schema` validates the input and gives the agent a typed tool definition.
+- `http` exposes this read-only action through `GET`, which lets
+  `useActionQuery` call it from React.
+- `run` contains the application logic shared by the agent and the UI.
 
-**Blank screen?** Create a `.env` file in your `my-app/` directory with
-`ANTHROPIC_API_KEY=sk-ant-...`, then restart `pnpm dev`. The in-app Setup
-panel only appears once the app has loaded, so a missing key that prevents
-the app from rendering needs to be fixed via the environment variable rather than
-the UI.
+Read [Defining Actions](/docs/actions-defining) for the complete API.
+
+## Call the action from React
+
+The template includes `actions/hello.ts`, but not a page for it. Create
+`app/routes/hello.tsx`:
+
+```tsx filename="app/routes/hello.tsx"
+import { useActionQuery } from "@agent-native/core/client/hooks";
+import { useState } from "react";
+
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+
+export default function HelloRoute() {
+  const [name, setName] = useState("Alex");
+  const { data } = useActionQuery("hello", { name });
+
+  return (
+    <main className="mx-auto grid w-full max-w-xl gap-6 p-6">
+      <h1 className="text-2xl font-semibold">Hello action</h1>
+      <div className="grid gap-2">
+        <Label htmlFor="name">Name</Label>
+        <Input
+          id="name"
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+        />
+      </div>
+      <p className="text-xl font-medium">{data?.message}</p>
+    </main>
+  );
+}
+```
+
+<Callout tone="info">
+
+Restart the development server so it discovers the new route, then append
+`/hello` to the local URL printed by `pnpm dev`.
 
 </Callout>
 
-## What's next {#next}
+As you type a name, `useActionQuery` calls `hello` and renders the result. It
+infers the action's input and result types, so the page doesn't need a custom
+API route or a second implementation of the greeting.
 
-Your app is running and the agent can respond. Continue the series to build it out:
+## Change the action
+
+In `actions/hello.ts`, change the return value:
+
+```ts
+return { message: `Welcome, ${name}.` };
+```
+
+Refresh `/hello`, then ask the agent to call `hello` again. Both return the
+updated greeting because they call the same action.
+
+## Call actions in other ways
+
+You called the same action from the agent and UI. The same action can also be
+called from:
+
+| Call from                               | Use it to                                                     |
+| --------------------------------------- | ------------------------------------------------------------- |
+| [HTTP API](/docs/http-api)              | Call an action from a script, backend, or integration.        |
+| [CLI](/docs/actions-other-surfaces#cli) | Run or test an action from a terminal.                        |
+| [MCP](/docs/actions-other-surfaces#mcp) | Let an external AI client discover and call actions as tools. |
+| [A2A](/docs/actions-other-surfaces#a2a) | Let another agent delegate work to yours.                     |
+
+Every caller uses the same action definition. You do not need a separate
+implementation for each one. This shared action model is central to
+Agent-Native: behavior, validation, and permissions stay aligned across the
+UI, agents, and integrations as you add capabilities.
+
+## What you built
+
+You created an agent with a chat UI, called the same `hello` action from the
+agent and a React UI, then changed the greeting once and watched both update.
+Every action you write from here follows that same pattern.
+
+## Next steps
 
 <Cards>
 
-### [Add an Action](/docs/getting-started-actions)
+### [What is Agent-Native?](/docs/what-is-agent-native)
 
-Define your first typed action and render its result as a chart directly inside
-the chat transcript.
+Understand why the UI and agent share actions, data, and context.
 
-### [Persist Data in SQL](/docs/getting-started-database)
+### [Key Concepts](/docs/key-concepts)
 
-Save action results to a database so the agent can reference them across
-conversations.
+Learn how actions, SQL data, application context, access, and live sync fit
+together.
 
-### [Add a Page](/docs/getting-started-pages)
+### [Actions](/docs/actions-overview)
 
-Build a React route that displays your saved data and wire it into the sidebar.
+Define actions for reads, writes, and approvals, then call them from the UI,
+agents, and external clients.
+
+### [Deploy an app](/docs/deploy-an-app)
+
+Move from local development to a persistent database, production auth, and a
+supported deployment target.
 
 </Cards>
-
-Or jump to a specific topic:
-
-- **[What Is Agent-Native?](/docs/what-is-agent-native)**: the vision and case for building this way.
-- **[Chat Template](/docs/template-chat)**: the minimal chat-first app you just created.
-- **[FAQ](/docs/faq)**: quick answers on cost, hosting, models, and templates.

@@ -1,3 +1,9 @@
+import { getAppConfig } from "../app-config/index.js";
+import {
+  BACKGROUND_AUTOMATION_SOFT_TIMEOUT_HEADROOM_MS,
+  BACKGROUND_SOFT_TIMEOUT_CEILING_MS,
+  RUN_NO_PROGRESS_HARD_TIMEOUT_MS,
+} from "../app-config/run-lifecycle-invariants.js";
 import { captureError } from "../server/capture-error.js";
 import {
   isLlmCredentialError,
@@ -10,7 +16,9 @@ import {
   isProviderConnectionError,
 } from "./engine/error-detail.js";
 import { EngineError } from "./engine/types.js";
+import type { EngineRequestShape } from "./engine/types.js";
 import {
+  type AgentTurnInitiator,
   insertRun,
   insertRunEvent,
   updateRunStatusIfRunning,
@@ -18,6 +26,7 @@ import {
   getRunAbortState,
   getRunStatus,
   getRunEventsSince,
+  getCurrentTurnRunEventsForThread,
   getRunById,
   getRunByThread,
   getRunTurnRef,
@@ -36,7 +45,13 @@ import {
   setRunError,
   setRunTerminalReason,
   persistRunCheckpointEvent,
+  recordRunDiagnostic,
+  RUN_DIAG_STAGE,
   terminalEventForAbortReason,
+  RUN_RECORD_MISSING_ERROR_EVENT,
+  RUN_RECORD_MISSING_GRACE_MS,
+  RUN_TERMINAL_LOOKUP_FAILED_ERROR_EVENT,
+  UNKNOWN_RUN_STATUS_ERROR_EVENT,
 } from "./run-store.js";
 import { isContinuationTerminalReason } from "./types.js";
 import type { AgentChatEvent, RunEvent, RunStatus } from "./types.js";
@@ -44,183 +59,45 @@ import type { AgentChatEvent, RunEvent, RunStatus } from "./types.js";
 export interface ActiveRun {
   runId: string;
   threadId: string;
-  /** Logical-turn identity (see StartRunOptions.turnId). Defaults to runId. */
+  parentId?: string | null;
   turnId: string;
   events: RunEvent[];
   status: RunStatus;
   subscribers: Set<(event: RunEvent) => void>;
   abort: AbortController;
   abortReason?: string;
-  /**
-   * Terminal event to emit when a server-driven continuation has been handed
-   * off successfully. The continuation runs outside this process, so the
-   * normal loop-level auto_continue event is not sent through this run's
-   * `send` callback.
-   */
   continuationTerminalEvent?: Extract<
     AgentChatEvent,
-    { type: "auto_continue" }
+    { type: "auto_continue" } | { type: "error" }
   >;
   startedAt: number;
 }
 
 export interface StartedRun extends ActiveRun {
-  /**
-   * Resolves after the terminal event and final SQL status have been persisted.
-   * Serverless workers must await this before returning or the runtime can
-   * freeze the isolate between onComplete and terminalization.
-   */
   finalized: Promise<void>;
 }
 
 const activeRuns = new Map<string, ActiveRun>();
 const threadToRun = new Map<string, string>();
 
-/** How long to keep completed runs in memory before cleanup (5 min) */
 const CLEANUP_DELAY_MS = 5 * 60 * 1000;
 
-/**
- * Default run chunk budget for hosted/serverless deploys.
- *
- * This MUST fire before the two upstream hard walls that otherwise kill a run
- * mid-turn with no chance to hand off:
- *   1. The Builder model gateway keeps a 45s cap only for hosted foreground
- *      runs; local and proven background-function runs use longer caps.
- *   2. Serverless functions are hard-killed around 60-65s (the heartbeat then
- *      reaps the row as a stale_run).
- * Production data showed every cutoff landing in the 44-70s window with ZERO
- * auto_continue events ever emitted — i.e. the old 45s default raced the 45s
- * gateway and lost, and per-template overrides (e.g. 240_000) pushed it past
- * BOTH walls so it could never fire. 40s leaves ~5s of headroom under the
- * gateway wall to abort, persist the partial turn, write the terminal event,
- * and emit a clean auto_continue so the client resumes seamlessly.
- */
 export const DEFAULT_HOSTED_RUN_SOFT_TIMEOUT_MS = 40_000;
 
-/**
- * Hard ceiling for the hosted soft timeout. On a hosted runtime the
- * foreground auto_continue soft timeout can never usefully exceed this — the
- * synchronous function (~60s) wall kills the run first, so a larger configured
- * or env value just guarantees the cutoff is a hard error instead of a graceful
- * hand-off. Any resolved value above this is clamped down for hosted foreground
- * runs. Local dev (non-hosted) is left alone so long-running local turns aren't
- * chunked.
- *
- * IMPORTANT: this clamp is for the INTERACTIVE / foreground path and must NOT
- * be raised. The foreground POST still rides a synchronous serverless function
- * (~60-65s wall), so 40s remains correct there. The only sanctioned exception
- * is the opt-in `backgroundFunction` mode (see
- * `BACKGROUND_SOFT_TIMEOUT_CEILING_MS`), which runs inside a Netlify background
- * function (no ~60s wall, 15-min budget) and therefore can safely outlast 40s.
- */
 export const HOSTED_SOFT_TIMEOUT_CEILING_MS = 40_000;
 
-/**
- * Hard ceiling for the soft timeout when a run executes inside a Netlify
- * background function (any deployed function whose name ends in `-background`).
- * Background functions return 202 immediately and run detached for up to 15
- * minutes, so the ~60s synchronous function wall that 40s defends against does
- * NOT apply. 13 minutes leaves ~2 min of headroom under Netlify's 15-min hard
- * kill to abort, persist the partial turn, write the terminal event, and (for
- * the rare >13-min turn) self-fire another background continuation.
- *
- * This ceiling is used ONLY when a caller explicitly opts in with
- * `backgroundFunction: true`. It does not change the foreground/interactive
- * ceiling and does not fire unless the durable-background path dispatched the
- * run into a background function. Per the design doc Guardrail, the 40s
- * interactive clamp stays correct for every non-background run.
- */
-export const BACKGROUND_SOFT_TIMEOUT_CEILING_MS = 13 * 60_000; // 780_000
-
-/**
- * Default soft-timeout budget for a background-function run when the caller
- * does not pass an explicit `softTimeoutMs`. Same value as the ceiling — we
- * want a background turn to use nearly its whole 15-min budget before handing
- * off to a chained background continuation.
- */
-export const DEFAULT_BACKGROUND_RUN_SOFT_TIMEOUT_MS =
-  BACKGROUND_SOFT_TIMEOUT_CEILING_MS;
-
-/**
- * AUTHORITATIVE no-progress backstop for a run, enforced by the run manager
- * itself (timer-driven, independent of any layer below).
- *
- * The finer-grained watchdogs inside the agent loop (model-stream and
- * action-preparation no-progress, both 90s) only guard the model event stream
- * — a stall in any segment OUTSIDE that guarded loop (engine-call
- * establishment, worker setup between continuation chunks, a wedged transport
- * that emits keepalives while the loop never runs) previously hung forever
- * with the client watching keepalives. This backstop covers every segment by
- * construction: if no REAL progress event (see `shouldBumpProgressForEvent`;
- * keepalives and zero-byte prep activity don't count) lands for this long —
- * and no tool call is in flight (tool execution legitimately emits nothing
- * for minutes and has its own 12-min timeout) — the run manager emits
- * `auto_continue { reason: "no_progress" }` and aborts the chunk, exactly
- * like the soft timeout, so the normal continuation machinery recovers it.
- *
- * This is now only the CEILING, not the value: `resolveRunNoProgressTimeoutMs`
- * clamps the foreground backstop to a fraction of the chunk's soft timeout
- * (~30s at a 40s chunk), which is BELOW the 90s in-loop watchdogs rather than
- * above them. That ordering is deliberate — the in-loop watchdogs could never
- * fire inside a hosted foreground chunk anyway, since the serverless wall
- * (~57-59s) arrives first. Proven durable-background chunks keep the full
- * `DEFAULT_BACKGROUND_NO_PROGRESS_TIMEOUT_MS` so large outputs can use the
- * background budget. Only armed when a soft-timeout regime is active (hosted
- * runs); local dev stays unbounded.
- */
-export const RUN_NO_PROGRESS_HARD_TIMEOUT_MS = 150_000;
-
-/**
- * Default no-progress window for a run executing inside a proven durable
- * background function. A background worker that is heartbeating but has no
- * real progress and no tool/A2A work in flight is still wedged; letting that
- * state outlive the client's follow budget only turns a recoverable stall into
- * a terminal timeout. In-flight work suspends this backstop, so use the same
- * server-owned 150s bound as the long foreground regime.
- */
 export const DEFAULT_BACKGROUND_NO_PROGRESS_TIMEOUT_MS =
   RUN_NO_PROGRESS_HARD_TIMEOUT_MS;
 
-/**
- * Fraction of the soft timeout a foreground no-progress backstop may consume.
- * The hosted foreground path rides a synchronous serverless function whose
- * REAL wall is ~57-59s, not the configured 75s — so every watchdog derived
- * from a fixed constant above the soft timeout (the old flat 150s backstop
- * included) was unreachable dead code. Deriving from the soft timeout keeps
- * the backstop inside the budget by construction: at a 40s chunk this is 30s,
- * comfortably under both the wall and the client-side stuck detector.
- */
 const FOREGROUND_NO_PROGRESS_SOFT_TIMEOUT_FRACTION = 0.75;
 
-/**
- * Headroom reserved between a foreground tool call's ceiling and the chunk's
- * own soft timeout. A tool given a budget at or above the soft timeout can
- * never be interrupted by its own timeout — the chunk boundary always fires
- * first — so its timeout is dead code. Callers that impose a per-tool timeout
- * must clamp to `resolveRunToolTimeoutCeilingMs`.
- */
 const RUN_TOOL_TIMEOUT_HEADROOM_MS = 5_000;
 
-/**
- * Largest per-tool timeout that can actually fire inside this run's chunk
- * budget. `0` means "no run-imposed ceiling" (local dev / unbounded runs), in
- * which case the caller keeps its own default.
- */
 export function resolveRunToolTimeoutCeilingMs(softTimeoutMs: number): number {
   if (!(softTimeoutMs > 0)) return 0;
   return Math.max(1_000, softTimeoutMs - RUN_TOOL_TIMEOUT_HEADROOM_MS);
 }
 
-/**
- * Resolve the no-progress backstop for a run.
- *
- * Foreground values are clamped to a fraction of the chunk's soft timeout so a
- * template cannot configure a background-sized window (templates/analytics
- * passed 3min unconditionally) that outlives the serverless wall AND the
- * client-side watchdog — which is how the server's whole recovery ladder came
- * to never run. Background-function runs keep the full background budget and
- * take `backgroundOverrideMs` when a caller wants to tune only that regime.
- */
 export function resolveRunNoProgressTimeoutMs(params: {
   softTimeoutMs: number;
   backgroundFunction?: boolean;
@@ -233,85 +110,101 @@ export function resolveRunNoProgressTimeoutMs(params: {
       ? value
       : undefined;
 
+  const configured = getAppConfig().agent;
+
+  const budgetCeilingMs = Math.floor(
+    softTimeoutMs * FOREGROUND_NO_PROGRESS_SOFT_TIMEOUT_FRACTION,
+  );
+
   if (backgroundFunction === true) {
     const override =
       explicit(params.backgroundOverrideMs) ?? explicit(params.overrideMs);
-    if (override !== undefined) return override;
-    return softTimeoutMs > 0 ? DEFAULT_BACKGROUND_NO_PROGRESS_TIMEOUT_MS : 0;
+    if (!(softTimeoutMs > 0)) return override ?? 0;
+    if (override !== undefined) {
+      return override === 0 ? 0 : Math.min(override, budgetCeilingMs);
+    }
+    return Math.min(configured.backgroundNoProgressTimeoutMs, budgetCeilingMs);
   }
 
   const override = explicit(params.overrideMs);
-  // Local dev keeps runs unbounded unless a caller explicitly asks otherwise.
   if (!(softTimeoutMs > 0)) return override ?? 0;
 
-  const ceiling = Math.min(
-    RUN_NO_PROGRESS_HARD_TIMEOUT_MS,
-    Math.floor(softTimeoutMs * FOREGROUND_NO_PROGRESS_SOFT_TIMEOUT_FRACTION),
-  );
+  const ceiling = Math.min(RUN_NO_PROGRESS_HARD_TIMEOUT_MS, budgetCeilingMs);
   if (override === undefined) return ceiling;
   return override === 0 ? 0 : Math.min(override, ceiling);
 }
 
-/**
- * Default SQL retention for completed run event logs (24 hours).
- *
- * Deliberately SHORTER than the errored retention below. Reading outcome rates
- * straight off `agent_runs` over any wider window therefore undercounts
- * successes — `cleanupOldRuns` rolls each pruned row into
- * `agent_run_outcome_daily` (see `getRunOutcomeCounters`) so rates stay
- * correct; use counters plus live rows, not live rows alone.
- */
+function inFlightWorkDelta(event: AgentChatEvent): -1 | 0 | 1 {
+  switch (event.type) {
+    case "tool_start":
+      return 1;
+    case "tool_done":
+      return -1;
+    case "agent_call":
+    case "model_stream":
+      return event.status === "start" ? 1 : -1;
+    default:
+      return 0;
+  }
+}
+
 export const DEFAULT_COMPLETED_RUN_RETENTION_MS = 24 * 60 * 60 * 1000;
 
-/**
- * Default SQL retention for unsuccessful run event logs — errored, aborted, AND
- * truncated (7 days). Kept longer than completed runs so cut-off / failed chats
- * survive for pattern analysis (listErroredRuns): they are exactly the runs we
- * need to study to keep hardening reliability. Truncations only reach this
- * window because they are no longer filed as `completed`; while they were, the
- * most-reported failures were also the fastest-deleted evidence.
- */
 export const DEFAULT_ERRORED_RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
-/**
- * How recently a terminal run must have started for `/runs/active` to surface
- * it. Reconnect after this window won't replay the run — typical real-world
- * disconnects resolve in seconds, so 10 minutes is generous while keeping us
- * from resurrecting ancient turns when the user reopens an old thread.
- */
-export const TERMINAL_RUN_RECONNECT_WINDOW_MS = 10 * 60 * 1000;
+export const TERMINAL_RUN_RECONNECT_WINDOW_MS = 20 * 60 * 1000;
 
-/** Fast poll cadence while a SQL-backed SSE subscription is actively receiving rows. */
 export const SQL_SUBSCRIPTION_ACTIVE_POLL_MS = 125;
 
-/** Baseline SQL-backed SSE poll cadence when the run is idle. */
 export const SQL_SUBSCRIPTION_IDLE_POLL_MS = 500;
 
-/**
- * Keep briefly polling quickly after rows arrive so token streams stay smooth,
- * then back off to the idle cadence if the producer goes quiet.
- */
 export const SQL_SUBSCRIPTION_ACTIVE_GRACE_MS = 2_000;
 
-/** Keep terminal/status probes at the historical cadence to bound DB work. */
 export const SQL_SUBSCRIPTION_STATUS_POLL_MS = 500;
 
-/** Initial retry delay after a transient cross-isolate SQL polling failure. */
+export const SQL_SUBSCRIPTION_IDLE_DECAY_AFTER_POLLS = 4;
+
+export const SQL_SUBSCRIPTION_IDLE_MAX_POLL_MS = 2_000;
+
+export const SQL_SUBSCRIPTION_REAP_POLL_MS = 5_000;
+
 export const SQL_SUBSCRIPTION_RETRY_BASE_MS = 250;
 
-/** Bound consecutive SQL polling failures so a dead subscription fails loud. */
+export const IN_MEMORY_TERMINAL_SETTLE_MS = 5_000;
+
 export const SQL_SUBSCRIPTION_MAX_CONSECUTIVE_FAILURES = 4;
 
-/** Cap retry delay even if the failure bound changes independently. */
 export const SQL_SUBSCRIPTION_RETRY_MAX_MS = 2_000;
 
 export function resolveSqlSubscriptionPollMs(
   now: number,
   activePollUntil: number,
+  consecutiveEmptyPolls = 0,
 ): number {
-  return now < activePollUntil
-    ? SQL_SUBSCRIPTION_ACTIVE_POLL_MS
-    : SQL_SUBSCRIPTION_IDLE_POLL_MS;
+  if (now < activePollUntil) return SQL_SUBSCRIPTION_ACTIVE_POLL_MS;
+  const steps = Math.min(
+    16,
+    Math.max(
+      0,
+      Math.floor(consecutiveEmptyPolls) -
+        SQL_SUBSCRIPTION_IDLE_DECAY_AFTER_POLLS,
+    ),
+  );
+  return Math.min(
+    SQL_SUBSCRIPTION_IDLE_MAX_POLL_MS,
+    SQL_SUBSCRIPTION_IDLE_POLL_MS * 2 ** steps,
+  );
+}
+
+export function nextSqlSubscriptionEmptyPolls(
+  current: number,
+  hadEvents: boolean,
+  now: number,
+  activePollUntil: number,
+): number {
+  if (hadEvents) return 0;
+  if (now < activePollUntil) return current;
+  return current + 1;
 }
 
 export function resolveSqlSubscriptionRetryMs(
@@ -352,10 +245,19 @@ function getRunErrorCode(err: unknown): string | undefined {
     if (err.statusCode === 429) return PROVIDER_RATE_LIMITED_ERROR_CODE;
   }
   if (isProviderConnectionError(err)) return PROVIDER_NETWORK_ERROR_CODE;
-  // The code rides the error EVENT to the client, which decides recovery from
-  // it — so an uncoded transport failure has to be classified here too, not
-  // only when the run row is persisted.
   return classifyTerminalErrorCode(describeErrorWithCauses(err));
+}
+
+export function engineRequestShapeTags(
+  shape: EngineRequestShape | undefined,
+): Record<string, string> {
+  if (!shape) return {};
+  return {
+    engineModel: shape.model,
+    enginePayloadBytes: String(shape.payloadBytes),
+    engineToolCount: String(shape.toolCount),
+    engineMessageCount: String(shape.messageCount),
+  };
 }
 
 function getEngineRunErrorDetails(err: EngineError): string | undefined {
@@ -380,6 +282,7 @@ function shouldCaptureRunError(err: unknown): boolean {
   return (
     !normalizedCode.startsWith("credits-limit") &&
     normalizedCode !== "builder_gateway_network_error" &&
+    normalizedCode !== "builder_gateway_stream_ended" &&
     normalizedCode !== PROVIDER_NETWORK_ERROR_CODE &&
     normalizedCode !== "provider_rate_limited" &&
     normalizedCode !== "rate_limit_exceeded"
@@ -387,87 +290,36 @@ function shouldCaptureRunError(err: unknown): boolean {
 }
 
 export interface StartRunOptions {
-  /** Keep a request-scoped serverless invocation alive for this run. */
   waitUntil?: (promise: Promise<unknown>) => void;
-  /** Optional internal run chunk budget. When reached, the framework emits an
-   * auto-continuation signal instead of a user-facing timeout. Leave unset for
-   * no framework-imposed run timeout. */
   softTimeoutMs?: number;
-  /** Opt into the hosted/serverless default chunk budget. Only callers with
-   * automatic continuation support should enable this. */
   useHostedSoftTimeoutDefault?: boolean;
-  /** Stable identity for the logical assistant turn this run belongs to. A
-   * turn may span several continuation runs (each chunk is its own run); they
-   * share one `turnId` so the durable assistant message can be folded across
-   * them instead of dropped per-run. Defaults to the runId (turn == run). */
   turnId?: string;
-  /**
-   * Opt into the durable-background-function soft-timeout regime for THIS run
-   * only. When true, `resolveRunSoftTimeoutMs` lifts the hosted ceiling from
-   * 40s to ~13min (`BACKGROUND_SOFT_TIMEOUT_CEILING_MS`) because the run is
-   * executing inside a Netlify background function (no ~60s wall). Off by
-   * default — the foreground/interactive path never sets this, so its 40s
-   * clamp is unchanged. See the design doc + the durable-background dispatch
-   * decision in production-agent.ts.
-   */
+  parentId?: string | null;
   backgroundFunction?: boolean;
-  /**
-   * Override the run-manager-level no-progress backstop
-   * (`RUN_NO_PROGRESS_HARD_TIMEOUT_MS`). `0` disables it. Defaults to the
-   * backstop constant whenever a soft-timeout regime is active (hosted runs)
-   * and to disabled otherwise (local dev stays unbounded).
-   */
   noProgressTimeoutMs?: number;
-  /**
-   * Override the no-progress backstop for a `backgroundFunction` run only.
-   * Exists so a template can raise the background window without also raising
-   * the foreground one — `noProgressTimeoutMs` is clamped to a fraction of the
-   * foreground chunk budget precisely so it can never outlive the serverless
-   * wall. See `resolveRunNoProgressTimeoutMs`.
-   */
   backgroundNoProgressTimeoutMs?: number;
-  /**
-   * Lifecycle metadata persisted to `agent_runs.dispatch_mode` and surfaced to
-   * clients through `/runs/active`. This does not change run-manager behavior;
-   * callers use it to describe who owns continuation at hosted chunk boundaries.
-   */
   dispatchMode?: "foreground" | "foreground-self-chain" | "background";
-  /**
-   * Optional context forwarded onto the terminal-outcome analytics event
-   * (see `emitRunTerminalTrackingEvent`) so run cutoffs can be broken down
-   * by model/engine/user. Run-manager has no way to know these on its own —
-   * the caller (production-agent.ts) knows them but does not thread them
-   * through yet; omitted fields are simply left off the event rather than
-   * defaulted to a placeholder.
-   */
+  turnInitiator?: AgentTurnInitiator;
+  runRowAlreadyInserted?: boolean;
   model?: string;
   engineName?: string;
   userId?: string;
-  /** Continuation/redispatch attempt number for this logical turn, if the
-   *  caller is tracking one. */
   attemptCount?: number;
+  recoverChunkBoundaries?: boolean;
+}
+
+export interface RunChunkControl {
+  readonly turnSignal: AbortSignal;
+  readonly chunkSignal: AbortSignal;
+  chunkBoundaryReason(): string | null;
+  beginChunk(): AbortSignal;
 }
 
 export interface ResolveRunSoftTimeoutOptions {
   useHostedDefault?: boolean;
-  /**
-   * Resolve the soft timeout for a run executing inside a Netlify background
-   * function. Lifts the hosted clamp to `BACKGROUND_SOFT_TIMEOUT_CEILING_MS`
-   * (~13min) for this invocation only and, when no override/env is supplied,
-   * defaults to `DEFAULT_BACKGROUND_RUN_SOFT_TIMEOUT_MS`. Does NOT change the
-   * foreground ceiling. Off by default.
-   */
   backgroundFunction?: boolean;
 }
 
-/**
- * True on hosted/serverless runtimes where the soft-timeout regime applies
- * (see `resolveRunSoftTimeoutMs`, which resolves to 0 — disabled — off these
- * runtimes). Exported so production-agent.ts can gate its foreground
- * first-model-event cap (`FOREGROUND_FIRST_MODEL_EVENT_TIMEOUT_MS`) on the
- * SAME predicate that selects the 40s clamp: the cap only makes sense where
- * that clamp (and the platform wall behind it) exists.
- */
 export function isHostedRuntime(): boolean {
   if (process.env.NETLIFY_LOCAL === "true") return false;
   if (process.env.NETLIFY === "false") return false;
@@ -501,33 +353,19 @@ export function resolveRunSoftTimeoutMs(
 ): number {
   const hosted = isHostedRuntime();
   const background = options?.backgroundFunction === true;
-  // The interactive/foreground ceiling is 40s — the synchronous serverless
-  // function wall. A background-function run (opt-in only) has no ~60s wall, so
-  // it is allowed to outlast that and is clamped to the larger 13-min ceiling
-  // instead. The 40s clamp for non-background hosted runs is unchanged.
   const ceiling = background
     ? BACKGROUND_SOFT_TIMEOUT_CEILING_MS
     : HOSTED_SOFT_TIMEOUT_CEILING_MS;
-  // A configured/env soft timeout that exceeds the upstream walls can never
-  // actually fire (the gateway/function kills the run first), so clamp it down
-  // on hosted runtimes. This is what makes auto_continue reach the client
-  // instead of the run dying as builder_gateway_timeout / stale_run. `0` means
-  // "disabled" and is never clamped up.
   const clampHosted = (ms: number): number =>
     hosted && ms > ceiling ? ceiling : ms;
 
   if (typeof overrideMs === "number" && Number.isFinite(overrideMs)) {
     return clampHosted(Math.max(0, overrideMs));
   }
-  const envValue = process.env.AGENT_RUN_SOFT_TIMEOUT_MS;
-  if (envValue !== undefined) {
-    const raw = Number(envValue);
-    if (Number.isFinite(raw) && raw >= 0) return clampHosted(raw);
-  }
-  // A background-function run uses the full background budget by default; the
-  // foreground default (40s) is unchanged.
+  const configured = getAppConfig().agent.runSoftTimeoutMs;
+  if (configured !== undefined) return clampHosted(configured);
   if (background) {
-    return hosted ? DEFAULT_BACKGROUND_RUN_SOFT_TIMEOUT_MS : 0;
+    return hosted ? BACKGROUND_SOFT_TIMEOUT_CEILING_MS : 0;
   }
   return options?.useHostedDefault && hosted
     ? DEFAULT_HOSTED_RUN_SOFT_TIMEOUT_MS
@@ -535,21 +373,36 @@ export function resolveRunSoftTimeoutMs(
 }
 
 export function resolveCompletedRunRetentionMs(): number {
-  const envValue = process.env.AGENT_RUN_RETENTION_MS;
-  if (envValue !== undefined) {
-    const raw = Number(envValue);
-    if (Number.isFinite(raw) && raw >= 0) return raw;
-  }
-  return DEFAULT_COMPLETED_RUN_RETENTION_MS;
+  return (
+    getAppConfig().agent.completedRunRetentionMs ??
+    DEFAULT_COMPLETED_RUN_RETENTION_MS
+  );
 }
 
 export function resolveErroredRunRetentionMs(): number {
-  const envValue = process.env.AGENT_ERRORED_RUN_RETENTION_MS;
-  if (envValue !== undefined) {
-    const raw = Number(envValue);
-    if (Number.isFinite(raw) && raw >= 0) return raw;
-  }
-  return DEFAULT_ERRORED_RUN_RETENTION_MS;
+  return (
+    getAppConfig().agent.erroredRunRetentionMs ??
+    DEFAULT_ERRORED_RUN_RETENTION_MS
+  );
+}
+
+export function resolveBackgroundRunHardTimeoutMs(): number {
+  return getAppConfig().agent.backgroundRunHardTimeoutMs;
+}
+
+export function resolveBackgroundAutomationSoftTimeoutMs(
+  overrideMs?: number,
+): number {
+  const budget = Math.max(
+    1_000,
+    resolveBackgroundRunHardTimeoutMs() -
+      BACKGROUND_AUTOMATION_SOFT_TIMEOUT_HEADROOM_MS,
+  );
+  const resolved = resolveRunSoftTimeoutMs(overrideMs, {
+    useHostedDefault: true,
+    backgroundFunction: true,
+  });
+  return resolved > 0 ? Math.min(resolved, budget) : 0;
 }
 
 function isTerminalRunEvent(event: AgentChatEvent): boolean {
@@ -562,6 +415,78 @@ function isTerminalRunEvent(event: AgentChatEvent): boolean {
   );
 }
 
+/**
+ * A tool result with no later assistant text is an unfinished turn, not a
+ * successful terminal response. Keep this predicate beside the run-manager's
+ * terminal synthesis so the run-manager and production continuation paths use
+ * the same boundary evidence.
+ *
+ * A FAILED tool result counts too. Skipping it made the verdict depend on
+ * whether some earlier call in the same turn happened to succeed: a turn ending
+ * on `resources` ok then `web_request` failed continued, while the same turn
+ * with both failing terminated as a plain `done`. The client can only render
+ * "stopped after these actions ... without sending a final message" for that,
+ * so the tool's real error — an expired handoff URL, a missing credential —
+ * never reached the user, and typing "continue" by hand was the only way to see
+ * it. The model has not read the error yet at this point, which makes a failed
+ * tail strictly more unfinished than a successful one.
+ */
+export function endsAfterToolResultWithoutAssistantFinal(
+  run: ActiveRun,
+): boolean {
+  let toolResultAfterLastAssistantText = false;
+  for (const { event } of run.events) {
+    if (event.type === "text" && event.text.trim().length > 0) {
+      toolResultAfterLastAssistantText = false;
+      continue;
+    }
+    if (event.type === "tool_done") {
+      toolResultAfterLastAssistantText =
+        event.isError === true ||
+        (event.chatUI === undefined && event.mcpApp === undefined);
+      continue;
+    }
+    if (
+      event.type === "clear" ||
+      event.type === "error" ||
+      event.type === "missing_api_key" ||
+      event.type === "auto_continue" ||
+      event.type === "loop_limit"
+    ) {
+      toolResultAfterLastAssistantText = false;
+    }
+  }
+  return toolResultAfterLastAssistantText;
+}
+
+export function endsDuringActionPreparation(run: ActiveRun): boolean {
+  let preparingAction = false;
+  for (const { event } of run.events) {
+    if (
+      isPreparingActionActivityEvent(event) ||
+      event.type === "tool_input_start" ||
+      event.type === "tool_input_delta"
+    ) {
+      preparingAction = true;
+      continue;
+    }
+    if (
+      (event.type === "text" && event.text.trim().length > 0) ||
+      event.type === "tool_start" ||
+      event.type === "tool_done" ||
+      event.type === "approval_required" ||
+      event.type === "clear" ||
+      event.type === "error" ||
+      event.type === "missing_api_key" ||
+      event.type === "auto_continue" ||
+      event.type === "loop_limit"
+    ) {
+      preparingAction = false;
+    }
+  }
+  return preparingAction;
+}
+
 function terminalEventForcesErroredStatus(event: AgentChatEvent | null) {
   return event?.type === "error" || event?.type === "missing_api_key";
 }
@@ -572,6 +497,13 @@ function terminalReasonForRun(
   abortReason: string | undefined,
   completionError: unknown,
 ): string {
+  if (
+    finalStatus !== "aborted" &&
+    completionError &&
+    terminalEvent?.type === "auto_continue"
+  ) {
+    return "completion_error";
+  }
   if (terminalEvent?.type === "auto_continue") {
     return terminalEvent.reason || "auto_continue";
   }
@@ -588,20 +520,50 @@ function terminalReasonForRun(
 
 const MAX_RUN_ERROR_DETAIL_LENGTH = 500;
 
-/**
- * Emit one analytics event per terminal run — the seam that makes cutoffs
- * (`run_budget_exhausted`, `loop_limit`, aborts, `truncated` continuation
- * boundaries) queryable in the same pipeline as `$ai_generation`
- * (see observability/traces.ts). Same mechanism: dynamic import of
- * `track()` with every failure swallowed, so a missing/broken tracking
- * provider can never affect the run or its persisted status. Must be called
- * AFTER the atomic-complete SQL writes in the `.finally()` boundary above —
- * never before, and never awaited by it.
- *
- * Operational metadata only: no message content, no prompt/response text,
- * no user email. `errorDetail` carries engine/gateway error strings (e.g.
- * "context_length_exceeded"), not user-authored text.
- */
+function emitRunBoundaryTrackingEvent(args: {
+  runId: string;
+  threadId: string;
+  reason: string;
+  recovered: boolean;
+  boundaryIndex: number;
+  dispatchMode?: string;
+  model?: string;
+  engineName?: string;
+  userId?: string;
+}): void {
+  const properties: Record<string, unknown> = {
+    source: "agent_run_manager",
+    run_id: args.runId,
+    thread_id: args.threadId,
+    reason: args.reason,
+    recovered: args.recovered,
+    boundary_index: args.boundaryIndex,
+    dispatch_mode: args.dispatchMode,
+    model: args.model,
+    engine: args.engineName,
+  };
+  for (const key of Object.keys(properties)) {
+    if (properties[key] === undefined) delete properties[key];
+  }
+  try {
+    void Promise.all([
+      import("../tracking/registry.js"),
+      import("../observability/tracking-identity.js"),
+    ])
+      .then(([{ track }, { trackingIdentityProperties }]) => {
+        track(
+          "agent_run_boundary",
+          { ...properties, ...trackingIdentityProperties() },
+          { userId: args.userId },
+        );
+      })
+      .catch(() => {});
+    // coercion-ok: a boundary counter must never affect the run it counts.
+  } catch {
+    // Tracking must never affect the agent run or its persisted status.
+  }
+}
+
 function emitRunTerminalTrackingEvent(args: {
   runId: string;
   threadId: string;
@@ -631,7 +593,7 @@ function emitRunTerminalTrackingEvent(args: {
         ? `${args.errorDetail.slice(0, MAX_RUN_ERROR_DETAIL_LENGTH)}…`
         : args.errorDetail
       : undefined,
-    dispatch_mode: args.dispatchMode ?? "foreground",
+    dispatch_mode: args.dispatchMode,
     abort_reason: args.abortReason,
     duration_ms: args.durationMs,
     model: args.model,
@@ -667,10 +629,19 @@ function abortInMemoryRun(run: ActiveRun, reason: string = "user") {
     threadToRun.delete(run.threadId);
   }
   run.abort.abort(reason);
-  const terminalEvent = terminalEventForAbortReason(reason);
+  const existingTerminalEvent = [...run.events]
+    .reverse()
+    .find((event) => isTerminalRunEvent(event.event));
+  const terminalRunEvent = existingTerminalEvent ?? {
+    seq: run.events.length,
+    event: terminalEventForAbortReason(reason),
+  };
+  if (!existingTerminalEvent) {
+    run.events.push(terminalRunEvent);
+  }
   for (const subscriber of run.subscribers) {
     try {
-      subscriber({ seq: run.events.length, event: terminalEvent });
+      subscriber(terminalRunEvent);
     } catch {
       // ignore — subscriber is being removed below
     }
@@ -678,30 +649,82 @@ function abortInMemoryRun(run: ActiveRun, reason: string = "user") {
   run.subscribers.clear();
 }
 
-/**
- * Start a new agent run in the background.
- * `runFn` receives a `send` callback and an `AbortSignal`.
- * The run continues even if all SSE subscribers disconnect.
- *
- * Events are persisted to SQL for cross-isolate access (Cloudflare Workers).
- */
 export function startRun(
   runId: string,
   threadId: string,
   runFn: (
     send: (event: AgentChatEvent) => void,
     signal: AbortSignal,
+    control: RunChunkControl,
   ) => Promise<void>,
   onComplete?: (run: ActiveRun) => void | Promise<void>,
   options?: StartRunOptions,
 ): StartedRun {
-  // If there's already a run for this thread, abort it
   const existingRunId = threadToRun.get(threadId);
   if (existingRunId) {
     abortRun(existingRunId);
   }
 
   const abort = new AbortController();
+  const recoverChunkBoundaries = options?.recoverChunkBoundaries === true;
+  let chunkAbort: AbortController | null = recoverChunkBoundaries
+    ? new AbortController()
+    : null;
+  let chunkBoundaryReason: string | null = null;
+  let chunkSoftTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
+  let armChunkSoftTimeout: () => void = () => {};
+  let recoverableRunDeadlineAt: number | null = null;
+  let recoveredChunkBoundaries = 0;
+  let pendingBoundary: {
+    reason: "no_progress" | "run_timeout";
+    diagnostic: { silentForMs?: number; lastEventType?: string };
+    index: number;
+  } | null = null;
+  const settleBoundary = (recovered: boolean) => {
+    const boundary = pendingBoundary;
+    if (!boundary) return;
+    pendingBoundary = null;
+    recordRunBoundaryDiagnostic(
+      boundary.reason,
+      boundary.diagnostic,
+      recovered ? "recovered" : "terminal",
+    );
+    emitRunBoundaryTrackingEvent({
+      runId,
+      threadId,
+      reason: boundary.reason,
+      recovered,
+      boundaryIndex: boundary.index,
+      dispatchMode: options?.dispatchMode,
+      model: options?.model,
+      engineName: options?.engineName,
+      userId: options?.userId,
+    });
+  };
+  if (chunkAbort) {
+    abort.signal.addEventListener("abort", () => {
+      chunkAbort?.abort(abort.signal.reason);
+    });
+  }
+  const runControl: RunChunkControl = {
+    get turnSignal() {
+      return abort.signal;
+    },
+    get chunkSignal() {
+      return chunkAbort?.signal ?? abort.signal;
+    },
+    chunkBoundaryReason: () => chunkBoundaryReason,
+    beginChunk: () => {
+      if (abort.signal.aborted || !chunkAbort) return abort.signal;
+      settleBoundary(true);
+      chunkBoundaryReason = null;
+      if (chunkSoftTimeoutTimer) clearTimeout(chunkSoftTimeoutTimer);
+      chunkAbort = new AbortController();
+      armChunkSoftTimeout();
+      lastRealProgressAt = Date.now();
+      return chunkAbort.signal;
+    },
+  };
   let softTimedOut = false;
   let resolveFinalized: () => void = () => {};
   let rejectFinalized: (reason?: unknown) => void = () => {};
@@ -709,13 +732,11 @@ export function startRun(
     resolveFinalized = resolve;
     rejectFinalized = reject;
   });
-  // Foreground callers do not await this promise, but terminal persistence
-  // failures must still be observable to background workers without creating
-  // an unhandled rejection in the foreground path.
   void finalized.catch(() => {});
   const run: StartedRun = {
     runId,
     threadId,
+    ...(options?.parentId !== undefined ? { parentId: options.parentId } : {}),
     turnId: options?.turnId ?? runId,
     events: [],
     status: "running",
@@ -764,38 +785,147 @@ export function startRun(
   // Persist run to SQL without blocking the response. Keep the promise so
   // final status cannot race ahead of a slow initial INSERT and then get
   // overwritten by a late row stuck at status='running'.
-  const insertOptions = options?.dispatchMode
-    ? { dispatchMode: options.dispatchMode }
-    : undefined;
+  const insertOptions =
+    options?.dispatchMode || options?.turnInitiator
+      ? {
+          ...(options?.dispatchMode
+            ? { dispatchMode: options.dispatchMode }
+            : {}),
+          ...(options?.turnInitiator
+            ? { turnInitiator: options.turnInitiator }
+            : {}),
+        }
+      : undefined;
   const insertRunPromise = (
-    insertOptions
-      ? insertRun(runId, threadId, options?.turnId, insertOptions)
-      : insertRun(runId, threadId, options?.turnId)
+    options?.runRowAlreadyInserted
+      ? Promise.resolve()
+      : insertOptions
+        ? insertRun(runId, threadId, options?.turnId, insertOptions)
+        : insertRun(runId, threadId, options?.turnId)
   ).catch((error) => {
     captureRunPersistenceError(error, "insert-run");
   });
 
-  // Per-run event persistence chain: events are chained so SQL inserts commit
-  // in seq order. Without this, a fast seq=5 commit before a slow seq=4 means
-  // the SQL poller advances its cursor past seq=4 (lastSeq = 5+1 = 6) and
-  // reconnecting clients permanently miss that event (silent gap). Chaining
-  // per run ensures order without blocking the fast in-memory SSE path.
   let persistenceChain: Promise<void> = Promise.resolve();
 
-  // Throttle the durable progress timestamp to at most once per second so
-  // a chatty token-by-token stream doesn't translate into one DB write per
-  // chunk. The stuck-detector threshold is on the order of tens of seconds,
-  // so 1s resolution is plenty.
+  const PROGRESS_BUMP_INTERVAL_MS = 1_000;
   let lastProgressBumpAt = 0;
+  let progressWriteInFlight: Promise<void> | null = null;
+  let progressWriteTimer: ReturnType<typeof setTimeout> | null = null;
+  let progressWritePending = false;
+  let progressWriteAttempts = 0;
+  let progressWriteFailures = 0;
+  let consecutiveProgressWriteFailures = 0;
   const preparingActivityBytes = new Map<string, number>();
   const preparingActivityTools = new Map<string, string>();
   const preparingActivityRestartHighWater = new Map<string, number>();
   let eventPersistenceErrorCaptured = false;
+  const recordProgressWriteFailure = (error: unknown, kind: string) => {
+    progressWriteFailures += 1;
+    consecutiveProgressWriteFailures += 1;
+    if (progressWriteFailures === 1 || progressWriteFailures % 10 === 0) {
+      const capturedError =
+        error instanceof Error ? error : new Error(String(error));
+      console.error(
+        `[run-manager] durable progress write ${kind} failed`,
+        runId,
+        {
+          attempts: progressWriteAttempts,
+          failures: progressWriteFailures,
+          consecutiveFailures: consecutiveProgressWriteFailures,
+          eventCount: run.events.length,
+        },
+        capturedError,
+      );
+      captureError(capturedError, {
+        route: "/_agent-native/agent-chat",
+        tags: {
+          source: "agent-run-manager",
+          phase: "progress",
+          kind,
+          consecutiveFailures: String(consecutiveProgressWriteFailures),
+        },
+        aiTraceId: runId,
+        extra: {
+          runId,
+          threadId,
+          attempts: progressWriteAttempts,
+          failures: progressWriteFailures,
+          eventCount: run.events.length,
+        },
+      });
+    }
+  };
+  const writeProgress = async (): Promise<void> => {
+    let updated = await bumpRunProgress(runId);
+    if (updated === false) {
+      await insertRunPromise;
+      updated = await bumpRunProgress(runId);
+    }
+    if (updated === false) {
+      if (run.status !== "running") return;
+      const persistedStatus = await getRunStatus(runId);
+      if (run.status !== "running") return;
+      if (persistedStatus !== null && persistedStatus !== "running") {
+        abortInMemoryRun(run, "displaced");
+        return;
+      }
+      recordProgressWriteFailure(
+        new Error("Durable progress update affected no running run row"),
+        "no-row",
+      );
+      progressWritePending = true;
+      return;
+    }
+    consecutiveProgressWriteFailures = 0;
+  };
+  function startProgressWrite(): void {
+    if (
+      !progressWritePending ||
+      progressWriteInFlight ||
+      run.status !== "running"
+    ) {
+      return;
+    }
+    progressWritePending = false;
+    lastProgressBumpAt = Date.now();
+    progressWriteAttempts += 1;
+    const write = writeProgress()
+      .catch((error: unknown) => {
+        recordProgressWriteFailure(error, "error");
+        progressWritePending = true;
+      })
+      .finally(() => {
+        progressWriteInFlight = null;
+        scheduleProgressWrite();
+      });
+    progressWriteInFlight = write;
+  }
+  function scheduleProgressWrite(): void {
+    if (
+      !progressWritePending ||
+      progressWriteInFlight ||
+      progressWriteTimer ||
+      run.status !== "running"
+    ) {
+      return;
+    }
+    const delayMs = Math.max(
+      0,
+      lastProgressBumpAt + PROGRESS_BUMP_INTERVAL_MS - Date.now(),
+    );
+    if (delayMs === 0) {
+      startProgressWrite();
+      return;
+    }
+    progressWriteTimer = setTimeout(() => {
+      progressWriteTimer = null;
+      startProgressWrite();
+    }, delayMs);
+  }
   const bumpProgressIfDue = () => {
-    const now = Date.now();
-    if (now - lastProgressBumpAt < 1000) return;
-    lastProgressBumpAt = now;
-    bumpRunProgress(runId).catch(() => {});
+    progressWritePending = true;
+    scheduleProgressWrite();
   };
   const shouldBumpProgressForEvent = (event: AgentChatEvent): boolean => {
     if (event.type === "stream_keepalive") return false;
@@ -886,52 +1016,41 @@ export function startRun(
     return true;
   };
 
-  // ── No-progress backstop (see RUN_NO_PROGRESS_HARD_TIMEOUT_MS) ──────────
-  // Timer-driven and independent of the agent loop, so it fires even when the
-  // stall is in a segment the in-loop watchdogs never see (engine-call
-  // establishment, setup, a wedged transport emitting keepalives). Tool calls
-  // and sub-agent calls in flight suspend it — tool execution legitimately
-  // emits nothing for minutes and carries its own 12-min timeout.
   let lastRealProgressAt = Date.now();
   let inFlightWorkCount = 0;
-  const trackInFlightWork = (event: AgentChatEvent) => {
-    const wasIdle = inFlightWorkCount === 0;
-    if (event.type === "tool_start") {
-      inFlightWorkCount += 1;
-    } else if (event.type === "tool_done") {
-      inFlightWorkCount = Math.max(0, inFlightWorkCount - 1);
-    } else if (event.type === "agent_call") {
-      if (event.status === "start") {
-        inFlightWorkCount += 1;
-      } else {
-        inFlightWorkCount = Math.max(0, inFlightWorkCount - 1);
-      }
+  let inFlightMarkerSince: number | null = null;
+  let inFlightMarkerWrite = Promise.resolve();
+  const mirrorInFlightMarker = (inFlight: boolean) => {
+    const markerSince = inFlight ? Date.now() : inFlightMarkerSince;
+    if (inFlight) {
+      inFlightMarkerSince = markerSince;
     } else {
-      return; // Not a work-tracking event — no transition possible.
+      inFlightMarkerSince = null;
     }
-    // Mirror the 0<->N transition into SQL so a stale reaper running in a
-    // DIFFERENT isolate (a client's SQL-subscription poll, a sibling
-    // isolate's opportunistic cleanup, a fresh boot's startup sweep) can
-    // grant this demonstrably-alive run a bounded grace even when THIS
-    // isolate's own heartbeat write is failing (e.g. Neon pooler saturation)
-    // — `inFlightWorkCount` itself is in-memory and invisible to those other
-    // isolates. Fire-and-forget: never block event emission on this write,
-    // and a write failure here is no worse than today's behavior (the row
-    // just gets no grace). See `setRunInFlightMarker` / `IN_FLIGHT_RUN_STALE_GRACE_MS`
-    // in run-store.ts for the full reasoning and the bounded-grace derivation.
+    inFlightMarkerWrite = inFlightMarkerWrite
+      .catch(() => undefined)
+      .then(() =>
+        setRunInFlightMarker(runId, inFlight, markerSince ?? undefined),
+      )
+      .catch((error: unknown) => {
+        console.error(
+          `[run-manager] failed to mirror in-flight marker (${inFlight ? "set" : "clear"})`,
+          runId,
+          error instanceof Error ? error.message : error,
+        );
+      });
+  };
+  const trackInFlightWork = (event: AgentChatEvent) => {
+    const delta = inFlightWorkDelta(event);
+    if (delta === 0) return;
+    const wasIdle = inFlightWorkCount === 0;
+    inFlightWorkCount = Math.max(0, inFlightWorkCount + delta);
     if (wasIdle && inFlightWorkCount > 0) {
-      setRunInFlightMarker(runId, true).catch(() => {});
+      mirrorInFlightMarker(true);
     } else if (!wasIdle && inFlightWorkCount === 0) {
-      setRunInFlightMarker(runId, false).catch(() => {});
+      mirrorInFlightMarker(false);
     }
   };
-  // Make a chunk boundary durable at the instant it is decided. The terminal
-  // event is otherwise only persisted after the agent loop unwinds, and
-  // wind-down routinely eats the little budget left under the ~58s serverless
-  // wall — the process is killed, the auto_continue is never written, and the
-  // reaper records a `stale_run` lie for a run that had honestly checkpointed.
-  // Written into the reserved seq band so it cannot collide with, or be
-  // streamed ahead of, the events the loop is still emitting.
   let checkpointAbortInFlight = false;
   const checkpointRunBoundary = async (
     event: AgentChatEvent,
@@ -955,40 +1074,112 @@ export function startRun(
     }
   };
 
+  const recordRunBoundaryDiagnostic = (
+    reason: string,
+    diagnostic: { silentForMs?: number; lastEventType?: string },
+    disposition: "recovered" | "terminal",
+  ) => {
+    void recordRunDiagnostic(
+      runId,
+      RUN_DIAG_STAGE.runBoundaryReached,
+      JSON.stringify({
+        reason,
+        disposition,
+        silentForMs: diagnostic.silentForMs,
+        lastEventType: diagnostic.lastEventType,
+        inFlightWorkCount,
+        eventCount: run.events.length,
+        elapsedMs: Date.now() - run.startedAt,
+      }),
+      // coercion-ok: recordRunDiagnostic already swallows its own failures;
+      // this guards only against an unhandled rejection.
+    ).catch(() => {});
+  };
+
+  const reachRunBoundary = (
+    reason: "no_progress" | "run_timeout",
+    diagnostic: { silentForMs?: number; lastEventType?: string } = {},
+  ) => {
+    if (run.status !== "running" || abort.signal.aborted) return;
+    const activeChunkAbort = chunkAbort;
+    const canRecoverChunk =
+      activeChunkAbort !== null &&
+      (recoverableRunDeadlineAt === null ||
+        Date.now() < recoverableRunDeadlineAt);
+    if (canRecoverChunk) {
+      if (activeChunkAbort.signal.aborted) return;
+      recoveredChunkBoundaries += 1;
+      console.warn(
+        `[run-manager] chunk boundary (${reason}) — recovering in-invocation`,
+        runId,
+        diagnostic,
+      );
+      pendingBoundary = { reason, diagnostic, index: recoveredChunkBoundaries };
+      chunkBoundaryReason = reason;
+      activeChunkAbort.abort(reason);
+      return;
+    }
+    if (chunkAbort) chunkBoundaryReason = reason;
+    softTimedOut = true;
+    recordRunBoundaryDiagnostic(reason, diagnostic, "terminal");
+    emitRunBoundaryTrackingEvent({
+      runId,
+      threadId,
+      reason,
+      recovered: false,
+      boundaryIndex: recoveredChunkBoundaries + 1,
+      dispatchMode: options?.dispatchMode,
+      model: options?.model,
+      engineName: options?.engineName,
+      userId: options?.userId,
+    });
+    const event: AgentChatEvent = { type: "auto_continue", reason };
+    send(event);
+    void checkpointRunBoundary(event, reason);
+  };
+
   const checkNoProgressBackstop = () => {
     if (noProgressTimeoutMs <= 0) return;
     if (run.status !== "running" || abort.signal.aborted) return;
     if (inFlightWorkCount > 0) return;
-    if (Date.now() - lastRealProgressAt < noProgressTimeoutMs) return;
-    console.error(
-      `[run-manager] no real progress for ${noProgressTimeoutMs}ms with no tool in flight — ` +
-        `checkpointing run for continuation`,
-      runId,
-    );
-    // Mirror the soft-timeout semantics exactly: the chunk completes (not
-    // aborts) at an auto_continue boundary, so the continuation machinery —
-    // server-chained for background workers, client-driven for foreground —
-    // recovers the turn.
-    softTimedOut = true;
-    const event: AgentChatEvent = {
-      type: "auto_continue",
-      reason: "no_progress",
-    };
-    send(event);
-    void checkpointRunBoundary(event, "no_progress");
+    const silentForMs = Date.now() - lastRealProgressAt;
+    if (silentForMs < noProgressTimeoutMs) return;
+    const lastEventType = run.events.at(-1)?.event.type;
+    if (!chunkAbort) {
+      console.error(
+        `[run-manager] no real progress for ${noProgressTimeoutMs}ms with no tool ` +
+          `or model stream in flight — ` +
+          `checkpointing run for continuation`,
+        runId,
+      );
+      captureError(
+        new Error(
+          `Agent run checkpointed after ${silentForMs}ms of silence (no_progress)`,
+        ),
+        {
+          route: "/_agent-native/agent-chat",
+          aiTraceId: runId,
+          tags: {
+            source: "agent-run-manager",
+            phase: "no-progress-backstop",
+            terminalReason: "no_progress",
+            lastEventType,
+          },
+          extra: {
+            runId,
+            threadId,
+            silentForMs,
+            noProgressTimeoutMs,
+            lastEventType,
+            eventCount: run.events.length,
+          },
+        },
+      );
+    }
+    reachRunBoundary("no_progress", { silentForMs, lastEventType });
   };
 
-  // Periodic SQL abort check interval (for cross-isolate abort on Workers).
-  // Also self-aborts when our row is no longer status='running' — catches the
-  // false-stale-reap zombie scenario where the reaper flipped the row while
-  // this isolate was briefly unable to heartbeat (DB latency / GC pause).
   let lastAbortCheck = Date.now() - 3000;
-  // A read failure here used to be indistinguishable from "not aborted" —
-  // exactly the coerced-to-false pattern that lets a real Stop go unseen for
-  // the rest of the run. Count consecutive failures like the heartbeat-write
-  // handler above; past the same threshold, fail closed (self-abort with a
-  // reason outside TURN_ENDING_ABORT_REASONS/RECOVERABLE_ABORT_REASONS, so it
-  // surfaces as a typed error) instead of silently retrying forever.
   let consecutiveAbortCheckFailures = 0;
   const checkSqlAbort = () => {
     const now = Date.now();
@@ -1000,9 +1191,6 @@ export function startRun(
           abortInMemoryRun(run, state.reason ?? "user");
           return;
         }
-        // If the row is no longer 'running' (reaped / replaced) and we're
-        // still executing, self-abort so we stop executing and don't overwrite
-        // the newer state with our terminal write.
         if (!abort.signal.aborted) {
           const status = await getRunStatus(runId);
           if (status !== null && status !== "running") {
@@ -1015,7 +1203,10 @@ export function startRun(
       })
       .catch((error) => {
         consecutiveAbortCheckFailures += 1;
-        if (consecutiveAbortCheckFailures >= 3) {
+        if (
+          consecutiveAbortCheckFailures === 3 ||
+          consecutiveAbortCheckFailures % 20 === 0
+        ) {
           captureError(error, {
             route: "/_agent-native/agent-chat",
             tags: {
@@ -1024,28 +1215,17 @@ export function startRun(
               consecutiveFailures: String(consecutiveAbortCheckFailures),
             },
             aiTraceId: runId,
-            extra: { runId, threadId },
+            extra: {
+              runId,
+              threadId,
+              unreadableForMs: consecutiveAbortCheckFailures * 3000,
+            },
           });
-          if (!abort.signal.aborted) {
-            abortInMemoryRun(run, "abort_check_unavailable");
-          }
         }
       });
   };
 
-  // Heartbeat: bump heartbeat_at every 1.5s so watchers can detect a dead
-  // producer (process crash, HMR restart, isolate eviction) quickly and
-  // reap the row. Paired with RUN_STALE_MS (15s) — 10x the interval to
-  // tolerate transient DB slowness without false positives.
   let consecutiveHeartbeatFailures = 0;
-  // Single-flight the heartbeat write. The timer fires every 1.5s but a write
-  // can take up to the DB op timeout (~8s) when the Neon pooler is saturated.
-  // Firing a fresh write each tick regardless piled up ~5 concurrent writes
-  // under contention, each holding a pooler connection — ADDING to the exact
-  // connection-cap exhaustion that starves the heartbeat and false-reaps the
-  // run as stale. Skip a tick's write while one is still outstanding so a run
-  // holds at most one heartbeat connection. The abort/backstop checks below
-  // still run every tick (they don't touch the DB on the hot path).
   let heartbeatInFlight = false;
   const heartbeatTimer: ReturnType<typeof setInterval> = setInterval(() => {
     if (!heartbeatInFlight) {
@@ -1056,9 +1236,6 @@ export function startRun(
         })
         .catch((error) => {
           consecutiveHeartbeatFailures += 1;
-          // Swallow routine single-tick blips; escalate once failures approach
-          // the stale window so false-positive stale_run from silent write
-          // failures is diagnosable.
           if (consecutiveHeartbeatFailures >= 3) {
             captureError(error, {
               route: "/_agent-native/agent-chat",
@@ -1083,9 +1260,6 @@ export function startRun(
     useHostedDefault: options?.useHostedSoftTimeoutDefault === true,
     backgroundFunction: options?.backgroundFunction === true,
   });
-  // Armed only when a soft-timeout regime is active (hosted): local dev keeps
-  // unbounded runs. For 40s foreground chunks the soft timeout always fires
-  // first, so in practice this guards the long background chunks.
   const noProgressTimeoutMs = resolveRunNoProgressTimeoutMs({
     softTimeoutMs,
     backgroundFunction: options?.backgroundFunction === true,
@@ -1093,22 +1267,36 @@ export function startRun(
     backgroundOverrideMs: options?.backgroundNoProgressTimeoutMs,
   });
   const softTimeoutTimer =
-    softTimeoutMs > 0
+    softTimeoutMs > 0 && !recoverChunkBoundaries
       ? setTimeout(() => {
-          if (run.status !== "running" || abort.signal.aborted) return;
-          softTimedOut = true;
-          const event: AgentChatEvent = {
-            type: "auto_continue",
-            reason: "run_timeout",
-          };
-          send(event);
-          void checkpointRunBoundary(event, "run_timeout");
+          reachRunBoundary("run_timeout", {
+            lastEventType: run.events.at(-1)?.event.type,
+          });
         }, softTimeoutMs)
       : null;
+  if (recoverChunkBoundaries && softTimeoutMs > 0) {
+    const runDeadlineAt = Date.now() + softTimeoutMs;
+    recoverableRunDeadlineAt = runDeadlineAt;
+    armChunkSoftTimeout = () => {
+      if (chunkSoftTimeoutTimer) clearTimeout(chunkSoftTimeoutTimer);
+      if (abort.signal.aborted || run.status !== "running") return;
+      chunkSoftTimeoutTimer = setTimeout(
+        () => {
+          chunkSoftTimeoutTimer = null;
+          reachRunBoundary("run_timeout", {
+            lastEventType: run.events.at(-1)?.event.type,
+          });
+        },
+        Math.max(0, runDeadlineAt - Date.now()),
+      );
+    };
+    armChunkSoftTimeout();
+  }
   let pendingTerminalEvent: RunEvent | null = null;
 
   const captureRunError = (error: unknown, phase: "run" | "completion") => {
     const errorCode = getRunErrorCode(error);
+    const engineError = error instanceof EngineError ? error : null;
     captureError(error, {
       route: "/_agent-native/agent-chat",
       aiTraceId: runId,
@@ -1119,6 +1307,12 @@ export function startRun(
         softTimedOut: softTimedOut ? "true" : "false",
         abortReason: run.abortReason,
         errorCode,
+        gatewayRequestId: engineError?.requestId,
+        statusCode:
+          engineError?.statusCode != null
+            ? String(engineError.statusCode)
+            : undefined,
+        ...engineRequestShapeTags(engineError?.requestShape),
       },
       extra: {
         runId,
@@ -1149,7 +1343,6 @@ export function startRun(
   ): Promise<void> => {
     run.events.push(runEvent);
 
-    // Notify in-memory subscribers (same isolate, fast path)
     for (const subscriber of run.subscribers) {
       try {
         subscriber(runEvent);
@@ -1158,35 +1351,35 @@ export function startRun(
       }
     }
 
-    // Bump the durable progress timestamp. Distinct from the heartbeat:
-    // heartbeat = "process is up", progress = "real work is happening." The
-    // gap between them is what the client-side stuck-detector reads to tell
-    // a hung run from a healthy one. Keepalive and zero-byte action prep are
-    // liveness only; streamed input bytes, text, and tool lifecycle events are
-    // real progress.
     trackInFlightWork(runEvent.event);
     if (shouldBumpProgressForEvent(runEvent.event)) {
       lastRealProgressAt = Date.now();
       bumpProgressIfDue();
     }
 
-    // Persist event to SQL. Events are chained through persistenceChain so
-    // inserts commit in seq order — an out-of-order commit would advance the
-    // SQL poller's cursor past the slow row, permanently dropping it for
-    // reconnecting clients. Terminal events surface persistence errors so the
-    // caller can decide how to handle a failed final write.
-    const thisInsert = persistenceChain.then(() =>
-      insertRunEvent(runId, runEvent.seq, JSON.stringify(runEvent.event)),
-    );
-    persistenceChain = thisInsert.catch((error) => {
-      if (!eventPersistenceErrorCaptured) {
-        eventPersistenceErrorCaptured = true;
-        captureRunPersistenceError(error, "insert-event", {
-          seq: runEvent.seq,
-          eventType: runEvent.event.type,
-        });
+    const thisInsert = persistenceChain.then(async () => {
+      try {
+        await insertRunEvent(
+          runId,
+          runEvent.seq,
+          JSON.stringify(runEvent.event),
+        );
+      } catch (error) {
+        if (!eventPersistenceErrorCaptured) {
+          eventPersistenceErrorCaptured = true;
+          captureRunPersistenceError(error, "insert-event", {
+            seq: runEvent.seq,
+            eventType: runEvent.event.type,
+          });
+        }
+        await insertRunEvent(
+          runId,
+          runEvent.seq,
+          JSON.stringify(runEvent.event),
+        );
       }
     });
+    persistenceChain = thisInsert;
     const persistence = thisInsert;
     if (!options?.surfacePersistenceError) {
       persistence.catch(() => {});
@@ -1205,12 +1398,12 @@ export function startRun(
       return;
     }
 
-    emitRunEvent(runEvent);
+    void emitRunEvent(runEvent);
   };
 
-  // Run in background — intentionally detached from any HTTP connection
-  const runPromise = runFn(send, abort.signal)
+  const runPromise = runFn(send, runControl.chunkSignal, runControl)
     .then(() => {
+      settleBoundary(false);
       if (abort.signal.aborted) {
         run.status = softTimedOut ? "completed" : "aborted";
         return;
@@ -1218,7 +1411,7 @@ export function startRun(
       run.status = "completed";
     })
     .catch((err) => {
-      // Don't surface abort errors — the run was intentionally stopped
+      settleBoundary(false);
       if (abort.signal.aborted) {
         run.status = softTimedOut ? "completed" : "aborted";
         return;
@@ -1239,27 +1432,37 @@ export function startRun(
         ...(err instanceof EngineError && err.upgradeUrl
           ? { upgradeUrl: err.upgradeUrl }
           : {}),
+        ...(err instanceof EngineError && err.providerRetryable === true
+          ? { providerRetryable: true }
+          : {}),
+        ...(err instanceof EngineError && err.contextOverflow === true
+          ? { contextOverflow: true }
+          : {}),
       });
     })
     .finally(async () => {
-      // Ordering matters here — this is the atomic-complete boundary.
-      // Invariant: once agent_runs.status flips to "completed"/"errored"
-      // in SQL, thread_data for this turn is already durable. This lets
-      // reconnecting clients trust the simple rule "status != running →
-      // fetch thread_data" without polling/retrying for a race window
-      // where onComplete was still pending.
-
-      // 1. Await the completion callback (thread_data save). Heartbeat is
-      //    still ticking so the run doesn't look stale to any concurrent
-      //    /runs/active check while we wait for SQL writes to land.
       let completionError: unknown = null;
       let terminalPersistenceError: unknown = null;
-      // Populated in step 5b for errored runs; read by the terminal tracking
-      // emission below so it doesn't have to re-walk diagnosticEvents.
+      let eventPersistenceError: unknown = null;
       let runTerminalErrorCode: string | undefined;
       let runTerminalErrorDetail: string | undefined;
       let terminalPersistenceEstablished = false;
+      try {
+        await persistenceChain;
+      } catch (error) {
+        eventPersistenceError = error;
+        run.status = "errored";
+        pendingTerminalEvent = {
+          seq: run.events.length,
+          event: {
+            type: "error",
+            error: "Agent run ended unexpectedly",
+            errorCode: "run_event_persistence_failed",
+          },
+        };
+      }
       const resolveTerminalEventForCompletion = () => {
+        if (eventPersistenceError) return pendingTerminalEvent;
         const continuationTerminalEvent = run.continuationTerminalEvent
           ? {
               seq: run.events.length,
@@ -1270,12 +1473,6 @@ export function startRun(
       };
       let terminalEventForCompletion = resolveTerminalEventForCompletion();
       let terminalEvent = terminalEventForCompletion?.event ?? null;
-      // Runs the completion callback for EVERY terminal outcome, aborts
-      // included. A no-progress abort used to skip it, which discarded the
-      // whole partial turn — prod saw 1471 events, 348 of them streamed text,
-      // vanish on reload. `foldAssistantTurn` in the thread_data writer is
-      // keyed on turnId, so a successor chunk folding onto the same turn
-      // merges rather than duplicating.
       if (onComplete) {
         try {
           const completionStatus =
@@ -1294,6 +1491,8 @@ export function startRun(
                 }
               : run;
           await onComplete(completionRun);
+          run.continuationTerminalEvent ??=
+            completionRun.continuationTerminalEvent;
         } catch (err) {
           completionError = err;
           captureRunError(err, "completion");
@@ -1304,15 +1503,9 @@ export function startRun(
         }
       }
 
-      // Server-driven continuation is installed by onComplete after the
-      // successor has been dispatched. Resolve the terminal event again so
-      // this chunk emits auto_continue instead of a misleading done event.
       terminalEventForCompletion = resolveTerminalEventForCompletion();
       terminalEvent = terminalEventForCompletion?.event ?? null;
 
-      // 2. Compute final status. If the completion callback threw, we'd
-      //    rather mark the run errored than claim success with incomplete
-      //    thread_data.
       const finalStatus =
         run.status === "aborted"
           ? "aborted"
@@ -1321,54 +1514,54 @@ export function startRun(
               terminalEventForcesErroredStatus(terminalEvent)
             ? "errored"
             : "completed";
-      const terminalReason = terminalReasonForRun(
-        finalStatus,
-        terminalEvent,
-        run.abortReason,
-        completionError,
-      );
-      // A run that stopped at a continuation boundary did not finish, so it is
-      // not `completed`. Persisted directly here rather than left for
-      // `setRunTerminalReason` to correct, so the row is never briefly readable
-      // as a success. `finalStatus` still drives terminal-event emission and
-      // error classification below — those key on "did this fail", not on
-      // "did this finish".
+      run.status = finalStatus;
+      const shouldAutoContinueAfterUnfinishedTurn =
+        finalStatus === "completed" &&
+        (endsAfterToolResultWithoutAssistantFinal(run) ||
+          endsDuringActionPreparation(run)) &&
+        (!terminalEventForCompletion ||
+          (terminalEventForCompletion.event.type === "done" &&
+            terminalEventForCompletion.event.reason !== "user"));
+      const unfinishedTurnContinuationEvent =
+        shouldAutoContinueAfterUnfinishedTurn
+          ? ({
+              type: "auto_continue" as const,
+              reason: "stream_ended" as const,
+            } satisfies Extract<AgentChatEvent, { type: "auto_continue" }>)
+          : null;
+      if (unfinishedTurnContinuationEvent) {
+        terminalEvent = unfinishedTurnContinuationEvent;
+      }
+      const terminalReason = eventPersistenceError
+        ? "error:run_event_persistence_failed"
+        : terminalReasonForRun(
+            finalStatus,
+            terminalEvent,
+            run.abortReason,
+            completionError,
+          );
       const persistedStatus =
         finalStatus === "completed" &&
         isContinuationTerminalReason(terminalReason)
           ? "truncated"
           : finalStatus;
 
-      // 3. Emit the terminal event only after thread_data is durable. Live
-      //    SSE clients close on this event and usually fetch thread_data
-      //    immediately, so emitting it earlier recreates the final-message
-      //    race this manager is meant to avoid.
       if (finalStatus === "completed" || finalStatus === "errored") {
-        // Choose the terminal event payload (done / the stashed terminal /
-        // a synthesized error). NOTE: the `seq` carried by
-        // `pendingTerminalEvent` was captured by `send()` at stash time as
-        // `run.events.length` and is NOT authoritative — if the runFn emitted
-        // any more events before it actually stopped on the abort signal,
-        // those events were pushed and reused that same seq. Persisting the
-        // terminal event with the stale seq would collide with an
-        // already-persisted streaming event and get silently dropped by
-        // insertRunEvent's `ON CONFLICT (run_id, seq) DO NOTHING`, so the
-        // client would never see the terminal/continuation signal. We always
-        // re-stamp the seq at emit time (max-seq+1) just below.
-        const terminalEvent: AgentChatEvent =
-          finalStatus === "completed"
-            ? (terminalEventForCompletion?.event ?? { type: "done" })
+        const terminalEventToEmit: AgentChatEvent = eventPersistenceError
+          ? {
+              type: "error",
+              error: "Agent run ended unexpectedly",
+              errorCode: "run_event_persistence_failed",
+            }
+          : finalStatus === "completed"
+            ? (unfinishedTurnContinuationEvent ??
+              terminalEventForCompletion?.event ?? { type: "done" })
             : terminalEventForCompletion?.event.type === "error" ||
                 terminalEventForCompletion?.event.type === "missing_api_key"
               ? terminalEventForCompletion.event
-              : terminalEventForCompletion?.event.type === "auto_continue"
-                ? // The run was checkpointed at a soft-timeout/loop boundary and
-                  // is recoverable: the partial turn is in agent_run_events and
-                  // the continuation run will re-attempt the thread_data save.
-                  // Even though the completion save failed (finalStatus stays
-                  // "errored" for SQL/diagnostics), re-emit the auto_continue so
-                  // the client resumes instead of seeing a dead chat.
-                  terminalEventForCompletion.event
+              : terminalEventForCompletion?.event.type === "auto_continue" &&
+                  run.continuationTerminalEvent
+                ? terminalEventForCompletion.event
                 : {
                     type: "error",
                     error: completionError
@@ -1377,13 +1570,9 @@ export function startRun(
                   };
         const last = run.events[run.events.length - 1];
         if (!last || !isTerminalRunEvent(last.event)) {
-          // Assign the seq at EMIT time, not at stash time. `run.events` is a
-          // contiguous 0-based log, so `run.events.length` is the next free
-          // seq and can never collide with an event that was pushed after the
-          // terminal event was stashed.
           const terminal: RunEvent = {
             seq: run.events.length,
-            event: terminalEvent,
+            event: terminalEventToEmit,
           };
           try {
             await emitRunEvent(terminal, { surfacePersistenceError: true });
@@ -1394,20 +1583,22 @@ export function startRun(
               "[run-manager] terminal event persistence error:",
               err instanceof Error ? err.message : err,
             );
-            try {
-              await insertRunEvent(
-                runId,
-                terminal.seq,
-                JSON.stringify(terminal.event),
-              );
-              terminalPersistenceError = null;
-            } catch (retryError) {
-              terminalPersistenceError = retryError;
-              captureRunError(retryError, "completion");
-              console.error(
-                "[run-manager] terminal event retry persistence error:",
-                retryError instanceof Error ? retryError.message : retryError,
-              );
+            if (!eventPersistenceError) {
+              try {
+                await insertRunEvent(
+                  runId,
+                  terminal.seq,
+                  JSON.stringify(terminal.event),
+                );
+                terminalPersistenceError = null;
+              } catch (retryError) {
+                terminalPersistenceError = retryError;
+                captureRunError(retryError, "completion");
+                console.error(
+                  "[run-manager] terminal event retry persistence error:",
+                  retryError instanceof Error ? retryError.message : retryError,
+                );
+              }
             }
           }
         }
@@ -1416,16 +1607,14 @@ export function startRun(
         run.subscribers.delete(subscriber);
       }
 
-      // 4. Stop the heartbeat — all liveness writes are done.
-      clearInterval(heartbeatTimer);
-      if (softTimeoutTimer) clearTimeout(softTimeoutTimer);
+      if (inFlightWorkCount > 0 || inFlightMarkerSince !== null) {
+        inFlightWorkCount = 0;
+        mirrorInFlightMarker(false);
+      }
 
-      // 5. Persist final status to SQL. Use the conditional write so a zombie
-      //    run (reaped or displaced while executing) cannot clobber the newer
-      //    status written by the reaper or a replacement run.
       try {
         await insertRunPromise;
-        if (!terminalPersistenceError) {
+        if (!terminalPersistenceError || eventPersistenceError) {
           let statusUpdated = false;
           try {
             statusUpdated = await updateRunStatusIfRunning(
@@ -1436,7 +1625,7 @@ export function startRun(
             statusUpdated = false;
           }
           if (statusUpdated) {
-            terminalPersistenceEstablished = true;
+            terminalPersistenceEstablished = !terminalPersistenceError;
             await setRunTerminalReason(runId, terminalReason);
           } else {
             terminalPersistenceEstablished =
@@ -1448,11 +1637,6 @@ export function startRun(
         // the heartbeat-stale path.
       }
 
-      // 5b. Record terminal failure classification for errored runs so
-      //     cut-off / failed chats are queryable for pattern analysis. Read
-      //     the actual error event the run emitted (errorCode + message) so
-      //     diagnostics reflect the real cause (builder_gateway_timeout,
-      //     stale_run, context_length_exceeded, completion_error, …).
       if (finalStatus === "errored") {
         let errorCode: string | undefined;
         let errorDetail: string | undefined;
@@ -1484,10 +1668,6 @@ export function startRun(
               ? completionError.message
               : String(completionError));
         }
-        // An engine that emitted an error event without a code has NOT told us
-        // the failure is unclassifiable — it told us nothing. Recover the code
-        // from the message before falling back to "unknown", which the client
-        // reads as "do not attempt recovery".
         errorCode ??= classifyTerminalErrorCode(errorDetail);
         runTerminalErrorCode = errorCode ?? "unknown";
         runTerminalErrorDetail = errorDetail;
@@ -1495,9 +1675,9 @@ export function startRun(
       }
 
       if (terminalPersistenceError) {
-        const reconciled = await reconcileTerminalRunFromEvents(runId).catch(
-          () => false,
-        );
+        const reconciled = eventPersistenceError
+          ? false
+          : await reconcileTerminalRunFromEvents(runId);
         if (!reconciled) throw terminalPersistenceError;
         terminalPersistenceEstablished = true;
       }
@@ -1528,8 +1708,14 @@ export function startRun(
           attemptCount: options?.attemptCount,
         });
       }
-
-      // 6. Schedule in-memory cleanup + opportunistic old-run pruning.
+    })
+    .finally(() => {
+      clearInterval(heartbeatTimer);
+      if (softTimeoutTimer) clearTimeout(softTimeoutTimer);
+      if (chunkSoftTimeoutTimer) clearTimeout(chunkSoftTimeoutTimer);
+      if (progressWriteTimer) clearTimeout(progressWriteTimer);
+      progressWriteTimer = null;
+      progressWritePending = false;
       setTimeout(() => {
         activeRuns.delete(runId);
         if (threadToRun.get(threadId) === runId) {
@@ -1543,22 +1729,11 @@ export function startRun(
     });
   runPromise.then(resolveFinalized, rejectFinalized);
 
-  // Keep the originating request alive when its runtime supports background
-  // work. The callback is passed through request context so concurrent Worker
-  // requests cannot overwrite one another through a global binding.
   options?.waitUntil?.(runPromise);
 
   return run;
 }
 
-/**
- * Subscribe to a run's events starting from `fromSeq`.
- * Returns a ReadableStream that replays buffered events then live-tails.
- * Cancelling the stream only unsubscribes — does NOT abort the agent.
- *
- * Falls back to SQL polling when the run is not in local memory
- * (cross-isolate reconnection on Workers).
- */
 export function subscribeToRun(
   runId: string,
   fromSeq: number,
@@ -1567,11 +1742,73 @@ export function subscribeToRun(
   if (run) {
     return subscribeInMemory(run, fromSeq);
   }
-  // Not in local memory — try SQL (cross-isolate path)
   return subscribeFromSQL(runId, fromSeq);
 }
 
-/** In-memory subscription (same isolate, fast path) */
+export async function replayCompletedTurn(
+  threadId: string,
+  turnId: string,
+): Promise<ReadableStream<Uint8Array> | null> {
+  const persisted = await getCurrentTurnRunEventsForThread(threadId, turnId);
+  if (persisted.length === 0) return null;
+  const events = persisted.filter(
+    ({ event }) => event.type !== "auto_continue",
+  );
+  const hasTerminalEvent = events.some(({ event }) =>
+    isTerminalRunEvent(event),
+  );
+  if (!hasTerminalEvent) {
+    const last = events.at(-1);
+    events.push({
+      runId: last?.runId ?? `turn-replay-${turnId}`,
+      seq: (last?.seq ?? -1) + 1,
+      event: { type: "done" },
+    });
+  }
+  const encoder = new TextEncoder();
+  return new ReadableStream({
+    start(controller) {
+      events.forEach(({ event, runId, seq }, replaySeq) => {
+        controller.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              ...event,
+              seq: replaySeq,
+              eventId: runEventIdentity(runId, seq),
+            })}\n\n`,
+          ),
+        );
+      });
+      controller.close();
+    },
+  });
+}
+
+function runEventIdentity(runId: string, seq: number): string {
+  return `${runId}:${seq}`;
+}
+
+function streamRunEvent(
+  runId: string,
+  runEvent: RunEvent,
+): Record<string, unknown> {
+  return {
+    ...runEvent.event,
+    seq: runEvent.seq,
+    eventId: runEventIdentity(runId, runEvent.seq),
+  };
+}
+
+function streamEventWithIdentity(
+  runId: string,
+  event: AgentChatEvent | Record<string, unknown>,
+  seq?: number,
+): Record<string, unknown> {
+  return seq === undefined
+    ? { ...event }
+    : { ...event, seq, eventId: runEventIdentity(runId, seq) };
+}
+
 function subscribeInMemory(
   run: ActiveRun,
   fromSeq: number,
@@ -1579,6 +1816,7 @@ function subscribeInMemory(
   const encoder = new TextEncoder();
   let subscriberRef: ((event: RunEvent) => void) | null = null;
   let pingTimer: ReturnType<typeof setInterval> | null = null;
+  let terminalSettleTimer: ReturnType<typeof setTimeout> | null = null;
 
   return new ReadableStream({
     start(controller) {
@@ -1588,17 +1826,17 @@ function subscribeInMemory(
         } catch {
           if (subscriberRef) run.subscribers.delete(subscriberRef);
           if (pingTimer) clearInterval(pingTimer);
+          if (terminalSettleTimer) clearTimeout(terminalSettleTimer);
         }
       };
       ping();
       pingTimer = setInterval(ping, 10_000);
 
-      // Replay buffered events from fromSeq
       for (let i = fromSeq; i < run.events.length; i++) {
         try {
           controller.enqueue(
             encoder.encode(
-              `data: ${JSON.stringify({ ...run.events[i].event, seq: run.events[i].seq })}\n\n`,
+              `data: ${JSON.stringify(streamRunEvent(run.runId, run.events[i]!))}\n\n`,
             ),
           );
         } catch {
@@ -1606,25 +1844,83 @@ function subscribeInMemory(
         }
       }
 
-      // If run is already done, close immediately
       if (run.status !== "running") {
-        if (pingTimer) clearInterval(pingTimer);
-        controller.close();
-        return;
+        let bufferedTerminalIndex = -1;
+        for (let index = run.events.length - 1; index >= 0; index -= 1) {
+          const buffered = run.events[index];
+          if (buffered && isTerminalRunEvent(buffered.event)) {
+            bufferedTerminalIndex = index;
+            break;
+          }
+        }
+        if (bufferedTerminalIndex >= 0) {
+          if (bufferedTerminalIndex < fromSeq) {
+            const buffered = run.events[bufferedTerminalIndex]!;
+            try {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify(streamRunEvent(run.runId, buffered))}\n\n`,
+                ),
+              );
+            } catch {
+              if (pingTimer) clearInterval(pingTimer);
+              return;
+            }
+          }
+          if (pingTimer) clearInterval(pingTimer);
+          controller.close();
+          return;
+        }
+        terminalSettleTimer = setTimeout(() => {
+          captureError(
+            new Error(
+              `Agent run ${run.runId} reached status ${run.status} without emitting a terminal event`,
+            ),
+            {
+              route: "/_agent-native/agent-chat/runs/:id/events",
+              aiTraceId: run.runId,
+              tags: {
+                source: "agent-run-manager",
+                phase: "memory-subscription-terminal",
+                runStatus: run.status,
+              },
+              extra: { runId: run.runId, fromSeq },
+            },
+          );
+          try {
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify(
+                  streamEventWithIdentity(
+                    run.runId,
+                    UNKNOWN_RUN_STATUS_ERROR_EVENT,
+                    run.events.length,
+                  ),
+                )}\n\n`,
+              ),
+            );
+            // coercion-ok: enqueue throws only once the reader is gone; the lost terminal event is already reported by captureError above.
+          } catch {}
+          if (subscriberRef) run.subscribers.delete(subscriberRef);
+          if (pingTimer) clearInterval(pingTimer);
+          try {
+            controller.close();
+            // coercion-ok: closing an already-closed controller is this cleanup's success case, not a failure to report.
+          } catch {}
+        }, IN_MEMORY_TERMINAL_SETTLE_MS);
       }
 
-      // Subscribe to live events
       subscriberRef = (event: RunEvent) => {
         try {
           controller.enqueue(
             encoder.encode(
-              `data: ${JSON.stringify({ ...event.event, seq: event.seq })}\n\n`,
+              `data: ${JSON.stringify(streamRunEvent(run.runId, event))}\n\n`,
             ),
           );
-          // Close stream after terminal events
           if (isTerminalRunEvent(event.event)) {
             run.subscribers.delete(subscriberRef!);
             if (pingTimer) clearInterval(pingTimer);
+            if (terminalSettleTimer) clearTimeout(terminalSettleTimer);
             controller.close();
           }
         } catch {
@@ -1635,14 +1931,13 @@ function subscribeInMemory(
       run.subscribers.add(subscriberRef);
     },
     cancel() {
-      // Only unsubscribe — do NOT abort the agent run
       if (subscriberRef) run.subscribers.delete(subscriberRef);
       if (pingTimer) clearInterval(pingTimer);
+      if (terminalSettleTimer) clearTimeout(terminalSettleTimer);
     },
   });
 }
 
-/** SQL-based subscription (cross-isolate, polling) */
 function subscribeFromSQL(
   runId: string,
   fromSeq: number,
@@ -1655,9 +1950,12 @@ function subscribeFromSQL(
   return new ReadableStream({
     async start(controller) {
       let lastSeq = fromSeq;
+      const subscriptionStartedAt = Date.now();
       let activePollUntil = 0;
       let lastStatusCheckAt = 0;
+      let lastReapCheckAt = 0;
       let consecutivePollFailures = 0;
+      let consecutiveEmptyPolls = 0;
       const ping = () => {
         try {
           controller.enqueue(encoder.encode(`: ping ${Date.now()}\n\n`));
@@ -1706,7 +2004,7 @@ function subscribeFromSQL(
         try {
           controller.enqueue(
             encoder.encode(
-              `data: ${JSON.stringify({ ...event, seq: lastSeq })}\n\n`,
+              `data: ${JSON.stringify(streamEventWithIdentity(runId, event))}\n\n`,
             ),
           );
         } catch {}
@@ -1716,16 +2014,17 @@ function subscribeFromSQL(
       const poll = async () => {
         if (cancelled) return;
         try {
-          // Read new events from SQL
           const events = await getRunEventsSince(runId, lastSeq);
+          consecutiveEmptyPolls = nextSqlSubscriptionEmptyPolls(
+            consecutiveEmptyPolls,
+            events.length > 0,
+            Date.now(),
+            activePollUntil,
+          );
           if (events.length > 0) {
             activePollUntil = Date.now() + SQL_SUBSCRIPTION_ACTIVE_GRACE_MS;
           }
           for (const { seq, eventData } of events) {
-            // Advance the cursor first, before any parse/enqueue branch can
-            // `continue`/`return`. Otherwise a single corrupt (unparseable)
-            // event row is re-fetched on every poll tick forever, wedging the
-            // SSE stream open and never delivering a terminal event.
             lastSeq = seq + 1;
             let parsed: any;
             try {
@@ -1736,7 +2035,7 @@ function subscribeFromSQL(
             try {
               controller.enqueue(
                 encoder.encode(
-                  `data: ${JSON.stringify({ ...parsed, seq })}\n\n`,
+                  `data: ${JSON.stringify(streamEventWithIdentity(runId, parsed, seq))}\n\n`,
                 ),
               );
             } catch {
@@ -1744,7 +2043,6 @@ function subscribeFromSQL(
               return;
             }
 
-            // Close on terminal events
             if (isTerminalRunEvent(parsed)) {
               if (pingTimer) clearInterval(pingTimer);
               controller.close();
@@ -1752,7 +2050,6 @@ function subscribeFromSQL(
             }
           }
 
-          // Check if run completed (no terminal event but status changed)
           if (events.length === 0) {
             const now = Date.now();
             if (now - lastStatusCheckAt < SQL_SUBSCRIPTION_STATUS_POLL_MS) {
@@ -1761,22 +2058,38 @@ function subscribeFromSQL(
                 const pollMs = resolveSqlSubscriptionPollMs(
                   now,
                   activePollUntil,
+                  consecutiveEmptyPolls,
                 );
                 pollTimer = setTimeout(poll, pollMs);
               }
               return;
             }
             lastStatusCheckAt = now;
-            // Opportunistically reap a stale producer before trusting SQL's
-            // "running" status — otherwise a crashed server leaves us polling
-            // forever.
-            await reapIfStale(runId).catch(() => {});
+            if (now - lastReapCheckAt >= SQL_SUBSCRIPTION_REAP_POLL_MS) {
+              lastReapCheckAt = now;
+              await reapIfStale(runId).catch(() => {});
+            }
             const run = await getRunById(runId);
+            if (
+              !run &&
+              now - subscriptionStartedAt < RUN_RECORD_MISSING_GRACE_MS
+            ) {
+              if (!cancelled) {
+                consecutivePollFailures = 0;
+                pollTimer = setTimeout(
+                  poll,
+                  resolveSqlSubscriptionPollMs(
+                    now,
+                    activePollUntil,
+                    consecutiveEmptyPolls,
+                  ),
+                );
+              }
+              return;
+            }
             if (!run || run.status !== "running") {
-              // Run ended — do one final event read, then close
               const finalEvents = await getRunEventsSince(runId, lastSeq);
               for (const { seq, eventData } of finalEvents) {
-                // Advance first — see the main poll loop above for why.
                 lastSeq = seq + 1;
                 let parsed: any;
                 try {
@@ -1787,7 +2100,7 @@ function subscribeFromSQL(
                 try {
                   controller.enqueue(
                     encoder.encode(
-                      `data: ${JSON.stringify({ ...parsed, seq })}\n\n`,
+                      `data: ${JSON.stringify(streamEventWithIdentity(runId, parsed, seq))}\n\n`,
                     ),
                   );
                 } catch {
@@ -1801,11 +2114,6 @@ function subscribeFromSQL(
                 }
               }
               if (run?.status === "aborted") {
-                // Same treatment as the `completed` branch below: a synthetic
-                // `done` is indistinguishable from a real finish, so an abort
-                // rendered as "the agent stopped without sending a final
-                // message" and dropped the client out of continuation. Prefer
-                // the REAL terminal event, then the reason recorded on the row.
                 const existing = await getLastTerminalRunEvent(runId).catch(
                   () => null,
                 );
@@ -1818,10 +2126,13 @@ function subscribeFromSQL(
                 try {
                   controller.enqueue(
                     encoder.encode(
-                      `data: ${JSON.stringify({
-                        ...terminalEvent,
-                        seq: existing?.seq ?? lastSeq,
-                      })}\n\n`,
+                      `data: ${JSON.stringify(
+                        streamEventWithIdentity(
+                          runId,
+                          terminalEvent,
+                          existing?.seq ?? lastSeq,
+                        ),
+                      )}\n\n`,
                     ),
                   );
                 } catch {
@@ -1852,10 +2163,13 @@ function subscribeFromSQL(
                 try {
                   controller.enqueue(
                     encoder.encode(
-                      `data: ${JSON.stringify({
-                        ...terminalEvent,
-                        seq: existing?.seq ?? lastSeq,
-                      })}\n\n`,
+                      `data: ${JSON.stringify(
+                        streamEventWithIdentity(
+                          runId,
+                          terminalEvent,
+                          existing?.seq ?? lastSeq,
+                        ),
+                      )}\n\n`,
                     ),
                   );
                 } catch {
@@ -1863,12 +2177,6 @@ function subscribeFromSQL(
                   return;
                 }
               } else if (run?.status === "errored") {
-                // The run row is terminal but this subscriber's cursor is
-                // already past (or never saw) the terminal event. Prefer the
-                // REAL last terminal event / row error_detail over inventing
-                // a stale_run card — slides prod showed Connection error.
-                // rows being mislabeled as stale_run on reconnect because
-                // this path always synthesized STALE_RUN_ERROR_EVENT.
                 const existing = await getLastTerminalRunEvent(runId).catch(
                   () => null,
                 );
@@ -1883,10 +2191,64 @@ function subscribeFromSQL(
                 try {
                   controller.enqueue(
                     encoder.encode(
-                      `data: ${JSON.stringify({
-                        ...resolved.event,
-                        seq: existing?.seq ?? lastSeq,
-                      })}\n\n`,
+                      `data: ${JSON.stringify(
+                        streamEventWithIdentity(
+                          runId,
+                          resolved.event,
+                          existing?.seq ?? lastSeq,
+                        ),
+                      )}\n\n`,
+                    ),
+                  );
+                } catch {
+                  cancelled = true;
+                  return;
+                }
+              } else {
+                const lookup = await getLastTerminalRunEvent(runId).then(
+                  (event) => ({ read: true as const, event }),
+                  () => ({ read: false as const, event: null }),
+                );
+                const existing = lookup.event;
+                const terminalEvent = existing
+                  ? existing.event
+                  : !lookup.read
+                    ? { ...RUN_TERMINAL_LOOKUP_FAILED_ERROR_EVENT }
+                    : run
+                      ? { ...UNKNOWN_RUN_STATUS_ERROR_EVENT }
+                      : { ...RUN_RECORD_MISSING_ERROR_EVENT };
+                if (!existing) {
+                  captureError(
+                    new Error(
+                      !lookup.read
+                        ? `Agent run ${runId} terminal-event lookup failed; outcome unknown`
+                        : run
+                          ? `Agent run ${runId} left 'running' with unrecognized status ${run.status}`
+                          : `Agent run ${runId} has no agent_runs row and no terminal event`,
+                    ),
+                    {
+                      route: "/_agent-native/agent-chat/runs/:id/events",
+                      aiTraceId: runId,
+                      tags: {
+                        source: "agent-run-manager",
+                        phase: "sql-subscription-terminal",
+                        runStatus: run?.status ?? "missing",
+                        terminalLookup: lookup.read ? "read" : "failed",
+                      },
+                      extra: { runId, fromSeq, lastSeq },
+                    },
+                  );
+                }
+                try {
+                  controller.enqueue(
+                    encoder.encode(
+                      `data: ${JSON.stringify(
+                        streamEventWithIdentity(
+                          runId,
+                          terminalEvent,
+                          existing?.seq ?? lastSeq,
+                        ),
+                      )}\n\n`,
                     ),
                   );
                 } catch {
@@ -1900,12 +2262,12 @@ function subscribeFromSQL(
             }
           }
 
-          // Schedule next poll
           if (!cancelled) {
             consecutivePollFailures = 0;
             const pollMs = resolveSqlSubscriptionPollMs(
               Date.now(),
               activePollUntil,
+              consecutiveEmptyPolls,
             );
             pollTimer = setTimeout(poll, pollMs);
           }
@@ -1934,7 +2296,6 @@ function subscribeFromSQL(
   });
 }
 
-/** Get the active run for a thread (if any) — checks memory then SQL */
 export function getActiveRunForThread(threadId: string): ActiveRun | null {
   const runId = threadToRun.get(threadId);
   if (runId) {
@@ -1944,38 +2305,10 @@ export function getActiveRunForThread(threadId: string): ActiveRun | null {
   return null;
 }
 
-/**
- * `/runs/active` wire compatibility for the `truncated` status.
- *
- * Shipped clients key their chunk-boundary handling off
- * `status === "completed"` plus `terminalReason`
- * (`BACKGROUND_CONTINUATION_TERMINAL_REASONS` in `client/agent-chat-adapter.ts`)
- * and would treat an unrecognized status as non-terminal, re-attaching to the
- * same finished run until a budget expires. SQL keeps the honest status for
- * retention and telemetry; only the wire reports the legacy value, and
- * `terminalReason` on the same payload still distinguishes the two.
- *
- * DELETE THIS once `client/agent-chat-adapter.ts` reads `truncated` directly —
- * that is also what lets its hand-maintained reason mirror go away.
- */
 function legacyWireRunStatus(status: string): string {
   return status === "truncated" ? "completed" : status;
 }
 
-/**
- * Async version that also checks SQL — for cross-isolate access.
- * Used by the /runs/active endpoint.
- *
- * Returns `heartbeatAt` so the client can independently decide a run is
- * dead even before the server-side stale reap has fired. Returns
- * `lastProgressAt` so the client-side stuck-detector can show a
- * user-visible "this chat looks stuck" affordance when a run is alive
- * (heartbeating) but not actually emitting events. Returns
- * `awaitingRedispatch` so the client's background follow loop can tell a
- * legitimately-deferred `chainServerDrivenContinuation` successor (recovery
- * in progress server-side) apart from a genuinely dead run — see this
- * field's own doc comment below.
- */
 export async function getActiveRunForThreadAsync(threadId: string): Promise<{
   runId: string;
   threadId: string;
@@ -1983,15 +2316,8 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
   status: string;
   heartbeatAt: number;
   lastProgressAt: number | null;
-  /** How the run was dispatched/continued (foreground, foreground-self-chain, background...). */
   dispatchMode?: string | null;
-  /** Compact terminal classification, e.g. done, run_timeout, stale_run. */
   terminalReason?: string | null;
-  /**
-   * Last reached `_process-run` worker stage as a JSON string
-   * `{stage,detail?,at}`. Surfaced so a silent background-worker death is
-   * diagnosable from the client WITHOUT the unreadable bg-fn logs.
-   */
   diagStage?: string | null;
   /**
    * True exactly when this run is a `chainServerDrivenContinuation` deferral
@@ -2007,44 +2333,12 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
    * isn't an unclaimed background dispatch.
    */
   awaitingRedispatch: boolean;
-  /**
-   * True exactly when this run's `in_flight_since` marker is set — a tool
-   * call or A2A `agent_call` delegation is open and has not yet resolved
-   * (see `setRunInFlightMarker` / `IN_FLIGHT_RUN_STALE_GRACE_MS` in
-   * run-store.ts). This is the SAME signal `reapIfStale` reads to grant its
-   * bounded stale-reap grace — computed here from the identical
-   * `in_flight_since` column via `getRunByThread`, never re-derived, so the
-   * client and the reaper cannot disagree about what "in flight" means.
-   *
-   * Surfaced on `/runs/active` (agent-chat-plugin.ts) as the
-   * server-authoritative alternative to the client-side proxy
-   * `RunStuckBanner` currently infers from unresolved `tool-call` content
-   * parts in the local message list — that proxy can go stale after a
-   * reconnect or reader-mode replay; this cannot, because it is read fresh
-   * from SQL on every poll.
-   */
   hasInFlightWork: boolean;
 } | null> {
-  // Check memory first — return both running AND recently-completed runs
-  // that still have events in memory. This allows sub-agent tabs to replay
-  // the full conversation from completed runs via SSE.
   const memRun = getActiveRunForThread(threadId);
   if (memRun && (memRun.status === "running" || memRun.events.length > 0)) {
     const sqlSnapshot = await fetchRunThreadSnapshot(memRun.runId, threadId);
 
-    // FIX 1 (durable-background incident): a terminal in-memory run (chunk
-    // completed at a soft-timeout/no-progress/loop-limit boundary, or any
-    // other terminal outcome) never clears `threadToRun` — it stays this
-    // thread's resident in-memory candidate for up to CLEANUP_DELAY_MS
-    // (5 min), and `fetchRunThreadSnapshot` above returns null the instant
-    // SQL's newest row for the thread is no longer THIS run (i.e. a
-    // successor already exists). Left alone, every poll that lands on this
-    // warm isolate would keep falling back to `memRun.status` below and
-    // never discover that a newer, still-running successor already exists
-    // in SQL — exactly the "stale terminal run masks a live successor" bug
-    // that produced the mid-sentence dead turn. Only pay for the extra SQL
-    // read here, in the terminal-candidate branch; the common "still
-    // running" poll (the vast majority) never reaches it.
     if (!sqlSnapshot && memRun.status !== "running") {
       const successor = await fetchNewerNonTerminalRunForSameTurn(
         threadId,
@@ -2061,8 +2355,6 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
           dispatchMode: successor.dispatchMode,
           terminalReason: successor.terminalReason,
           diagStage: successor.diagStage,
-          // Definitionally non-terminal and freshly read from SQL above —
-          // never the stale in-memory candidate's own state.
           awaitingRedispatch: false,
           hasInFlightWork: successor.inFlightSince != null,
         };
@@ -2079,42 +2371,15 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
       threadId: memRun.threadId,
       turnId: memRun.turnId,
       status,
-      // In-memory means this isolate is the producer. By definition, the
-      // heartbeat is fresh as of "now" while the run is still running. Once
-      // SQL has terminal truth, prefer that timestamp so a stale in-memory
-      // buffer cannot keep the browser believing a finished background run is
-      // still alive.
       heartbeatAt,
-      // For an in-memory run we don't have a separate "last event emit"
-      // timestamp tracked in JS — the SQL bump is throttled per-second.
-      // Read it back from SQL on demand. For the common case the SQL row
-      // is well under 1s old; if it isn't, the stuck-detector will pick
-      // it up on the next poll cycle.
       lastProgressAt: sqlSnapshot?.lastProgressAt ?? null,
       dispatchMode: sqlSnapshot?.dispatchMode ?? null,
       terminalReason: sqlSnapshot?.terminalReason ?? null,
       diagStage: sqlSnapshot?.diagStage ?? null,
-      // In-memory means this isolate is the live producer — never the
-      // "deferred, nobody producing" state this flag identifies.
       awaitingRedispatch: false,
-      // Read from the SAME SQL snapshot the other fields above already read
-      // (`fetchRunThreadSnapshot` -> `getRunByThread`) rather than the
-      // producer's own in-memory `inFlightWorkCount` — this isolate IS the
-      // live producer, but there is no separate in-memory channel wired for
-      // that counter today, and the SQL marker is written on every 0<->N
-      // transition (see run-manager's `trackInFlightWork`), so it is at most
-      // one event behind here — the same tolerance `lastProgressAt` above
-      // already accepts.
       hasInFlightWork: sqlSnapshot?.inFlightSince != null,
     };
   }
-  // Fall back to SQL — also surface recently terminated runs so the client
-  // can reconnect and replay synthesized done/error events instead of
-  // retrying the original POST. Without this, a POST that fails after the
-  // server already accepted (and finished) the run would re-execute the
-  // turn and double-apply mutations: the in-memory branch above already
-  // returns terminal runs whose events are still buffered, but the SQL
-  // path is the only authority once memory has been evicted.
   try {
     const sqlRun = await getRunByThread(threadId, { includeTerminal: true });
     if (!sqlRun) return null;
@@ -2164,9 +2429,6 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
         );
         if (recovered) return null;
       }
-      // If the producer is dead (no recent heartbeat), reap before the
-      // client can see a stale "running" status and enter a reconnect
-      // loop it can never exit.
       const reaped = await reapIfStale(sqlRun.id).catch(() => false);
       if (reaped) return null;
       return {
@@ -2181,9 +2443,6 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
         diagStage: sqlRun.diagStage,
         awaitingRedispatch:
           isUnclaimedBackgroundDispatch && stillInsideRedispatchBound,
-        // Same `in_flight_since` column `reapIfStale` (just called above,
-        // and it did NOT reap this row) reads for its own grace decision —
-        // one source of truth, not a second re-derived notion of "in flight".
         hasInFlightWork: sqlRun.inFlightSince != null,
       };
     }
@@ -2192,17 +2451,6 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
       sqlRun.status === "truncated" ||
       sqlRun.status === "errored"
     ) {
-      // Cap how far back we'll surface terminal runs as "active". The goal
-      // is to catch the recently-completed-but-reconnecting case, not to
-      // resurrect ancient turns when the user reopens an old thread.
-      //
-      // Measure age from the run's terminal timestamp, not its start. A
-      // long-running task that ran 11 minutes and completed five seconds
-      // ago should still be reachable — the client's disconnect happened
-      // around completion, so completion time is what matters for the
-      // "is the user still here waiting?" question. Fall back to the last
-      // heartbeat (older deployments may have unset completed_at) and
-      // finally to startedAt for ancient rows.
       const referenceAt =
         sqlRun.completedAt ?? sqlRun.heartbeatAt ?? sqlRun.startedAt;
       const terminalAge = Date.now() - referenceAt;
@@ -2217,9 +2465,7 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
         dispatchMode: sqlRun.dispatchMode,
         terminalReason: sqlRun.terminalReason,
         diagStage: sqlRun.diagStage,
-        // Terminal already — never the "still deferred, running" state.
         awaitingRedispatch: false,
-        // Terminal already — no live work can still be in flight.
         hasInFlightWork: false,
       };
     }
@@ -2231,8 +2477,6 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
 
 async function fetchRunThreadSnapshot(runId: string, threadId: string) {
   try {
-    // `getRunById` returns a narrow projection today; ask for the row via
-    // the thread lookup which carries dispatch/terminal/progress fields.
     const byThread = await getRunByThread(threadId, {
       includeTerminal: true,
     });
@@ -2243,19 +2487,6 @@ async function fetchRunThreadSnapshot(runId: string, threadId: string) {
   }
 }
 
-/**
- * FIX 1 (durable-background incident): find a genuinely newer, still-running
- * SQL row for the SAME turn as a terminal in-memory `ActiveRun` — used only
- * when `fetchRunThreadSnapshot` found no SQL row matching the in-memory
- * run's own id (i.e. SQL's newest row for the thread is a different run).
- * `getRunByThread` always returns the thread's newest row by `started_at`,
- * so this is the same read `fetchRunThreadSnapshot` already made; we just
- * don't throw its result away when the id doesn't match.
- *
- * Scoped to the SAME `turnId` (not just the same thread) so an unrelated,
- * later user turn on the same thread is never mistaken for a continuation
- * successor of this one.
- */
 async function fetchNewerNonTerminalRunForSameTurn(
   threadId: string,
   memRun: ActiveRun,
@@ -2277,7 +2508,6 @@ async function fetchNewerNonTerminalRunForSameTurn(
   }
 }
 
-/** Get a run by ID */
 export function getRun(runId: string): ActiveRun | null {
   return activeRuns.get(runId) ?? null;
 }
@@ -2290,10 +2520,8 @@ function abortRunInMemory(runId: string, reason: string): boolean {
   return !!run;
 }
 
-/** Explicitly abort a run (e.g. Stop button). */
 export function abortRun(runId: string, reason: string = "user"): boolean {
   const abortedInMemory = abortRunInMemory(runId, reason);
-  // Also mark as aborted in SQL (for cross-isolate abort on Workers)
   markRunAborted(runId, reason).catch(() => {});
   return abortedInMemory;
 }
@@ -2312,10 +2540,6 @@ export async function abortRunDurably(
   try {
     await markRunAborted(runId, reason);
   } catch (error) {
-    // The local run is already stopped. A transient durable cleanup failure
-    // must not turn the user's Stop/Retry request into a 500 after that
-    // irreversible in-memory outcome. Capture it for repair/reaping and let
-    // the request report the abort it did complete.
     captureError(error, {
       route: "/_agent-native/agent-chat/runs/:id/abort",
       aiTraceId: runId,
@@ -2333,33 +2557,31 @@ export async function abortRunDurably(
   return abortedInMemory;
 }
 
-/**
- * Stop the whole turn `runId` belongs to, not just that run.
- *
- * A turn is executed as a chain of runs: every `loop_limit` / `auto_continue`
- * boundary and every background handoff starts a successor run with a NEW run
- * id under the same turn id. Aborting one run therefore only ends the current
- * chunk — the successor claims itself and the turn keeps going, which is what
- * users see as "Stop didn't stop it". The durable turn-abort marker is the only
- * thing the successor-claim path (`isTurnAborted`) consults.
- */
+export async function abortTurnByRefDurably(
+  threadId: string,
+  turnId: string,
+  reason: string = "user",
+): Promise<"aborted" | "already_terminal"> {
+  for (const run of activeRuns.values()) {
+    if (run.threadId === threadId && run.turnId === turnId) {
+      abortInMemoryRun(run, reason);
+    }
+  }
+  return markTurnAborted(threadId, turnId, reason);
+}
+
 export async function abortTurnDurably(
   runId: string,
   reason: string = "user",
 ): Promise<void> {
   const memRun = activeRuns.get(runId);
-  // In-memory first: a foreground run's SQL insert is async, so the row may not
-  // exist yet when Stop lands moments after send.
   const ref = memRun
     ? { threadId: memRun.threadId, turnId: memRun.turnId }
     : await getRunTurnRef(runId).catch(() => null);
   if (!ref) return;
   try {
-    await markTurnAborted(ref.threadId, ref.turnId, reason);
+    await abortTurnByRefDurably(ref.threadId, ref.turnId, reason);
   } catch (error) {
-    // The current run is already stopped; a failed marker write must not turn
-    // Stop into a 500. Successors will keep running — capture it so that is
-    // visible rather than silent.
     captureError(error, {
       route: "/_agent-native/agent-chat/runs/:id/abort",
       aiTraceId: runId,
@@ -2369,5 +2591,4 @@ export async function abortTurnDurably(
   }
 }
 
-// Re-export so callers can avoid importing from run-store directly.
 export { tryClaimRunSlot } from "./run-store.js";

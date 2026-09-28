@@ -1,11 +1,3 @@
-/**
- * Shared screen-capture quality policy for browser-based Clips recorders.
- *
- * Display capture constraints are applied after the user chooses a surface. We
- * use `max` envelopes (never `min`/`exact`) so Retina and 4K sources are
- * downscaled before MediaRecorder has to encode them.
- */
-
 export const SCREEN_CAPTURE_FRAME_RATE = 24;
 export const SCREEN_CAPTURE_MAX_WIDTH = 1920;
 export const SCREEN_CAPTURE_MAX_HEIGHT = 1080;
@@ -33,5 +25,26 @@ export function screenCaptureVideoConstraints(
       max: SCREEN_CAPTURE_MAX_HEIGHT,
     },
     displaySurface,
+  };
+}
+
+export type ScreenCaptureDisplayOptions = {
+  video: ScreenCaptureVideoConstraints;
+  audio: boolean;
+  selfBrowserSurface: "include" | "exclude";
+  surfaceSwitching: "include" | "exclude";
+  systemAudio: "include" | "exclude";
+};
+
+export function screenCaptureDisplayOptions(
+  displaySurface: ScreenCaptureSurface,
+  wantsMic: boolean,
+): ScreenCaptureDisplayOptions {
+  return {
+    video: screenCaptureVideoConstraints(displaySurface),
+    audio: wantsMic,
+    selfBrowserSurface: displaySurface === "browser" ? "include" : "exclude",
+    surfaceSwitching: "include",
+    systemAudio: wantsMic ? "include" : "exclude",
   };
 }

@@ -4,6 +4,8 @@ import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { TooltipProvider } from "../components/ui/tooltip.js";
+import { AgentNativeI18nProvider } from "../i18n.js";
 import { ShareButton } from "./ShareButton.js";
 
 const shareMutate = vi.hoisted(() => vi.fn());
@@ -18,12 +20,22 @@ const popoverInteractOutsideHandlers = vi.hoisted(
       }) => void
     >,
 );
+const sheetInteractOutsideHandlers = vi.hoisted(
+  () =>
+    [] as Array<
+      (event: {
+        detail: { originalEvent: { target: EventTarget | null } };
+        preventDefault: () => void;
+      }) => void
+    >,
+);
 const popoverOpenChangeHandlers = vi.hoisted(
   () => [] as Array<(open: boolean) => void>,
 );
 const popoverTestState = vi.hoisted(() => ({
   simulateMounting: false,
 }));
+const sharesError = vi.hoisted(() => ({ current: false }));
 const sharesData = vi.hoisted(() => ({
   current: {
     ownerEmail: "owner@example.com",
@@ -37,6 +49,7 @@ const sharesData = vi.hoisted(() => ({
 vi.mock("../use-action.js", () => ({
   useActionQuery: () => ({
     data: sharesData.current,
+    isError: sharesError.current,
     refetch: refetchShares,
   }),
   useActionMutation: (name: string) => ({
@@ -116,7 +129,31 @@ vi.mock("../components/ui/popover.js", () => {
   };
 });
 
-function setInputValue(input: HTMLInputElement, value: string) {
+vi.mock("../components/ui/sheet.js", () => ({
+  Sheet: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  SheetTrigger: ({ children }: { children: React.ReactNode }) => (
+    <>{children}</>
+  ),
+  SheetTitle: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  SheetContent: ({
+    children,
+    onInteractOutside,
+  }: {
+    children: React.ReactNode;
+    onInteractOutside?: (event: {
+      detail: { originalEvent: { target: EventTarget | null } };
+      preventDefault: () => void;
+    }) => void;
+  }) => {
+    if (onInteractOutside) sheetInteractOutsideHandlers.push(onInteractOutside);
+    return <div>{children}</div>;
+  },
+}));
+
+function setInputValue(
+  input: HTMLInputElement | HTMLTextAreaElement,
+  value: string,
+) {
   const setter = Object.getOwnPropertyDescriptor(
     Object.getPrototypeOf(input),
     "value",
@@ -147,8 +184,10 @@ describe("ShareButton", () => {
     otherMutate.mockReset();
     refetchShares.mockClear();
     popoverInteractOutsideHandlers.length = 0;
+    sheetInteractOutsideHandlers.length = 0;
     popoverOpenChangeHandlers.length = 0;
     popoverTestState.simulateMounting = false;
+    sharesError.current = false;
     sharesData.current = {
       ownerEmail: "owner@example.com",
       orgId: null,
@@ -187,6 +226,8 @@ describe("ShareButton", () => {
       );
     });
 
+    expect(container.textContent).not.toContain('Share "Launch notes"');
+
     const input = container.querySelector(
       'input[placeholder="Add people by email"]',
     ) as HTMLInputElement;
@@ -213,6 +254,124 @@ describe("ShareButton", () => {
     expect(
       container.querySelector('input[placeholder="Add people by email"]'),
     ).toBeTruthy();
+  });
+
+  it("uses commenter role copy overrides and persists the commenter role", async () => {
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ShareButton
+            resourceType="deck"
+            resourceId="deck-1"
+            roleCopy={{
+              commenter: {
+                label: "Commenter",
+                description: "Can view and add comments",
+              },
+            }}
+          />
+        </QueryClientProvider>,
+      );
+    });
+
+    const roleTrigger = container.querySelector(
+      'button[aria-label="Role"]',
+    ) as HTMLButtonElement | null;
+    expect(roleTrigger?.textContent).toContain("Viewer");
+    await act(async () => roleTrigger?.click());
+    expect(document.body.textContent).toContain("Can view and add comments");
+    const commenterOption = Array.from(
+      document.querySelectorAll<HTMLElement>('[role="option"]'),
+    ).find((option) => option.textContent?.includes("Commenter"));
+    expect(commenterOption).toBeTruthy();
+    act(() => commenterOption?.click());
+    expect(roleTrigger?.textContent).toContain("Commenter");
+
+    const input = container.querySelector(
+      'input[placeholder="Add people by email"]',
+    ) as HTMLInputElement;
+    setInputValue(input, "commenter@example.com");
+    const add = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Add",
+    );
+    if (!add) throw new Error("Add button not found");
+
+    act(() => add.click());
+
+    expect(shareMutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        principalId: "commenter@example.com",
+        role: "commenter",
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it("can omit commenter for resources without comment support", async () => {
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ShareButton
+            resourceType="form"
+            resourceId="form-1"
+            allowedRoles={["viewer", "editor", "admin"]}
+          />
+        </QueryClientProvider>,
+      );
+    });
+
+    const roleTrigger = container.querySelector(
+      'button[aria-label="Role"]',
+    ) as HTMLButtonElement | null;
+    await act(async () => roleTrigger?.click());
+    expect(document.body.textContent).not.toContain(
+      "Can view and add comments",
+    );
+    expect(
+      Array.from(
+        document.querySelectorAll<HTMLElement>('[role="option"]'),
+      ).some((option) => option.textContent?.includes("Commenter")),
+    ).toBe(false);
+  });
+
+  it("sends an optional message with the notification", async () => {
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ShareButton resourceType="deck" resourceId="deck-1" />
+        </QueryClientProvider>,
+      );
+    });
+
+    const input = container.querySelector(
+      'input[placeholder="Add people by email"]',
+    ) as HTMLInputElement;
+    setInputValue(input, "recipient@example.com");
+
+    const addMessage = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Add a message",
+    );
+    if (!addMessage) throw new Error("Add a message button not found");
+    act(() => addMessage.click());
+
+    const message = container.querySelector(
+      'textarea[aria-label="Message"]',
+    ) as HTMLTextAreaElement;
+    setInputValue(message, "Here is the latest version.");
+
+    const add = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Add",
+    );
+    if (!add) throw new Error("Add button not found");
+    act(() => add.click());
+
+    expect(shareMutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        principalId: "recipient@example.com",
+        message: "Here is the latest version.",
+      }),
+      expect.any(Object),
+    );
   });
 
   it("keeps a draft email when the share popover is closed and reopened", async () => {
@@ -250,9 +409,6 @@ describe("ShareButton", () => {
   });
 
   it("shows the copy action for share URLs regardless of visibility", async () => {
-    // Mirrors Google Slides: the copy button is always live. Access is
-    // enforced when the recipient opens the URL, not by hiding the link in
-    // the share dialog.
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
@@ -314,7 +470,7 @@ describe("ShareButton", () => {
     expect(copy.textContent).toBe("Copied");
   });
 
-  it("can render an icon-only trigger", async () => {
+  it("standardizes legacy icon triggers as text-only", async () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
@@ -329,11 +485,33 @@ describe("ShareButton", () => {
     });
 
     const trigger = container.querySelector(
-      'button[aria-label="Share (Private)"]',
+      'button[aria-label="Share"]',
     ) as HTMLButtonElement | null;
 
     expect(trigger).toBeTruthy();
-    expect(trigger?.textContent).not.toContain("Share");
+    expect(trigger?.textContent).toBe("Share");
+    expect(trigger?.querySelector("svg")).toBeFalsy();
+  });
+
+  it("allows an explicit compact trigger while preserving the Share label", async () => {
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ShareButton
+            resourceType="chat_thread"
+            resourceId="thread-1"
+            triggerContent={<span data-share-icon="">↗</span>}
+          />
+        </QueryClientProvider>,
+      );
+    });
+
+    const trigger = container.querySelector(
+      'button[aria-label="Share"]',
+    ) as HTMLButtonElement | null;
+
+    expect(trigger?.querySelector("[data-share-icon]")).not.toBeNull();
+    expect(trigger?.getAttribute("title")).toBe("Share");
   });
 
   it("renders the label trigger as text only regardless of visibility", async () => {
@@ -367,7 +545,7 @@ describe("ShareButton", () => {
     expect(trigger?.querySelector(".animate-pulse")).toBeFalsy();
   });
 
-  it("renders the icon-only trigger without a loading placeholder", async () => {
+  it("keeps the standardized trigger usable while sharing data loads", async () => {
     sharesData.current = undefined as any;
 
     await act(async () => {
@@ -387,8 +565,40 @@ describe("ShareButton", () => {
       'button[aria-label="Share"]',
     ) as HTMLButtonElement | null;
 
-    expect(trigger?.querySelector("svg")).toBeTruthy();
+    expect(trigger?.textContent).toBe("Share");
+    expect(trigger?.querySelector("svg")).toBeFalsy();
     expect(trigger?.querySelector(".animate-pulse")).toBeFalsy();
+  });
+
+  it("reports a failed shares read instead of skeletoning forever", async () => {
+    sharesData.current = undefined as any;
+    sharesError.current = true;
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ShareButton
+            resourceType="plan"
+            resourceId="plan-1"
+            shareUrl="https://plan.agent-native.com/plans/plan-1"
+          />
+        </QueryClientProvider>,
+      );
+    });
+
+    expect(container.textContent).toContain("Couldn't load sharing settings.");
+    expect(container.querySelector(".animate-pulse")).toBeFalsy();
+
+    const retry = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Retry",
+    );
+    if (!retry) throw new Error("Retry button not found");
+    const refetchesBefore = refetchShares.mock.calls.length;
+    act(() => {
+      retry.click();
+    });
+
+    expect(refetchShares.mock.calls.length).toBe(refetchesBefore + 1);
   });
 
   it("renders both primary and secondary share URLs", async () => {
@@ -407,15 +617,45 @@ describe("ShareButton", () => {
       );
     });
 
-    const inputs = Array.from(container.querySelectorAll("input"));
-    const editorInput = inputs.find(
-      (i) => i.value === "https://slides.agent-native.com/deck/deck-1",
+    const text = container.textContent ?? "";
+    expect(text).toContain("Editor link");
+    expect(text).toContain("Presentation link");
+    expect(text).not.toContain("https://slides.agent-native.com");
+    expect(
+      Array.from(container.querySelectorAll("button")).filter(
+        (button) => button.textContent === "Copy",
+      ),
+    ).toHaveLength(2);
+  });
+
+  it("keeps agent-readable sharing collapsed until requested", async () => {
+    sharesData.current = {
+      ...sharesData.current,
+      agentReadable: true,
+    };
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ShareButton resourceType="deck" resourceId="deck-1" />
+        </QueryClientProvider>,
+      );
+    });
+
+    expect(container.textContent).toContain("Share with agents");
+    expect(container.textContent).not.toContain("Agent context link");
+
+    const disclosure = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent?.includes("Share with agents"),
     );
-    const presentationInput = inputs.find(
-      (i) => i.value === "https://slides.agent-native.com/p/deck-1",
+    if (!disclosure) throw new Error("Agent share disclosure not found");
+
+    act(() => disclosure.click());
+
+    expect(otherMutate).toHaveBeenCalledWith(
+      { resourceType: "deck", resourceId: "deck-1" },
+      expect.any(Object),
     );
-    expect(editorInput).toBeTruthy();
-    expect(presentationInput).toBeTruthy();
   });
 
   it("can customize access labels and move the share URL to the top", async () => {
@@ -436,10 +676,17 @@ describe("ShareButton", () => {
     });
 
     const text = container.textContent ?? "";
-    expect(text).toContain("People with editing access");
     expect(text).toContain("General editing access");
-    expect(text.indexOf("Public response link")).toBeLessThan(
-      text.indexOf("People with editing access"),
+    expect(container.textContent).toContain("People with editing access");
+    expect(
+      Array.from(container.querySelectorAll("button")).some(
+        (button) => button.textContent === "Manage access",
+      ),
+    ).toBe(false);
+    expect(
+      (container.textContent ?? "").indexOf("General editing access"),
+    ).toBeLessThan(
+      (container.textContent ?? "").indexOf("People with editing access"),
     );
   });
 
@@ -577,6 +824,50 @@ describe("ShareButton", () => {
     outside.remove();
   });
 
+  it("keeps the mobile share sheet open for nested portaled share menus", async () => {
+    vi.stubGlobal("matchMedia", () => ({
+      matches: true,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    }));
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ShareButton resourceType="document" resourceId="doc-1" mobileSheet />
+        </QueryClientProvider>,
+      );
+    });
+
+    const handler =
+      sheetInteractOutsideHandlers[sheetInteractOutsideHandlers.length - 1];
+    if (!handler) throw new Error("share sheet outside handler not found");
+
+    const nestedOverlay = document.createElement("div");
+    nestedOverlay.setAttribute("data-agent-native-share-overlay", "");
+    const nestedItem = document.createElement("button");
+    nestedOverlay.appendChild(nestedItem);
+    document.body.appendChild(nestedOverlay);
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+
+    const preventNestedDismiss = vi.fn();
+    handler({
+      detail: { originalEvent: { target: nestedItem } },
+      preventDefault: preventNestedDismiss,
+    });
+    expect(preventNestedDismiss).toHaveBeenCalledOnce();
+
+    const preventOutsideDismiss = vi.fn();
+    handler({
+      detail: { originalEvent: { target: outside } },
+      preventDefault: preventOutsideDismiss,
+    });
+    expect(preventOutsideDismiss).not.toHaveBeenCalled();
+
+    nestedOverlay.remove();
+    outside.remove();
+  });
+
   it("renders optional share tabs and switches to custom tab content", async () => {
     await act(async () => {
       root.render(
@@ -597,6 +888,11 @@ describe("ShareButton", () => {
                   label: "Send to...",
                   content: <div>Send body</div>,
                 },
+                {
+                  value: "context",
+                  label: "Context",
+                  content: <div>Context body</div>,
+                },
               ],
             }}
           />
@@ -607,7 +903,16 @@ describe("ShareButton", () => {
     expect(container.textContent).toContain("Share link");
     expect(container.textContent).toContain("Export");
     expect(container.textContent).toContain("Send to...");
+    expect(container.textContent).toContain("Context");
+    expect(container.textContent).not.toContain("Context body");
     expect(container.textContent).not.toContain("Export body");
+    for (const tab of container.querySelectorAll<HTMLButtonElement>(
+      '[role="tab"]',
+    )) {
+      expect(
+        document.getElementById(tab.getAttribute("aria-controls") ?? ""),
+      ).not.toBeNull();
+    }
 
     const exportTab = Array.from(container.querySelectorAll("button")).find(
       (button) => button.textContent === "Export",
@@ -620,6 +925,52 @@ describe("ShareButton", () => {
 
     expect(container.textContent).toContain("Export body");
     expect(container.textContent).not.toContain("Send body");
+  });
+
+  it("renders the context tab when it is the only custom share tab", async () => {
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ShareButton
+            resourceType="deck"
+            resourceId="deck-1"
+            shareTabs={{
+              tabs: [
+                {
+                  value: "context",
+                  label: "Context",
+                  content: <div>Context body</div>,
+                },
+              ],
+            }}
+          />
+        </QueryClientProvider>,
+      );
+    });
+
+    expect(container.textContent).toContain("Share link");
+    expect(container.textContent).toContain("Context");
+    expect(container.textContent).not.toContain("Context body");
+    expect(container.querySelector('[role="tablist"]')).not.toBeNull();
+
+    const contextTab = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Context",
+    );
+    if (!contextTab) throw new Error("Context tab not found");
+
+    act(() => {
+      contextTab.click();
+    });
+
+    expect(container.textContent).toContain("Context body");
+    const contextPanelId = contextTab.getAttribute("aria-controls");
+    expect(contextPanelId).toBeTruthy();
+    const contextPanel = contextPanelId
+      ? document.getElementById(contextPanelId)
+      : null;
+    expect(contextPanel?.getAttribute("aria-labelledby")).toBe(
+      contextTab.getAttribute("id"),
+    );
   });
 
   it("buries organization search visibility under Advanced", async () => {
@@ -673,7 +1024,14 @@ describe("ShareButton", () => {
       const url = String(input);
       if (url.includes("/_agent-native/org/members")) {
         return Response.json({
-          members: [{ email: "akash@builder.io", role: "member" }],
+          members: [
+            {
+              email: "akash@builder.io",
+              image: "https://lh3.googleusercontent.com/a/avatar.jpg",
+              name: "Akash",
+              role: "member",
+            },
+          ],
           hasMore: false,
           nextOffset: null,
         });
@@ -709,6 +1067,16 @@ describe("ShareButton", () => {
     expect(String(memberSearchCall?.[0])).toContain("search=aka");
     expect(String(memberSearchCall?.[0])).toContain("limit=25");
     expect(container.textContent).toContain("akash@builder.io");
+    expect(
+      container.querySelector(
+        'img[src="https://lh3.googleusercontent.com/a/avatar.jpg"]',
+      ),
+    ).toBeTruthy();
+    expect(
+      fetchMock.mock.calls.some((call) =>
+        String(call[0]).includes("/_agent-native/avatar/"),
+      ),
+    ).toBe(false);
 
     act(() => {
       input.dispatchEvent(
@@ -725,22 +1093,25 @@ describe("ShareButton", () => {
   });
 
   it("requests the next org-member page from the share autocomplete", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        Response.json({
-          members: [{ email: "first@builder.io", role: "member" }],
-          hasMore: true,
-          nextOffset: 25,
-        }),
-      )
-      .mockResolvedValueOnce(
-        Response.json({
-          members: [{ email: "second@builder.io", role: "member" }],
-          hasMore: false,
-          nextOffset: null,
-        }),
-      );
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/_agent-native/org/members")) {
+        return Promise.resolve(
+          url.includes("offset=25")
+            ? Response.json({
+                members: [{ email: "second@builder.io", role: "member" }],
+                hasMore: false,
+                nextOffset: null,
+              })
+            : Response.json({
+                members: [{ email: "first@builder.io", role: "member" }],
+                hasMore: true,
+                nextOffset: 25,
+              }),
+        );
+      }
+      return Promise.resolve(Response.json({ image: null }));
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     await act(async () => {
@@ -773,7 +1144,95 @@ describe("ShareButton", () => {
       await Promise.resolve();
     });
 
-    expect(String(fetchMock.mock.calls[1]?.[0])).toContain("offset=25");
+    const loadMoreCall = fetchMock.mock.calls.find((call) =>
+      String(call[0]).includes("offset=25"),
+    );
+    expect(String(loadMoreCall?.[0])).toContain("offset=25");
     expect(container.textContent).toContain("second@builder.io");
+  });
+
+  it("keeps quick copy separate from People and Agents tabs", async () => {
+    const onCopy = vi.fn(async () => true);
+    await act(async () => {
+      root.render(
+        <TooltipProvider>
+          <QueryClientProvider client={queryClient}>
+            <ShareButton
+              resourceType="document"
+              resourceId="doc-1"
+              quickCopy={{
+                label: "Copy page link",
+                copiedLabel: "Copied page link",
+                onCopy,
+              }}
+              peopleTabLabel="People"
+              agentsTabLabel="Agents"
+              agentTabContent={<button type="button">Copy agent prompt</button>}
+            />
+          </QueryClientProvider>
+        </TooltipProvider>,
+      );
+    });
+
+    const copy = container.querySelector(
+      'button[aria-label="Copy page link"]',
+    ) as HTMLButtonElement;
+    expect(copy).not.toBeNull();
+    await act(async () => copy.click());
+    expect(onCopy).toHaveBeenCalledTimes(1);
+    expect(
+      container.querySelector('[role="tab"][aria-selected="true"]')
+        ?.textContent,
+    ).toBe("People");
+    expect(container.textContent).toContain("Only people with access can view");
+    expect(container.textContent).not.toContain("Copy agent prompt");
+
+    const agents = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('[role="tab"]'),
+    ).find((tab) => tab.textContent === "Agents");
+    expect(agents).toBeDefined();
+    await act(async () => {
+      agents!.dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true, button: 0 }),
+      );
+    });
+    expect(
+      container.querySelector('[role="tab"][aria-selected="true"]')
+        ?.textContent,
+    ).toBe("Agents");
+    expect(container.textContent).toContain("Copy agent prompt");
+    expect(container.textContent).not.toContain("owner@example.com");
+  });
+
+  // Keep the non-source-locale provider test last: react-i18next's global
+  // fallback instance otherwise leaks the selected language into tests that
+  // intentionally exercise providerless compatibility.
+  it("localizes the standardized text trigger", async () => {
+    await act(async () => {
+      root.render(
+        <AgentNativeI18nProvider
+          initialLocale="de-DE"
+          initialPreference="de-DE"
+          persistPreference={false}
+        >
+          <QueryClientProvider client={queryClient}>
+            <ShareButton
+              resourceType="plan"
+              resourceId="plan-1"
+              trigger="icon"
+            />
+          </QueryClientProvider>
+        </AgentNativeI18nProvider>,
+      );
+    });
+
+    await vi.waitFor(() => {
+      const trigger = container.querySelector(
+        'button[aria-label="Teilen"]',
+      ) as HTMLButtonElement | null;
+      expect(trigger, container.innerHTML).not.toBeNull();
+      expect(trigger?.textContent).toBe("Teilen");
+      expect(trigger?.querySelector("svg")).toBeFalsy();
+    });
   });
 });

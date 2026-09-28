@@ -3,7 +3,6 @@ import type { DesignSystemData } from "@shared/api";
 import type { InlineTextStyleKey } from "./rich-text-selection";
 
 export interface SlideStyleSnapshot {
-  /** Omitted snapshots are existing object snapshots for backward compatibility. */
   mode?: "object";
   selector: string;
   label: string;
@@ -11,6 +10,8 @@ export interface SlideStyleSnapshot {
   textPreview: string;
   isText: boolean;
   isImage: boolean;
+  objectFit?: "cover" | "contain";
+  objectPosition?: string;
   isAbsolute: boolean;
   x: number;
   y: number;
@@ -20,6 +21,7 @@ export interface SlideStyleSnapshot {
   slideWidth: number;
   slideHeight: number;
   color: string;
+  fontFamily: string;
   backgroundColor: string;
   fontSize: number;
   fontWeight: string;
@@ -41,6 +43,7 @@ export interface SlideStyleSnapshot {
 
 export type SlideStylePatch = Partial<{
   color: string;
+  fontFamily: string;
   backgroundColor: string;
   fontSize: string;
   fontWeight: string;
@@ -63,6 +66,40 @@ export type SlideStylePatch = Partial<{
   transform: string;
   zIndex: string;
 }>;
+
+const MULTI_STYLE_KEYS = [
+  "color",
+  "fontFamily",
+  "fontSize",
+  "fontWeight",
+  "fontStyle",
+  "textDecoration",
+] as const satisfies readonly InlineTextStyleKey[];
+
+export function mergeSlideStyleSnapshots(
+  snapshots: readonly SlideStyleSnapshot[],
+): SlideStyleSnapshot | null {
+  const first = snapshots[0];
+  if (
+    !first ||
+    snapshots.some(
+      (snapshot) =>
+        snapshot.isText !== first.isText || snapshot.isImage !== first.isImage,
+    )
+  ) {
+    return null;
+  }
+
+  return {
+    ...first,
+    isAbsolute: false,
+    mixedTextStyles: first.isText
+      ? MULTI_STYLE_KEYS.filter((key) =>
+          snapshots.some((snapshot) => snapshot[key] !== first[key]),
+        )
+      : [],
+  };
+}
 
 export function tokenPalette(
   designSystem: DesignSystemData | undefined,
@@ -109,9 +146,6 @@ export function tokenPalette(
       ]
     : [];
 
-  // Fixed swatches offered when a deck has no design system. These are
-  // document colors the user paints onto slide content, so they must stay
-  // literal — theming them would repaint finished decks on a theme switch.
   const presets: Array<[key: string, hex: string]> = [
     ["white", "#ffffff"], // guard:allow-raw-color
     ["black", "#000000"], // guard:allow-raw-color
@@ -133,20 +167,7 @@ export function tokenPalette(
   ];
 }
 
-// `slide.background` holds either a raw CSS value or a Tailwind arbitrary
-// class (`bg-[...]`), which SlideRenderer applies as a class rather than
-// an inline style. The picker only speaks CSS colors, so unwrap the arbitrary
-// form and report anything else (named utilities, gradients) as unreadable
-// rather than guessing a hex the slide is not actually using.
-export function backgroundCssValue(
-  background: string | undefined,
-): string | null {
-  // guard:allow-raw-color — mirrors SlideRenderer's own default slide fill
-  if (!background) return "#000000";
-  const arbitrary = background.match(/^bg-\[(.+)\]$/);
-  if (arbitrary) return arbitrary[1].replace(/_/g, " ");
-  return background.startsWith("bg-") ? null : background;
-}
+export { backgroundCssValue } from "@shared/slide-background";
 
 export function formatValue(value: number) {
   return Number.isInteger(value)

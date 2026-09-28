@@ -1,4 +1,4 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { accessFilter } from "@agent-native/core/sharing";
 import { and, countDistinct, desc, eq, inArray, ne } from "drizzle-orm";
 import { z } from "zod";
@@ -6,6 +6,7 @@ import { z } from "zod";
 import { getDb, schema } from "../server/db/index.js";
 import { nextBrainSourceSyncAt } from "../server/jobs/sync-sources.js";
 import { listAccessibleAudienceIds } from "../server/lib/audiences.js";
+import { sourceHealthState } from "../server/lib/brain-health.js";
 import { parseJson, serializeSource } from "../server/lib/brain.js";
 import { sourceProviderSchema } from "./_schemas.js";
 
@@ -13,8 +14,6 @@ async function sourceRecordCount(sourceId: string): Promise<number> {
   const audienceIds = await listAccessibleAudienceIds([sourceId]);
   if (!audienceIds.length) return 0;
 
-  // Count only — never load the heavy `content` blob of every capture row
-  // just to take `.length`.
   const [row] = await getDb()
     .select({ value: countDistinct(schema.brainRawCaptures.id) })
     .from(schema.brainRawCaptures)
@@ -71,14 +70,23 @@ export default defineAction({
       .from(schema.brainSources)
       .where(and(...clauses))
       .orderBy(desc(schema.brainSources.updatedAt));
+    const nowMs = Date.now();
     const sources = await Promise.all(
-      rows.map(async (row) => ({
-        ...serializeSource(row),
-        recordCount: await sourceRecordCount(row.id),
-        latestRun: await latestRun(row.id),
-        nextSyncAt: nextBrainSourceSyncAt(row),
-      })),
+      rows.map(async (row) => {
+        const latest = await latestRun(row.id);
+        const nextSyncAt = nextBrainSourceSyncAt(row);
+        return {
+          ...serializeSource(row),
+          recordCount: await sourceRecordCount(row.id),
+          latestRun: latest,
+          nextSyncAt,
+          health: sourceHealthState(row, latest, nextSyncAt, nowMs),
+        };
+      }),
     );
-    return { count: rows.length, sources };
+    return {
+      count: rows.length,
+      sources,
+    };
   },
 });

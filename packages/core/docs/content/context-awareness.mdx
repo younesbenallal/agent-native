@@ -405,6 +405,8 @@ export function useNavigationState() {
 }
 ```
 
+The `TAB_ID` imported from `app/lib/tab-id.ts` is the framework's `getBrowserTabId()` value. Page-local WebMCP calls send the same id in `X-Agent-Native-Browser-Tab`, so the server resolves per-tab `navigation`/`selection` state to the exact tab the agent or user is driving — there is no second tab scheme to keep in sync.
+
 | You write                                              | The framework handles                                                                    |
 | ------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
 | `getNavigationState` — map the URL to semantic state   | `navigation` writes, tab-scoped plus a global fallback key                               |
@@ -486,5 +488,5 @@ How it works:
 - [**Agent Mentions**](/docs/agent-mentions) — `@`-mention files and agents into a turn instead of relying on ambient context
 - [**Drop-in Agent**](/docs/drop-in-agent) — mount the panel that reads and writes this state
 - [**Real-Time Collaboration**](/docs/real-time-collaboration) — keep app state in sync when the agent and users edit together
-- [**Client Methods**](/docs/client) — the full `application-state` and client helper reference
+- [**Application State**](/docs/client-advanced#application-state) — the full `application-state` and client helper reference
 - [**Toolkit piece: Context & Knowledge**](/docs/toolkit-context-knowledge) — the Context X-Ray presentation built on this state

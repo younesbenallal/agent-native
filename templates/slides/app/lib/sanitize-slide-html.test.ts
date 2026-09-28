@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { describe, expect, it } from "vitest";
 
+import { extractMermaidBlocks } from "./mermaid-blocks";
 import {
   sanitizeCssValue,
   sanitizeSlideHtml,
@@ -56,6 +57,36 @@ describe("sanitizeSlideHtml", () => {
     );
     expect(html).not.toContain("body {");
   });
+
+  it("heals a stylesheet scoped by an earlier save to a single scope", () => {
+    const html = sanitizeSlideHtml(
+      '<style>[data-slide-content-scope="slide-a"] [data-slide-content-scope="slide-b"] .card { color: red; } [data-slide-content-scope="slide-a"], [data-slide-content-scope="slide-a"] * { margin: 0; }</style><div class="card">ok</div>',
+      { scopeSelector: '[data-slide-content-scope="slide-c"]' },
+    );
+
+    expect(html).toContain(
+      '[data-slide-content-scope="slide-c"] .card { color: red; }',
+    );
+    expect(html).toContain(
+      '[data-slide-content-scope="slide-c"], [data-slide-content-scope="slide-c"], [data-slide-content-scope="slide-c"] *',
+    );
+    expect(html).not.toContain("slide-a");
+    expect(html).not.toContain("slide-b");
+  });
+
+  it("keeps source stamps, including on a mermaid block", () => {
+    const html = sanitizeSlideHtml(
+      '<div class="fmd-slide" data-src-i="n:0"><p data-src-i="n:1">x</p></div>',
+    );
+    expect(html).toContain('data-src-i="n:0"');
+    expect(html).toContain('data-src-i="n:1"');
+
+    const { blocks, contentWithPlaceholders } = extractMermaidBlocks(
+      '<div class="mermaid" data-src-i="n:2">graph TD\nA --> B</div>',
+    );
+    expect(blocks).toEqual(["graph TD\nA --> B"]);
+    expect(contentWithPlaceholders).toBe('<div data-mermaid-index="0"></div>');
+  });
 });
 
 describe("sanitizeSlideUrl", () => {
@@ -64,6 +95,29 @@ describe("sanitizeSlideUrl", () => {
       "https://example.com/a.png",
     );
     expect(sanitizeSlideUrl("javascript:alert(1)", "image")).toBeNull();
+  });
+
+  it("allows blob urls only for explicitly enabled client previews", () => {
+    expect(
+      sanitizeSlideUrl("blob:https://example.com/preview", "image"),
+    ).toBeNull();
+    expect(
+      sanitizeSlideUrl("blob:https://example.com/preview", "image", {
+        allowBlob: true,
+      }),
+    ).toBe("blob:https://example.com/preview");
+    expect(
+      sanitizeSlideUrl("blob:https://example.com/preview", "link"),
+    ).toBeNull();
+  });
+
+  it("does not persist blob image sources without the client preview opt-in", () => {
+    const html = '<div class="fmd-slide"><img src="blob:preview"></div>';
+
+    expect(sanitizeSlideHtml(html)).not.toContain("blob:preview");
+    expect(sanitizeSlideHtml(html, { allowBlobImages: true })).toContain(
+      "blob:preview",
+    );
   });
 });
 

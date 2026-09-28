@@ -1,6 +1,7 @@
 import {
   Checkbox,
   Picker,
+  Skeleton,
   TextField,
 } from "@agent-native/toolkit/design-system";
 import { Button as ToolkitButton } from "@agent-native/toolkit/ui/button";
@@ -40,6 +41,8 @@ import {
   IconApps,
   IconUsersGroup,
   IconTool,
+  IconAlertCircle,
+  IconSearch,
 } from "@tabler/icons-react";
 import React, {
   Suspense,
@@ -51,12 +54,40 @@ import React, {
   useRef,
 } from "react";
 
+import {
+  CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
+  CHATGPT_SUBSCRIPTION_ENGINE_NAME,
+  CHATGPT_SUBSCRIPTION_LAB_KEY,
+} from "../../agent/chatgpt-subscription-contract.js";
 import { PROVIDER_ENV_PLACEHOLDERS } from "../../agent/engine/provider-env-vars.js";
-import { buildSettingsRoute } from "../../navigation/index.js";
-import { saveAgentEngineProviderSettings } from "../agent-engine-key.js";
+import {
+  buildSettingsRoute,
+  STANDARD_APP_ROUTES,
+} from "../../navigation/index.js";
+import { docsUrl } from "../../shared/docs-url.js";
+import {
+  fetchOllamaModels,
+  saveAgentEngineProviderSettings,
+  setAgentEngineProvider,
+  type AgentEngineDefaultModelOutcome,
+} from "../agent-engine-key.js";
 import { AgentWorkspaceContent } from "../agent-page/AgentWorkspaceContent.js";
-import { agentNativePath } from "../api-path.js";
+import {
+  AGENT_PROVIDER_CATALOG,
+  getAgentProviderOption,
+  providerIdForEngine,
+  type AgentProviderId,
+} from "../agent-provider-catalog.js";
+import { agentNativePath, appMountedPath } from "../api-path.js";
 import { BuilderBMark } from "../builder-mark.js";
+import {
+  usesLiveOllamaModels,
+  type ChatModelSelectionState,
+} from "../chat-model-groups.js";
+import {
+  fetchAgentEngineStatus,
+  fetchEnvironmentStatus,
+} from "../client-status-requests.js";
 import {
   Popover,
   PopoverContent,
@@ -67,22 +98,29 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "../components/ui/tooltip.js";
-import { useT } from "../i18n.js";
+import { useOptionalLocale, useT } from "../i18n.js";
+import { useLabState } from "../labs/use-lab.js";
+import { openOAuthPopup } from "../oauth-popup.js";
+import { useOrg } from "../org/hooks.js";
 import { TeamPage } from "../org/TeamPage.js";
-import { BuilderConnectCard } from "../setup-connections/BuilderConnectCard.js";
+import { useOrgSwitcherAppLinks } from "../org/workspace-app-links.js";
+import { McpAccessSettings } from "../resources/McpAccessSettings.js";
+import { BuilderConnectionMenu } from "../setup-connections/BuilderConnectCard.js";
 import { callAction } from "../use-action.js";
 import { useDevMode } from "../use-dev-mode.js";
 import { cn } from "../utils.js";
 import {
   AGENT_SETTINGS_SECTIONS,
   ALL_SETTINGS_SECTIONS,
-  INTEGRATION_SETTINGS_SECTIONS,
   WORKSPACE_SETTINGS_SECTIONS,
   getAgentSettingsSearchTabs,
   type SettingsSectionId,
 } from "./agent-settings-search.js";
+import { AgentPersonalizationSettings } from "./AgentPersonalizationSettings.js";
+import { AgentProviderPicker } from "./AgentProviderPicker.js";
 import { AgentsSection } from "./AgentsSection.js";
 import { AutomationsSection } from "./AutomationsSection.js";
+import { DeferredBuilderConnectPopover } from "./deferred-builder-connect-popover.js";
 import { DemoModeSection } from "./DemoModeSection.js";
 import { ExtensionsSettingsContent } from "./ExtensionsSettingsContent.js";
 import { SecretsSection } from "./SecretsSection.js";
@@ -93,9 +131,14 @@ import {
   useSettingsSurface,
   type SettingsSurface,
 } from "./SettingsSection.js";
+import { SettingsLoadingRow, SettingsSkeleton } from "./SettingsSkeleton.js";
 import type { SettingsTabItem } from "./SettingsTabsPage.js";
+import { StorageSettingsForm } from "./StorageSettingsForm.js";
 import { UsageSection } from "./UsageSection.js";
+import { useProviderKeySaveScope } from "./use-provider-key-save-scope.js";
 import {
+  isPopupClosed,
+  POPUP_CLOSED_CONFIRMATION_GRACE_MS,
   type BuilderConnectFlow,
   useBuilderConnectFlow,
   useBuilderStatus,
@@ -114,7 +157,8 @@ const Button = React.forwardRef<
     ref={ref}
     variant="ghost"
     className={cn(
-      "h-auto p-0 hover:bg-transparent hover:text-inherit active:scale-100 [&_svg]:!size-auto",
+      "h-auto p-0 hover:bg-transparent active:scale-100 [&_svg]:!size-auto",
+      props.emphasis === "solid" ? null : "hover:text-inherit",
       className,
     )}
     {...props}
@@ -126,19 +170,20 @@ const ManageButton = React.forwardRef<
   HTMLButtonElement,
   React.ComponentPropsWithoutRef<typeof ToolkitButton>
 >(({ children = "Manage", className, ...props }, ref) => (
-  <Button
+  <ToolkitButton
     ref={ref}
     type="button"
+    variant="ghost"
     intent="neutral"
     emphasis="outline"
     className={cn(
-      "inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-sm font-medium text-foreground hover:bg-accent/40",
+      "inline-flex h-9 min-h-9 items-center justify-center gap-1 rounded-md border border-border px-3 text-sm font-medium leading-none text-foreground hover:bg-accent/40 active:scale-100 [&_svg]:!size-4",
       className,
     )}
     {...props}
   >
     {children}
-  </Button>
+  </ToolkitButton>
 ));
 ManageButton.displayName = "SettingsManageButton";
 
@@ -147,60 +192,6 @@ const IntegrationsPanel = lazy(() =>
     default: m.IntegrationsPanel,
   })),
 );
-
-// ─── Shared helpers ─────────────────────────────────────────────────────────
-
-function SettingsSkeleton({ lines = 3 }: { lines?: number }) {
-  return (
-    <div className="space-y-3 animate-pulse">
-      {Array.from({ length: lines }, (_, i) => (
-        <div key={i} className="space-y-1.5">
-          <div
-            className="h-3 rounded bg-muted-foreground/10"
-            style={{ width: i === 0 ? "30%" : i === 1 ? "100%" : "60%" }}
-          />
-          {i < 2 && (
-            <div className="h-9 rounded-md border border-border bg-muted-foreground/5" />
-          )}
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function SettingsLoadingRow({
-  label,
-  description,
-  controlCount = 1,
-}: {
-  label: string;
-  description?: string;
-  controlCount?: number;
-}) {
-  return (
-    <div className="flex items-center justify-between gap-4 px-5 py-4 sm:px-6">
-      <div className="min-w-0 space-y-2">
-        <div className="text-sm font-medium text-foreground">{label}</div>
-        {description ? (
-          <p className="text-sm leading-5 text-muted-foreground">
-            {description}
-          </p>
-        ) : null}
-      </div>
-      <div className="flex shrink-0 items-center gap-2" aria-hidden="true">
-        {Array.from({ length: controlCount }, (_, index) => (
-          <div
-            key={index}
-            className={cn(
-              "h-9 animate-pulse rounded-md border border-border bg-muted-foreground/10",
-              index === 0 ? "w-28" : "w-20",
-            )}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
 
 interface SettingsSelectOption {
   value: string;
@@ -218,19 +209,14 @@ const CONTROL_STYLE_PAGE = {
   lineHeight: 1.2,
 } satisfies React.CSSProperties;
 
-// Surface-aware class helpers so section bodies (shared with the compact
-// sidebar) read as roomy, shadcn-style forms on the full settings page while
-// staying dense in the sidebar.
 function fieldLabelClass(isPage: boolean): string {
   return cn("font-medium text-foreground", isPage ? "text-sm" : "text-[12px]");
 }
 
-// Secondary label / row-title size (e.g. "This app", provider names).
 function subTextClass(isPage: boolean): string {
   return isPage ? "text-sm" : "text-[11px]";
 }
 
-// Helper / hint / status note size.
 function noteTextClass(isPage: boolean): string {
   return isPage ? "text-xs" : "text-[10px]";
 }
@@ -311,166 +297,6 @@ function SettingsSelect({
   );
 }
 
-// ─── Disconnect button for the Builder card's connected state ───────────────
-//
-// Two-step confirmation: first click arms the button ("Confirm?"), second
-// click actually disconnects. Arm auto-reverts after 4s of idle so a user
-// who wandered off doesn't come back to a disconnect waiting for them.
-//
-// Hits /_agent-native/builder/disconnect which removes request-scoped
-// Builder credentials from app_secrets. Deployment env credentials are left
-// alone and remain as fallback. On success we dispatch
-// `agent-engine:configured-changed` so dependent cards refresh inline.
-function DisconnectBuilderButton() {
-  const { status } = useBuilderStatus();
-  const [phase, setPhase] = useState<"idle" | "armed" | "busy">("idle");
-  const [err, setErr] = useState<string | null>(null);
-  const armedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const clearArmedTimer = useCallback(() => {
-    if (armedTimerRef.current) {
-      clearTimeout(armedTimerRef.current);
-      armedTimerRef.current = null;
-    }
-  }, []);
-
-  useEffect(() => {
-    return () => clearArmedTimer();
-  }, [clearArmedTimer]);
-
-  const performDisconnect = useCallback(async () => {
-    setPhase("busy");
-    setErr(null);
-    clearArmedTimer();
-    try {
-      const res = await fetch(
-        agentNativePath("/_agent-native/builder/disconnect"),
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-        },
-      );
-      // Parse defensively — a nitro 404 fallback returns HTML, not JSON,
-      // and res.json() on that would throw.
-      const text = await res.text();
-      let body: {
-        ok?: boolean;
-        error?: string;
-        warnings?: Record<string, string>;
-      } = {};
-      if (text) {
-        try {
-          body = JSON.parse(text);
-        } catch {
-          // Non-JSON response — likely a 404/HTML fallback.
-        }
-      }
-      if (!res.ok) {
-        throw new Error(
-          body.error ||
-            `Failed (${res.status}). Is your dev server up to date?`,
-        );
-      }
-      if (body.ok !== true) {
-        throw new Error(body.error || "Disconnect didn't confirm ok");
-      }
-      if (body.warnings && Object.keys(body.warnings).length > 0) {
-        // Disconnect flag persisted (we only reach here when ok:true), so
-        // the user IS disconnected — but some ancillary cleanup failed.
-        // Log so it's visible during dev; don't block the success path.
-        console.warn(
-          "[builder-disconnect] completed with warnings:",
-          body.warnings,
-        );
-      }
-      window.dispatchEvent(new CustomEvent("agent-engine:configured-changed"));
-      setPhase("idle");
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : "Disconnect failed");
-      setPhase("idle");
-    }
-  }, [clearArmedTimer]);
-
-  const handleDisconnectClick = useCallback(() => {
-    if (phase === "busy") return;
-    if (phase === "idle") {
-      // First click — arm the button. Auto-revert after 4s to avoid a
-      // stale "confirm" state someone else could hit by accident.
-      setPhase("armed");
-      setErr(null);
-      clearArmedTimer();
-      armedTimerRef.current = setTimeout(() => {
-        setPhase("idle");
-        armedTimerRef.current = null;
-      }, 4000);
-      return;
-    }
-    // phase === "armed" — user confirmed, actually disconnect.
-    void performDisconnect();
-  }, [phase, performDisconnect, clearArmedTimer]);
-
-  const handleCancel = useCallback(() => {
-    clearArmedTimer();
-    setPhase("idle");
-  }, [clearArmedTimer]);
-
-  // When only the deploy fallback is active there is nothing request-scoped
-  // for this button to remove. The early return MUST come after every hook
-  // above to satisfy rules-of-hooks.
-  if (status?.credentialSource === "env") return null;
-
-  if (phase === "armed") {
-    return (
-      <>
-        <Button
-          type="button"
-          intent="danger"
-          emphasis="solid"
-          onClick={handleDisconnectClick}
-          className="inline-flex items-center gap-1 rounded border border-destructive/40 bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive hover:bg-destructive/20"
-        >
-          Confirm disconnect
-        </Button>
-        <Button
-          type="button"
-          intent="neutral"
-          emphasis="outline"
-          onClick={handleCancel}
-          className="inline-flex items-center gap-1 rounded border border-border px-2 py-0.5 text-[10px] text-muted-foreground hover:text-foreground hover:bg-accent/40"
-        >
-          Cancel
-        </Button>
-      </>
-    );
-  }
-
-  return (
-    <>
-      <Button
-        type="button"
-        intent="danger"
-        emphasis="outline"
-        onClick={handleDisconnectClick}
-        disabled={phase === "busy"}
-        className="inline-flex items-center gap-1 rounded border border-border px-2 py-0.5 text-[10px] text-muted-foreground hover:text-foreground hover:bg-accent/40 disabled:opacity-60 disabled:cursor-wait"
-        aria-busy={phase === "busy"}
-      >
-        {phase === "busy" ? (
-          <>
-            <IconLoader2 size={10} className="animate-spin" />
-            Disconnecting…
-          </>
-        ) : (
-          "Disconnect"
-        )}
-      </Button>
-      {err && <span className="text-[10px] text-destructive">{err}</span>}
-    </>
-  );
-}
-
-// ─── "Connect Builder.io" card (shared across all sections) ─────────────────
-
 function UseBuilderCard({
   builderFlow,
   connectUrl,
@@ -496,12 +322,13 @@ function UseBuilderCard({
   label?: string;
   subtitle?: string;
   dim?: boolean;
-  /** Use a Codex-style row when this card is the primary action in a page section. */
   compact?: boolean;
 }) {
   const isPage = useSettingsSurface() === "page";
   const effectiveConnected = connected || builderFlow.configured;
   const effectiveOrgName = builderFlow.orgName ?? orgName;
+  const effectiveCredentialSource =
+    credentialSource ?? builderFlow.credentialSource;
   const bgClass = dim ? "" : "bg-accent/30";
   const titleCls = isPage ? "text-sm" : "text-[11px]";
   const bodyCls = isPage ? "text-xs" : "text-[10px]";
@@ -548,50 +375,45 @@ function UseBuilderCard({
               : "Using your connected Builder account. Deployment fallback is still available."}
           </p>
         ) : null}
-        {connectUrl || credentialSource !== "env" ? (
-          <div className="flex items-center gap-2 mt-2.5">
-            {connectUrl && (
-              <Button
-                type="button"
-                intent="neutral"
-                emphasis="ghost"
-                onClick={() =>
-                  builderFlow.start({ trackingSource, trackingFlow })
-                }
-                disabled={builderFlow.connecting}
-                className={cn(pillButtonClass(isPage, "ghost"), "no-underline")}
-              >
-                {builderFlow.connecting
-                  ? "Connecting..."
-                  : credentialSource === "env"
-                    ? "Connect account"
-                    : "Reconnect"}
-              </Button>
-            )}
-            {credentialSource !== "env" ? <DisconnectBuilderButton /> : null}
+        {connectUrl || effectiveCredentialSource !== "env" ? (
+          <div className="mt-2.5 flex items-center justify-end">
+            <BuilderConnectionMenu
+              flow={builderFlow}
+              credentialSource={effectiveCredentialSource}
+              trackingSource={trackingSource}
+              trackingFlow={trackingFlow}
+            />
           </div>
         ) : null}
       </div>
     );
   }
 
-  if (!connectUrl) return null;
-
   if (compact) {
     return (
-      <Button
-        type="button"
-        intent="primary"
-        emphasis="solid"
-        onClick={() => builderFlow.start({ trackingSource, trackingFlow })}
-        disabled={builderFlow.connecting}
-        className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-wait disabled:opacity-70"
+      <DeferredBuilderConnectPopover
+        flow={builderFlow}
+        onConnect={(provisionAccount) =>
+          builderFlow.start({
+            trackingSource,
+            trackingFlow,
+            provisionAccount,
+          })
+        }
       >
-        {builderFlow.connecting ? "Connecting…" : "Connect Builder.io"}
-        {builderFlow.connecting ? (
-          <IconLoader2 size={14} className="animate-spin" />
-        ) : null}
-      </Button>
+        <Button
+          type="button"
+          intent="primary"
+          emphasis="solid"
+          disabled={builderFlow.connecting}
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-wait disabled:opacity-70"
+        >
+          {builderFlow.connecting ? "Connecting…" : "Connect Builder.io"}
+          {builderFlow.connecting ? (
+            <IconLoader2 size={14} className="animate-spin" />
+          ) : null}
+        </Button>
+      </DeferredBuilderConnectPopover>
     );
   }
 
@@ -644,27 +466,35 @@ function UseBuilderCard({
           )}
         </div>
       </div>
-      <Button
-        type="button"
-        intent="neutral"
-        emphasis="outline"
-        onClick={() => builderFlow.start({ trackingSource, trackingFlow })}
-        disabled={builderFlow.connecting}
-        className={cn(
-          "inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-1.5 font-medium text-foreground hover:bg-accent/40 disabled:cursor-wait disabled:opacity-70",
-          isPage ? "text-sm" : "text-[11px]",
-        )}
+      <DeferredBuilderConnectPopover
+        flow={builderFlow}
+        onConnect={(provisionAccount) =>
+          builderFlow.start({
+            trackingSource,
+            trackingFlow,
+            provisionAccount,
+          })
+        }
       >
-        {builderFlow.connecting ? "Connecting…" : "Connect Builder.io"}
-        {builderFlow.connecting ? (
-          <IconLoader2 size={isPage ? 14 : 12} className="animate-spin" />
-        ) : null}
-      </Button>
+        <Button
+          type="button"
+          intent="neutral"
+          emphasis="outline"
+          disabled={builderFlow.connecting}
+          className={cn(
+            "inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-1.5 font-medium text-foreground hover:bg-accent/40 disabled:cursor-wait disabled:opacity-70",
+            isPage ? "text-sm" : "text-[11px]",
+          )}
+        >
+          {builderFlow.connecting ? "Connecting…" : "Connect Builder.io"}
+          {builderFlow.connecting ? (
+            <IconLoader2 size={isPage ? 14 : 12} className="animate-spin" />
+          ) : null}
+        </Button>
+      </DeferredBuilderConnectPopover>
     </div>
   );
 }
-
-// ─── Manual setup card ──────────────────────────────────────────────────────
 
 function ManualSetupCard({
   id,
@@ -678,6 +508,7 @@ function ManualSetupCard({
   bare = false,
   popover = false,
   popoverLabel = "Manage",
+  summaryContent,
 }: {
   id?: string;
   title?: string;
@@ -686,14 +517,11 @@ function ManualSetupCard({
   docsLabel?: string;
   children?: React.ReactNode;
   dim?: boolean;
-  /** Optional "Connected via X" badge shown in the header row. */
   sourceBadge?: string;
-  /** Render the form without another card surface when used in a popover. */
   bare?: boolean;
-  /** Show only a Manage trigger and progressively disclose the form. */
   popover?: boolean;
-  /** Label for the trigger when the form is shown in a popover. */
   popoverLabel?: string;
+  summaryContent?: React.ReactNode;
 }) {
   const isPage = useSettingsSurface() === "page";
   const titleCls = isPage ? "text-sm" : "text-[11px]";
@@ -755,28 +583,31 @@ function ManualSetupCard({
       <PopoverContent
         align="end"
         sideOffset={6}
-        className="max-h-[min(640px,calc(100vh-2rem))] w-[min(420px,calc(100vw-2rem))] overflow-y-auto p-4"
+        collisionPadding={16}
+        className="max-h-[min(640px,calc(100dvh-2rem),var(--radix-popover-content-available-height))] w-[min(420px,calc(100vw-2rem))] overflow-y-auto p-4"
       >
-        {content}
+        <div className="space-y-3">
+          {summaryContent}
+          {content}
+        </div>
       </PopoverContent>
     </Popover>
   );
 }
 
-// ─── LLM helpers ────────────────────────────────────────────────────────────
-
-function friendlyModelName(model: string): string {
+export function friendlyModelName(model: string): string {
   if (model === "z-ai/glm-5.2") return "GLM 5.2";
-  const claude = model.match(
-    /^claude-(opus|sonnet|haiku)-(\d+)(?:-(\d+))?(?:-\d{8,})?$/,
+  const normalizedModel = model.replace(/^(?:anthropic|openai)\//, "");
+  const claude = normalizedModel.match(
+    /^claude-(opus|sonnet|haiku)-(\d+)(?:[-.](\d+))?(?:-\d{8,})?$/,
   );
   if (claude) {
     const tier = claude[1][0].toUpperCase() + claude[1].slice(1);
     return `${tier} ${claude[2]}${claude[3] ? `.${claude[3]}` : ""}`;
   }
-  if (model.startsWith("gpt-")) {
-    const rest = model.slice(4);
-    const gpt = rest.match(/^(\d+)[.-](\d+)(?:[.-](.+))?$/);
+  if (normalizedModel.startsWith("gpt-")) {
+    const rest = normalizedModel.slice(4);
+    const gpt = rest.match(/^(\d+)(?:[.-](\d+))?(?:[.-](.+))?$/);
     if (gpt) {
       const suffix = gpt[3]
         ? ` ${gpt[3]
@@ -784,11 +615,12 @@ function friendlyModelName(model: string): string {
             .map((part) => part[0].toUpperCase() + part.slice(1))
             .join(" ")}`
         : "";
-      return `GPT-${gpt[1]}.${gpt[2]}${suffix}`;
+      const version = gpt[2] ? `${gpt[1]}.${gpt[2]}` : gpt[1];
+      return `GPT-${version}${suffix}`;
     }
     return `GPT-${rest}`;
   }
-  if (/^o\d/.test(model)) return model;
+  if (/^o\d/.test(normalizedModel)) return normalizedModel;
   const geminiVersioned = model.match(
     /^gemini-(\d+)-(\d+)-(.+?)(?:-preview)?$/,
   );
@@ -810,11 +642,21 @@ function friendlyModelName(model: string): string {
   return model;
 }
 
+type SettingsSource = "env" | "settings" | "app_secrets";
+
 type SettingsStatus = {
   engine: string;
-  source: "env" | "settings";
+  source: SettingsSource;
   envVar: string | null;
 } | null;
+
+type AgentEngineStatusResponse = {
+  configured?: boolean;
+  engine?: string;
+  source?: SettingsSource;
+  envVar?: string | null;
+  openAiBaseUrlConfigured?: boolean;
+};
 
 function computeSourceBadge(args: {
   settingsConfigured: boolean;
@@ -829,6 +671,9 @@ function computeSourceBadge(args: {
     if (settingsStatus?.source === "env") {
       return `Connected via ${settingsStatus.envVar ?? args.envVar ?? "env"}`;
     }
+    if (settingsStatus?.source === "app_secrets") {
+      return "Connected via saved key";
+    }
     return "Connected via template (server-side)";
   }
   if (args.envConfigured) return `Connected via ${args.envVar ?? "env"}`;
@@ -838,7 +683,9 @@ function computeSourceBadge(args: {
 function latestModelsOnly(models: string[]): string[] {
   const seen = new Set<string>();
   return models.filter((m) => {
-    const claude = m.match(/^claude-(opus|sonnet|haiku)-/);
+    const claude = m
+      .replace(/^anthropic\//, "")
+      .match(/^claude-(opus|sonnet|haiku)-/);
     if (claude) {
       if (seen.has(claude[1])) return false;
       seen.add(claude[1]);
@@ -877,10 +724,6 @@ export function AppDefaultModelField({
     (model) => ({ value: model, label: friendlyModelName(model) }),
   );
 
-  // Builder models are a closed catalog (and are validated server-side), so a
-  // real select keeps every available model visible even when one is already
-  // selected. Native datalists filter against the current input value, which
-  // made this field appear to contain only the active model.
   if (engine === "builder" && modelOptions.length > 0) {
     return (
       <SettingsSelect
@@ -928,17 +771,18 @@ export function AppDefaultModelField({
   );
 }
 
-// ─── LLM Section ────────────────────────────────────────────────────────────
-
 interface EngineInfo {
   name: string;
   label: string;
   description: string;
   defaultModel: string;
   supportedModels: string[];
+  acceptsCustomModels?: boolean;
   requiredEnvVars: string[];
   installPackage?: string;
   packageInstalled?: boolean;
+  configured?: boolean;
+  modelSelection?: ChatModelSelectionState;
 }
 
 const PROVIDER_DOCS: Record<string, string> = {
@@ -952,9 +796,281 @@ const PROVIDER_DOCS: Record<string, string> = {
   "ai-sdk:cohere": "https://dashboard.cohere.com/api-keys",
 };
 
+interface ChatGPTSubscriptionStatus {
+  connected: boolean;
+  reconnectRequired: boolean;
+}
+
+function ChatGPTSubscriptionCard({
+  currentEngine,
+  canUpdateDefault,
+  onConfigured,
+  grouped = false,
+}: {
+  currentEngine: string;
+  /** "Use in chat" changes the default model, so it needs owner/admin. */
+  canUpdateDefault: boolean | null;
+  onConfigured: () => void;
+  grouped?: boolean;
+}) {
+  const isPage = useSettingsSurface() === "page";
+  const t = useT();
+  const lab = useLabState(CHATGPT_SUBSCRIPTION_LAB_KEY);
+  const [status, setStatus] = useState<ChatGPTSubscriptionStatus | null>(null);
+  const [connecting, setConnecting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const popupRef = useRef<Window | null>(null);
+  const popupClosedAtRef = useRef<number | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const next = (await callAction(
+        "get-chatgpt-subscription-status" as any,
+        {} as any,
+        { method: "GET" },
+      )) as ChatGPTSubscriptionStatus;
+      setStatus(next);
+      return next;
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      return null;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (lab.isSuccess && lab.enabled) void refresh();
+  }, [lab.enabled, lab.isSuccess, refresh]);
+
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      if (
+        event.origin === window.location.origin &&
+        event.data?.type === "agent-native-chatgpt-subscription-connected"
+      ) {
+        popupRef.current = null;
+        popupClosedAtRef.current = null;
+        setConnecting(false);
+        void refresh().then((next) => {
+          if (next?.connected) onConfigured();
+        });
+      }
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [onConfigured, refresh]);
+
+  useEffect(() => {
+    if (!connecting || !popupRef.current) return;
+    const timer = window.setInterval(() => {
+      if (!isPopupClosed(popupRef.current)) return;
+      popupClosedAtRef.current ??= Date.now();
+      if (
+        Date.now() - popupClosedAtRef.current <=
+        POPUP_CLOSED_CONFIRMATION_GRACE_MS
+      ) {
+        return;
+      }
+      window.clearInterval(timer);
+      popupRef.current = null;
+      popupClosedAtRef.current = null;
+      setConnecting(false);
+      void refresh().then((next) => {
+        if (next?.connected) onConfigured();
+      });
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [connecting, onConfigured, refresh]);
+
+  const connect = useCallback(() => {
+    setError(null);
+    const popup = openOAuthPopup({
+      initialUrl: agentNativePath(
+        "/_agent-native/agent-engine/chatgpt-subscription/start",
+      ),
+      features: "popup,width=520,height=720",
+    });
+    if (!popup) {
+      setError(
+        t("agentPanel.chatgptSubscriptionPopupBlocked", {
+          defaultValue: "Allow pop-ups for this site, then try again.",
+        }),
+      );
+      return;
+    }
+    popupRef.current = popup;
+    popupClosedAtRef.current = null;
+    setConnecting(true);
+  }, [t]);
+
+  const disconnect = useCallback(async () => {
+    setError(null);
+    try {
+      await callAction("disconnect-chatgpt-subscription" as any, {} as any);
+      setStatus({ connected: false, reconnectRequired: false });
+      onConfigured();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }, [onConfigured]);
+
+  const selectSubscriptionEngine = useCallback(async () => {
+    setError(null);
+    try {
+      await callAction(
+        "manage-agent-engine" as any,
+        {
+          action: "set",
+          engine: CHATGPT_SUBSCRIPTION_ENGINE_NAME,
+          model: CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
+        } as any,
+      );
+      onConfigured();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }, [onConfigured]);
+
+  if (!lab.isSuccess || !lab.enabled) return null;
+
+  const connected = status?.connected === true;
+  const inUse = currentEngine === CHATGPT_SUBSCRIPTION_ENGINE_NAME;
+  const title = t("agentPanel.chatgptSubscriptionTitle", {
+    defaultValue: "ChatGPT subscription",
+  });
+  const description = t("agentPanel.chatgptSubscriptionDescription", {
+    defaultValue:
+      "Experimental Codex access through your ChatGPT subscription.",
+  });
+  const statusLabel = connected ? (
+    <span className="flex shrink-0 items-center gap-1 text-primary">
+      <IconCheck size={isPage ? 14 : 11} />
+      {inUse
+        ? t("agentPanel.chatgptSubscriptionInUse", {
+            defaultValue: "In use",
+          })
+        : t("agentPanel.chatgptSubscriptionConnected", {
+            defaultValue: "Connected",
+          })}
+    </span>
+  ) : null;
+  const actions = !connected ? (
+    <Button
+      type="button"
+      intent="primary"
+      emphasis="solid"
+      onClick={connect}
+      disabled={connecting}
+      className={cn(
+        "rounded-md bg-primary px-3 py-1.5 font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-70",
+        isPage ? "text-sm" : "text-[11px]",
+      )}
+    >
+      {connecting
+        ? t("agentPanel.chatgptSubscriptionConnecting", {
+            defaultValue: "Connecting…",
+          })
+        : status?.reconnectRequired
+          ? t("agentPanel.chatgptSubscriptionReconnect", {
+              defaultValue: "Reconnect",
+            })
+          : t("agentPanel.chatgptSubscriptionConnect", {
+              defaultValue: "Connect ChatGPT",
+            })}
+    </Button>
+  ) : (
+    <>
+      {!inUse && canUpdateDefault !== false ? (
+        <Button
+          type="button"
+          intent="primary"
+          emphasis="solid"
+          onClick={() => void selectSubscriptionEngine()}
+          className={cn(
+            "rounded-md bg-primary px-3 py-1.5 font-medium text-primary-foreground hover:bg-primary/90",
+            isPage ? "text-sm" : "text-[11px]",
+          )}
+        >
+          {t("agentPanel.chatgptSubscriptionUse", {
+            defaultValue: "Use in chat",
+          })}
+        </Button>
+      ) : null}
+      <Button
+        type="button"
+        intent="neutral"
+        emphasis="outline"
+        onClick={() => void disconnect()}
+        className={cn(
+          "rounded-md border border-border px-3 py-1.5 text-foreground hover:bg-accent/40",
+          isPage ? "text-sm" : "text-[11px]",
+        )}
+      >
+        {t("agentPanel.chatgptSubscriptionDisconnect", {
+          defaultValue: "Disconnect",
+        })}
+      </Button>
+    </>
+  );
+
+  if (isPage) {
+    return (
+      <SettingsRow
+        className={cn(grouped ? "border-b border-border/60" : "-mx-5 sm:-mx-6")}
+        label={title}
+        description={description}
+        status={statusLabel}
+        control={
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {actions}
+          </div>
+        }
+      >
+        {error ? <p className="text-sm text-destructive">{error}</p> : null}
+      </SettingsRow>
+    );
+  }
+
+  return (
+    <div
+      className={cn(
+        "rounded-md border border-border bg-accent/20",
+        isPage ? "px-4 py-3.5" : "px-3 py-3",
+      )}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p
+            className={cn("font-medium text-foreground", subTextClass(isPage))}
+          >
+            {title}
+          </p>
+          <p
+            className={cn(
+              "mt-0.5 text-muted-foreground",
+              noteTextClass(isPage),
+            )}
+          >
+            {description}
+          </p>
+        </div>
+        {statusLabel}
+      </div>
+      <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+        {actions}
+      </div>
+      {error ? (
+        <p className={cn("mt-2 text-destructive", noteTextClass(isPage))}>
+          {error}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 function LLMSectionInner({
   builderFlow,
   builderLoading,
+  builderStatusAvailable,
   connectUrl,
   connected,
   orgName,
@@ -966,6 +1082,7 @@ function LLMSectionInner({
 }: {
   builderFlow: BuilderConnectFlow;
   builderLoading?: boolean;
+  builderStatusAvailable: boolean;
   connectUrl?: string;
   connected: boolean;
   orgName?: string;
@@ -980,20 +1097,38 @@ function LLMSectionInner({
   const [envKeys, setEnvKeys] = useState<
     Array<{ key: string; configured: boolean }>
   >([]);
-  const [apiKey, setApiKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [engines, setEngines] = useState<EngineInfo[]>([]);
-  const [currentEngine, setCurrentEngine] = useState("anthropic");
-  const [currentModel, setCurrentModel] = useState("");
-  const [selectedEngine, setSelectedEngine] = useState("anthropic");
-  const [selectedModel, setSelectedModel] = useState("");
-  const [baseUrl, setBaseUrl] = useState("");
+  const [
+    {
+      currentEngine,
+      currentModel,
+      selectedEngine,
+      selectedModel,
+      apiKey,
+      baseUrl,
+      clearBaseUrl,
+    },
+    setSelectionState,
+  ] = useState({
+    currentEngine: "anthropic",
+    currentModel: "",
+    selectedEngine: "anthropic",
+    selectedModel: "",
+    apiKey: "",
+    baseUrl: "",
+    clearBaseUrl: false,
+  });
   const [baseUrlConfigured, setBaseUrlConfigured] = useState(false);
-  const [clearBaseUrl, setClearBaseUrl] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [manualSetupOpen, setManualSetupOpen] = useState(false);
   const [applyNote, setApplyNote] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [applyError, setApplyError] = useState<string | null>(null);
+  // null until the catalog answers; the server enforces it either way.
+  const [canUpdateDefault, setCanUpdateDefault] = useState<boolean | null>(
+    null,
+  );
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<
     | { ok: true; latencyMs: number; model: string }
@@ -1002,34 +1137,59 @@ function LLMSectionInner({
   >(null);
   const [settingsStatus, setSettingsStatus] = useState<SettingsStatus>(null);
   const [disconnectError, setDisconnectError] = useState<string | null>(null);
-  const [envLoaded, setEnvLoaded] = useState(false);
+  const [providerSettingsError, setProviderSettingsError] = useState<
+    string | null
+  >(null);
+  const [envProbeAvailable, setEnvProbeAvailable] = useState(false);
   const [enginesLoaded, setEnginesLoaded] = useState(false);
-  const [statusLoaded, setStatusLoaded] = useState(false);
+  const [engineCatalogAvailable, setEngineCatalogAvailable] = useState(false);
+  const [statusProbeAvailable, setStatusProbeAvailable] = useState(false);
+  const probeGenerationRef = useRef({ env: 0, status: 0 });
+  const [ollamaModels, setOllamaModels] = useState<string[] | null>(null);
+  const [ollamaModelsError, setOllamaModelsError] = useState<string | null>(
+    null,
+  );
+  const [ollamaModelsLoading, setOllamaModelsLoading] = useState(false);
 
-  const initialLoading =
-    !envLoaded || !enginesLoaded || !statusLoaded || !!builderLoading;
+  const initialLoading = !enginesLoaded || !!builderLoading;
 
-  useEffect(() => {
-    fetch(agentNativePath("/_agent-native/env-status"))
-      .then((r) => (r.ok ? r.json() : []))
-      .then(setEnvKeys)
-      .catch(() => {})
-      .finally(() => setEnvLoaded(true));
-  }, [saved]);
+  const refreshEnvKeys = useCallback(() => {
+    const generation = ++probeGenerationRef.current.env;
+    setEnvProbeAvailable(false);
+    setEnvKeys([]);
+    void fetchEnvironmentStatus<
+      Array<{ key: string; configured: boolean }>
+    >().then((result) => {
+      if (generation !== probeGenerationRef.current.env) return;
+      if (result.state !== "available" || !Array.isArray(result.value)) {
+        return;
+      }
+      setEnvKeys(result.value);
+      setEnvProbeAvailable(true);
+    });
+  }, []);
 
   const notifyConfigChanged = useCallback(() => {
     window.dispatchEvent(new CustomEvent("agent-engine:configured-changed"));
   }, []);
 
   const refreshSettingsStatus = useCallback(() => {
-    fetch(agentNativePath("/_agent-native/agent-engine/status"))
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
+    const generation = ++probeGenerationRef.current.status;
+    setStatusProbeAvailable(false);
+    setSettingsStatus(null);
+    setBaseUrlConfigured(false);
+    void fetchAgentEngineStatus<AgentEngineStatusResponse>()
+      .then((result) => {
+        if (generation !== probeGenerationRef.current.status) return;
+        if (result.state !== "available") return;
+        const data = result.value;
         setBaseUrlConfigured(Boolean(data?.openAiBaseUrlConfigured));
         if (
           data?.configured &&
           typeof data.engine === "string" &&
-          (data.source === "env" || data.source === "settings")
+          (data.source === "env" ||
+            data.source === "settings" ||
+            data.source === "app_secrets")
         ) {
           setSettingsStatus({
             engine: data.engine,
@@ -1039,100 +1199,264 @@ function LLMSectionInner({
         } else {
           setSettingsStatus(null);
         }
+        setStatusProbeAvailable(true);
       })
-      .catch(() => {})
-      .finally(() => setStatusLoaded(true));
+      .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    refreshEnvKeys();
+  }, [refreshEnvKeys]);
 
   useEffect(() => {
     refreshSettingsStatus();
   }, [refreshSettingsStatus]);
 
   useEffect(() => {
-    callAction("manage-agent-engine" as any, { action: "list" } as any)
-      .then((data) => {
-        if (!data) return;
-        const engineData = data as {
-          engines?: EngineInfo[];
-          current?: { engine?: string; model?: string };
-        };
-        setEngines(engineData.engines ?? []);
-        const cur = engineData.current ?? {};
-        setCurrentEngine(cur.engine ?? "anthropic");
-        setCurrentModel(cur.model ?? "");
-        setSelectedEngine(cur.engine ?? "anthropic");
-        setSelectedModel(cur.model ?? "");
-      })
-      .catch(() => {})
-      .finally(() => setEnginesLoaded(true));
+    const refresh = () => {
+      refreshEnvKeys();
+      refreshSettingsStatus();
+    };
+    window.addEventListener("agent-engine:configured-changed", refresh);
+    window.addEventListener("focus", refresh);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") refresh();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("agent-engine:configured-changed", refresh);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [refreshEnvKeys, refreshSettingsStatus]);
+
+  useEffect(() => {
+    let generation = 0;
+    const refresh = () => {
+      const request = ++generation;
+      setEngineCatalogAvailable(false);
+      void callAction("manage-agent-engine" as any, { action: "list" } as any)
+        .then((data) => {
+          if (request !== generation || !data) return;
+          const engineData = data as {
+            engines?: EngineInfo[];
+            current?: { engine?: string; model?: string };
+            canUpdateDefault?: boolean;
+          };
+          if (!Array.isArray(engineData.engines)) return;
+          setEngines(engineData.engines);
+          setEngineCatalogAvailable(true);
+          setCanUpdateDefault(
+            typeof engineData.canUpdateDefault === "boolean"
+              ? engineData.canUpdateDefault
+              : null,
+          );
+          const cur = engineData.current ?? {};
+          setSelectionState((previous) => {
+            const dirty =
+              previous.selectedEngine !== previous.currentEngine ||
+              previous.selectedModel !== previous.currentModel ||
+              !!previous.apiKey.trim() ||
+              !!previous.baseUrl.trim() ||
+              previous.clearBaseUrl;
+            const engine = cur.engine ?? "anthropic";
+            const model = cur.model ?? "";
+            return {
+              ...previous,
+              currentEngine: engine,
+              currentModel: model,
+              selectedEngine: dirty ? previous.selectedEngine : engine,
+              selectedModel: dirty ? previous.selectedModel : model,
+            };
+          });
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (request === generation) setEnginesLoaded(true);
+        });
+    };
+    refresh();
+    window.addEventListener("agent-engine:configured-changed", refresh);
+    window.addEventListener("focus", refresh);
+    return () => {
+      generation++;
+      window.removeEventListener("agent-engine:configured-changed", refresh);
+      window.removeEventListener("focus", refresh);
+    };
   }, []);
 
   const selectedEngineInfo = engines.find((e) => e.name === selectedEngine);
-  const envVar = selectedEngineInfo?.requiredEnvVars?.[0];
+  const selectedProvider =
+    providerIdForEngine(selectedEngine) ??
+    (selectedEngine === CHATGPT_SUBSCRIPTION_ENGINE_NAME
+      ? "openai"
+      : "anthropic");
+  const selectedProviderOption = getAgentProviderOption(selectedProvider);
+  const envVar = selectedProviderOption.key;
   const selectedEnginePackageInstalled =
     selectedEngineInfo?.packageInstalled !== false;
   const envConfigured = envVar
     ? (envKeys.find((k) => k.key === envVar)?.configured ?? false)
     : false;
   const settingsConfigured =
-    settingsStatus != null && settingsStatus.engine === currentEngine;
-  const builderConnected = connected || builderFlow.configured;
+    settingsStatus != null &&
+    (settingsStatus.engine === selectedEngine ||
+      (!!envVar && settingsStatus.envVar === envVar));
+  const configuredProviderIds = useMemo(() => {
+    const configured = new Set<AgentProviderId>();
+    for (const option of AGENT_PROVIDER_CATALOG) {
+      const engine = engines.find((entry) => entry.name === option.engine);
+      if (engine?.packageInstalled === false || engine?.configured === false) {
+        continue;
+      }
+      if (
+        option.key &&
+        envKeys.some((entry) => entry.key === option.key && entry.configured)
+      ) {
+        configured.add(option.id);
+      }
+    }
+    if (
+      settingsStatus &&
+      engines.some(
+        (engine) =>
+          engine.name === settingsStatus.engine &&
+          engine.packageInstalled !== false &&
+          engine.configured !== false,
+      )
+    ) {
+      const statusProvider = providerIdForEngine(settingsStatus.engine);
+      if (statusProvider) configured.add(statusProvider);
+      if (settingsStatus.envVar) {
+        const statusOption = AGENT_PROVIDER_CATALOG.find(
+          (option) => option.key === settingsStatus.envVar,
+        );
+        if (statusOption) configured.add(statusOption.id);
+      }
+    }
+    return configured;
+  }, [engines, envKeys, settingsStatus]);
+  const builderConnected =
+    builderStatusAvailable && (connected || builderFlow.configured);
+  const configurationKnown =
+    envProbeAvailable && statusProbeAvailable && engineCatalogAvailable;
+  const builderEngineSelected = selectedEngine === "builder";
+  const selectedConfigurationKnown = builderEngineSelected
+    ? builderStatusAvailable
+    : configurationKnown;
   const anyKeyConfigured =
-    builderConnected ||
-    (selectedEnginePackageInstalled && (envConfigured || settingsConfigured));
+    (builderEngineSelected && builderConnected) ||
+    (!builderEngineSelected &&
+      configurationKnown &&
+      selectedEnginePackageInstalled &&
+      (selectedEngineInfo?.configured ??
+        (envConfigured || settingsConfigured)));
   const sourceBadge = computeSourceBadge({
-    settingsConfigured,
-    settingsStatus,
-    envConfigured,
+    settingsConfigured: configurationKnown && settingsConfigured,
+    settingsStatus: configurationKnown ? settingsStatus : null,
+    envConfigured: configurationKnown && envConfigured,
     envVar,
     builderConnected,
   });
-  const manualSetupHint =
-    selectedEngine === "ai-sdk:openrouter"
-      ? "Provide an OpenRouter key to use OpenRouter models like GLM 5.2."
-      : "Choose your AI provider and model.";
+  const manualSetupHint = "Select a provider.";
 
   const engineChanged =
     selectedEngine !== currentEngine || selectedModel !== currentModel;
-  const isOpenAiEngine = selectedEngine === "ai-sdk:openai";
-  const endpointChanged = isOpenAiEngine && (!!baseUrl.trim() || clearBaseUrl);
+  const isEndpointProvider = selectedProviderOption.supportsEndpoint === true;
+  const isOllama = selectedProvider === "ollama";
+  const endpointChanged =
+    isEndpointProvider && (!!baseUrl.trim() || clearBaseUrl);
   const providerSettingsChanged = !!apiKey.trim() || endpointChanged;
+  // Saving picks the provider too, so there is no separate Apply step. Only
+  // owners and admins change the organization's default model.
+  const canSelectDefault = engineChanged && canUpdateDefault !== false;
+  const keyEntryVisible = !!envVar && !(envConfigured || settingsConfigured);
+  const {
+    scope: keySaveScope,
+    roleUnavailable: keySaveRoleUnavailable,
+    retry: retryKeySaveRole,
+  } = useProviderKeySaveScope();
 
-  // Hide the Anthropic-via-AI-SDK alias (redundant with the native entry)
-  // and Ollama (no API key to set here). The currently-selected engine is
-  // always kept so a stale setting doesn't vanish from the picker.
-  const providerOptions: SettingsSelectOption[] = engines
-    .filter(
-      (e) =>
-        e.name === selectedEngine ||
-        (e.name !== "ai-sdk:anthropic" && e.name !== "ai-sdk:ollama"),
-    )
-    .map((e) => ({ value: e.name, label: e.label }));
+  const handleFindOllamaModels = () => {
+    setOllamaModelsLoading(true);
+    setOllamaModelsError(null);
+    const typedEndpoint = baseUrl.trim();
+    void fetchOllamaModels(typedEndpoint || undefined)
+      .then(async (models) => {
+        setOllamaModels(models);
+        setOllamaModelsError(null);
+        if (typedEndpoint && keySaveScope) {
+          try {
+            await saveAgentEngineProviderSettings({
+              provider: selectedProvider,
+              ...(envVar ? { key: envVar } : {}),
+              baseUrl: typedEndpoint,
+              scope: keySaveScope,
+            });
+            setBaseUrlConfigured(true);
+          } catch {
+            // coercion-ok: the connectivity check itself still succeeded and
+            // the found models are shown; the address just wasn't persisted
+            // (e.g. a dropped session). The "Save endpoint" button below
+            // retries it, so this is never reported as a clean success.
+          }
+        }
+      })
+      .catch((err) => {
+        setOllamaModels(null);
+        setOllamaModelsError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => setOllamaModelsLoading(false));
+  };
 
-  const modelOptions: SettingsSelectOption[] = latestModelsOnly(
-    selectedEngineInfo?.supportedModels ?? [],
+  const modelOptions: SettingsSelectOption[] = (
+    selectedEngineInfo?.supportedModels ?? []
   ).map((m) => ({ value: m, label: friendlyModelName(m) }));
 
   const handleSave = async () => {
-    if (!providerSettingsChanged || !envVar) return;
+    if (
+      !keySaveScope ||
+      !providerSettingsChanged ||
+      (!envVar && !isEndpointProvider)
+    ) {
+      return;
+    }
     setSaving(true);
+    setProviderSettingsError(null);
     try {
-      const nextBaseUrl = isOpenAiEngine ? baseUrl.trim() : "";
-      await saveAgentEngineProviderSettings({
-        key: envVar,
+      const nextBaseUrl = isEndpointProvider ? baseUrl.trim() : "";
+      const result = await saveAgentEngineProviderSettings({
+        provider: selectedProvider,
+        ...(envVar ? { key: envVar } : {}),
         ...(apiKey.trim() ? { apiKey } : {}),
         ...(nextBaseUrl ? { baseUrl: nextBaseUrl } : {}),
-        ...(isOpenAiEngine && clearBaseUrl ? { clearBaseUrl: true } : {}),
+        ...(isEndpointProvider && clearBaseUrl ? { clearBaseUrl: true } : {}),
+        scope: keySaveScope,
+        ...(canSelectDefault
+          ? {
+              defaultModel: {
+                engine: selectedEngine,
+                model: selectedModel || selectedEngineInfo?.defaultModel,
+              },
+            }
+          : {}),
       });
+      applyDefaultModelOutcome(result.defaultModel);
       setSaved(true);
-      setApiKey("");
-      setBaseUrl("");
-      setClearBaseUrl(false);
+      setSelectionState((previous) => ({
+        ...previous,
+        apiKey: "",
+        baseUrl: "",
+        clearBaseUrl: false,
+      }));
       if (nextBaseUrl) setBaseUrlConfigured(true);
       if (clearBaseUrl) setBaseUrlConfigured(false);
-      refreshSettingsStatus();
       notifyConfigChanged();
       setTimeout(() => setSaved(false), 2000);
+    } catch (err) {
+      setProviderSettingsError(
+        err instanceof Error ? err.message : String(err),
+      );
     } finally {
       setSaving(false);
     }
@@ -1150,7 +1474,6 @@ function LLMSectionInner({
       if (res.ok) {
         setTestResult(null);
         setApplyNote(false);
-        refreshSettingsStatus();
         notifyConfigChanged();
         return;
       }
@@ -1180,8 +1503,6 @@ function LLMSectionInner({
           model: selectedModel || selectedEngineInfo?.defaultModel,
         } as any,
       );
-      // Older action paths wrapped tool output in { result }. Accept either
-      // shape while the action route normalizes JSON-string script output.
       const parsed =
         typeof data === "string"
           ? JSON.parse(data)
@@ -1210,29 +1531,45 @@ function LLMSectionInner({
     }
   };
 
-  const handleApply = async () => {
+  const showSavedSelection = (selection: { engine: string; model: string }) => {
+    setSelectionState((previous) => ({
+      ...previous,
+      currentEngine: selection.engine,
+      currentModel: selection.model,
+      selectedEngine: selection.engine,
+      selectedModel: selection.model,
+    }));
+    setApplyNote(true);
+    setTimeout(() => setApplyNote(false), 4000);
+  };
+
+  const applyDefaultModelOutcome = (
+    outcome: AgentEngineDefaultModelOutcome | undefined,
+  ) => {
+    setApplyError(null);
+    setApplyNote(false);
+    if (outcome?.status === "selected") showSavedSelection(outcome);
+    else if (outcome?.status === "failed") setApplyError(outcome.error);
+  };
+
+  // A provider that needs no new key or endpoint: saving only picks it.
+  const handleSaveSelection = async () => {
+    if (applying) return;
+    setApplying(true);
+    setApplyError(null);
+    setApplyNote(false);
     try {
-      const res = await fetch(
-        agentNativePath("/_agent-native/actions/manage-agent-engine"),
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            action: "set",
-            engine: selectedEngine,
-            model: selectedModel,
-          }),
-        },
+      showSavedSelection(
+        await setAgentEngineProvider({
+          provider: selectedProvider,
+          model: selectedModel,
+        }),
       );
-      if (res.ok) {
-        setCurrentEngine(selectedEngine);
-        setCurrentModel(selectedModel);
-        setApplyNote(true);
-        refreshSettingsStatus();
-        notifyConfigChanged();
-        setTimeout(() => setApplyNote(false), 4000);
-      }
-    } catch {}
+    } catch (err) {
+      setApplyError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setApplying(false);
+    }
   };
 
   return (
@@ -1240,114 +1577,247 @@ function LLMSectionInner({
       id={settingsSectionDomId("llm")}
       icon={<IconBrain size={14} />}
       title="LLM"
-      subtitle="Use Builder.io free credits or your own LLM provider."
       required
-      connected={initialLoading ? undefined : anyKeyConfigured}
+      connected={
+        initialLoading || !selectedConfigurationKnown
+          ? undefined
+          : anyKeyConfigured
+      }
+      subtitle={
+        isPage
+          ? undefined
+          : t("agentPanel.builderOrOwnKeys", {
+              defaultValue: "Choose Builder.io or custom keys.",
+            })
+      }
       grouped={isPage && grouped}
       open={open}
       onToggle={onToggle}
     >
       {initialLoading ? (
-        <SettingsLoadingRow
-          label="Connect an LLM"
-          description="Use Builder.io free credits or your own provider."
-          controlCount={2}
-        />
+        <SettingsLoadingRow controlCount={2} />
       ) : (
-        <div
-          className={cn(
-            isPage
-              ? "flex items-center justify-between gap-4 px-5 py-4 sm:px-6"
-              : "space-y-2",
-          )}
-        >
-          {isPage && (
-            <div className="min-w-0">
-              <p className="text-sm font-medium text-foreground">
-                Connect an LLM
-              </p>
-              <p className="mt-1 text-sm leading-6 text-muted-foreground">
-                Use Builder.io free credits or your own provider.
-              </p>
-            </div>
-          )}
+        <>
+          <ChatGPTSubscriptionCard
+            currentEngine={currentEngine}
+            canUpdateDefault={canUpdateDefault}
+            onConfigured={notifyConfigChanged}
+            grouped={isPage && grouped}
+          />
           <div
             className={cn(
-              isPage && "flex flex-wrap items-center justify-end gap-2",
+              isPage
+                ? "flex items-center justify-between gap-4 px-5 py-4 sm:px-6"
+                : "flex items-center justify-between gap-2",
             )}
           >
-            <UseBuilderCard
-              builderFlow={builderFlow}
-              connectUrl={connectUrl}
-              connected={connected}
-              orgName={orgName}
-              envManaged={envManaged}
-              credentialSource={credentialSource}
-              trackingSource="llm_settings"
-              trackingFlow="connect_llm"
-              label="Connect Builder.io"
-              compact={isPage}
-            />
-            {builderConnected && !isPage && (
-              <Button
-                type="button"
-                intent="neutral"
-                emphasis="ghost"
-                aria-expanded={manualSetupOpen}
-                aria-controls="llm-manual-setup"
-                onClick={() => setManualSetupOpen((open) => !open)}
-                className={cn(
-                  "inline-flex items-center gap-1 px-0.5 text-muted-foreground hover:text-foreground",
-                  isPage ? "text-xs" : "text-[10px]",
-                )}
-              >
-                {t("agentPanel.addOwnKeys", {
-                  defaultValue: "Add your own keys",
-                })}
-                <IconChevronDown
-                  size={isPage ? 14 : 11}
-                  className={cn(
-                    "transition-transform",
-                    manualSetupOpen && "rotate-180",
-                  )}
-                />
-              </Button>
+            {isPage && (
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-foreground">
+                  AI provider
+                </p>
+                <p className="mt-1 text-sm leading-6 text-muted-foreground">
+                  {t("agentPanel.builderOrOwnKeys", {
+                    defaultValue: "Choose Builder.io or custom keys.",
+                  })}
+                </p>
+              </div>
             )}
-            {(!builderConnected || manualSetupOpen || isPage) && (
+            <div
+              className={cn("flex flex-wrap items-center justify-end gap-2")}
+            >
+              {selectedConfigurationKnown && !anyKeyConfigured && (
+                <UseBuilderCard
+                  builderFlow={builderFlow}
+                  connectUrl={connectUrl}
+                  connected={builderConnected}
+                  orgName={orgName}
+                  envManaged={envManaged}
+                  credentialSource={credentialSource}
+                  trackingSource="llm_settings"
+                  trackingFlow="connect_llm"
+                  label="Connect Builder.io"
+                  compact
+                />
+              )}
               <ManualSetupCard
                 id="llm-manual-setup"
                 title="Custom keys"
                 hint={manualSetupHint}
-                sourceBadge={builderConnected ? undefined : sourceBadge}
+                sourceBadge={
+                  builderConnected || engineChanged || !anyKeyConfigured
+                    ? undefined
+                    : sourceBadge
+                }
                 bare={isPage}
-                popover={isPage}
-                popoverLabel="Custom keys"
+                popover
+                popoverLabel={
+                  settingsConfigured
+                    ? "Manage"
+                    : t("agentPanel.addOwnKeys", {
+                        defaultValue: "Custom keys",
+                      })
+                }
+                summaryContent={
+                  selectedConfigurationKnown && anyKeyConfigured ? (
+                    <UseBuilderCard
+                      builderFlow={builderFlow}
+                      connectUrl={connectUrl}
+                      connected={builderConnected}
+                      orgName={orgName}
+                      envManaged={envManaged}
+                      credentialSource={credentialSource}
+                      trackingSource="llm_settings"
+                      trackingFlow="connect_llm"
+                      label="Connect Builder.io"
+                    />
+                  ) : undefined
+                }
               >
-                <div className="space-y-2 mb-1">
-                  <SettingsSelect
-                    label="Provider"
-                    value={selectedEngine}
-                    options={providerOptions}
-                    onValueChange={(val) => {
-                      setSelectedEngine(val);
-                      const info = engines.find((e) => e.name === val);
-                      setSelectedModel(info?.defaultModel ?? "");
-                      setApiKey("");
-                      setBaseUrl("");
-                      setClearBaseUrl(false);
+                <fieldset disabled={applying} className="space-y-2 mb-1">
+                  <AgentProviderPicker
+                    value={selectedProvider}
+                    configuredProviders={
+                      configurationKnown ? configuredProviderIds : undefined
+                    }
+                    layout={isPage ? "page" : "compact"}
+                    onChange={(provider) => {
+                      const option = getAgentProviderOption(provider);
+                      setSelectionState((previous) => ({
+                        ...previous,
+                        selectedEngine: option.engine,
+                        selectedModel: option.defaultModel,
+                        apiKey: "",
+                        baseUrl: "",
+                        clearBaseUrl: false,
+                      }));
                       setAdvancedOpen(false);
+                      setApplyError(null);
+                      setApplyNote(false);
+                      setTestResult(null);
+                      setOllamaModels(null);
+                      setOllamaModelsError(null);
                     }}
                   />
 
-                  {/* Free-form input so OpenRouter/Ollama custom model IDs can
-                be typed — the registry's supportedModels is only suggestions. */}
+                  {isOllama && isEndpointProvider ? (
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-[12px] font-medium text-foreground">
+                          Endpoint URL
+                        </p>
+                        <span className="text-[10px] text-muted-foreground">
+                          {baseUrlConfigured ? "Configured" : "Optional"}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          type="url"
+                          value={baseUrl}
+                          onChange={(e) => {
+                            const baseUrl = e.target.value;
+                            setSelectionState((previous) => ({
+                              ...previous,
+                              baseUrl,
+                              clearBaseUrl: baseUrl.trim()
+                                ? false
+                                : previous.clearBaseUrl,
+                            }));
+                            setOllamaModels(null);
+                            setOllamaModelsError(null);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") void handleSave();
+                          }}
+                          placeholder={
+                            baseUrlConfigured
+                              ? "Leave blank to keep current endpoint"
+                              : "http://localhost:11434 or local network address like http://192.168.1.123:11434"
+                          }
+                          disabled={clearBaseUrl}
+                          spellCheck={false}
+                          autoComplete="off"
+                          className="flex h-9 min-w-0 flex-1 rounded-md border border-border bg-background px-3 text-[12px] text-foreground outline-none transition-colors hover:bg-accent/40 focus:ring-1 focus:ring-accent disabled:opacity-50 placeholder:text-muted-foreground/50"
+                          style={CONTROL_STYLE}
+                        />
+                        <Button
+                          type="button"
+                          intent="neutral"
+                          emphasis="outline"
+                          disabled={
+                            saving || ollamaModelsLoading || clearBaseUrl
+                          }
+                          onClick={handleFindOllamaModels}
+                          className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-2.5 text-[11px] font-medium text-foreground hover:bg-accent/40 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {ollamaModelsLoading ? (
+                            <IconLoader2 size={12} className="animate-spin" />
+                          ) : (
+                            <IconSearch size={12} />
+                          )}
+                          Find models
+                        </Button>
+                      </div>
+                      {baseUrlConfigured && (
+                        <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                          <Checkbox
+                            checked={clearBaseUrl}
+                            onChange={(checked) => {
+                              setSelectionState((previous) => ({
+                                ...previous,
+                                clearBaseUrl: checked,
+                                baseUrl: checked ? "" : previous.baseUrl,
+                              }));
+                            }}
+                            aria-label="Clear saved endpoint override"
+                            className="shrink-0"
+                          />
+                          Clear saved endpoint override
+                        </label>
+                      )}
+                      {endpointChanged && (
+                        <Button
+                          type="button"
+                          intent="neutral"
+                          emphasis="solid"
+                          onClick={handleSave}
+                          disabled={saving}
+                          className="rounded bg-accent px-2.5 py-1 text-[10px] font-medium text-foreground hover:bg-accent/80 disabled:opacity-40"
+                        >
+                          {saving ? (
+                            <IconLoader2 size={10} className="animate-spin" />
+                          ) : saved ? (
+                            <IconCheck size={10} />
+                          ) : (
+                            "Save endpoint"
+                          )}
+                        </Button>
+                      )}
+                    </div>
+                  ) : null}
+
+                  {/* Catalog entries are suggestions; every provider also accepts
+                a model ID typed here so new releases need no UI update. */}
                   <div className="space-y-1.5">
                     <p className={fieldLabelClass(isPage)}>Model</p>
                     <input
                       type="text"
-                      list={`model-suggestions-${selectedEngine}`}
+                      list={
+                        isOllama
+                          ? undefined
+                          : `model-suggestions-${selectedEngine}`
+                      }
                       value={selectedModel}
-                      onChange={(e) => setSelectedModel(e.target.value)}
+                      onChange={(e) => {
+                        const model = e.target.value;
+                        setSelectionState((previous) => ({
+                          ...previous,
+                          selectedModel: model,
+                        }));
+                        setApplyError(null);
+                        setApplyNote(false);
+                        setTestResult(null);
+                      }}
                       placeholder={
                         selectedEngineInfo?.defaultModel ?? "e.g. model-id"
                       }
@@ -1356,7 +1826,7 @@ function LLMSectionInner({
                       className={textInputClass(isPage)}
                       style={isPage ? CONTROL_STYLE_PAGE : CONTROL_STYLE}
                     />
-                    {modelOptions.length > 0 && (
+                    {!isOllama && modelOptions.length > 0 && (
                       <datalist id={`model-suggestions-${selectedEngine}`}>
                         {modelOptions.map((opt) => (
                           <option
@@ -1367,9 +1837,53 @@ function LLMSectionInner({
                         ))}
                       </datalist>
                     )}
+                    {isOllama ? (
+                      <div className="space-y-1.5">
+                        {ollamaModels && ollamaModels.length > 0 ? (
+                          <div className="flex flex-wrap gap-1.5">
+                            {ollamaModels.map((modelOption) => (
+                              <Button
+                                key={modelOption}
+                                type="button"
+                                disabled={saving}
+                                onClick={() => {
+                                  setSelectionState((previous) => ({
+                                    ...previous,
+                                    selectedModel: modelOption,
+                                  }));
+                                  setApplyError(null);
+                                  setApplyNote(false);
+                                  setTestResult(null);
+                                }}
+                                aria-pressed={selectedModel === modelOption}
+                                className={cn(
+                                  "rounded-md border px-2 py-1 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+                                  selectedModel === modelOption
+                                    ? "border-primary bg-primary/10 text-primary"
+                                    : "border-border bg-background text-foreground hover:bg-accent/40",
+                                )}
+                              >
+                                {modelOption}
+                              </Button>
+                            ))}
+                          </div>
+                        ) : null}
+                        <p className="text-[10px] leading-relaxed text-muted-foreground">
+                          {ollamaModelsLoading
+                            ? "Checking installed models…"
+                            : ollamaModels && ollamaModels.length > 0
+                              ? `Found ${ollamaModels.length} installed model${ollamaModels.length === 1 ? "" : "s"}.`
+                              : ollamaModels
+                                ? "Connected, but no models are pulled yet — run `ollama pull llama3.1`."
+                                : ollamaModelsError
+                                  ? `${ollamaModelsError} Showing example model names below.`
+                                  : 'Click "Find models" above to list what your Ollama server actually has installed.'}
+                        </p>
+                      </div>
+                    ) : null}
                   </div>
 
-                  {isOpenAiEngine && (
+                  {!isOllama && isEndpointProvider && (
                     <div className="border-t border-border/70 pt-2">
                       <Button
                         type="button"
@@ -1406,11 +1920,17 @@ function LLMSectionInner({
                             type="url"
                             value={baseUrl}
                             onChange={(e) => {
-                              setBaseUrl(e.target.value);
-                              if (e.target.value.trim()) setClearBaseUrl(false);
+                              const baseUrl = e.target.value;
+                              setSelectionState((previous) => ({
+                                ...previous,
+                                baseUrl,
+                                clearBaseUrl: baseUrl.trim()
+                                  ? false
+                                  : previous.clearBaseUrl,
+                              }));
                             }}
                             onKeyDown={(e) => {
-                              if (e.key === "Enter") handleSave();
+                              if (e.key === "Enter") void handleSave();
                             }}
                             placeholder={
                               baseUrlConfigured
@@ -1423,17 +1943,16 @@ function LLMSectionInner({
                             className="flex h-9 w-full rounded-md border border-border bg-background px-3 text-[12px] text-foreground outline-none transition-colors hover:bg-accent/40 focus:ring-1 focus:ring-accent disabled:opacity-50 placeholder:text-muted-foreground/50"
                             style={CONTROL_STYLE}
                           />
-                          <p className="text-[10px] leading-relaxed text-muted-foreground">
-                            Use for LiteLLM or another OpenAI-compatible chat
-                            gateway. Leave blank for OpenAI.
-                          </p>
                           {baseUrlConfigured && (
                             <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
                               <Checkbox
                                 checked={clearBaseUrl}
                                 onChange={(checked) => {
-                                  setClearBaseUrl(checked);
-                                  if (checked) setBaseUrl("");
+                                  setSelectionState((previous) => ({
+                                    ...previous,
+                                    clearBaseUrl: checked,
+                                    baseUrl: checked ? "" : previous.baseUrl,
+                                  }));
                                 }}
                                 aria-label="Clear saved endpoint override"
                                 className="shrink-0"
@@ -1441,13 +1960,13 @@ function LLMSectionInner({
                               Clear saved endpoint override
                             </label>
                           )}
-                          {envVar && envConfigured && endpointChanged && (
+                          {endpointChanged && (
                             <Button
                               type="button"
                               intent="neutral"
                               emphasis="solid"
                               onClick={handleSave}
-                              disabled={saving}
+                              disabled={saving || !keySaveScope}
                               className="rounded bg-accent px-2.5 py-1 text-[10px] font-medium text-foreground hover:bg-accent/80 disabled:opacity-40"
                             >
                               {saving ? (
@@ -1466,8 +1985,7 @@ function LLMSectionInner({
                       )}
                     </div>
                   )}
-
-                  {envVar && envConfigured ? (
+                  {envVar && (envConfigured || settingsConfigured) ? (
                     <div
                       className={cn(
                         "flex items-center gap-1.5 text-primary",
@@ -1475,16 +1993,25 @@ function LLMSectionInner({
                       )}
                     >
                       <IconCheck size={isPage ? 14 : 10} />
-                      {envVar} configured
+                      {settingsStatus?.source === "app_secrets" &&
+                      settingsConfigured
+                        ? "Saved key configured"
+                        : `${envVar} configured`}
                     </div>
                   ) : envVar ? (
                     <div className="flex gap-1.5">
                       <input
                         type="password"
                         value={apiKey}
-                        onChange={(e) => setApiKey(e.target.value)}
+                        onChange={(e) => {
+                          const apiKey = e.target.value;
+                          setSelectionState((previous) => ({
+                            ...previous,
+                            apiKey,
+                          }));
+                        }}
                         onKeyDown={(e) => {
-                          if (e.key === "Enter") handleSave();
+                          if (e.key === "Enter") void handleSave();
                         }}
                         placeholder={PROVIDER_ENV_PLACEHOLDERS[envVar] ?? "..."}
                         className={cn(textInputClass(isPage), "flex-1")}
@@ -1493,8 +2020,16 @@ function LLMSectionInner({
                       <Button
                         intent="primary"
                         emphasis="solid"
-                        onClick={handleSave}
-                        disabled={!providerSettingsChanged || saving}
+                        onClick={
+                          providerSettingsChanged
+                            ? handleSave
+                            : handleSaveSelection
+                        }
+                        disabled={
+                          (!providerSettingsChanged && !canSelectDefault) ||
+                          (providerSettingsChanged && !keySaveScope) ||
+                          saving
+                        }
                         className={pillButtonClass(isPage, "solid")}
                       >
                         {saving ? (
@@ -1516,7 +2051,11 @@ function LLMSectionInner({
                       intent="neutral"
                       emphasis="outline"
                       onClick={handleTest}
-                      disabled={testing}
+                      disabled={
+                        testing ||
+                        !selectedConfigurationKnown ||
+                        !anyKeyConfigured
+                      }
                       className={pillButtonClass(isPage, "outline")}
                     >
                       {testing ? (
@@ -1545,17 +2084,19 @@ function LLMSectionInner({
                         <IconExternalLink size={isPage ? 14 : 10} />
                       </a>
                     ) : null}
-                    {engineChanged && (
-                      <Button
-                        intent="primary"
-                        emphasis="solid"
-                        onClick={handleApply}
-                        className={pillButtonClass(isPage, "solid")}
-                      >
-                        Apply
-                      </Button>
-                    )}
-                    {settingsStatus != null && (
+                    {canSelectDefault &&
+                      !providerSettingsChanged &&
+                      !keyEntryVisible && (
+                        <Button
+                          intent="primary"
+                          emphasis="solid"
+                          onClick={handleSaveSelection}
+                          className={pillButtonClass(isPage, "solid")}
+                        >
+                          Save
+                        </Button>
+                      )}
+                    {settingsStatus != null && canUpdateDefault !== false && (
                       <Tooltip>
                         <TooltipTrigger asChild>
                           <Button
@@ -1571,8 +2112,8 @@ function LLMSectionInner({
                           </Button>
                         </TooltipTrigger>
                         <TooltipContent>
-                          Clear the saved engine — the app will fall back to the
-                          default until you re-apply.
+                          Clear the default model. Chats use the next available
+                          provider until you save one again.
                         </TooltipContent>
                       </Tooltip>
                     )}
@@ -1608,6 +2149,49 @@ function LLMSectionInner({
                       Disconnect failed: {disconnectError}
                     </p>
                   )}
+                  {keySaveRoleUnavailable && (
+                    <div
+                      role="alert"
+                      className={cn(
+                        "flex flex-wrap items-center gap-1.5 text-destructive",
+                        isPage ? "text-xs" : "text-[10px]",
+                      )}
+                    >
+                      <IconAlertCircle size={isPage ? 14 : 10} />
+                      {t("agentPanel.saveScopeRoleUnavailable")}
+                      <Button
+                        intent="neutral"
+                        emphasis="ghost"
+                        onClick={retryKeySaveRole}
+                        className="h-auto px-1 py-0 font-medium text-foreground underline underline-offset-2"
+                      >
+                        {t("agentChat.common.retry")}
+                      </Button>
+                    </div>
+                  )}
+                  {providerSettingsError && (
+                    <div
+                      role="alert"
+                      className={cn(
+                        "flex items-center gap-1.5 text-destructive",
+                        isPage ? "text-xs" : "text-[10px]",
+                      )}
+                    >
+                      <IconAlertCircle size={isPage ? 14 : 10} />
+                      {providerSettingsError}
+                    </div>
+                  )}
+                  {applyError && (
+                    <p
+                      role="alert"
+                      className={cn(
+                        "text-destructive",
+                        isPage ? "text-xs" : "text-[10px]",
+                      )}
+                    >
+                      Save failed: {applyError}
+                    </p>
+                  )}
                   {applyNote && (
                     <p
                       className={cn(
@@ -1618,17 +2202,15 @@ function LLMSectionInner({
                       Changes take effect on next conversation
                     </p>
                   )}
-                </div>
+                </fieldset>
               </ManualSetupCard>
-            )}
+            </div>
           </div>
-        </div>
+        </>
       )}
     </SettingsSection>
   );
 }
-
-// ─── App Default Model Section ──────────────────────────────────────────────
 
 interface AppModelDefaultEngine extends EngineInfo {
   configured: boolean;
@@ -1667,10 +2249,26 @@ function AppDefaultModelPicker({
   onChange: (value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [ollamaModels, setOllamaModels] = useState<string[] | null>(null);
   const visibleEngines = engines.filter(
-    (engine) =>
-      engine.name !== "ai-sdk:anthropic" && engine.name !== "ai-sdk:ollama",
+    (engine) => engine.name !== "ai-sdk:anthropic",
   );
+
+  useEffect(() => {
+    if (!open) return;
+    if (!engines.some(usesLiveOllamaModels)) return;
+    let cancelled = false;
+    void fetchOllamaModels()
+      .then((models) => {
+        if (!cancelled && models.length > 0) setOllamaModels(models);
+      })
+      .catch(() => {
+        // No local Ollama server reachable — keep the static suggestions.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, engines]);
   const selectedModel = value.includes("::")
     ? value.slice(value.indexOf("::") + 2)
     : null;
@@ -1681,10 +2279,17 @@ function AppDefaultModelPicker({
     ? `${selectedEngine?.label ?? selectedEngine?.name ?? "Provider"} · ${friendlyModelName(selectedModel)}`
     : "Global default";
 
-  const openIntegrations = () => {
+  const openApiKeys = () => {
     setOpen(false);
     if (typeof window !== "undefined") {
-      window.history.pushState(null, "", buildSettingsRoute("integrations"));
+      window.history.pushState(
+        null,
+        "",
+        appMountedPath(
+          buildSettingsRoute("keys"),
+          STANDARD_APP_ROUTES.settings,
+        ),
+      );
       window.dispatchEvent(new Event("popstate"));
     }
   };
@@ -1748,7 +2353,10 @@ function AppDefaultModelPicker({
                 engine.name === "builder"
                   ? "Builder.io"
                   : engine.label || engine.name;
-              const modelIds = latestModelsOnly(engine.supportedModels);
+              const modelIds =
+                usesLiveOllamaModels(engine) && ollamaModels?.length
+                  ? ollamaModels
+                  : latestModelsOnly(engine.supportedModels);
               const models = modelIds.length
                 ? modelIds
                 : engine.defaultModel
@@ -1786,12 +2394,12 @@ function AppDefaultModelPicker({
                   })}
                   {!configured && (
                     <CommandItem
-                      value={`configure ${providerLabel} in integrations api keys`}
-                      onSelect={openIntegrations}
+                      value={`configure ${providerLabel} in api keys`}
+                      onSelect={openApiKeys}
                       className="gap-2 text-muted-foreground"
                     >
                       <IconExternalLink size={14} />
-                      Configure in Integrations
+                      Configure in API keys
                     </CommandItem>
                   )}
                 </CommandGroup>
@@ -1823,6 +2431,7 @@ function AppModelDefaultsSectionInner({
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [ollamaModels, setOllamaModels] = useState<string[] | null>(null);
 
   const load = useCallback(() => {
     let cancelled = false;
@@ -1852,13 +2461,35 @@ function AppModelDefaultsSectionInner({
 
   useEffect(() => load(), [load]);
 
+  useEffect(() => {
+    if (selectedEngine !== "ai-sdk:ollama") return;
+    let cancelled = false;
+    void fetchOllamaModels()
+      .then((models) => {
+        if (!cancelled && models.length > 0) setOllamaModels(models);
+      })
+      .catch(() => {
+        // No local Ollama server reachable — keep the static suggestions.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedEngine]);
+
+  if (!loading && !settings) return null;
+
   const selectedEngineInfo =
     settings?.engines.find((engine) => engine.name === selectedEngine) ?? null;
+  const selectedEngineModels =
+    selectedEngineInfo &&
+    usesLiveOllamaModels(selectedEngineInfo) &&
+    ollamaModels?.length
+      ? ollamaModels
+      : (selectedEngineInfo?.supportedModels ?? []);
   const engineOptions: SettingsSelectOption[] = (settings?.engines ?? [])
     .filter(
       (engine) =>
-        engine.name === selectedEngine ||
-        (engine.name !== "ai-sdk:anthropic" && engine.name !== "ai-sdk:ollama"),
+        engine.name === selectedEngine || engine.name !== "ai-sdk:anthropic",
     )
     .map((engine) => ({
       value: engine.name,
@@ -1973,10 +2604,7 @@ function AppModelDefaultsSectionInner({
       onToggle={onToggle}
     >
       {loading ? (
-        <SettingsLoadingRow
-          label="Default model"
-          description="Choose the model used by this app by default."
-        />
+        <SettingsLoadingRow />
       ) : settings ? (
         isPage ? (
           <SettingsRow
@@ -2080,7 +2708,7 @@ function AppModelDefaultsSectionInner({
 
                 <AppDefaultModelField
                   engine={selectedEngine}
-                  models={selectedEngineInfo?.supportedModels ?? []}
+                  models={selectedEngineModels}
                   value={selectedModel}
                   defaultModel={selectedEngineInfo?.defaultModel}
                   disabled={!settings.canUpdate || saving}
@@ -2168,18 +2796,12 @@ function AppModelDefaultsSectionInner({
             </div>
           </div>
         )
-      ) : (
-        <p className={cn("text-muted-foreground", noteTextClass(isPage))}>
-          App model defaults are unavailable.
-        </p>
-      )}
+      ) : null}
     </SettingsSection>
   );
 }
 
-// ─── Email Section ──────────────────────────────────────────────────────────
-
-function EmailSectionInner({
+export function EmailSectionInner({
   open,
   onToggle,
 }: {
@@ -2251,7 +2873,7 @@ function EmailSectionInner({
       vars.push({ key: "RESEND_API_KEY", value: resendKey.trim() });
     if (fromAddr.trim())
       vars.push({ key: "EMAIL_FROM", value: fromAddr.trim() });
-    if (vars.length) save(vars);
+    if (vars.length) void save(vars);
   };
 
   const saveSendgrid = () => {
@@ -2260,7 +2882,7 @@ function EmailSectionInner({
       vars.push({ key: "SENDGRID_API_KEY", value: sendgridKey.trim() });
     if (fromAddr.trim())
       vars.push({ key: "EMAIL_FROM", value: fromAddr.trim() });
-    if (vars.length) save(vars);
+    if (vars.length) void save(vars);
   };
 
   return (
@@ -2470,8 +3092,6 @@ function EmailSectionInner({
   );
 }
 
-// ─── Agent Limits Section ──────────────────────────────────────────────────
-
 interface AgentLoopSettingsResponse {
   maxIterations: number;
   defaultMaxIterations: number;
@@ -2537,6 +3157,8 @@ function AgentLimitsSectionInner({
     return () =>
       window.removeEventListener("agent-loop-settings:changed", handler);
   }, []);
+
+  if (!loading && !settings) return null;
 
   const numericValue = Number(value);
   const hasPendingChange =
@@ -2627,10 +3249,7 @@ function AgentLimitsSectionInner({
       onToggle={onToggle}
     >
       {loading ? (
-        <SettingsLoadingRow
-          label="Max iterations"
-          description="Set how long a response can work before pausing."
-        />
+        <SettingsLoadingRow />
       ) : settings ? (
         isPage ? (
           <SettingsRow
@@ -2836,16 +3455,10 @@ function AgentLimitsSectionInner({
             </div>
           </div>
         )
-      ) : (
-        <p className={cn("text-muted-foreground", noteTextClass(isPage))}>
-          Agent limit settings are unavailable.
-        </p>
-      )}
+      ) : null}
     </SettingsSection>
   );
 }
-
-// ─── Main SettingsPanel ─────────────────────────────────────────────────────
 
 export interface SettingsPanelProps {
   isDevMode: boolean;
@@ -2857,14 +3470,24 @@ export interface SettingsPanelProps {
 }
 
 export interface AgentSettingsTabsOptions {
-  /**
-   * Include the shared Extensions management tab. Extensions are an optional
-   * app capability and stay hidden unless the host opts in.
-   */
+  appName?: string;
   extensionTools?: boolean;
-  /** Optional page-level settings to show in the Agent section. */
   agentAdditionalContent?: React.ReactNode;
+  agentAdditionalTabFactories?: AgentSettingsTabFactory[];
+  usageAppId?: string | null;
+  usageViewAllHref?: string;
+  organizationContent?: React.ReactNode;
 }
+
+export interface AgentSettingsTabFactoryContext {
+  scope: "user";
+  canManageOrg?: boolean;
+  scopeControl: React.ReactNode;
+}
+
+export type AgentSettingsTabFactory = (
+  context: AgentSettingsTabFactoryContext,
+) => SettingsTabItem;
 
 export function areExtensionSettingsEnabled(
   options: AgentSettingsTabsOptions = {},
@@ -2933,7 +3556,7 @@ function CapabilityStatusStrip({
           active={builderConnected}
           value={
             builderLoading ? (
-              "Checking..."
+              <Skeleton className="h-3 w-16" />
             ) : builderConnected ? (
               "Connected"
             ) : (
@@ -2974,18 +3597,27 @@ function SettingsPanelContent({
   builderConnectionOwnedExternally = false,
   agentAdditionalContent,
 }: SettingsPanelContentProps) {
-  const { status: builder, loading: builderLoading } = useBuilderStatus({
+  const t = useT();
+  const {
+    status: builder,
+    loading: builderLoading,
+    stale: builderStatusStale,
+  } = useBuilderStatus({
     enabled: !builderConnectionOwnedExternally,
   });
   const connected = builder?.configured ?? false;
-  const connectUrl = builder?.cliAuthUrl ?? builder?.connectUrl;
+  const builderStatusAvailable =
+    !builderLoading && !builderStatusStale && builder != null;
+  const connectUrl = builder?.connectUrl;
   const orgName = builder?.orgName;
   const envManaged = !!builder?.envManaged;
   const credentialSource = builder?.credentialSource;
   const builderBranchesAvailable = !!builder?.builderEnabled;
+  const showWorkspaceBuilderConnect = builderStatusAvailable && !connected;
   const builderFlow = useBuilderConnectFlow({
     enabled: !builderConnectionOwnedExternally,
     popupUrl: connectUrl,
+    provisionAccount: true,
     trackingSource: "settings_panel_builder_card",
   });
 
@@ -3017,6 +3649,7 @@ function SettingsPanelContent({
 
   const isPage = surface === "page";
   const isWorkspacePage = isPage && sections.includes("hosting");
+  const { isWorkspace, dispatchAllAppsHref } = useOrgSwitcherAppLinks(isPage);
 
   return (
     <SettingsSurfaceProvider surface={surface}>
@@ -3046,6 +3679,7 @@ function SettingsPanelContent({
                 <LLMSectionInner
                   builderFlow={builderFlow}
                   builderLoading={builderLoading}
+                  builderStatusAvailable={builderStatusAvailable}
                   connectUrl={connectUrl}
                   connected={connected}
                   orgName={orgName}
@@ -3103,7 +3737,7 @@ function SettingsPanelContent({
                   id={settingsSectionDomId("automations")}
                   icon={<IconBolt size={14} />}
                   title="Automations"
-                  subtitle="Scheduled and event-triggered agent tasks."
+                  subtitle="Scheduled, event-triggered, and webhook-triggered agent tasks."
                   grouped
                   flat
                   open={openSection === "automations"}
@@ -3111,10 +3745,13 @@ function SettingsPanelContent({
                 >
                   <SettingsRow
                     label="Automations"
-                    description="Schedule agent tasks or run them from events."
+                    description="Schedule agent tasks or run them from events and webhooks."
                     control={
                       <a
-                        href="/settings/agent/automations"
+                        href={appMountedPath(
+                          buildSettingsRoute("agent:automations"),
+                          STANDARD_APP_ROUTES.settings,
+                        )}
                         className="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-sm font-medium text-foreground no-underline transition-colors hover:bg-accent/40"
                       >
                         Open automations
@@ -3140,17 +3777,19 @@ function SettingsPanelContent({
                     label="Background agent"
                     description="Make code changes from production mode via Builder."
                     control={
-                      <UseBuilderCard
-                        builderFlow={builderFlow}
-                        connectUrl={connectUrl}
-                        connected={connected}
-                        orgName={orgName}
-                        envManaged={envManaged}
-                        credentialSource={credentialSource}
-                        trackingSource="background_agent_settings"
-                        trackingFlow="background_agent"
-                        compact
-                      />
+                      builderStatusAvailable ? (
+                        <UseBuilderCard
+                          builderFlow={builderFlow}
+                          connectUrl={connectUrl}
+                          connected={connected}
+                          orgName={orgName}
+                          envManaged={envManaged}
+                          credentialSource={credentialSource}
+                          trackingSource="background_agent_settings"
+                          trackingFlow="background_agent"
+                          compact
+                        />
+                      ) : null
                     }
                   />
                 </SettingsSection>
@@ -3158,9 +3797,23 @@ function SettingsPanelContent({
             </SettingsGroup>
           )}
 
-        {isWorkspacePage && (
+        {isPage && (isWorkspace || isWorkspacePage) && (
           <SettingsGroup title="Workspace">
-            {shouldShowSection("demo-mode") && (
+            {isWorkspace && (
+              <SettingsRow
+                label={t("dispatch.pages.workspaceApps")}
+                control={
+                  <a
+                    href={dispatchAllAppsHref}
+                    className="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-sm font-medium text-foreground no-underline transition-colors hover:bg-accent/40"
+                  >
+                    {t("dispatch.pages.browseApps")}
+                    <IconExternalLink size={14} />
+                  </a>
+                }
+              />
+            )}
+            {isWorkspacePage && shouldShowSection("demo-mode") && (
               <SettingsRow
                 id={settingsSectionDomId("demo-mode")}
                 label="Demo mode"
@@ -3168,32 +3821,51 @@ function SettingsPanelContent({
                 control={<DemoModeSection compact />}
               />
             )}
-            {shouldShowSection("hosting") && (
+            {isWorkspacePage && shouldShowSection("hosting") && (
               <SettingsRow
                 id={settingsSectionDomId("hosting")}
                 label="Hosting"
                 description="Deploy the app to the cloud."
                 control={
                   <div className="flex flex-wrap items-center justify-end gap-2">
-                    <UseBuilderCard
-                      builderFlow={builderFlow}
-                      connectUrl={connectUrl}
-                      connected={connected}
-                      orgName={orgName}
-                      envManaged={envManaged}
-                      credentialSource={credentialSource}
-                      trackingSource="hosting_settings"
-                      trackingFlow="hosting"
-                      compact
-                    />
+                    {showWorkspaceBuilderConnect && (
+                      <UseBuilderCard
+                        builderFlow={builderFlow}
+                        connectUrl={connectUrl}
+                        connected={connected}
+                        orgName={orgName}
+                        envManaged={envManaged}
+                        credentialSource={credentialSource}
+                        trackingSource="hosting_settings"
+                        trackingFlow="hosting"
+                        compact
+                      />
+                    )}
                     <ManualSetupCard
                       title="Set up manually"
                       hint="Deploy manually to Netlify, Vercel, Cloudflare, or any Nitro-supported target."
-                      docsUrl="https://www.builder.io/c/docs/agent-native-deployment?utm_source=agent-native&utm_medium=product&utm_campaign=onboarding&utm_content=deployment_settings"
+                      docsUrl={docsUrl("deployment", {
+                        campaign: "onboarding",
+                        content: "deployment_settings",
+                      })}
                       dim={connected}
                       bare
                       popover
                       popoverLabel="Manage"
+                      summaryContent={
+                        connected ? (
+                          <UseBuilderCard
+                            builderFlow={builderFlow}
+                            connectUrl={connectUrl}
+                            connected={connected}
+                            orgName={orgName}
+                            envManaged={envManaged}
+                            credentialSource={credentialSource}
+                            trackingSource="hosting_settings"
+                            trackingFlow="hosting"
+                          />
+                        ) : undefined
+                      }
                     />
                   </div>
                 }
@@ -3206,25 +3878,44 @@ function SettingsPanelContent({
                 description="Connect persistent app storage."
                 control={
                   <div className="flex flex-wrap items-center justify-end gap-2">
-                    <UseBuilderCard
-                      builderFlow={builderFlow}
-                      connectUrl={connectUrl}
-                      connected={connected}
-                      orgName={orgName}
-                      envManaged={envManaged}
-                      credentialSource={credentialSource}
-                      trackingSource="database_settings"
-                      trackingFlow="database"
-                      compact
-                    />
+                    {showWorkspaceBuilderConnect && (
+                      <UseBuilderCard
+                        builderFlow={builderFlow}
+                        connectUrl={connectUrl}
+                        connected={connected}
+                        orgName={orgName}
+                        envManaged={envManaged}
+                        credentialSource={credentialSource}
+                        trackingSource="database_settings"
+                        trackingFlow="database"
+                        compact
+                      />
+                    )}
                     <ManualSetupCard
                       title="Set up manually"
                       hint="Set DATABASE_URL in your .env to connect a supported database."
-                      docsUrl="https://www.builder.io/c/docs/agent-native-database?utm_source=agent-native&utm_medium=product&utm_campaign=onboarding&utm_content=database_settings"
+                      docsUrl={docsUrl("database", {
+                        campaign: "onboarding",
+                        content: "database_settings",
+                      })}
                       dim={connected}
                       bare
                       popover
                       popoverLabel="Manage"
+                      summaryContent={
+                        connected ? (
+                          <UseBuilderCard
+                            builderFlow={builderFlow}
+                            connectUrl={connectUrl}
+                            connected={connected}
+                            orgName={orgName}
+                            envManaged={envManaged}
+                            credentialSource={credentialSource}
+                            trackingSource="database_settings"
+                            trackingFlow="database"
+                          />
+                        ) : undefined
+                      }
                     />
                   </div>
                 }
@@ -3237,26 +3928,47 @@ function SettingsPanelContent({
                 description="Store avatars and chat attachments."
                 control={
                   <div className="flex flex-wrap items-center justify-end gap-2">
-                    <UseBuilderCard
-                      builderFlow={builderFlow}
-                      connectUrl={connectUrl}
-                      connected={connected}
-                      orgName={orgName}
-                      envManaged={envManaged}
-                      credentialSource={credentialSource}
-                      trackingSource="file_upload_settings"
-                      trackingFlow="file_upload"
-                      compact
-                    />
+                    {showWorkspaceBuilderConnect && (
+                      <UseBuilderCard
+                        builderFlow={builderFlow}
+                        connectUrl={connectUrl}
+                        connected={connected}
+                        orgName={orgName}
+                        envManaged={envManaged}
+                        credentialSource={credentialSource}
+                        trackingSource="file_upload_settings"
+                        trackingFlow="file_upload"
+                        compact
+                      />
+                    )}
                     <ManualSetupCard
                       title="Set up manually"
-                      hint="Configure your own file or object storage provider."
-                      docsUrl="https://www.builder.io/c/docs/agent-native-file-uploads?utm_source=agent-native&utm_medium=product&utm_campaign=onboarding&utm_content=file_upload_settings"
+                      hint="Use an S3-compatible bucket with a stable public URL for durable chat attachments."
+                      docsUrl={docsUrl("file-uploads", {
+                        campaign: "onboarding",
+                        content: "file_upload_settings",
+                      })}
                       dim={connected}
                       bare
                       popover
                       popoverLabel="Manage"
-                    />
+                      summaryContent={
+                        connected ? (
+                          <UseBuilderCard
+                            builderFlow={builderFlow}
+                            connectUrl={connectUrl}
+                            connected={connected}
+                            orgName={orgName}
+                            envManaged={envManaged}
+                            credentialSource={credentialSource}
+                            trackingSource="file_upload_settings"
+                            trackingFlow="file_upload"
+                          />
+                        ) : undefined
+                      }
+                    >
+                      <StorageSettingsForm />
+                    </ManualSetupCard>
                   </div>
                 }
               />
@@ -3268,25 +3980,44 @@ function SettingsPanelContent({
                 description="Set up sign-in and access control."
                 control={
                   <div className="flex flex-wrap items-center justify-end gap-2">
-                    <UseBuilderCard
-                      builderFlow={builderFlow}
-                      connectUrl={connectUrl}
-                      connected={connected}
-                      orgName={orgName}
-                      envManaged={envManaged}
-                      credentialSource={credentialSource}
-                      trackingSource="auth_settings"
-                      trackingFlow="auth"
-                      compact
-                    />
+                    {showWorkspaceBuilderConnect && (
+                      <UseBuilderCard
+                        builderFlow={builderFlow}
+                        connectUrl={connectUrl}
+                        connected={connected}
+                        orgName={orgName}
+                        envManaged={envManaged}
+                        credentialSource={credentialSource}
+                        trackingSource="auth_settings"
+                        trackingFlow="auth"
+                        compact
+                      />
+                    )}
                     <ManualSetupCard
                       title="Set up manually"
                       hint="Configure Better Auth and optional Google or GitHub providers."
-                      docsUrl="https://www.builder.io/c/docs/agent-native-authentication?utm_source=agent-native&utm_medium=product&utm_campaign=onboarding&utm_content=authentication_settings"
+                      docsUrl={docsUrl("authentication", {
+                        campaign: "onboarding",
+                        content: "authentication_settings",
+                      })}
                       dim={connected}
                       bare
                       popover
                       popoverLabel="Manage"
+                      summaryContent={
+                        connected ? (
+                          <UseBuilderCard
+                            builderFlow={builderFlow}
+                            connectUrl={connectUrl}
+                            connected={connected}
+                            orgName={orgName}
+                            envManaged={envManaged}
+                            credentialSource={credentialSource}
+                            trackingSource="auth_settings"
+                            trackingFlow="auth"
+                          />
+                        ) : undefined
+                      }
                     />
                   </div>
                 }
@@ -3299,6 +4030,7 @@ function SettingsPanelContent({
           <LLMSectionInner
             builderFlow={builderFlow}
             builderLoading={builderLoading}
+            builderStatusAvailable={builderStatusAvailable}
             connectUrl={connectUrl}
             connected={connected}
             orgName={orgName}
@@ -3358,7 +4090,7 @@ function SettingsPanelContent({
             id={settingsSectionDomId("automations")}
             icon={<IconBolt size={14} />}
             title="Automations"
-            subtitle="Scheduled and event-triggered agent tasks."
+            subtitle="Scheduled, event-triggered, and webhook-triggered agent tasks."
             flat
             open={openSection === "automations"}
             onToggle={() => toggle("automations")}
@@ -3407,7 +4139,10 @@ function SettingsPanelContent({
               />
               <ManualSetupCard
                 hint="Deploy manually to Netlify, Vercel, Cloudflare, or any Nitro-supported target."
-                docsUrl="https://www.builder.io/c/docs/agent-native-deployment?utm_source=agent-native&utm_medium=product&utm_campaign=onboarding&utm_content=deployment_settings"
+                docsUrl={docsUrl("deployment", {
+                  campaign: "onboarding",
+                  content: "deployment_settings",
+                })}
                 dim={connected}
               />
             </div>
@@ -3438,8 +4173,11 @@ function SettingsPanelContent({
                 trackingFlow="database"
               />
               <ManualSetupCard
-                hint="Set DATABASE_URL in your .env to connect Neon, Supabase, Turso, any Postgres/SQLite database, or local PGlite with pglite:./data/pglite."
-                docsUrl="https://www.builder.io/c/docs/agent-native-database?utm_source=agent-native&utm_medium=product&utm_campaign=onboarding&utm_content=database_settings"
+                hint="Set DATABASE_URL in your .env to connect hosted Postgres, or use local PGlite with pglite:./data/pglite."
+                docsUrl={docsUrl("database", {
+                  campaign: "onboarding",
+                  content: "database_settings",
+                })}
                 dim={connected}
               />
             </div>
@@ -3470,10 +4208,15 @@ function SettingsPanelContent({
                 trackingFlow="file_upload"
               />
               <ManualSetupCard
-                hint="Without a provider, files are stored as base64 in your database. Fine for dev, not recommended for production."
-                docsUrl="https://www.builder.io/c/docs/agent-native-file-uploads?utm_source=agent-native&utm_medium=product&utm_campaign=onboarding&utm_content=file_upload_settings"
+                hint="Object storage keeps uploaded files durable and their URLs reusable throughout the thread. Connect Builder or use an S3-compatible bucket below."
+                docsUrl={docsUrl("file-uploads", {
+                  campaign: "onboarding",
+                  content: "file_upload_settings",
+                })}
                 dim={connected}
-              />
+              >
+                <StorageSettingsForm />
+              </ManualSetupCard>
             </div>
           </SettingsSection>
         )}
@@ -3503,7 +4246,10 @@ function SettingsPanelContent({
               />
               <ManualSetupCard
                 hint="Configure Better Auth with BETTER_AUTH_SECRET and optional Google/GitHub OAuth providers."
-                docsUrl="https://www.builder.io/c/docs/agent-native-authentication?utm_source=agent-native&utm_medium=product&utm_campaign=onboarding&utm_content=authentication_settings"
+                docsUrl={docsUrl("authentication", {
+                  campaign: "onboarding",
+                  content: "authentication_settings",
+                })}
                 dim={connected}
               />
             </div>
@@ -3558,16 +4304,18 @@ function SettingsPanelContent({
               open={openSection === "background"}
               onToggle={() => toggle("background")}
             >
-              <UseBuilderCard
-                builderFlow={builderFlow}
-                connectUrl={connectUrl}
-                connected={connected}
-                orgName={orgName}
-                envManaged={envManaged}
-                credentialSource={credentialSource}
-                trackingSource="background_agent_settings"
-                trackingFlow="background_agent"
-              />
+              {builderStatusAvailable ? (
+                <UseBuilderCard
+                  builderFlow={builderFlow}
+                  connectUrl={connectUrl}
+                  connected={connected}
+                  orgName={orgName}
+                  envManaged={envManaged}
+                  credentialSource={credentialSource}
+                  trackingSource="background_agent_settings"
+                  trackingFlow="background_agent"
+                />
+              ) : null}
             </SettingsSection>
           )}
 
@@ -3627,26 +4375,15 @@ export function SettingsPanel(props: SettingsPanelProps) {
 }
 
 export function ConnectionsSettingsContent({
-  settingsPanelProps,
+  settingsPanelProps: _settingsPanelProps,
 }: {
   settingsPanelProps: SettingsPanelProps;
 }) {
   return (
-    <div className="w-full space-y-8">
+    <div className="w-full">
       <Suspense fallback={null}>
         <IntegrationsPanel />
       </Suspense>
-      <BuilderConnectCard trackingSource="settings_connections" />
-      <SettingsPanelContent
-        {...settingsPanelProps}
-        surface="page"
-        sections={INTEGRATION_SETTINGS_SECTIONS.filter(
-          (section) => section !== "integrations",
-        )}
-        showCapabilityStrip={false}
-        className="w-full"
-        builderConnectionOwnedExternally
-      />
     </div>
   );
 }
@@ -3687,9 +4424,19 @@ export function AgentSettingsContent({
 export function useAgentSettingsTabs(
   options: AgentSettingsTabsOptions = {},
 ): SettingsTabItem[] {
+  const t = useT();
   const { isDevMode, canToggle, setDevMode } = useDevMode();
+  const { data: org } = useOrg();
+  const locale = useOptionalLocale()?.locale ?? "en-US";
+  const canManageOrg =
+    !org?.orgId || org.role === "owner" || org.role === "admin";
   const extensionToolsEnabled = areExtensionSettingsEnabled(options);
+  const appName = options.appName;
   const agentAdditionalContent = options.agentAdditionalContent;
+  const agentAdditionalTabFactories = options.agentAdditionalTabFactories ?? [];
+  const usageAppId = options.usageAppId ?? null;
+  const usageViewAllHref = options.usageViewAllHref;
+  const organizationContent = options.organizationContent;
   const baseProps = useMemo<SettingsPanelProps>(
     () => ({
       isDevMode,
@@ -3700,11 +4447,29 @@ export function useAgentSettingsTabs(
     }),
     [canToggle, isDevMode, setDevMode],
   );
+  const additionalTabs = useMemo(
+    () =>
+      agentAdditionalTabFactories.map((factory) =>
+        factory({
+          scope: "user",
+          canManageOrg,
+          scopeControl: null,
+        }),
+      ),
+    [agentAdditionalTabFactories, canManageOrg],
+  );
 
   return useMemo<SettingsTabItem[]>(() => {
-    const searchTabs = getAgentSettingsSearchTabs();
+    const searchTabs = getAgentSettingsSearchTabs(locale);
     const searchTab = (
-      id: "agent" | "integrations" | "organization" | "workspace",
+      id:
+        | "agent"
+        | "integrations"
+        | "keys"
+        | "mcp"
+        | "usage"
+        | "organization"
+        | "workspace",
     ) => {
       const tab = searchTabs.find((candidate) => candidate.id === id);
       if (!tab) throw new Error(`Missing agent workspace tab: ${id}`);
@@ -3712,6 +4477,9 @@ export function useAgentSettingsTabs(
     };
     const agent = searchTab("agent");
     const integrations = searchTab("integrations");
+    const keys = searchTab("keys");
+    const mcp = searchTab("mcp");
+    const usage = searchTab("usage");
     const organization = searchTab("organization");
     const workspace = searchTab("workspace");
     const overviewSearchEntries = (agent.searchEntries ?? []).filter(
@@ -3790,12 +4558,45 @@ export function useAgentSettingsTabs(
         content: <ConnectionsSettingsContent settingsPanelProps={baseProps} />,
       },
       {
+        ...keys,
+        icon: IconKey,
+        group: "integrations",
+        content: (
+          <div className="w-full">
+            <SettingsPanelContent
+              {...baseProps}
+              surface="page"
+              sections={["secrets"]}
+              showCapabilityStrip={false}
+              className="w-full"
+              builderConnectionOwnedExternally
+            />
+          </div>
+        ),
+      },
+      {
+        ...mcp,
+        icon: IconApps,
+        group: "integrations",
+        content: <McpAccessSettings appName={appName} />,
+      },
+      {
+        ...usage,
+        icon: IconCoin,
+        group: "integrations",
+        content: (
+          <div className="w-full">
+            <UsageSection appId={usageAppId} viewAllHref={usageViewAllHref} />
+          </div>
+        ),
+      },
+      {
         ...organization,
         icon: IconUsersGroup,
         group: "workspace",
         content: (
           <div className="w-full">
-            <TeamPage showTitle={false} />
+            {organizationContent ?? <TeamPage showTitle={false} />}
           </div>
         ),
       },
@@ -3846,6 +4647,7 @@ export function useAgentSettingsTabs(
             }
           />
         ),
+        shellExtraContent: agentAdditionalContent,
       },
       {
         id: "agent:resources",
@@ -3858,6 +4660,26 @@ export function useAgentSettingsTabs(
         content: (
           <AgentWorkspaceContent activeTab="resources" overview={null} />
         ),
+      },
+      {
+        id: "agent:personalization",
+        label: t("agentChat.personalization.tab"),
+        icon: IconBrain,
+        group: "agent",
+        keywords:
+          "personalization custom instructions memory preferences remember",
+        searchEntries: [
+          {
+            id: "agent-personalization",
+            label: t("agentChat.personalization.tab"),
+            keywords:
+              "custom instructions personal memory remember preferences",
+            tabId: "agent:personalization",
+            hash: "agent:personalization",
+            icon: IconBrain,
+          },
+        ],
+        content: <AgentPersonalizationSettings />,
       },
       {
         id: "agent:automations",
@@ -3881,6 +4703,29 @@ export function useAgentSettingsTabs(
         ),
       },
       {
+        id: "agent:directory",
+        label: t("agentChat.agents.directoryTab"),
+        icon: IconTopologyRing2,
+        group: "agent",
+        keywords:
+          "agent directory providers registry foundry gemini anthropic a2a connect",
+        searchEntries: [
+          {
+            id: "agent-directory",
+            label: t("agentChat.agents.directoryTab"),
+            keywords:
+              "agent directory providers registry foundry gemini anthropic a2a connect",
+            description: t("agentChat.agents.directoryPageHint"),
+            tabId: "agent:directory",
+            hash: "agent:directory",
+            icon: IconTopologyRing2,
+          },
+        ],
+        content: (
+          <AgentWorkspaceContent activeTab="directory" overview={null} />
+        ),
+      },
+      {
         id: "agent:agents",
         label: "Connected agents",
         icon: IconTopologyRing2,
@@ -3899,6 +4744,18 @@ export function useAgentSettingsTabs(
         ],
         content: <AgentWorkspaceContent activeTab="agents" overview={null} />,
       },
+      ...additionalTabs,
     ];
-  }, [agentAdditionalContent, baseProps, extensionToolsEnabled]);
+  }, [
+    agentAdditionalContent,
+    additionalTabs,
+    appName,
+    baseProps,
+    extensionToolsEnabled,
+    locale,
+    organizationContent,
+    t,
+    usageAppId,
+    usageViewAllHref,
+  ]);
 }

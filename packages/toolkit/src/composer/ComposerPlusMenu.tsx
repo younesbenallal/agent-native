@@ -11,6 +11,8 @@ import {
   IconLoader2,
   IconArrowLeft,
   IconX,
+  IconHelpCircle,
+  IconTerminal2,
 } from "@tabler/icons-react";
 import React, {
   useState,
@@ -22,6 +24,7 @@ import React, {
 import { createPortal } from "react-dom";
 
 import { Popover, PopoverTrigger, PopoverContent } from "../ui/popover.js";
+import { Switch } from "../ui/switch.js";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip.js";
 import { cn } from "../utils.js";
 import {
@@ -29,25 +32,26 @@ import {
   isExternalAssetPickerUrl,
   standaloneAssetPickerUrl,
 } from "./asset-picker-url.js";
+import { formatAttachmentError } from "./attachment-accept.js";
 import { useComposerRuntimeAdapters } from "./runtime-adapters.js";
 import type { ComposerMode } from "./types.js";
 
+export interface ComposerTerminalModeControl {
+  enabled: boolean;
+  onChange: (enabled: boolean) => void;
+  onNewTerminal?: () => void;
+}
+
 interface ComposerPlusMenuProps {
   onSelectMode?: (mode: ComposerMode) => void;
+  addAttachment?: (file: File) => Promise<unknown>;
+  attachmentsEnabled?: boolean;
+  onAttachmentRequest?: () => void;
   onAttachmentError?: (message: string) => void;
-  /**
-   * Show the "Create Extension" entry. Extensions are optional and hidden
-   * unless the host explicitly enables their agent tool surface.
-   */
+  attachmentAccept?: string;
   extensionTools?: boolean;
-  /**
-   * "full" (default): full + menu with Upload File, Create Skill, Schedule Task,
-   * Automation, and MCP Server. Extension is included only when
-   * `extensionTools` is true. "upload-only": clicking + opens the file picker
-   * directly — no popover, no other modes. Use for prompt popovers where the
-   * only thing to attach is a file.
-   */
-  mode?: "full" | "upload-only";
+  mode?: "full" | "upload-only" | "terminal";
+  terminalModeControl?: ComposerTerminalModeControl;
 }
 
 type View = "menu" | "skill-upload";
@@ -148,7 +152,11 @@ function assetImageSource(payload: unknown): string | null {
   );
 }
 
-function assetTitle(payload: unknown, url: string): string {
+function assetTitle(
+  payload: unknown,
+  url: string,
+  generatedImageLabel: string,
+): string {
   if (payload && typeof payload === "object") {
     const title = assetString((payload as AssetPickerPayload).title);
     if (title) return title;
@@ -157,9 +165,9 @@ function assetTitle(payload: unknown, url: string): string {
   }
   try {
     const name = new URL(url).pathname.split("/").filter(Boolean).pop();
-    return name ? decodeURIComponent(name) : "Generated image";
+    return name ? decodeURIComponent(name) : generatedImageLabel;
   } catch {
-    return "Generated image";
+    return generatedImageLabel;
   }
 }
 
@@ -188,54 +196,112 @@ function slugifyName(value: string): string {
   );
 }
 
-function formatAttachmentError(error: unknown, fallback: string): string {
-  return error instanceof Error ? error.message : fallback;
+function MenuItemHelp({
+  label,
+  description,
+}: {
+  label: string;
+  description?: string;
+}) {
+  const normalizedDescription = description?.trim();
+  if (!normalizedDescription) return null;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          role="img"
+          tabIndex={0}
+          aria-label={`${label}: ${normalizedDescription}`}
+          onClick={(event) => event.stopPropagation()}
+          className="flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+        >
+          <IconHelpCircle
+            aria-hidden="true"
+            className="size-3"
+            strokeWidth={1.8}
+          />
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="right" className="max-w-xs">
+        {normalizedDescription}
+      </TooltipContent>
+    </Tooltip>
+  );
 }
 
 function UploadOnlyAttachButton({
+  addAttachment,
+  attachmentsEnabled,
+  onAttachmentRequest,
   onAttachmentError,
-}: Pick<ComposerPlusMenuProps, "onAttachmentError">) {
+  attachmentAccept,
+}: Pick<
+  ComposerPlusMenuProps,
+  | "addAttachment"
+  | "attachmentsEnabled"
+  | "onAttachmentRequest"
+  | "onAttachmentError"
+  | "attachmentAccept"
+>) {
   const composerRuntime = useComposerRuntime();
+  const t = useComposerRuntimeAdapters().translate!;
   const inputRef = useRef<HTMLInputElement>(null);
   const handleFilesSelected = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
     try {
       await Promise.all(
-        Array.from(files).map((file) => composerRuntime.addAttachment(file)),
+        Array.from(files).map((file) =>
+          (addAttachment ?? composerRuntime.addAttachment)(file),
+        ),
       );
     } catch (error) {
       onAttachmentError?.(
-        formatAttachmentError(error, "Could not upload the selected file."),
+        formatAttachmentError(
+          error,
+          t("agentChat.composer.uploadFailed", {
+            defaultValue: "Could not upload the selected file.",
+          }),
+        ),
       );
     }
   };
 
   return (
     <>
-      <input
-        ref={inputRef}
-        type="file"
-        multiple
-        className="hidden"
-        onChange={(event) => {
-          void handleFilesSelected(event.target.files);
-          event.target.value = "";
-        }}
-      />
+      {attachmentsEnabled ? (
+        <input
+          ref={inputRef}
+          type="file"
+          multiple
+          accept={attachmentAccept}
+          className="hidden"
+          onChange={(event) => {
+            void handleFilesSelected(event.target.files);
+            event.target.value = "";
+          }}
+        />
+      ) : null}
       <Tooltip>
         <TooltipTrigger asChild>
           <span className="inline-flex shrink-0">
             <button
               type="button"
               className="shrink-0 flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-accent/50"
-              aria-label="Upload"
-              onClick={() => inputRef.current?.click()}
+              aria-label={t("agentChat.composer.upload", {
+                defaultValue: "Upload",
+              })}
+              onClick={() => {
+                if (attachmentsEnabled) inputRef.current?.click();
+                else onAttachmentRequest?.();
+              }}
             >
               <IconPlus className="h-4 w-4" />
             </button>
           </span>
         </TooltipTrigger>
-        <TooltipContent>Upload</TooltipContent>
+        <TooltipContent>
+          {t("agentChat.composer.upload", { defaultValue: "Upload" })}
+        </TooltipContent>
       </Tooltip>
     </>
   );
@@ -243,29 +309,129 @@ function UploadOnlyAttachButton({
 
 export function ComposerPlusMenu({
   onSelectMode,
+  addAttachment,
+  attachmentsEnabled = true,
+  onAttachmentRequest,
   onAttachmentError,
+  attachmentAccept,
   extensionTools = false,
   mode = "full",
+  terminalModeControl,
 }: ComposerPlusMenuProps) {
   if (mode === "upload-only") {
-    return <UploadOnlyAttachButton onAttachmentError={onAttachmentError} />;
+    if (!attachmentsEnabled && !onAttachmentRequest) return null;
+    return (
+      <UploadOnlyAttachButton
+        addAttachment={addAttachment}
+        attachmentsEnabled={attachmentsEnabled}
+        onAttachmentRequest={onAttachmentRequest}
+        onAttachmentError={onAttachmentError}
+        attachmentAccept={attachmentAccept}
+      />
+    );
+  }
+  if (mode === "terminal" && terminalModeControl) {
+    return (
+      <ComposerPlusMenuTerminal terminalModeControl={terminalModeControl} />
+    );
   }
   return (
     <ComposerPlusMenuFull
       onSelectMode={onSelectMode}
+      addAttachment={addAttachment}
+      attachmentsEnabled={attachmentsEnabled}
+      onAttachmentRequest={onAttachmentRequest}
       onAttachmentError={onAttachmentError}
+      attachmentAccept={attachmentAccept}
       extensionTools={extensionTools}
     />
   );
 }
 
+function ComposerPlusMenuTerminal({
+  terminalModeControl,
+}: Pick<ComposerPlusMenuProps, "terminalModeControl">) {
+  const [open, setOpen] = useState(false);
+
+  if (!terminalModeControl) return null;
+
+  const handlePrimaryAction = () => {
+    if (!terminalModeControl.enabled) {
+      terminalModeControl.onChange(true);
+      setOpen(false);
+      return;
+    }
+    terminalModeControl.onNewTerminal?.();
+    setOpen(false);
+  };
+
+  return (
+    <>
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+            aria-label="Terminal options" /* i18n-ignore -- portable toolkit label */
+            title="Terminal options" /* i18n-ignore -- portable toolkit label */
+          >
+            <IconPlus className="h-4 w-4" />
+          </button>
+        </PopoverTrigger>
+        <PopoverContent
+          align="start"
+          sideOffset={8}
+          className="w-56 border-input bg-muted p-1 text-foreground"
+          onOpenAutoFocus={(event) => event.preventDefault()}
+        >
+          <button
+            type="button"
+            className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-start text-[12px] font-medium text-foreground hover:bg-accent/60"
+            onClick={handlePrimaryAction}
+          >
+            <IconTerminal2
+              size={14}
+              className="shrink-0 text-muted-foreground"
+              aria-hidden="true"
+            />
+            <span>
+              {terminalModeControl.enabled ? "New terminal" : "Start terminal"}
+            </span>
+          </button>
+          <div className="my-1 border-t border-border/70" />
+          <div className="flex items-center justify-between gap-3 px-2.5 py-2">
+            <span className="text-[12px] font-medium text-foreground">
+              {"Terminal mode" /* i18n-ignore -- portable toolkit label */}
+            </span>
+            <Switch
+              checked={terminalModeControl.enabled}
+              onCheckedChange={terminalModeControl.onChange}
+              aria-label="Terminal mode" /* i18n-ignore -- portable toolkit label */
+            />
+          </div>
+        </PopoverContent>
+      </Popover>
+    </>
+  );
+}
+
 function ComposerPlusMenuFull({
   onSelectMode,
+  addAttachment,
+  attachmentsEnabled,
+  onAttachmentRequest,
   onAttachmentError,
+  attachmentAccept,
   extensionTools,
 }: Pick<
   ComposerPlusMenuProps,
-  "onSelectMode" | "onAttachmentError" | "extensionTools"
+  | "addAttachment"
+  | "attachmentsEnabled"
+  | "onAttachmentRequest"
+  | "onSelectMode"
+  | "onAttachmentError"
+  | "attachmentAccept"
+  | "extensionTools"
 >) {
   const adapters = useComposerRuntimeAdapters();
   const t = adapters.translate!;
@@ -284,9 +450,7 @@ function ComposerPlusMenuFull({
   const canCreateOrgMcp =
     !org?.orgId || org.role === "owner" || org.role === "admin";
   const hasOrg = !!org?.orgId;
-  // Composer connections belong to the person asking for them. Organization
-  // sharing remains an explicit choice for owners and admins in the dialog.
-  const defaultMcpScope: "user" = "user";
+  const defaultMcpScope = "user" as const;
   const createMcp = resources.useCreateMcpServer!();
   const McpIntegrationDialog = resources.McpIntegrationDialog;
 
@@ -356,14 +520,21 @@ function ComposerPlusMenuFull({
   };
 
   const handleFilesSelected = async (files: FileList | null) => {
-    if (!files || files.length === 0) return;
+    if (!attachmentsEnabled || !files || files.length === 0) return;
     try {
       await Promise.all(
-        Array.from(files).map((file) => composerRuntime.addAttachment(file)),
+        Array.from(files).map((file) =>
+          (addAttachment ?? composerRuntime.addAttachment)(file),
+        ),
       );
     } catch (error) {
       onAttachmentError?.(
-        formatAttachmentError(error, "Could not upload the selected file."),
+        formatAttachmentError(
+          error,
+          t("agentChat.composer.uploadFailed", {
+            defaultValue: "Could not upload the selected file.",
+          }),
+        ),
       );
     }
   };
@@ -390,17 +561,30 @@ function ComposerPlusMenuFull({
       );
       if (!res.ok) {
         const body = await res.text().catch(() => "");
-        throw new Error(body || `Upload failed (${res.status})`);
+        throw new Error(
+          body ||
+            t("agentChat.composer.skill.uploadFailedStatus", {
+              status: res.status,
+              defaultValue: `Upload failed (${res.status})`,
+            }),
+        );
       }
       setSkillUploadStatus({
         kind: "ok",
-        message: `Skill "${skillUploadFileName || `${slug}/SKILL.md`}" added`,
+        message: t("agentChat.composer.skill.added", {
+          name: skillUploadFileName || `${slug}/SKILL.md`,
+          defaultValue: `Skill "${skillUploadFileName || `${slug}/SKILL.md`}" added`,
+        }),
       });
       window.setTimeout(() => setOpen(false), 1200);
     } catch (err: any) {
       setSkillUploadStatus({
         kind: "err",
-        message: err?.message || "Failed to save skill file",
+        message:
+          err?.message ||
+          t("agentChat.composer.skill.saveFailed", {
+            defaultValue: "Failed to save skill file",
+          }),
       });
     } finally {
       setSkillUploadBusy(false);
@@ -411,22 +595,39 @@ function ComposerPlusMenuFull({
     icon: React.ReactNode;
     label: string;
     desc: string;
-    action: () => void;
+    action: (anchor?: HTMLElement) => void;
     hoverAction?: () => void;
+    isSkill?: boolean;
   }[] = [
-    {
-      icon: <IconUpload className="h-3.5 w-3.5" />,
-      label: "Upload File",
-      desc: "Images, PDFs, text/code, JSON, CSV",
-      action: () => {
-        setOpen(false);
-        setTimeout(() => fileUploadRef.current?.click(), 0);
-      },
-    },
+    ...(attachmentsEnabled || onAttachmentRequest
+      ? [
+          {
+            icon: <IconUpload className="h-3.5 w-3.5" />,
+            label: t("agentChat.composer.menu.uploadFile", {
+              defaultValue: "Upload File",
+            }),
+            desc: t("agentChat.composer.menu.uploadFileDescription", {
+              defaultValue: "Images, PDFs, text/code, JSON, CSV",
+            }),
+            action: () => {
+              setOpen(false);
+              if (attachmentsEnabled) {
+                setTimeout(() => fileUploadRef.current?.click(), 0);
+              } else {
+                onAttachmentRequest?.();
+              }
+            },
+          },
+        ]
+      : []),
     {
       icon: <IconPhotoPlus className="h-3.5 w-3.5" />,
-      label: "Generate Image",
-      desc: "Open the Assets image picker",
+      label: t("agentChat.composer.menu.generateImage", {
+        defaultValue: "Generate Image",
+      }),
+      desc: t("agentChat.composer.menu.generateImageDescription", {
+        defaultValue: "Open the Assets image picker",
+      }),
       action: () => {
         setOpen(false);
         setAssetsPickerOpen(true);
@@ -434,8 +635,12 @@ function ComposerPlusMenuFull({
     },
     {
       icon: <IconClock className="h-3.5 w-3.5" />,
-      label: "Schedule Task",
-      desc: "Run something on a schedule",
+      label: t("agentChat.composer.menu.scheduleTask", {
+        defaultValue: "Schedule Task",
+      }),
+      desc: t("agentChat.composer.menu.scheduleTaskDescription", {
+        defaultValue: "Run something on a schedule",
+      }),
       action: () => {
         onSelectMode?.("job");
         setOpen(false);
@@ -443,8 +648,12 @@ function ComposerPlusMenuFull({
     },
     {
       icon: <IconBolt className="h-3.5 w-3.5" />,
-      label: "Create Automation",
-      desc: "Set up a when-X-do-Y rule",
+      label: t("agentChat.composer.menu.createAutomation", {
+        defaultValue: "Create Automation",
+      }),
+      desc: t("agentChat.composer.menu.createAutomationDescription", {
+        defaultValue: "Set up a when-X-do-Y rule",
+      }),
       action: () => {
         onSelectMode?.("automation");
         setOpen(false);
@@ -454,8 +663,12 @@ function ComposerPlusMenuFull({
       ? [
           {
             icon: <IconTool className="h-3.5 w-3.5" />,
-            label: "Create Extension",
-            desc: "Build a mini app extension",
+            label: t("agentChat.composer.menu.createExtension", {
+              defaultValue: "Create Extension",
+            }),
+            desc: t("agentChat.composer.menu.createExtensionDescription", {
+              defaultValue: "Build a mini app extension",
+            }),
             action: () => {
               onSelectMode?.("extension");
               setOpen(false);
@@ -467,8 +680,12 @@ function ComposerPlusMenuFull({
       ? [
           {
             icon: <IconPlugConnected className="h-3.5 w-3.5" />,
-            label: t("mcpIntegrations.menuLabel"),
-            desc: t("mcpIntegrations.menuDescription"),
+            label: t("agentChat.composer.menu.integrations", {
+              defaultValue: "Integrations",
+            }),
+            desc: t("agentChat.composer.menu.integrationsDescription", {
+              defaultValue: "Connect tools and services to the agent",
+            }),
             action: () => {
               setOpen(false);
               setMcpDialogOpen(true);
@@ -478,10 +695,15 @@ function ComposerPlusMenuFull({
       : []),
     {
       icon: <IconBulb className="h-3.5 w-3.5" />,
-      label: "Create Skill",
-      desc: "Teach the agent a new ability",
+      label: t("agentChat.composer.menu.createSkill", {
+        defaultValue: "Create Skill",
+      }),
+      desc: t("agentChat.composer.menu.createSkillDescription", {
+        defaultValue: "Teach the agent a new ability",
+      }),
       action: openSkillFlyout,
       hoverAction: openSkillFlyout,
+      isSkill: true,
     },
   ];
 
@@ -492,7 +714,9 @@ function ComposerPlusMenuFull({
         ref={fileUploadRef}
         type="file"
         multiple
+        accept={attachmentAccept}
         className="hidden"
+        disabled={!attachmentsEnabled}
         onChange={(event) => {
           void handleFilesSelected(event.target.files);
           event.target.value = "";
@@ -516,7 +740,10 @@ function ComposerPlusMenuFull({
               <PopoverTrigger asChild>
                 <button
                   type="button"
-                  aria-label="Add..."
+                  data-agent-composer-slot="plus-button"
+                  aria-label={t("agentChat.composer.add", {
+                    defaultValue: "Add...",
+                  })}
                   className="shrink-0 flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-accent/50 disabled:opacity-30 disabled:cursor-not-allowed"
                 >
                   <IconPlus className="h-4 w-4" />
@@ -524,14 +751,16 @@ function ComposerPlusMenuFull({
               </PopoverTrigger>
             </span>
           </TooltipTrigger>
-          <TooltipContent>Add...</TooltipContent>
+          <TooltipContent>
+            {t("agentChat.composer.add", { defaultValue: "Add..." })}
+          </TooltipContent>
         </Tooltip>
         <PopoverContent
           side="top"
           align="start"
           sideOffset={8}
           className={cn(
-            "p-0 rounded-lg",
+            "rounded-lg border-input bg-muted p-0 text-foreground",
             view === "skill-upload"
               ? "max-h-[70vh] w-[calc(100vw-24px)] max-w-[380px] overflow-y-auto"
               : "w-[260px]",
@@ -542,11 +771,15 @@ function ComposerPlusMenuFull({
           {view === "menu" && (
             <div className="py-1">
               {menuItems.map((item) => {
-                const isSkill = item.label === "Create Skill";
+                const isSkill = item.isSkill === true;
                 return (
                   <div
                     key={item.label}
-                    className={cn("relative", isSkill && "group/skill")}
+                    className={cn(
+                      "relative flex items-center hover:bg-accent/50",
+                      isSkill && "group/skill",
+                      isSkill && skillFlyoutOpen && "bg-accent/50",
+                    )}
                     onMouseEnter={(e) => {
                       if (isSkill) {
                         openSkillFlyout(e.currentTarget);
@@ -572,80 +805,109 @@ function ComposerPlusMenuFull({
                   >
                     <button
                       type="button"
-                      onClick={item.action}
+                      onClick={(event) => item.action(event.currentTarget)}
                       className={cn(
-                        "flex w-full items-center gap-2.5 px-3 py-2 text-start hover:bg-accent/50",
-                        isSkill && skillFlyoutOpen && "bg-accent/50",
+                        "flex min-w-0 flex-1 items-center gap-2.5 px-3 py-2 text-start",
                       )}
                     >
                       <span className="text-muted-foreground">{item.icon}</span>
-                      <div className="min-w-0 flex-1">
-                        <div className="text-[12px] font-medium text-foreground">
+                      <span className="flex min-w-0 items-center gap-0.5">
+                        <span className="min-w-0 truncate text-[12px] font-medium text-foreground">
                           {item.label}
-                        </div>
-                        <div className="mt-0.5 text-[10px] text-muted-foreground/60">
-                          {item.desc}
-                        </div>
-                      </div>
-                      {isSkill && (
-                        <span className="ms-auto text-muted-foreground/60">
-                          ›
                         </span>
-                      )}
+                        <MenuItemHelp
+                          label={item.label}
+                          description={item.desc}
+                        />
+                      </span>
                     </button>
+                    {isSkill && (
+                      <span className="me-3 ms-auto text-muted-foreground/60">
+                        ›
+                      </span>
+                    )}
                     {isSkill && skillFlyoutOpen && (
                       <div
                         role="menu"
                         onMouseEnter={() => openSkillFlyout()}
                         onMouseLeave={scheduleSkillFlyoutClose}
                         className={cn(
-                          "absolute top-0 z-20 w-[240px] rounded-lg border border-border bg-popover py-1 shadow-md",
+                          "absolute top-0 z-20 w-[240px] rounded-lg border border-input bg-muted py-1 text-foreground shadow-md",
                           skillFlyoutSide === "right"
                             ? "left-full ml-1"
                             : "right-full mr-1",
                         )}
                       >
-                        <button
-                          type="button"
-                          onClick={() => {
-                            onSelectMode?.("skill");
-                            setSkillFlyoutOpen(false);
-                            setOpen(false);
-                          }}
-                          className="flex w-full items-center gap-2.5 px-3 py-2 text-start hover:bg-accent/50"
-                        >
-                          <span className="text-muted-foreground">
-                            <IconBulb className="h-3.5 w-3.5" />
-                          </span>
-                          <div className="min-w-0">
-                            <div className="text-[12px] font-medium text-foreground">
-                              Create new skill
-                            </div>
-                            <div className="mt-0.5 text-[10px] text-muted-foreground/60">
-                              Describe a skill and let the agent draft it
-                            </div>
-                          </div>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setSkillFlyoutOpen(false);
-                            skillFileInputRef.current?.click();
-                          }}
-                          className="flex w-full items-center gap-2.5 px-3 py-2 text-start hover:bg-accent/50"
-                        >
-                          <span className="text-muted-foreground">
-                            <IconUpload className="h-3.5 w-3.5" />
-                          </span>
-                          <div className="min-w-0">
-                            <div className="text-[12px] font-medium text-foreground">
-                              Upload skill file
-                            </div>
-                            <div className="mt-0.5 text-[10px] text-muted-foreground/60">
-                              Import an existing SKILL.md file
-                            </div>
-                          </div>
-                        </button>
+                        <div className="flex items-center hover:bg-accent/50">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              onSelectMode?.("skill");
+                              setSkillFlyoutOpen(false);
+                              setOpen(false);
+                            }}
+                            className="flex min-w-0 flex-1 items-center gap-2.5 px-3 py-2 text-start"
+                          >
+                            <span className="text-muted-foreground">
+                              <IconBulb className="h-3.5 w-3.5" />
+                            </span>
+                            <span className="flex min-w-0 items-center gap-0.5">
+                              <span className="min-w-0 truncate text-[12px] font-medium text-foreground">
+                                {t("agentChat.composer.skill.createNew", {
+                                  defaultValue: "Create new skill",
+                                })}
+                              </span>
+                              <MenuItemHelp
+                                label={t("agentChat.composer.skill.createNew", {
+                                  defaultValue: "Create new skill",
+                                })}
+                                description={t(
+                                  "agentChat.composer.skill.createDescription",
+                                  {
+                                    defaultValue:
+                                      "Describe a skill and let the agent draft it",
+                                  },
+                                )}
+                              />
+                            </span>
+                          </button>
+                        </div>
+                        <div className="flex items-center hover:bg-accent/50">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSkillFlyoutOpen(false);
+                              skillFileInputRef.current?.click();
+                            }}
+                            className="flex min-w-0 flex-1 items-center gap-2.5 px-3 py-2 text-start"
+                          >
+                            <span className="text-muted-foreground">
+                              <IconUpload className="h-3.5 w-3.5" />
+                            </span>
+                            <span className="flex min-w-0 items-center gap-0.5">
+                              <span className="min-w-0 truncate text-[12px] font-medium text-foreground">
+                                {t("agentChat.composer.skill.uploadFile", {
+                                  defaultValue: "Upload skill file",
+                                })}
+                              </span>
+                              <MenuItemHelp
+                                label={t(
+                                  "agentChat.composer.skill.uploadFile",
+                                  {
+                                    defaultValue: "Upload skill file",
+                                  },
+                                )}
+                                description={t(
+                                  "agentChat.composer.skill.uploadDescription",
+                                  {
+                                    defaultValue:
+                                      "Import an existing SKILL.md file",
+                                  },
+                                )}
+                              />
+                            </span>
+                          </button>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -662,20 +924,29 @@ function ComposerPlusMenuFull({
                 className="mb-1.5 flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
               >
                 <IconArrowLeft className="h-3 w-3 rtl:-scale-x-100" />
-                Back
+                {t("agentChat.composer.skill.back", {
+                  defaultValue: "Back",
+                })}
               </button>
               <label className="mb-1 block text-[11px] font-semibold text-foreground">
-                Upload skill file
+                {t("agentChat.composer.skill.uploadFile", {
+                  defaultValue: "Upload skill file",
+                })}
               </label>
               <p className="mb-2 text-[10px] leading-relaxed text-muted-foreground/60">
-                Review the content from{" "}
-                <span className="font-mono">
-                  {skillUploadFileName || "the selected file"}
-                </span>{" "}
-                before saving.
+                {t("agentChat.composer.skill.review", {
+                  name:
+                    skillUploadFileName ||
+                    t("agentChat.composer.skill.selectedFile", {
+                      defaultValue: "the selected file",
+                    }),
+                  defaultValue: `Review the content from ${skillUploadFileName || "the selected file"} before saving.`,
+                })}
               </p>
               <label className="mb-1 block text-[10px] font-medium text-muted-foreground">
-                Skill name
+                {t("agentChat.composer.skill.name", {
+                  defaultValue: "Skill name",
+                })}
               </label>
               <input
                 value={skillUploadSlug}
@@ -684,14 +955,18 @@ function ComposerPlusMenuFull({
                 placeholder="my-skill"
               />
               <p className="mb-2 text-[10px] text-muted-foreground/60">
-                Saved at{" "}
+                {t("agentChat.composer.skill.savedAt", {
+                  defaultValue: "Saved at",
+                })}{" "}
                 <span className="font-mono">
                   skills/{slugifyName(skillUploadSlug || "uploaded-skill")}
                   /SKILL.md
                 </span>
               </p>
               <label className="mb-1 block text-[10px] font-medium text-muted-foreground">
-                Content
+                {t("agentChat.composer.skill.content", {
+                  defaultValue: "Content",
+                })}
               </label>
               <textarea
                 value={skillUploadContent}
@@ -717,7 +992,9 @@ function ComposerPlusMenuFull({
                   onClick={() => setView("menu")}
                   className="rounded-md px-3 py-1.5 text-[12px] font-medium text-muted-foreground hover:bg-accent/40"
                 >
-                  Cancel
+                  {t("agentChat.common.cancel", {
+                    defaultValue: "Cancel",
+                  })}
                 </button>
                 <button
                   type="button"
@@ -732,7 +1009,7 @@ function ComposerPlusMenuFull({
                   {skillUploadBusy ? (
                     <IconLoader2 className="h-3 w-3 animate-spin" />
                   ) : (
-                    "Save"
+                    t("agentChat.common.save", { defaultValue: "Save" })
                   )}
                 </button>
               </div>
@@ -766,6 +1043,7 @@ function AssetsPickerModal({
   onOpenChange: (open: boolean) => void;
 }) {
   const adapters = useComposerRuntimeAdapters();
+  const t = adapters.translate!;
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const standaloneWindowRef = useRef<Window | null>(null);
   const [pickerReady, setPickerReady] = useState(false);
@@ -862,14 +1140,23 @@ function AssetsPickerModal({
 
       const url = assetImageSource(event.data.payload);
       if (!url) return;
-      const title = assetTitle(event.data.payload, url);
+      const title = assetTitle(
+        event.data.payload,
+        url,
+        t("agentChat.composer.assets.generatedImage", {
+          defaultValue: "Generated image",
+        }),
+      );
       const assetId =
         event.data.payload && typeof event.data.payload === "object"
           ? assetString((event.data.payload as AssetPickerPayload).assetId)
           : null;
       adapters.agentChat!.setContextItem!({
         key: `asset-image:${assetId ?? url}`,
-        title: `Image: ${title}`,
+        title: t("agentChat.composer.assets.contextTitle", {
+          title,
+          defaultValue: `Image: ${title}`,
+        }),
         context: assetContext(event.data.payload, url),
       });
       standaloneWindowRef.current = null;
@@ -894,6 +1181,7 @@ function AssetsPickerModal({
     onOpenChange,
     open,
     standaloneHandoffId,
+    t,
     targetOrigin,
   ]);
 
@@ -927,13 +1215,17 @@ function AssetsPickerModal({
             id="composer-assets-picker-title"
             className="text-sm font-medium text-foreground"
           >
-            Generate image
+            {t("agentChat.composer.assets.generateImage", {
+              defaultValue: "Generate image",
+            })}
           </div>
           <button
             type="button"
             onClick={() => onOpenChange(false)}
             className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
-            aria-label="Close image picker"
+            aria-label={t("agentChat.composer.assets.closePicker", {
+              defaultValue: "Close image picker",
+            })}
           >
             <IconX className="h-4 w-4" />
           </button>
@@ -941,7 +1233,10 @@ function AssetsPickerModal({
         {externalPicker ? (
           <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
             <div className="max-w-md text-sm text-muted-foreground">
-              Open Assets in a new tab to sign in and choose an image securely.
+              {t("agentChat.composer.assets.openSecurely", {
+                defaultValue:
+                  "Open Assets in a new tab to sign in and choose an image securely.",
+              })}
             </div>
             <a
               href={standaloneUrl}
@@ -949,7 +1244,9 @@ function AssetsPickerModal({
               onClick={openStandalonePicker}
               className="inline-flex h-9 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90"
             >
-              Open Assets image picker
+              {t("agentChat.composer.assets.openPicker", {
+                defaultValue: "Open Assets image picker",
+              })}
             </a>
           </div>
         ) : targetOrigin ? (
@@ -958,7 +1255,9 @@ function AssetsPickerModal({
             <iframe
               ref={iframeRef}
               src={iframeUrl}
-              title="Assets image picker"
+              title={t("agentChat.composer.assets.pickerTitle", {
+                defaultValue: "Assets image picker",
+              })}
               className={cn(
                 "absolute inset-0 h-full w-full border-0 bg-background transition-opacity duration-150",
                 pickerReady ? "opacity-100" : "pointer-events-none opacity-0",
@@ -974,7 +1273,9 @@ function AssetsPickerModal({
           </div>
         ) : (
           <div className="flex min-h-0 flex-1 items-center justify-center p-8 text-center text-sm text-muted-foreground">
-            The configured image picker URL is not valid.
+            {t("agentChat.composer.assets.invalidUrl", {
+              defaultValue: "The configured image picker URL is not valid.",
+            })}
           </div>
         )}
       </div>
@@ -984,11 +1285,14 @@ function AssetsPickerModal({
 }
 
 function AssetsPickerLoadingSkeleton() {
+  const t = useComposerRuntimeAdapters().translate!;
   return (
     <div
       className="absolute inset-0 flex flex-col gap-5 p-5"
       role="status"
-      aria-label="Loading Assets picker"
+      aria-label={t("agentChat.composer.assets.loadingPicker", {
+        defaultValue: "Loading Assets picker",
+      })}
     >
       <div className="flex items-center gap-3">
         <div className="h-9 flex-1 animate-pulse rounded-md bg-muted" />

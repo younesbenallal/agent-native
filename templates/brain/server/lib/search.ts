@@ -298,11 +298,41 @@ export function buildSnippet(
   return buildSearchSnippet(value, terms, maxLength);
 }
 
+export function citationEvidenceMatchesCapture(
+  citation:
+    | {
+        quote?: string | null;
+        preview?: string | null;
+        verbatim?: boolean;
+      }
+    | null
+    | undefined,
+  captureContent: string,
+) {
+  const redactedContent = redactSensitiveText(captureContent)
+    .replace(/\s+/g, " ")
+    .trim();
+  const quote = citation?.quote?.trim();
+  if (quote) return captureContent.includes(quote);
+  if (citation?.verbatim !== false) return false;
+  const preview = citation.preview
+    ?.trim()
+    .replace(/^\.\.\./, "")
+    .replace(/\.\.\.$/, "")
+    .trim()
+    .replace(/\s+/g, " ");
+  if (!preview) return false;
+  return redactedContent.includes(preview);
+}
+
 export function scoreSearchText(
   fields: {
     title?: string | null;
     summary?: string | null;
     body?: string | null;
+    topic?: string | null;
+    tags?: string | null;
+    entities?: string | null;
     provider?: string | null;
     status?: string | null;
   },
@@ -313,7 +343,7 @@ export function scoreSearchText(
       title: fields.title,
       summary: fields.summary,
       body: fields.body,
-      metadata: `${fields.provider ?? ""} ${fields.status ?? ""}`,
+      metadata: `${fields.topic ?? ""} ${fields.tags ?? ""} ${fields.entities ?? ""} ${fields.provider ?? ""} ${fields.status ?? ""}`,
     },
     terms,
   );
@@ -398,6 +428,8 @@ async function searchKnowledgeResults(
             schema.brainKnowledge.summary,
             schema.brainKnowledge.body,
             schema.brainKnowledge.topic,
+            schema.brainKnowledge.tagsJson,
+            schema.brainKnowledge.entitiesJson,
           ],
           terms,
         ),
@@ -417,6 +449,9 @@ async function searchKnowledgeResults(
           title: row.title,
           summary: row.summary,
           body: row.body,
+          topic: row.topic,
+          tags: row.tagsJson,
+          entities: row.entitiesJson,
           status: row.status,
         },
         terms,

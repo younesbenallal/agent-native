@@ -25,8 +25,6 @@ export default function CodeBlock({
         light: "github-light-default",
         dark: "github-dark-default",
       },
-      // Emit BOTH --shiki-light and --shiki-dark CSS vars (no baked-in default
-      // theme) so the per-theme color rules in global.css work in both modes.
       defaultColor: false,
     })
       .then((result) => {
@@ -41,7 +39,7 @@ export default function CodeBlock({
   }, [code, lang]);
 
   function handleCopy() {
-    navigator.clipboard.writeText(code.trim());
+    void navigator.clipboard.writeText(code.trim());
     setCopied(true);
     trackEvent("copy code block", { lang, snippet: code.trim().slice(0, 100) });
     if (timeoutRef.current) clearTimeout(timeoutRef.current);

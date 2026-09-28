@@ -1,5 +1,453 @@
 # @agent-native/scheduling
 
+## 0.2.3
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies [880740b]
+- Updated dependencies [55c9666]
+- Updated dependencies [55c9666]
+- Updated dependencies
+  - @agent-native/toolkit@0.22.3
+
+## 0.2.2
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- ed3801e: Remove nonessential source comments.
+- Updated dependencies [d462819]
+- Updated dependencies [797b3e2]
+- Updated dependencies [e76947b]
+- Updated dependencies
+- Updated dependencies [adc7497]
+- Updated dependencies [797b3e2]
+- Updated dependencies [ed3801e]
+- Updated dependencies [e7b6fcc]
+- Updated dependencies [e76947b]
+- Updated dependencies [2397f94]
+  - @agent-native/toolkit@0.22.2
+
+## 0.2.1
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- af54bfd: Keep Zoom-backed slots reserved until meeting cleanup succeeds.
+- Updated dependencies [7e8a10a]
+- Updated dependencies
+  - @agent-native/toolkit@0.22.1
+
+## 0.2.0
+
+### Minor Changes
+
+- da924dd: Improve public share previews and recover Calendar bookings safely after Zoom outcomes.
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies [dbb10d5]
+- Updated dependencies [39a89d0]
+- Updated dependencies [39a89d0]
+- Updated dependencies [39a89d0]
+- Updated dependencies [39a89d0]
+- Updated dependencies
+- Updated dependencies [39a89d0]
+- Updated dependencies [39a89d0]
+- Updated dependencies [39a89d0]
+  - @agent-native/toolkit@0.22.0
+
+## 0.1.75
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+- Updated dependencies [6ff4d47]
+  - @agent-native/toolkit@0.21.3
+
+## 0.1.74
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+- Updated dependencies [2ba6541]
+  - @agent-native/toolkit@0.21.2
+
+## 0.1.73
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+  - @agent-native/toolkit@0.21.1
+
+## 0.1.72
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies [21fdd86]
+- Updated dependencies [4917d34]
+- Updated dependencies
+- Updated dependencies [ac01083]
+- Updated dependencies [21fdd86]
+- Updated dependencies [185e25d]
+  - @agent-native/toolkit@0.21.0
+
+## 0.1.71
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+  - @agent-native/toolkit@0.20.9
+
+## 0.1.70
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+  - @agent-native/toolkit@0.20.8
+
+## 0.1.69
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies [2427195]
+- Updated dependencies [d43305d]
+- Updated dependencies
+  - @agent-native/toolkit@0.20.7
+
+## 0.1.68
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+- Updated dependencies [e973e00]
+  - @agent-native/toolkit@0.20.6
+
+## 0.1.67
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies [58b0779]
+- Updated dependencies [3ecc476]
+- Updated dependencies
+- Updated dependencies [15ec2fb]
+  - @agent-native/toolkit@0.20.5
+
+## 0.1.66
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies [5ede9f7]
+- Updated dependencies
+- Updated dependencies [ffafd84]
+- Updated dependencies [424d0cd]
+  - @agent-native/toolkit@0.20.4
+
+## 0.1.65
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies [901376b]
+- Updated dependencies [b35949b]
+- Updated dependencies [116c315]
+- Updated dependencies
+  - @agent-native/toolkit@0.20.3
+
+## 0.1.64
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+- Updated dependencies [c9cb7de]
+  - @agent-native/toolkit@0.20.2
+
+## 0.1.63
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies [9f08f5d]
+- Updated dependencies [cd40555]
+- Updated dependencies [1f43d89]
+- Updated dependencies [25dc407]
+- Updated dependencies [e32e1d5]
+- Updated dependencies
+- Updated dependencies [657bba1]
+- Updated dependencies [25dc407]
+- Updated dependencies [6ba23d3]
+  - @agent-native/toolkit@0.20.1
+
+## 0.1.62
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies [210c7d0]
+- Updated dependencies [743039f]
+- Updated dependencies [bd3e96e]
+- Updated dependencies [b83d472]
+- Updated dependencies [875f793]
+- Updated dependencies [97564cd]
+- Updated dependencies [64e6346]
+- Updated dependencies [64e6346]
+- Updated dependencies [a30a54d]
+- Updated dependencies [587297c]
+- Updated dependencies
+- Updated dependencies [210c7d0]
+- Updated dependencies [7a9238c]
+- Updated dependencies [ccad889]
+  - @agent-native/toolkit@0.20.0
+
+## 0.1.61
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- b7c56a1: Harden security across CLI action runners and scheduling actions: safely tokenize and quote CLI arguments in fallback action routes to prevent shell command injection, require viewer access on routing form responses, and enforce access checks on event type ID queries.
+- Updated dependencies [35eb1e6]
+- Updated dependencies [4676e71]
+- Updated dependencies
+  - @agent-native/toolkit@0.19.7
+
+## 0.1.60
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- 8f0c972: Keep the event-type authorization test fixture in step with the shared shares
+  table, which now records when a share notification was sent.
+- Updated dependencies [e8b291e]
+- Updated dependencies [4915b82]
+- Updated dependencies
+- Updated dependencies [3bde94f]
+  - @agent-native/toolkit@0.19.6
+
+## 0.1.59
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+- Updated dependencies [58d9dc3]
+  - @agent-native/toolkit@0.19.5
+
+## 0.1.58
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- cc2a915: Standardize framework persistence on PostgreSQL. Local development uses PGlite,
+  hosted deployments use PostgreSQL, and the database client, schema, migrations,
+  templates, docs, and tooling now target PostgreSQL directly.
+- Updated dependencies [e29fee8]
+- Updated dependencies [cef8c06]
+- Updated dependencies
+- Updated dependencies [73c36ce]
+  - @agent-native/toolkit@0.19.4
+
+## 0.1.57
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+- Updated dependencies [760d108]
+  - @agent-native/toolkit@0.19.3
+
+## 0.1.56
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+- Updated dependencies [0566ce9]
+  - @agent-native/toolkit@0.19.2
+
+## 0.1.55
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies [e74593d]
+- Updated dependencies
+  - @agent-native/toolkit@0.19.1
+
+## 0.1.54
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+- Updated dependencies [349ce5c]
+- Updated dependencies [353f95a]
+- Updated dependencies [a1869cc]
+- Updated dependencies [f0fb6c5]
+- Updated dependencies [03711a6]
+  - @agent-native/toolkit@0.19.0
+
+## 0.1.53
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies [844fa10]
+- Updated dependencies [4af2889]
+- Updated dependencies
+- Updated dependencies [dcc9f89]
+- Updated dependencies [163dd55]
+- Updated dependencies [5b7a8ea]
+  - @agent-native/toolkit@0.18.0
+
+## 0.1.52
+
+### Patch Changes
+
+- 6621544: Generate `docs/llms-full.txt` in a locale-independent order. The bundle sorted its sections with `localeCompare`, so a full-ICU Node produced a different order than the small-ICU build that generated the committed file — leaving the tracked artifact modified after every `pnpm install`.
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+  - @agent-native/toolkit@0.17.6
+
+## 0.1.51
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- 4776e61: Reduce CI lint warnings with safer type narrowing, callback binding, and explicit async intent.
+- Updated dependencies [ac1ecfc]
+- Updated dependencies
+- Updated dependencies [5a12f71]
+- Updated dependencies [d2b314b]
+- Updated dependencies [5c96078]
+  - @agent-native/toolkit@0.17.5
+
+## 0.1.50
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+  - @agent-native/toolkit@0.17.4
+
+## 0.1.49
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies [db91905]
+- Updated dependencies
+  - @agent-native/toolkit@0.17.3
+
+## 0.1.48
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies [65a3b88]
+- Updated dependencies
+  - @agent-native/toolkit@0.17.2
+
+## 0.1.47
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+  - @agent-native/toolkit@0.17.1
+
+## 0.1.46
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+- Updated dependencies [cf473dc]
+  - @agent-native/toolkit@0.17.0
+
+## 0.1.45
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+  - @agent-native/toolkit@0.16.16
+
+## 0.1.44
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+  - @agent-native/toolkit@0.16.15
+
+## 0.1.43
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+  - @agent-native/toolkit@0.16.14
+
+## 0.1.42
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+  - @agent-native/toolkit@0.16.13
+
+## 0.1.41
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+  - @agent-native/toolkit@0.16.12
+
+## 0.1.40
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- Updated dependencies
+  - @agent-native/toolkit@0.16.10
+
+## 0.1.39
+
+### Patch Changes
+
+- Updated dependencies [9e21e1b]
+- Updated dependencies [9e21e1b]
+- Updated dependencies [9e21e1b]
+  - @agent-native/toolkit@0.16.0
+
+## 0.1.38
+
+### Patch Changes
+
+- Updated dependencies [f07ec04]
+  - @agent-native/toolkit@0.15.0
+
+## 0.1.37
+
+### Patch Changes
+
+- Updated dependencies [aa17e22]
+  - @agent-native/toolkit@0.14.0
+
 ## 0.1.36
 
 ### Patch Changes
@@ -259,7 +707,7 @@
 
 ### Patch Changes
 
-- 79a0eb9: Align local Drizzle peer resolution with the framework's libsql driver version.
+- 79a0eb9: Align local Drizzle peer resolution with the framework's Postgres driver version.
 
 ## 0.1.4
 

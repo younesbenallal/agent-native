@@ -1,11 +1,11 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
 
 import { searchAgentThreads } from "../server/lib/thread-debug-store.js";
 
 export default defineAction({
   description:
-    "Search agent chat threads by title, preview, full persisted thread content, or an exact request/run ID. Non-admins are limited to their own current Dispatch DB threads.",
+    "Search agent chat threads by title, owner email, preview, full persisted thread content, or an exact request/run ID. Non-admins are limited to their own current Dispatch DB threads.",
   schema: z.object({
     sourceId: z
       .string()
@@ -15,7 +15,7 @@ export default defineAction({
       .string()
       .optional()
       .describe(
-        "Full-text search term matched against title, preview, and thread data.",
+        "Full-text search term matched against title, owner email, preview, and thread data.",
       ),
     ownerEmail: z
       .string()

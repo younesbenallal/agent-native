@@ -16,3 +16,8 @@ export {
   RECURRING_JOBS_SWEEP_TOKEN_SUBJECT,
 } from "./scheduler-dispatch.js";
 export { createJobTools } from "./tools.js";
+export {
+  AUTOMATION_RUN_MIGRATIONS,
+  deleteAutomationRuns,
+  runAutomationRunMigrations,
+} from "./run-history.js";

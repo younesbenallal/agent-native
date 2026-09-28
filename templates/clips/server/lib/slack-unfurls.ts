@@ -6,6 +6,7 @@ import { eq } from "drizzle-orm";
 import {
   clipsShareDescription,
   displayRecordingTitle,
+  resolveClipsSocialImageUrl,
 } from "../../shared/share-meta.js";
 import { getDb, schema } from "../db/index.js";
 
@@ -38,6 +39,7 @@ type SlackUnfurlRecording = {
   trashedAt: string | null;
   expiresAt: string | null;
   videoUrl: string | null;
+  sourceAppName: string | null;
 };
 
 export type SlackVideoBlock = {
@@ -191,15 +193,6 @@ function appPath(path: string, basePath: string): string {
   return base ? `/${base}${path}` : path;
 }
 
-function absoluteUrl(value: string | null | undefined, origin: string): string {
-  if (!value) return AGENT_NATIVE_DEFAULT_SOCIAL_IMAGE;
-  try {
-    return new URL(value, origin).toString();
-  } catch {
-    return AGENT_NATIVE_DEFAULT_SOCIAL_IMAGE;
-  }
-}
-
 function isExpired(value: string | null): boolean {
   if (!value) return false;
   const expires = new Date(value).getTime();
@@ -255,10 +248,12 @@ export function buildSlackVideoBlock(options: {
   const description = duration
     ? `${duration} · ${shareDescription}`
     : shareDescription;
-  const thumbnailUrl = absoluteUrl(
-    recording.thumbnailUrl || recording.animatedThumbnailUrl,
-    origin,
-  );
+  const thumbnailUrl =
+    resolveClipsSocialImageUrl({
+      recording,
+      origin,
+      basePath,
+    }) ?? AGENT_NATIVE_DEFAULT_SOCIAL_IMAGE;
 
   return {
     type: "video",
@@ -293,6 +288,7 @@ export async function loadSlackVideoBlockForUrl(
       trashedAt: schema.recordings.trashedAt,
       expiresAt: schema.recordings.expiresAt,
       videoUrl: schema.recordings.videoUrl,
+      sourceAppName: schema.recordings.sourceAppName,
     })
     .from(schema.recordings)
     .where(eq(schema.recordings.id, share.id))

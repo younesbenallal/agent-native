@@ -1,6 +1,15 @@
 export const OPENAI_BASE_URL_ENV_VAR = "OPENAI_BASE_URL";
+export const OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
+export const OLLAMA_BASE_URL_ENV_VAR = "OLLAMA_BASE_URL";
+export const OLLAMA_DEFAULT_BASE_URL = "http://127.0.0.1:11434";
 
-export function normalizeOpenAiBaseUrl(value: string): string {
+export function isCustomOpenAiBaseUrl(value: string | undefined): boolean {
+  return Boolean(
+    value && value.replace(/\/+$/, "") !== OPENAI_DEFAULT_BASE_URL,
+  );
+}
+
+export function normalizeProviderBaseUrl(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) {
     throw new Error("Endpoint URL is required.");
@@ -22,4 +31,12 @@ export function normalizeOpenAiBaseUrl(value: string): string {
 
   url.hash = "";
   return url.toString().replace(/\/+$/, "");
+}
+
+export function normalizeOpenAiBaseUrl(value: string): string {
+  return normalizeProviderBaseUrl(value);
+}
+
+export function stripOllamaV1Suffix(value: string): string {
+  return value.replace(/\/v1$/i, "");
 }

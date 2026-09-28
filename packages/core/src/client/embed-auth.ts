@@ -6,10 +6,12 @@ import {
   EMBED_TOKEN_QUERY_PARAM,
   MCP_APP_CHAT_BRIDGE_QUERY_PARAM,
 } from "../shared/embed-auth.js";
+import { FRAMEWORK_INTERNAL_ROUTE_PREFIX } from "../shared/framework-route-prefix.js";
 import {
   SIGN_IN_ENTRY_PATH,
   SIGN_IN_LEGACY_ENTRY_PATH,
 } from "../shared/sign-in-journey.js";
+import { frameworkRoutePrefix } from "./api-path.js";
 
 let installed = false;
 let memoryToken: string | null = null;
@@ -24,6 +26,11 @@ const AUTH_FAILURE_HEADER = "x-agent-native-auth-circuit-breaker";
 const MCP_CHAT_BRIDGE_VIEWPORT_STYLE_ID =
   "agent-native-mcp-chat-bridge-viewport";
 const MCP_CHAT_BRIDGE_VIEWPORT_HEIGHT = 560;
+let pendingMcpChatBridgeViewportNotification: {
+  win: Window;
+  animationFrameId: number | null;
+  timeoutIds: number[];
+} | null = null;
 
 type AuthFailureRecord = {
   status: number;
@@ -120,7 +127,6 @@ export function isEmbedMcpChatBridgeActive(): boolean {
   if (mcpChatBridgeActive) {
     if (scope == null) return true;
     if (mcpChatBridgeScope == null || mcpChatBridgeScope === scope) {
-      // Capture the scope now that we have one; future calls can compare.
       mcpChatBridgeScope = scope;
       return true;
     }
@@ -132,8 +138,6 @@ export function isEmbedMcpChatBridgeActive(): boolean {
       MCP_CHAT_BRIDGE_STORAGE_KEY,
     );
     if (storedScope && (scope == null || storedScope === scope)) {
-      // Promote the persisted enrollment into in-memory state so subsequent
-      // reads survive sessionStorage becoming unavailable later in the session.
       mcpChatBridgeActive = true;
       mcpChatBridgeScope = storedScope;
       return true;
@@ -247,18 +251,48 @@ function notifyMcpChatBridgeViewportHeight(win: Window): void {
     }
   };
 
+  const pending = pendingMcpChatBridgeViewportNotification;
+  pendingMcpChatBridgeViewportNotification = null;
+  if (pending) {
+    if (pending.animationFrameId !== null) {
+      pending.win.cancelAnimationFrame?.(pending.animationFrameId);
+    }
+    for (const id of pending.timeoutIds) pending.win.clearTimeout(id);
+  }
+
   notify();
+  const nextPending = {
+    win,
+    animationFrameId: null as number | null,
+    timeoutIds: [] as number[],
+  };
+  pendingMcpChatBridgeViewportNotification = nextPending;
+  const notifyIfCurrent = () => {
+    if (pendingMcpChatBridgeViewportNotification !== nextPending) return;
+    notify();
+  };
   try {
-    win.requestAnimationFrame?.(() => notify());
-    win.setTimeout?.(notify, 250);
-    win.setTimeout?.(notify, 1000);
+    if (win.requestAnimationFrame) {
+      nextPending.animationFrameId = win.requestAnimationFrame(notifyIfCurrent);
+    }
+    if (win.setTimeout) {
+      nextPending.timeoutIds.push(win.setTimeout(notifyIfCurrent, 250));
+      nextPending.timeoutIds.push(win.setTimeout(notifyIfCurrent, 1000));
+    }
   } catch {
     // Timers are a progressive enhancement for late host bridge initialization.
   }
 }
 
-/** Internal test helper. Do not use in app code. */
 export function _resetEmbedAuthForTests(): void {
+  if (pendingMcpChatBridgeViewportNotification) {
+    const pending = pendingMcpChatBridgeViewportNotification;
+    pendingMcpChatBridgeViewportNotification = null;
+    if (pending.animationFrameId !== null) {
+      pending.win.cancelAnimationFrame?.(pending.animationFrameId);
+    }
+    for (const id of pending.timeoutIds) pending.win.clearTimeout(id);
+  }
   installed = false;
   memoryToken = null;
   mcpChatBridgeActive = false;
@@ -283,7 +317,6 @@ function isOpaqueOriginFrame(win: Window): boolean {
   try {
     return win.location.origin === "null";
   } catch {
-    // A thrown access is itself a signal of an opaque/cross-origin context.
     return true;
   }
 }
@@ -291,8 +324,10 @@ function isOpaqueOriginFrame(win: Window): boolean {
 function stripTokenFromUrl(win: Window): void {
   // Keep the token in the URL for opaque-origin frames — see
   // isOpaqueOriginFrame. Stripping it there breaks re-auth on any document
-  // reload. Referrer-Policy is set to no-referrer on embed responses, so the
-  // retained token does not leak via the Referer header.
+  // reload. Embed responses now use Referrer-Policy: same-origin, but that
+  // never leaks the retained token here: an opaque origin never equals any
+  // other origin (including its own), so "same-origin" requests from this
+  // document never qualify and no Referer is sent at all.
   if (isOpaqueOriginFrame(win)) return;
   try {
     const url = currentUrl(win);
@@ -341,10 +376,11 @@ function sameOrigin(input: RequestInfo | URL, win: Window): boolean {
 }
 
 function isAgentNativeRuntimePath(pathname: string): boolean {
-  return (
-    pathname === "/_agent-native" ||
-    pathname.endsWith("/_agent-native") ||
-    pathname.includes("/_agent-native/")
+  return [FRAMEWORK_INTERNAL_ROUTE_PREFIX, frameworkRoutePrefix()].some(
+    (prefix) =>
+      pathname === prefix ||
+      pathname.endsWith(prefix) ||
+      pathname.includes(`${prefix}/`),
   );
 }
 
@@ -367,9 +403,6 @@ function isAuthFailureStatus(status: number): boolean {
 function shouldGuardAuthFailure(method: string, url: URL): boolean {
   if (!GUARDED_METHODS.has(method)) return false;
   if (url.pathname === EMBED_START_PATH) return false;
-  // Suffix, not equality: an app mounted under a base path serves
-  // `/<app>/sign-in` (or the legacy framework path), which an exact match
-  // would miss.
   if (
     url.pathname.endsWith(SIGN_IN_ENTRY_PATH) ||
     url.pathname.endsWith(SIGN_IN_LEGACY_ENTRY_PATH)
@@ -529,10 +562,11 @@ export function ensureEmbedAuthFetchInterceptor(): void {
 
   if (installed) return;
   if (typeof win.fetch !== "function") return;
-  installed = true;
-
   const originalFetch = win.fetch.bind(win);
-  win.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const patchedFetch = (async (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ) => {
     const request = requestUrlAndKey(input, init, win);
     const embedMode = isEmbedAuthActive();
     if (request?.shouldGuard) {
@@ -555,4 +589,18 @@ export function ensureEmbedAuthFetchInterceptor(): void {
     }
     return response;
   }) as typeof fetch;
+  try {
+    win.fetch = patchedFetch;
+  } catch {
+    try {
+      Object.defineProperty(win, "fetch", {
+        configurable: true,
+        value: patchedFetch,
+        writable: true,
+      });
+    } catch {
+      return;
+    }
+  }
+  installed = true;
 }

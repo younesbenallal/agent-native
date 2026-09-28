@@ -5,6 +5,13 @@ const state = vi.hoisted(() => ({
   where: null as unknown,
   rows: [] as Record<string, unknown>[],
   settings: {} as Record<string, Record<string, unknown>>,
+  settingsError: null as Error | null,
+  settingsPrefixCalls: [] as Array<{
+    prefix: string;
+    options?: { limit?: number };
+  }>,
+  queryLimit: null as number | null,
+  orderBy: [] as unknown[],
   insert: vi.fn(),
   accessFilter: vi.fn(),
 }));
@@ -13,16 +20,21 @@ function column(name: string) {
   return { name };
 }
 
-vi.mock("@agent-native/core/db", () => ({
-  isPostgres: () => false,
-}));
-
 vi.mock("@agent-native/core/server", () => ({
   recordChange: () => undefined,
 }));
 
 vi.mock("@agent-native/core/settings", () => ({
-  getAllSettings: async () => state.settings,
+  listSettingsByPrefix: vi.fn(
+    async (prefix: string, options?: { limit?: number }) => {
+      state.settingsPrefixCalls.push({ prefix, options });
+      if (state.settingsError) throw state.settingsError;
+      const rows = Object.entries(state.settings)
+        .filter(([key]) => key.startsWith(prefix))
+        .map(([key, value]) => ({ key, value }));
+      return options?.limit === undefined ? rows : rows.slice(0, options.limit);
+    },
+  ),
   getOrgSetting: async () => null,
   getUserSetting: async () => null,
   deleteOrgSetting: async () => false,
@@ -38,6 +50,7 @@ vi.mock("@agent-native/core/sharing", () => ({
 
 vi.mock("drizzle-orm", () => ({
   and: (...conditions: unknown[]) => ({ kind: "and", conditions }),
+  asc: (value: unknown) => ({ kind: "asc", value }),
   desc: (value: unknown) => ({ kind: "desc", value }),
   eq: (target: unknown, value: unknown) => ({ kind: "eq", target, value }),
   isNotNull: (target: unknown) => ({ kind: "isNotNull", target }),
@@ -97,7 +110,19 @@ vi.mock("../db/index.js", () => {
         from: () => ({
           where: (where: unknown) => {
             state.where = where;
-            return Promise.resolve(state.rows);
+            const result = Promise.resolve(state.rows);
+            Object.assign(result, {
+              orderBy: (...ordering: unknown[]) => {
+                state.orderBy = ordering;
+                return {
+                  limit: (limit: number) => {
+                    state.queryLimit = limit;
+                    return Promise.resolve(state.rows.slice(0, limit));
+                  },
+                };
+              },
+            });
+            return result;
           },
         }),
       };
@@ -107,7 +132,11 @@ vi.mock("../db/index.js", () => {
   return { schema, getDb: () => db };
 });
 
-const { listDashboardSummaries } = await import("./dashboards-store.js");
+const {
+  assertDashboardNameIsAvailable,
+  listDashboardSummaries,
+  normalizeDashboardName,
+} = await import("./dashboards-store.js");
 
 const ctx = { email: "alice@example.com", orgId: "org-1" };
 
@@ -116,6 +145,10 @@ beforeEach(() => {
   state.where = null;
   state.rows = [];
   state.settings = {};
+  state.settingsError = null;
+  state.settingsPrefixCalls = [];
+  state.queryLimit = null;
+  state.orderBy = [];
   state.insert.mockReset();
   state.accessFilter.mockReset();
   state.accessFilter.mockReturnValue({ kind: "access" });
@@ -128,6 +161,7 @@ describe("listDashboardSummaries", () => {
         id: "child",
         kind: "sql",
         name: "Child dashboard",
+        description: "Used for catalog ranking",
         parentId: "parent",
         ownerEmail: ctx.email,
         orgId: undefined,
@@ -147,6 +181,7 @@ describe("listDashboardSummaries", () => {
 
     expect(state.projection).not.toHaveProperty("config");
     expect(state.projection?.name).toEqual({ name: "title" });
+    expect(state.projection).toHaveProperty("description");
     expect(state.projection).toHaveProperty("configName");
     expect(state.projection).toHaveProperty("catalogTemplateId");
     expect(state.projection).toHaveProperty("demoId");
@@ -154,6 +189,7 @@ describe("listDashboardSummaries", () => {
     expect(result[0]).toMatchObject({
       id: "child",
       name: "Child dashboard",
+      description: "Used for catalog ranking",
       parentId: "parent",
       orgId: null,
       archivedAt: null,
@@ -258,5 +294,97 @@ describe("listDashboardSummaries", () => {
         { kind: "isNull", target: { name: "hiddenAt" } },
       ],
     });
+  });
+
+  it("bounds catalog summaries and scopes legacy SQL dashboard reads", async () => {
+    state.settings = {
+      "u:alice@example.com:sql-dashboard-legacy-user": {
+        name: "Legacy user dashboard",
+      },
+      "o:org-1:sql-dashboard-legacy-org": {
+        name: "Legacy org dashboard",
+      },
+      "u:alice@example.com:favorites": { ids: ["other"] },
+    };
+
+    const result = await listDashboardSummaries(ctx, {
+      kind: "sql",
+      limit: 1,
+    });
+
+    expect(state.queryLimit).toBe(1);
+    expect(state.orderBy).toEqual([
+      { kind: "desc", value: { name: "updatedAt" } },
+      { kind: "asc", value: { name: "id" } },
+    ]);
+    expect(result.map((row) => row.id)).toEqual(["legacy-user"]);
+    expect(state.settingsPrefixCalls).toEqual([
+      {
+        prefix: "u:alice@example.com:sql-dashboard-",
+        options: { limit: 1 },
+      },
+      { prefix: "o:org-1:sql-dashboard-", options: { limit: 1 } },
+    ]);
+  });
+
+  it("normalizes dashboard names consistently for matching", () => {
+    expect(normalizeDashboardName("  Revenue\nDashboard  ")).toBe(
+      "revenue dashboard",
+    );
+  });
+
+  it("rejects a name already used by a visible dashboard", async () => {
+    state.rows = [
+      {
+        id: "revenue",
+        kind: "sql",
+        name: "Revenue Dashboard",
+        ownerEmail: "bob@example.com",
+        orgId: ctx.orgId,
+        visibility: "org",
+        createdAt: "2026-07-01T00:00:00.000Z",
+        updatedAt: "2026-07-01T00:00:00.000Z",
+        archivedAt: null,
+        hiddenAt: null,
+        hiddenBy: null,
+      },
+    ];
+
+    await expect(
+      assertDashboardNameIsAvailable(" revenue  dashboard ", ctx),
+    ).rejects.toThrow(
+      'Dashboard name "revenue  dashboard" is already used by visible dashboard "Revenue Dashboard"',
+    );
+  });
+
+  it("allows the dashboard being updated to keep its current name", async () => {
+    state.rows = [
+      {
+        id: "revenue",
+        kind: "sql",
+        name: "Revenue Dashboard",
+        ownerEmail: ctx.email,
+        orgId: null,
+        visibility: "private",
+        createdAt: "2026-07-01T00:00:00.000Z",
+        updatedAt: "2026-07-01T00:00:00.000Z",
+        archivedAt: null,
+        hiddenAt: null,
+        hiddenBy: null,
+      },
+    ];
+
+    await expect(
+      assertDashboardNameIsAvailable("Revenue Dashboard", ctx, "revenue"),
+    ).resolves.toBeUndefined();
+  });
+
+  it("fails closed when the legacy dashboard scan is unavailable", async () => {
+    const error = new Error("legacy settings unavailable");
+    state.settingsError = error;
+
+    await expect(
+      assertDashboardNameIsAvailable("New dashboard", ctx),
+    ).rejects.toBe(error);
   });
 });

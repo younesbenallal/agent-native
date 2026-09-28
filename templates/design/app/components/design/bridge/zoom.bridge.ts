@@ -8,7 +8,8 @@
  *
  * Protocol (iframe → parent):
  *
- *   { type: 'pinch-zoom-wheel', deltaY, clientX, clientY }
+ *   { type: 'pinch-zoom-wheel', deltaY, deltaMode, clientX, clientY,
+ *     ctrlKey, metaKey }
  *
  * Rules:
  *   • No import/require of any module (DOM globals only).
@@ -16,14 +17,11 @@
  *   • Wrap everything in a self-executing IIFE.
  */
 (function () {
-  // Attach to documentElement (not window/document) so { passive: false }
-  // is honored consistently and the browser doesn't natively pinch-zoom the
-  // iframe's own document alongside the parent's zoom.
   var target: EventTarget =
     document.documentElement || document.body || document;
   function onWheel(e: WheelEvent): void {
     if (!(e.ctrlKey || e.metaKey)) return;
-    e.preventDefault();
+    if (e.cancelable) e.preventDefault();
     try {
       (window.parent as Window).postMessage(
         {
@@ -31,6 +29,9 @@
           deltaY: e.deltaY,
           clientX: e.clientX,
           clientY: e.clientY,
+          deltaMode: e.deltaMode,
+          ctrlKey: !!e.ctrlKey,
+          metaKey: !!e.metaKey,
         },
         "*",
       );

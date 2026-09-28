@@ -61,6 +61,44 @@ describe("agent teams message queue", () => {
     ).toHaveLength(2);
   }, 30_000);
 
+  it("scopes task reads and controls by owner and organization", async () => {
+    const { getTask, listTasks, sendToTask } = await import("./agent-teams.js");
+    appState.set("agent-task:private", {
+      taskId: "private",
+      threadId: "thread-private",
+      ownerEmail: "alice@example.com",
+      orgId: "org-a",
+      description: "private work",
+      status: "running",
+      preview: "",
+      summary: "",
+      currentStep: "",
+      createdAt: Date.now(),
+    });
+
+    await expect(
+      getTask("private", {
+        ownerEmail: "alice@example.com",
+        orgId: "org-a",
+      }),
+    ).resolves.toMatchObject({ taskId: "private" });
+    await expect(
+      getTask("private", {
+        ownerEmail: "mallory@example.com",
+        orgId: "org-a",
+      }),
+    ).resolves.toBeUndefined();
+    await expect(
+      listTasks({ ownerEmail: "alice@example.com", orgId: "org-a" }),
+    ).resolves.toHaveLength(1);
+    await expect(
+      sendToTask("private", "read this", {
+        ownerEmail: "mallory@example.com",
+        orgId: "org-a",
+      }),
+    ).resolves.toEqual({ ok: false, error: "Task not found" });
+  });
+
   it("drains queued messages into the next tool result once", async () => {
     const { sendToTask, _agentTeamsQueueForTests } =
       await import("./agent-teams.js");
@@ -165,7 +203,6 @@ describe("agent teams message queue", () => {
   it("preserves long sub-agent output up to 50 000 chars without truncation", async () => {
     const { _agentTeamsQueueForTests } = await import("./agent-teams.js");
 
-    // A result shorter than the cap must round-trip verbatim.
     const short = "A".repeat(10_000);
     const shortResult = _agentTeamsQueueForTests.resolveTaskCompletion(
       { status: "completed" },
@@ -174,7 +211,6 @@ describe("agent teams message queue", () => {
     expect(shortResult.summary).toBe(short);
     expect(shortResult.summary.length).toBe(10_000);
 
-    // A result exactly at the cap must round-trip verbatim.
     const atCap = "B".repeat(50_000);
     expect(
       _agentTeamsQueueForTests.resolveTaskCompletion(
@@ -183,7 +219,6 @@ describe("agent teams message queue", () => {
       ).summary,
     ).toBe(atCap);
 
-    // A result exceeding the cap gets the tail (last 50 000 chars).
     const overCap = "X".repeat(10_000) + "Y".repeat(50_000);
     const overResult = _agentTeamsQueueForTests.resolveTaskCompletion(
       { status: "completed" },
@@ -465,7 +500,6 @@ describe("agent teams message queue", () => {
       }),
     );
   });
-  // ── Completion loop injection ────────────────────────────────────────────
 
   it("appends a parent-completion injection when parentThreadId is set", async () => {
     const {
@@ -473,8 +507,6 @@ describe("agent teams message queue", () => {
       formatParentCompletionInjections,
     } = await import("./agent-teams.js");
 
-    // Pre-populate the app state with a completion injection (simulates what
-    // finalizeAgentTeamRun writes internally via appendParentCompletionInjection).
     const injKey = "parent-completion:parent-thread-1:inj-test-001";
     appState.set(injKey, {
       id: "inj-test-001",
@@ -496,7 +528,6 @@ describe("agent teams message queue", () => {
       status: "completed",
       summaryExcerpt: "Found 10 results.",
     });
-    // Consumed — second drain is empty
     await expect(
       drainParentCompletionInjections("parent-thread-1"),
     ).resolves.toEqual([]);
@@ -603,7 +634,6 @@ describe("getCurrentDelegationDepth", () => {
       });
       seen.push(getCurrentDelegationDepth());
     });
-    // Back outside the scope it is 0 again.
     seen.push(getCurrentDelegationDepth());
 
     expect(seen).toEqual([2, 3, 2, 0]);

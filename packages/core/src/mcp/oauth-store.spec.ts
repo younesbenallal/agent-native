@@ -1,17 +1,8 @@
-import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-/**
- * oauth-store persists OAuth clients, short-lived authorization codes, and
- * hashed refresh tokens for the standard remote MCP OAuth flow. We back it with
- * a REAL in-memory sqlite engine (wrapped to the framework's `DbExec` shape, the
- * same wrapper production uses for sqlite) so expiry filtering, consume-once
- * atomicity, UNIQUE constraints, and refresh rotation are exercised for real —
- * not pattern-matched. SQL stays dialect-agnostic; we never assert sqlite-only
- * behavior.
- */
+import { createTestPglite } from "../a2a/test-pglite.js";
 
-let sqlite: Database.Database;
+let pglite: Awaited<ReturnType<typeof createTestPglite>>;
 let connectionErrorNext = false;
 let genericErrorNext = false;
 
@@ -30,12 +21,11 @@ function makeExec() {
       const args = (
         typeof input === "string" ? [] : (input.args ?? [])
       ) as any[];
-      const stmt = sqlite.prepare(rawSql);
-      if (stmt.reader) {
-        return { rows: stmt.all(...args) as any[], rowsAffected: 0 };
-      }
-      const result = stmt.run(...args);
-      return { rows: [] as any[], rowsAffected: result.changes ?? 0 };
+      const result = await pglite.query(rawSql, args);
+      return {
+        rows: Array.from(result.rows ?? []) as any[],
+        rowsAffected: result.affectedRows ?? result.rowCount ?? 0,
+      };
     },
   };
 }
@@ -45,26 +35,21 @@ let exec = makeExec();
 vi.mock("../db/client.js", () => ({
   getDbExec: () => exec,
   isConnectionError: (err: any) => err?.message === "CONNECTION_LOST",
-  intType: () => "INTEGER",
-  isPostgres: () => false,
+  isProductionServerlessFunctionRuntime: () => false,
 }));
 
-beforeEach(() => {
-  sqlite = new Database(":memory:");
+beforeEach(async () => {
+  pglite = await createTestPglite();
   connectionErrorNext = false;
   genericErrorNext = false;
   exec = makeExec();
 });
 
-afterEach(() => {
-  sqlite.close();
+afterEach(async () => {
+  await pglite.close();
   vi.restoreAllMocks();
 });
 
-// The store memoizes its CREATE TABLE init in a module-scoped `_initPromise`.
-// Re-importing with a reset module graph each test rebinds that init to the
-// current in-memory DB (there is no reset export), so tables are recreated in
-// the fresh sqlite instance the test just opened.
 async function freshStore() {
   vi.resetModules();
   return import("./oauth-store.js");
@@ -76,7 +61,6 @@ describe("oauth-store hashing & token generation", () => {
     const a = s.generateOpaqueToken();
     const b = s.generateOpaqueToken();
     expect(a).not.toBe(b);
-    // 32 random bytes → 43-char base64url, no padding / non-url-safe chars.
     expect(a).toMatch(/^[A-Za-z0-9_-]+$/);
     expect(a.length).toBeGreaterThanOrEqual(43);
   });
@@ -92,7 +76,7 @@ describe("oauth-store hashing & token generation", () => {
 
 describe("client registration", () => {
   it("infers native application type for a pre-migration loopback client", async () => {
-    sqlite.exec(`
+    await pglite.exec(`
       CREATE TABLE mcp_oauth_clients (
         client_id TEXT PRIMARY KEY,
         client_name TEXT,
@@ -100,7 +84,7 @@ describe("client registration", () => {
         grant_types TEXT,
         response_types TEXT,
         token_endpoint_auth_method TEXT,
-        created_at INTEGER
+        created_at BIGINT
       );
       INSERT INTO mcp_oauth_clients (
         client_id,
@@ -192,15 +176,12 @@ describe("client registration", () => {
 
   it("registrations outside the window do not count toward the limit", async () => {
     const s = await freshStore();
-    // One ancient registration well before the window.
     vi.spyOn(Date, "now").mockReturnValue(0);
     await s.registerOAuthClient({ redirectUris: ["https://x/cb"] });
-    // Move far past the window; fill up to MAX-1 fresh registrations.
     vi.spyOn(Date, "now").mockReturnValue(10_000_000);
     for (let i = 0; i < s.MCP_OAUTH_REGISTER_MAX - 1; i++) {
       await s.registerOAuthClient({ redirectUris: ["https://x/cb"] });
     }
-    // The ancient one is outside the window, so one more must still succeed.
     await expect(
       s.registerOAuthClient({ redirectUris: ["https://x/cb"] }),
     ).resolves.toBeTruthy();
@@ -208,8 +189,6 @@ describe("client registration", () => {
 
   it("getOAuthClient swallows connection errors and returns null", async () => {
     const s = await freshStore();
-    // Make sure the table exists first (so ensureTable in the call doesn't
-    // need the DB), then fail the SELECT with a connection error.
     await s.registerOAuthClient({ redirectUris: ["https://x/cb"] });
     connectionErrorNext = true;
     expect(await s.getOAuthClient("anything")).toBeNull();
@@ -217,8 +196,6 @@ describe("client registration", () => {
 
   it("getOAuthClient re-throws non-connection errors (no silent null)", async () => {
     const s = await freshStore();
-    // Table already initialized, so the next execute is the SELECT. A
-    // non-connection failure must surface rather than be masked as "not found".
     await s.registerOAuthClient({ redirectUris: ["https://x/cb"] });
     genericErrorNext = true;
     await expect(s.getOAuthClient("anything")).rejects.toThrow("SYNTAX_ERROR");
@@ -226,16 +203,12 @@ describe("client registration", () => {
 
   it("registration proceeds when the rate-limit count read fails transiently", async () => {
     const s = await freshStore();
-    // Table already initialized; the next execute is the COUNT(*) rate-limit
-    // read. A transient connection failure there is swallowed (not RATE_LIMITED)
-    // and the INSERT still proceeds, so the client is registered.
     await s.registerOAuthClient({ redirectUris: ["https://seed/cb"] });
     connectionErrorNext = true;
     const reg = await s.registerOAuthClient({
       redirectUris: ["https://after-failure/cb"],
     });
     expect(reg.clientId).toMatch(/^agent-native-oauth-client-/);
-    // It was genuinely persisted, not just returned.
     expect(await s.getOAuthClient(reg.clientId)).toMatchObject({
       redirectUris: ["https://after-failure/cb"],
     });
@@ -294,9 +267,7 @@ describe("authorization codes", () => {
     const first = await s.consumeOAuthCode(created.code);
     expect(first?.code).toBe(created.code);
     expect(first?.ownerEmail).toBe("owner@example.com");
-    // A second consume returns null — the code is spent.
     expect(await s.consumeOAuthCode(created.code)).toBeNull();
-    // And it is no longer readable.
     expect(await s.getOAuthCode(created.code)).toBeNull();
   });
 
@@ -341,10 +312,9 @@ describe("refresh tokens", () => {
     const row = await s.createOAuthRefreshToken(refreshParams);
     expect(row.tokenHash).toBe(s.hashOAuthToken("raw-refresh-token"));
     expect(row.tokenHash).not.toBe("raw-refresh-token");
-    // The raw value must not be retrievable from any stored column.
-    const dump = sqlite
+    const dump = (await pglite
       .prepare("SELECT * FROM mcp_oauth_refresh_tokens")
-      .all() as any[];
+      .all()) as any[];
     const serialized = JSON.stringify(dump);
     expect(serialized).not.toContain("raw-refresh-token");
     expect(serialized).toContain(row.tokenHash);
@@ -383,13 +353,11 @@ describe("refresh tokens", () => {
 
   it("touchOAuthRefreshToken slides the expiry window (active users never expire)", async () => {
     const s = await freshStore();
-    // Create at t=1000 — initial expiry is 1000 + TTL.
     vi.spyOn(Date, "now").mockReturnValue(1000);
     await s.createOAuthRefreshToken(refreshParams);
     const original = await s.getOAuthRefreshToken("raw-refresh-token");
     expect(original?.expiresAt).toBe(1000 + s.MCP_OAUTH_REFRESH_TOKEN_TTL_MS);
 
-    // Touch at t=2000 — expiry must extend to 2000 + TTL.
     vi.spyOn(Date, "now").mockReturnValue(2000);
     await s.touchOAuthRefreshToken("raw-refresh-token");
     const touched = await s.getOAuthRefreshToken("raw-refresh-token");
@@ -420,7 +388,6 @@ describe("refresh tokens", () => {
       newRefreshToken: "new-refresh-token",
     });
     expect(rotated).not.toBeNull();
-    // The new token carries the original's identity/scope/resource.
     expect(rotated).toMatchObject({
       clientId: "client-1",
       ownerEmail: "owner@example.com",
@@ -433,9 +400,7 @@ describe("refresh tokens", () => {
     expect(rotated?.tokenHash).toBe(s.hashOAuthToken("new-refresh-token"));
     expect(rotated?.id).not.toBe(original.id);
 
-    // The old token is revoked and no longer resolvable.
     expect(await s.getOAuthRefreshToken("raw-refresh-token")).toBeNull();
-    // The new one is active.
     expect(await s.getOAuthRefreshToken("new-refresh-token")).not.toBeNull();
   });
 
@@ -446,9 +411,9 @@ describe("refresh tokens", () => {
       oldRefreshToken: "raw-refresh-token",
       newRefreshToken: "new-refresh-token",
     });
-    const oldRow = sqlite
+    const oldRow = (await pglite
       .prepare("SELECT * FROM mcp_oauth_refresh_tokens WHERE token_hash = ?")
-      .get(s.hashOAuthToken("raw-refresh-token")) as any;
+      .get(s.hashOAuthToken("raw-refresh-token"))) as any;
     expect(oldRow.revoked_at).not.toBeNull();
     expect(oldRow.replaced_by_hash).toBe(s.hashOAuthToken("new-refresh-token"));
   });
@@ -491,11 +456,10 @@ describe("refresh tokens", () => {
       newRefreshToken: "new-token",
     });
     expect(rotated).toBeNull();
-    // No replacement row was inserted.
     const count = (
-      sqlite
+      (await pglite
         .prepare("SELECT COUNT(*) AS n FROM mcp_oauth_refresh_tokens")
-        .get() as any
+        .get()) as any
     ).n;
     expect(count).toBe(1);
   });

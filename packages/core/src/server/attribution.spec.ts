@@ -1,16 +1,21 @@
 import { describe, it, expect } from "vitest";
 
 import {
+  addSignupAttributionHeader,
+  decodeSignupAttributionContext,
   deriveReferralSource,
   deriveSignupAttribution,
+  encodeSignupAttributionContext,
   parseCookieHeader,
+  SIGNUP_ATTRIBUTION_HEADER_NAME,
   readAnalyticsAnonymousId,
   readFirstTouchAttribution,
+  signupAttributionContextFromCookieHeader,
+  signupAttributionContextFromHeaders,
   signupAttributionFromCookieHeader,
   type FirstTouchAttribution,
 } from "./attribution.js";
 
-/** Build an `an_ft` cookie header from a first-touch object (matches client). */
 function ftCookie(ft: FirstTouchAttribution): string {
   return `an_ft=${encodeURIComponent(JSON.stringify(ft))}`;
 }
@@ -217,5 +222,94 @@ describe("signupAttributionFromCookieHeader", () => {
     expect(signupAttributionFromCookieHeader(undefined)).toEqual({
       referral_source: "direct",
     });
+  });
+});
+
+describe("signupAttributionContextFromCookieHeader", () => {
+  it("captures attribution and the anonymous identity handoff together", () => {
+    const ft = {
+      ref: "clip_share",
+      via: "owner_9",
+      landing_path: "/share/c",
+      utm_campaign: "launch",
+    };
+
+    expect(
+      signupAttributionContextFromCookieHeader(
+        `${ftCookie(ft)}; an_aid=anon_123-abc`,
+      ),
+    ).toEqual({
+      attribution: {
+        referral_source: "clip_share",
+        referrer_user: "owner_9",
+        referral_campaign: "launch",
+        utm_campaign: "launch",
+        first_touch_path: "/share/c",
+      },
+      anonymousId: "anon_123-abc",
+    });
+  });
+
+  it("keeps malformed browser identity input out of the context", () => {
+    expect(
+      signupAttributionContextFromCookieHeader("an_aid=has%20space"),
+    ).toBeUndefined();
+  });
+
+  it("reports no browser context rather than direct attribution", () => {
+    expect(signupAttributionContextFromCookieHeader(null)).toBeUndefined();
+    expect(signupAttributionContextFromCookieHeader("")).toBeUndefined();
+    expect(
+      signupAttributionContextFromCookieHeader("other=1; session=abc"),
+    ).toBeUndefined();
+  });
+
+  it("still reports direct for a real visitor carrying no campaign", () => {
+    expect(
+      signupAttributionContextFromCookieHeader(
+        `${ftCookie({ landing_path: "/" })}; an_aid=anon_1`,
+      ),
+    ).toEqual({
+      attribution: { referral_source: "direct", first_touch_path: "/" },
+      anonymousId: "anon_1",
+    });
+  });
+});
+
+describe("signup attribution request handoff", () => {
+  it("round-trips through the explicit Better Auth header", () => {
+    const context = {
+      attribution: { referral_source: "clip_share", utm_campaign: "launch" },
+      anonymousId: "anon_signup_1",
+    };
+    const headers = addSignupAttributionHeader(
+      { cookie: "an_aid=wrong-client-value" },
+      context,
+    );
+
+    expect(signupAttributionContextFromHeaders(headers)).toEqual(context);
+    expect(
+      decodeSignupAttributionContext(encodeSignupAttributionContext(context)),
+    ).toEqual(context);
+  });
+
+  it("distinguishes malformed handoffs from direct attribution", () => {
+    expect(decodeSignupAttributionContext("not-json")).toBeUndefined();
+    expect(signupAttributionContextFromHeaders(new Headers())).toBeUndefined();
+  });
+
+  it("drops an inbound handoff when there is nothing of ours to stamp", () => {
+    const spoofed = addSignupAttributionHeader(
+      {
+        [SIGNUP_ATTRIBUTION_HEADER_NAME]: encodeSignupAttributionContext({
+          attribution: { utm_campaign: "attacker" },
+          anonymousId: "anon_attacker",
+        }),
+      },
+      undefined,
+    );
+
+    expect(spoofed.get(SIGNUP_ATTRIBUTION_HEADER_NAME)).toBeNull();
+    expect(signupAttributionContextFromHeaders(spoofed)).toBeUndefined();
   });
 });

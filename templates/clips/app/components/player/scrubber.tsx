@@ -1,22 +1,35 @@
-import { IconMessage2Filled } from "@tabler/icons-react";
-import { useMemo, useRef, useState } from "react";
+import { IconMessageFilled } from "@tabler/icons-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { cn } from "@/lib/utils";
 
 import {
+  COMMENT_PREVIEW_WIDTH_PX,
+  CommentPreview,
+  type CommentPreviewData,
+} from "./playback-comment-overlay";
+import {
   scrubberFillPercent,
   scrubberPositionFromClientX,
+  timelineMarkerAlignment,
+  timelineMarkerLanes,
+  timelineMarkerMs,
 } from "./scrubber-position";
 
 export interface ScrubberProps {
   currentMs: number;
   durationMs: number;
   onSeek: (ms: number) => void;
-  comments?: { id: string; videoTimestampMs: number; content: string }[];
+  comments?: (CommentPreviewData & {
+    videoTimestampMs: number;
+  })[];
   chapters?: { startMs: number; title: string }[];
   reactions?: { id: string; emoji: string; videoTimestampMs: number }[];
-  excludedRanges?: { startMs: number; endMs: number }[];
+  onMarkerLanesChange?: (lanes: Map<number, number>) => void;
 }
+
+const MARKER_CONTROL_SIZE_PX = 28;
+const MARKER_GAP_PX = 2;
 
 export function Scrubber(props: ScrubberProps) {
   const {
@@ -26,16 +39,18 @@ export function Scrubber(props: ScrubberProps) {
     comments,
     chapters,
     reactions,
-    excludedRanges,
+    onMarkerLanesChange,
   } = props;
   const barRef = useRef<HTMLDivElement | null>(null);
   const activePointerIdRef = useRef<number | null>(null);
+  const [barWidth, setBarWidth] = useState(0);
   const [hoverMs, setHoverMs] = useState<number | null>(null);
   const [hoverX, setHoverX] = useState<number>(0);
   const [dragging, setDragging] = useState(false);
   const [tooltip, setTooltip] = useState<
-    | { kind: "comment"; content: string; ms: number }
-    | { kind: "chapter"; title: string; ms: number }
+    | { kind: "comment"; comment: CommentPreviewData; ms: number; lane: number }
+    | { kind: "chapter"; title: string; ms: number; lane: number }
+    | { kind: "reaction"; content: string; ms: number; lane: number }
     | null
   >(null);
 
@@ -106,16 +121,101 @@ export function Scrubber(props: ScrubberProps) {
   }
 
   const commentsByMs = useMemo(() => {
-    const map = new Map<number, { id: string; content: string }[]>();
+    const map = new Map<number, CommentPreviewData[]>();
     (comments ?? []).forEach((c) => {
-      // Bucket by 500ms so overlapping comments cluster.
-      const key = Math.round(c.videoTimestampMs / 500) * 500;
+      const key = timelineMarkerMs(c.videoTimestampMs);
       const list = map.get(key) ?? [];
-      list.push({ id: c.id, content: c.content });
+      list.push({
+        id: c.id,
+        content: c.content,
+        authorEmail: c.authorEmail,
+        authorName: c.authorName,
+      });
       map.set(key, list);
     });
     return map;
   }, [comments]);
+
+  const reactionsByMs = useMemo(() => {
+    const map = new Map<number, { id: string; emoji: string }[]>();
+    recentReactions.forEach((reaction) => {
+      const key = timelineMarkerMs(reaction.videoTimestampMs);
+      const list = map.get(key) ?? [];
+      list.push({ id: reaction.id, emoji: reaction.emoji });
+      map.set(key, list);
+    });
+    return map;
+  }, [recentReactions]);
+
+  const markerTimes = useMemo(
+    () =>
+      Array.from(
+        new Set([...commentsByMs.keys(), ...reactionsByMs.keys()]),
+      ).sort((a, b) => a - b),
+    [commentsByMs, reactionsByMs],
+  );
+
+  const markerWidths = useMemo(
+    () =>
+      new Map(
+        markerTimes.map((ms) => [
+          ms,
+          MARKER_CONTROL_SIZE_PX *
+            (Number(commentsByMs.has(ms)) + Number(reactionsByMs.has(ms))) +
+            (commentsByMs.has(ms) && reactionsByMs.has(ms) ? MARKER_GAP_PX : 0),
+        ]),
+      ),
+    [commentsByMs, markerTimes, reactionsByMs],
+  );
+  const markerLanes = useMemo(
+    () => timelineMarkerLanes(markerTimes, markerWidths, durationMs, barWidth),
+    [barWidth, durationMs, markerTimes, markerWidths],
+  );
+  const previousMarkerLanesRef = useRef<Map<number, number> | null>(null);
+  useEffect(() => {
+    const bar = barRef.current;
+    if (!bar || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(([entry]) => {
+      const width = entry?.contentRect.width ?? bar.clientWidth;
+      setBarWidth(Math.max(1, width));
+    });
+    observer.observe(bar);
+    setBarWidth(
+      Math.max(1, bar.getBoundingClientRect().width || bar.clientWidth),
+    );
+    return () => observer.disconnect();
+  }, []);
+  useEffect(() => {
+    if (!onMarkerLanesChange) {
+      previousMarkerLanesRef.current = null;
+      return;
+    }
+    const previousMarkerLanes = previousMarkerLanesRef.current;
+    if (
+      previousMarkerLanes &&
+      previousMarkerLanes.size === markerLanes.size &&
+      [...markerLanes].every(
+        ([time, lane]) => previousMarkerLanes.get(time) === lane,
+      )
+    ) {
+      return;
+    }
+    previousMarkerLanesRef.current = markerLanes;
+    onMarkerLanesChange(markerLanes);
+  }, [markerLanes, onMarkerLanesChange]);
+  const tooltipPositionPercent = tooltip
+    ? Math.min(100, Math.max(0, (tooltip.ms / Math.max(1, durationMs)) * 100))
+    : 50;
+  const tooltipAlignment = tooltip
+    ? timelineMarkerAlignment(
+        tooltip.ms,
+        durationMs,
+        tooltip.kind === "comment"
+          ? Math.min(COMMENT_PREVIEW_WIDTH_PX, barWidth)
+          : (markerWidths.get(tooltip.ms) ?? MARKER_CONTROL_SIZE_PX),
+        barWidth,
+      )
+    : "center";
 
   return (
     <div
@@ -147,10 +247,30 @@ export function Scrubber(props: ScrubberProps) {
       {/* Tooltip (comment / chapter) */}
       {tooltip ? (
         <div
-          className="absolute -top-10 -translate-x-1/2 max-w-[240px] rounded bg-primary px-2 py-1 text-[11px] text-primary-foreground"
-          style={{ left: (tooltip.ms / Math.max(1, durationMs)) * 100 + "%" }}
+          data-player-comment-hover
+          className={cn(
+            "pointer-events-none absolute bottom-[calc(100%+1rem)] z-50 w-80 max-w-full",
+            tooltipAlignment === "center" && "-translate-x-1/2",
+          )}
+          style={{
+            ...(tooltipAlignment === "start"
+              ? { left: "0%" }
+              : tooltipAlignment === "end"
+                ? { right: "0%" }
+                : { left: tooltipPositionPercent + "%" }),
+            bottom: `calc(100% + ${1 + tooltip.lane * 1.75}rem)`,
+          }}
         >
-          {tooltip.kind === "comment" ? tooltip.content : tooltip.title}
+          {tooltip.kind === "comment" ? (
+            <CommentPreview
+              comment={tooltip.comment}
+              className="animate-in fade-in slide-in-from-bottom-2 duration-200"
+            />
+          ) : (
+            <div className="max-w-[min(36rem,100%)] rounded-xl bg-foreground/95 px-3 py-2.5 text-left text-[11px] text-background shadow-2xl ring-1 ring-background/15 backdrop-blur-md dark:bg-background/95 dark:text-foreground dark:ring-foreground/15">
+              {tooltip.kind === "reaction" ? tooltip.content : tooltip.title}
+            </div>
+          )}
         </div>
       ) : null}
 
@@ -165,36 +285,18 @@ export function Scrubber(props: ScrubberProps) {
           style={{ width: pct + "%" }}
         />
 
-        {/* Cut ranges */}
-        {excludedRanges?.map((range, i) => {
-          const startPct =
-            (Math.max(0, range.startMs) / Math.max(1, durationMs)) * 100;
-          const endPct =
-            (Math.min(durationMs, range.endMs) / Math.max(1, durationMs)) * 100;
-          return (
-            <div
-              key={`${range.startMs}-${range.endMs}-${i}`}
-              className="absolute inset-y-0 rounded-sm bg-black/70"
-              style={{
-                left: `${startPct}%`,
-                width: `${Math.max(0.5, endPct - startPct)}%`,
-                backgroundImage:
-                  "repeating-linear-gradient(45deg, rgba(255,255,255,0.2) 0 3px, transparent 3px 7px)",
-              }}
-              title={`Cut: ${msToClock(range.startMs)}-${msToClock(
-                range.endMs,
-              )}`}
-            />
-          );
-        })}
-
         {/* Chapter notches */}
         {chapters?.map((ch, i) => (
           <button
             key={i}
             type="button"
             onMouseEnter={() =>
-              setTooltip({ kind: "chapter", title: ch.title, ms: ch.startMs })
+              setTooltip({
+                kind: "chapter",
+                title: ch.title,
+                ms: ch.startMs,
+                lane: 0,
+              })
             }
             onMouseLeave={() => setTooltip(null)}
             onClick={(e) => {
@@ -209,48 +311,99 @@ export function Scrubber(props: ScrubberProps) {
           />
         ))}
 
-        {/* Comment dots */}
-        {Array.from(commentsByMs.entries()).map(([ms, list]) => (
-          <button
-            key={ms}
-            type="button"
-            onMouseEnter={() =>
-              setTooltip({
-                kind: "comment",
-                content: list[0].content.slice(0, 100),
-                ms,
-              })
-            }
-            onMouseLeave={() => setTooltip(null)}
-            onClick={(e) => {
-              e.stopPropagation();
-              onSeek(ms);
-            }}
-            className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2 flex h-4 w-4 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-md ring-2 ring-background transition-transform hover:scale-125"
-            style={{ left: (ms / Math.max(1, durationMs)) * 100 + "%" }}
-            aria-label={`${list.length} comment${list.length > 1 ? "s" : ""}`}
-          >
-            <IconMessage2Filled className="h-2.5 w-2.5" />
-            {list.length > 1 && (
-              <span className="absolute -top-1.5 -right-1.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-primary px-0.5 text-[8px] font-bold leading-none text-primary-foreground ring-2 ring-background">
-                {list.length}
-              </span>
-            )}
-          </button>
-        ))}
+        {/* Timeline markers */}
+        {markerTimes.map((ms) => {
+          const commentList = commentsByMs.get(ms);
+          const reactionList = reactionsByMs.get(ms);
+          const markerLane = markerLanes.get(ms) ?? 0;
+          const markerAlignment = timelineMarkerAlignment(
+            ms,
+            durationMs,
+            markerWidths.get(ms) ?? MARKER_CONTROL_SIZE_PX,
+            barWidth,
+          );
 
-        {/* Reaction dots */}
-        {recentReactions.map((r) => (
-          <div
-            key={r.id}
-            className="absolute -bottom-4 -translate-x-1/2 text-[11px] pointer-events-none"
-            style={{
-              left: (r.videoTimestampMs / Math.max(1, durationMs)) * 100 + "%",
-            }}
-          >
-            {r.emoji}
-          </div>
-        ))}
+          return (
+            <div
+              key={`marker-${ms}`}
+              data-player-marker-group
+              className={cn(
+                "absolute flex h-7 items-center gap-0.5",
+                markerAlignment === "center" && "-translate-x-1/2",
+                markerLane ? "-top-14" : "-top-7",
+              )}
+              style={{
+                ...(markerAlignment === "start"
+                  ? { left: "0%" }
+                  : markerAlignment === "end"
+                    ? { right: "0%" }
+                    : { left: (ms / Math.max(1, durationMs)) * 100 + "%" }),
+                ...(markerLane > 1
+                  ? { top: `-${(markerLane + 1) * 1.75}rem` }
+                  : {}),
+              }}
+            >
+              {commentList ? (
+                <button
+                  type="button"
+                  onPointerDown={(event) => event.stopPropagation()}
+                  onMouseEnter={() =>
+                    setTooltip({
+                      kind: "comment",
+                      comment: commentList[0],
+                      ms,
+                      lane: markerLane,
+                    })
+                  }
+                  onMouseLeave={() => setTooltip(null)}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onSeek(ms);
+                  }}
+                  className="relative flex h-7 w-7 shrink-0 items-center justify-center text-background drop-shadow-md transition-transform hover:scale-110 focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-background/80 dark:text-foreground dark:focus-visible:ring-foreground/80"
+                  aria-label={`${commentList.length} comment${commentList.length > 1 ? "s" : ""}`}
+                >
+                  <IconMessageFilled className="h-6 w-6" />
+                  {commentList.length > 1 && (
+                    <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-foreground/75 px-0.5 text-[8px] font-bold leading-none text-background shadow-sm dark:bg-background/75 dark:text-foreground">
+                      {commentList.length}
+                    </span>
+                  )}
+                </button>
+              ) : null}
+
+              {reactionList ? (
+                <button
+                  type="button"
+                  data-player-reaction-marker
+                  onPointerDown={(event) => event.stopPropagation()}
+                  onMouseEnter={() =>
+                    setTooltip({
+                      kind: "reaction",
+                      content: `${reactionList.map((reaction) => reaction.emoji).join(" ")} · ${reactionList.length} reaction${reactionList.length === 1 ? "" : "s"}`,
+                      ms,
+                      lane: markerLane,
+                    })
+                  }
+                  onMouseLeave={() => setTooltip(null)}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onSeek(ms);
+                  }}
+                  className="relative flex h-7 min-w-7 shrink-0 items-center justify-center px-0.5 text-2xl leading-none text-background drop-shadow-sm transition-transform hover:scale-110 focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-background/80 dark:text-foreground dark:focus-visible:ring-foreground/80"
+                  aria-label={`${reactionList.length} reaction${reactionList.length === 1 ? "" : "s"} at ${msToClock(ms)}`}
+                >
+                  {reactionList[0].emoji}
+                  {reactionList.length > 1 ? (
+                    <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-foreground/75 px-0.5 text-[8px] font-bold leading-none text-background shadow-sm dark:bg-background/75 dark:text-foreground">
+                      {reactionList.length}
+                    </span>
+                  ) : null}
+                </button>
+              ) : null}
+            </div>
+          );
+        })}
 
         {/* Thumb */}
         <div

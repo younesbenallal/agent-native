@@ -1,11 +1,11 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
 
 import { grantSecretsToApp } from "../server/lib/vault-store.js";
 
 export default defineAction({
   description:
-    "Grant multiple Dispatch vault secrets to a workspace app in manual vault access mode. Existing active grants are skipped.",
+    "Grant multiple Dispatch vault secrets to a workspace app in manual vault access mode. Admin only. Existing active grants are skipped.",
   http: { method: "POST" },
   schema: z.object({
     appId: z

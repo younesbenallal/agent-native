@@ -91,9 +91,6 @@ async function flushMicrotasks() {
 }
 
 async function flushHostLifecycleTurn() {
-  // The direct host handshake awaits multiple lifecycle turns before the
-  // caller's follow-up request is posted, so flush enough macrotask turns to
-  // let the post-initialize continuation run.
   for (let i = 0; i < 4; i++) {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
@@ -150,6 +147,7 @@ describe("MCP app host client helpers", () => {
           context: { route: { pathname: "/customers" } },
           capabilities: { openLink: true, displayModes: ["inline", "pip"] },
           version: "1.0.0",
+          hostInfo: { name: "Claude Code", version: "1.0.0" },
         },
       });
     });
@@ -158,6 +156,7 @@ describe("MCP app host client helpers", () => {
       context: { route: { pathname: "/customers" } },
       capabilities: { openLink: true, displayModes: ["inline", "pip"] },
       version: "1.0.0",
+      hostInfo: { name: "Claude Code", version: "1.0.0" },
     });
     expect(snapshots.at(-1)).toEqual(getMcpAppHostContext());
   });
@@ -284,6 +283,10 @@ describe("MCP app host client helpers", () => {
       },
     });
     await flushHostLifecycleTurn();
+
+    expect(getMcpAppHostContext()).toMatchObject({
+      version: "2026-01-26",
+    });
 
     calls = getJsonRpcCalls(parent);
     expect(calls).toEqual(

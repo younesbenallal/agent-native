@@ -1,4 +1,4 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { writeAppStateForCurrentTab } from "@agent-native/core/application-state";
 import {
   getRequestOrgId,
@@ -6,11 +6,10 @@ import {
 } from "@agent-native/core/server";
 import { z } from "zod";
 
-import { listDashboardSummaries } from "../server/lib/dashboards-store";
-
-function normalizeDashboardName(value: string): string {
-  return value.trim().replace(/\s+/g, " ").toLowerCase();
-}
+import {
+  listDashboardSummaries,
+  normalizeDashboardName,
+} from "../server/lib/dashboards-store";
 
 async function resolveDashboardIdByName(name: string): Promise<string> {
   const email = getRequestUserEmail();
@@ -62,7 +61,7 @@ export default defineAction({
       .min(1)
       .optional()
       .describe(
-        'Accessible SQL dashboard name to open when its id is unknown (for example, "Agent Native" or "Agent Native dashboard").',
+        'Accessible SQL dashboard name to open when its id is unknown (for example, "Agent-Native" or "Agent-Native dashboard").',
       ),
     analysisId: z
       .string()
@@ -171,19 +170,16 @@ export default defineAction({
     }
     if (args.monitorId) {
       nav.monitorId = args.monitorId;
-      // Monitors live under the uptime subview.
       nav.monitoringView = "uptime";
       if (!args.view) nav.view = "monitoring";
     }
     if (args.statusPageId) {
       nav.statusPageId = args.statusPageId;
-      // Status pages are configured under the uptime subview.
       nav.monitoringView = "uptime";
       if (!args.view) nav.view = "monitoring";
     }
     if (args.errorIssueId) {
       nav.errorIssueId = args.errorIssueId;
-      // Error issues live under the errors subview.
       nav.monitoringView = "errors";
       if (!args.view) nav.view = "monitoring";
     }

@@ -1,4 +1,5 @@
 import { useT } from "@agent-native/core/client/i18n";
+import { DefaultSpinner } from "@agent-native/core/client/ui";
 import {
   IconCalendar,
   IconClock,
@@ -24,7 +25,6 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
-import { Spinner } from "@/components/ui/spinner";
 import { appApiPath } from "@/lib/api-path";
 
 interface BookingInfo {
@@ -34,6 +34,8 @@ interface BookingInfo {
   end: string;
   slug: string;
   meetingLink?: string;
+  zoomCancellationNeedsReview?: boolean;
+  meetingLinkPending?: boolean;
   status: "confirmed" | "cancelled";
 }
 
@@ -80,11 +82,7 @@ export function ManageBookingPage() {
   const isPast = booking ? new Date(booking.end) < new Date() : false;
 
   if (isLoading) {
-    return (
-      <div className="flex items-center justify-center min-h-screen">
-        <Spinner className="size-8 text-foreground" />
-      </div>
-    );
+    return <DefaultSpinner />;
   }
 
   if (error || !booking) {
@@ -156,11 +154,20 @@ export function ManageBookingPage() {
           <div className="text-sm text-muted-foreground">
             {t("manageBooking.bookedBy", { name: booking.name })}
           </div>
+          {booking.meetingLinkPending && (
+            <p className="text-sm text-muted-foreground">
+              {t("bookingLinks.meetingDetailsPending")}
+            </p>
+          )}
         </div>
 
         {isPast ? (
           <p className="text-center text-sm text-muted-foreground">
             {t("manageBooking.pastMeeting")}
+          </p>
+        ) : booking.zoomCancellationNeedsReview ? (
+          <p className="text-center text-sm text-muted-foreground">
+            {t("bookingLinks.zoomCancellationRequiresHostReview")}
           </p>
         ) : (
           <div className="flex flex-col gap-3">

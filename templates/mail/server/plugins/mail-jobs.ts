@@ -1,7 +1,16 @@
 import { registerEvent } from "@agent-native/core/event-bus";
 import { listOAuthAccounts } from "@agent-native/core/oauth-tokens";
+import {
+  registerRecurringSweepHandler,
+  startIntervalJob,
+} from "@agent-native/core/server";
 import { z } from "zod";
 
+import {
+  processMailAiFilterBackfills,
+  purgeExpiredMailAiFilterBackfills,
+} from "../lib/ai-filter-backfill.js";
+import { purgeExpiredMailAiFilterRuleUndoSnapshots } from "../lib/ai-filter-rule-undo.js";
 import { processAutomations } from "../lib/automation-engine.js";
 import { getClientForAccount, startWatch } from "../lib/google-auth.js";
 import {
@@ -16,12 +25,11 @@ import {
   type SendLaterPayload,
 } from "../lib/jobs.js";
 
-const INTERVAL_MS = 60_000; // 1 minute
+const INTERVAL_MS = 60_000;
+const AI_FILTER_BACKFILL_INTERVAL_MS = 10_000;
 const WATCH_RENEW_INTERVAL_MS = 12 * 60 * 60_000;
+const TICK_ABORT_MS = Math.max(10_000, INTERVAL_MS * 4);
 let lastWatchRenewalAt = 0;
-// Vite's dev server initializes Nitro plugins more than once during boot
-// (initial load + post-init). Module-scope flag ensures the "skipping" log
-// fires at most once per process.
 let skippingLogged = false;
 
 async function renewAllWatches(): Promise<void> {
@@ -29,9 +37,6 @@ async function renewAllWatches(): Promise<void> {
   const accounts = await listOAuthAccounts("google");
   for (const acc of accounts) {
     try {
-      // Use accountId-based lookup so secondary/added accounts (where
-      // `owner !== accountId`) also get their watch renewed. Gmail watches
-      // expire in ~7 days and must be renewed regularly.
       const client = await getClientForAccount(acc.accountId);
       if (!client) continue;
       await startWatch(client.accessToken);
@@ -67,7 +72,7 @@ async function processJobs(): Promise<void> {
         await sendScheduledEmail(
           JSON.parse(job.payload) as SendLaterPayload,
           acctEmail,
-          ownerEmail || undefined,
+          job.ownerEmail ?? undefined,
         );
       }
       await markJobDone(job.id);
@@ -79,13 +84,17 @@ async function processJobs(): Promise<void> {
 }
 
 export default () => {
-  // ── Register mail events (runs in all modes, not just background jobs) ──
+  registerRecurringSweepHandler("mail-ai-filter-backfills", () =>
+    processMailAiFilterBackfills(),
+  );
+
   registerEvent({
     name: "mail.message.received",
     description:
-      "A new email was received in the user's inbox. Fires once per message during the polling sync cycle.",
+      "A new email was received in the user's inbox. Fires once per message and includes the accountEmail and messageId for exact message lookup.",
     payloadSchema: z.object({
       messageId: z.string(),
+      accountEmail: z.string(),
       from: z.string(),
       to: z.string(),
       subject: z.string(),
@@ -93,6 +102,16 @@ export default () => {
       labels: z.array(z.string()).optional(),
       threadId: z.string().optional(),
     }) as any,
+    example: {
+      messageId: "message_123",
+      accountEmail: "person@example.com",
+      from: "sender@example.com",
+      to: "person@example.com",
+      subject: "A new message",
+      snippet: "Message preview",
+      labels: ["INBOX"],
+      threadId: "thread_123",
+    },
   });
 
   registerEvent({
@@ -106,11 +125,6 @@ export default () => {
     }) as any,
   });
 
-  // Background cron defaults on in production and off in dev. The dev gate
-  // exists because every connected dev server would otherwise process jobs
-  // and automations for every user globally, causing duplicate actions and
-  // duplicate Anthropic spend. Set RUN_BACKGROUND_JOBS=1 to opt in locally,
-  // or RUN_BACKGROUND_JOBS=0 to opt out in production.
   const isProd = process.env.NODE_ENV === "production";
   const flag = process.env.RUN_BACKGROUND_JOBS;
   const enabled = flag === "1" || (isProd && flag !== "0");
@@ -124,24 +138,56 @@ export default () => {
     return;
   }
 
-  setInterval(async () => {
-    try {
-      await processJobs();
-    } catch (err) {
-      console.error("[mail-jobs] processJobs failed:", err);
-    }
-    try {
-      await processAutomations();
-    } catch (err) {
-      console.error("[mail-jobs] processAutomations failed:", err);
-    }
-    if (Date.now() - lastWatchRenewalAt > WATCH_RENEW_INTERVAL_MS) {
-      lastWatchRenewalAt = Date.now();
+  startIntervalJob(
+    async () => {
       try {
-        await renewAllWatches();
+        await purgeExpiredMailAiFilterRuleUndoSnapshots();
       } catch (err) {
-        console.error("[mail-jobs] renewAllWatches failed:", err);
+        console.error("[mail-jobs] AI-filter undo cleanup failed:", err);
       }
-    }
-  }, INTERVAL_MS);
+      try {
+        await purgeExpiredMailAiFilterBackfills();
+      } catch (err) {
+        console.error("[mail-jobs] AI-filter backfill cleanup failed:", err);
+      }
+      try {
+        await processJobs();
+      } catch (err) {
+        console.error("[mail-jobs] processJobs failed:", err);
+      }
+      try {
+        await processAutomations();
+      } catch (err) {
+        console.error("[mail-jobs] processAutomations failed:", err);
+      }
+      if (Date.now() - lastWatchRenewalAt > WATCH_RENEW_INTERVAL_MS) {
+        lastWatchRenewalAt = Date.now();
+        try {
+          await renewAllWatches();
+        } catch (err) {
+          console.error("[mail-jobs] renewAllWatches failed:", err);
+        }
+      }
+    },
+    {
+      intervalMs: INTERVAL_MS,
+      timeoutMs: TICK_ABORT_MS,
+      leading: false,
+      onError: (err) =>
+        console.error("[mail-jobs] tick exceeded time budget:", err),
+    },
+  );
+
+  startIntervalJob(
+    async () => {
+      await processMailAiFilterBackfills();
+    },
+    {
+      intervalMs: AI_FILTER_BACKFILL_INTERVAL_MS,
+      timeoutMs: 45_000,
+      leading: false,
+      onError: (err) =>
+        console.error("[mail-jobs] AI-filter backfill tick failed:", err),
+    },
+  );
 };

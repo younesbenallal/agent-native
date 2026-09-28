@@ -98,12 +98,14 @@ export function extensionOptionsWithSelectedFallback(
   return [{ id, name: id }, ...extensions];
 }
 
-/** Parsed shape of a `program` panel's `sql` field: {programId, params?}. */
 function parseProgramDescriptor(sql: string): {
   programId: string;
   paramsText: string;
 } {
   if (!sql.trim()) return { programId: "", paramsText: "" };
+  if (/^dp_[A-Za-z0-9]+$/.test(sql.trim())) {
+    return { programId: sql.trim(), paramsText: "" };
+  }
   try {
     const parsed = JSON.parse(sql) as { programId?: unknown; params?: unknown };
     const programId =
@@ -127,8 +129,6 @@ function serializeProgramDescriptor(
   try {
     params = JSON.parse(trimmedParams);
   } catch {
-    // Preserve the raw text so the user's edits aren't discarded; the save
-    // attempt will surface the same JSON error from the server.
     throw new Error("Params must be valid JSON.");
   }
   return JSON.stringify({ programId, params });
@@ -148,11 +148,7 @@ export interface PanelFormValues {
   title: string;
   chartType: ChartType;
   source: DataSourceType;
-  /** Legacy storage field retained for existing dashboards. Row widths are
-   *  now inferred from how many panels share the row. */
   width: number;
-  /** Section panels only: number of grid columns the panels following this
-   *  section should use. Ignored when `chartType` is not `"section"`. */
   columns: number;
   sql: string;
   description: string;
@@ -239,13 +235,8 @@ export function formToPanel(
 interface PanelEditorDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** Existing panel when editing; null when adding. */
   panel: SqlPanel | null;
-  /** Async save. Should throw on error; dialog stays open and surfaces the
-   *  message inline. On success the dialog closes. */
   onSave: (panel: SqlPanel) => Promise<void>;
-  /** Dashboard id + existing panel titles used in the agent-chat prompt context
-   *  when the user describes a panel instead of writing it manually. */
   dashboardId: string;
   existingPanelTitles: string[];
 }
@@ -281,13 +272,11 @@ function PanelEditorContent({
   const [tab, setTab] = useState<"describe" | "manual">("describe");
   const { send, isGenerating } = useSendToAgentChat();
 
-  // Reset form whenever the dialog opens or the target panel changes.
   useEffect(() => {
     if (open) {
       setForm(panelToForm(panel));
       setError(null);
       setSaving(false);
-      // Editing an existing panel always goes straight to the manual form.
       setTab(panel ? "manual" : "describe");
     }
   }, [open, panel]);
@@ -404,7 +393,7 @@ function PanelEditorContent({
         `For prometheus panels, sql is a JSON descriptor: {"promql":"rate(http_requests_total[5m])","mode":"range","range":"1h","step":"30s"}. mode defaults to "range"; range defaults to "1h"; step is auto if omitted. Returned rows have shape {timestamp, series, value} — set config.xKey="timestamp", config.yKey="value", and a single series in config.yKeys for clean charting. ` +
         `For program panels (arbitrary provider data joins/cohorts not expressible in the other sources), first save-data-program (or reuse an existing one via list-data-programs), then set sql to a JSON descriptor: {"programId":"<id>","params":{...}}. See the data-programs skill for the emit(rows, schema) contract and the Risk Meeting worked example. ` +
         `Native dashboard panels and Data Programs come first. Add an extension panel only when the user explicitly asks for a genuinely bespoke, one-off Custom Block for this dashboard and native panels cannot represent it faithfully. For a reusable/native capability call connect-builder instead. New agent-authored Custom Blocks use config.extensionId plus config.customBlock={authoredBy:"agent",intent:"one-off",scope:"dashboard",nativeGapReason:"custom-visualization"|"custom-interaction"|"custom-layout"|"other"}; never put prompt/customer text in that metadata. Use config.extensionSlotId only when the user explicitly asks for a personal/per-viewer slot; slot installs are per-user and automated report identities may have no install. ` +
-        `Config is optional: { xKey, yKey, yKeys, yFormatter ('number'|'currency'|'percent'), rightYKeys, rightYFormatter, description, columns, pivot, limit, color, colors, stacked, legend, valueLabels }. For funnel panels, use config.xKey for the stage label, config.yKey for the non-negative count/value, and keep the SQL ORDER BY in the intended funnel order. ` +
+        `Config is optional: { xKey, yKey, yKeys, yFormatter ('number'|'currency'|'percent'), rightYKeys, rightYFormatter, seriesLabels (exact series key -> display label), description, columns, pivot, limit, color, colors, stacked, legend, valueLabels }. For funnel panels, use config.xKey for the stage label, config.yKey for the non-negative count/value, and keep the SQL ORDER BY in the intended funnel order. ` +
         `For line/area/bar series that share an x-axis but not a unit (a count next to a rate), put the smaller-unit series on a second y-axis with config.rightYKeys (a subset of yKeys) and an optional config.rightYFormatter — do not build an extension for a dual-axis chart. Use heatmap, callout, and section panels when their native contracts fit; do not create a Custom Block for a supported native panel. ` +
         `Chart legends render automatically; set config.legend=false only when the user explicitly asks to hide the legend. ` +
         `Use \`get-sql-dashboard.layout.groups[].rows[].rowNumber/panelIds\` to identify and verify visible rows. ` +
@@ -450,7 +439,7 @@ function PanelEditorContent({
               setForm((f) => ({ ...f, chartType: v }))
             }
           >
-            <SelectTrigger id="panel-chart-type" className="h-9 text-sm">
+            <SelectTrigger id="panel-chart-type" className="text-sm">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -472,7 +461,7 @@ function PanelEditorContent({
                 setForm((f) => ({ ...f, source: v }))
               }
             >
-              <SelectTrigger id="panel-source" className="h-9 text-sm">
+              <SelectTrigger id="panel-source" className="text-sm">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -531,7 +520,7 @@ function PanelEditorContent({
                 }))
               }
             >
-              <SelectTrigger id="panel-extension-mode" className="h-9 text-sm">
+              <SelectTrigger id="panel-extension-mode" className="text-sm">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -556,7 +545,7 @@ function PanelEditorContent({
                   setForm((current) => ({ ...current, extensionId }))
                 }
               >
-                <SelectTrigger id="panel-extension" className="h-9 text-sm">
+                <SelectTrigger id="panel-extension" className="text-sm">
                   <SelectValue
                     placeholder={
                       extensionsLoading
@@ -618,7 +607,7 @@ function PanelEditorContent({
               value={selectedProgramId || undefined}
               onValueChange={(v) => setSelectedProgramId(v)}
             >
-              <SelectTrigger id="panel-program" className="h-9 text-sm">
+              <SelectTrigger id="panel-program" className="text-sm">
                 <SelectValue
                   placeholder={
                     programsLoading
@@ -756,7 +745,6 @@ function PanelEditorContent({
         <div className="grid gap-3">
           <Label>{t("panelEditor.whatToChart")}</Label>
           <PromptComposer
-            autoFocus
             disabled={isGenerating}
             placeholder={t("panelEditor.promptPlaceholder")}
             draftScope="analytics:add-panel"
@@ -805,7 +793,7 @@ export function PanelEditorDialog(props: PanelEditorDialogProps) {
 
   return (
     <Dialog open={props.open} onOpenChange={props.onOpenChange}>
-      <DialogContent className="sm:max-w-[640px] max-h-[90vh] overflow-y-auto">
+      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-[640px]">
         <DialogHeader>
           <DialogTitle>{t("panelEditor.editPanel")}</DialogTitle>
         </DialogHeader>

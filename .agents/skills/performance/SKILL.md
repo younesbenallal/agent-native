@@ -3,8 +3,10 @@ name: performance
 description: >-
   Keep apps and templates loading fast. Read when adding a data model, a
   list/read action, a page or sidebar that loads data, or when something loads
-  slowly. Covers column projection, indexing hot-path queries, avoiding N+1 and
-  round-trip waterfalls, cheap polling, and not recomputing on every read.
+  slowly, or when adding a dependency to the deployed server bundle. Covers
+  column projection, indexing hot-path queries, avoiding N+1 and round-trip
+  waterfalls, cheap polling, not recomputing on every read, and cold-start
+  artifact size.
 scope: dev
 metadata:
   internal: true
@@ -19,8 +21,8 @@ things dominate it: **how much data crosses the wire**, and **how many
 round-trips and table scans it takes**. On a hosted/serverless SQL backend each
 query is a network round-trip, and an unindexed filter scans the whole — often
 shared and growing — table. So default to **projected columns**, **indexed
-hot-path queries**, and **parallel/batched** fetches. These rules are
-provider-agnostic: they hold on SQLite, Postgres, or any managed SQL backend.
+hot-path queries**, and **parallel/batched** fetches. These rules hold on local
+PGlite or hosted Postgres.
 
 This skill is about the data and load path. See the `storing-data` skill for the schema
 and migration mechanics it references, and the `real-time-sync` skill for how updates
@@ -45,7 +47,6 @@ A list/index query should select only the columns the list actually renders.
       id: docs.id,
       title: docs.title,
       updatedAt: docs.updatedAt,
-      // substr/length work on both SQLite and Postgres
       preview: sql<string>`substr(${docs.content}, 1, 400)`,
     })
     .from(docs)
@@ -57,6 +58,40 @@ A list/index query should select only the columns the list actually renders.
   dropped column is provably unused on the list path. If the list genuinely
   renders a heavy column (a thumbnail, an inline preview the UI shows), keep it —
   don't break behavior to chase a payload win.
+
+## 1b. Never put a heavy column in a `WHERE`
+
+Projecting a blob out of the `SELECT` is only half the job. A **predicate** on a
+large text/JSON column is worse, because Postgres must fetch and detoast that
+value for every row the scan touches — **before `LIMIT` applies**. The column
+does not even have to be selected.
+
+Measured in production on the agent chat sidebar list (~20 rows of title +
+timestamp), from one predicate on the message-history blob:
+
+| request | with the predicate | without |
+| --- | --- | --- |
+| `limit=20` | 2207ms | 222ms |
+| `limit=5` | 3166ms | 220ms |
+
+**`limit=5` costing more than `limit=20` is the fingerprint.** If asking for
+less data costs more, something in the `WHERE` is scanning what `LIMIT` cannot
+bound. Diagnose it from the browser console on the live page — fetch the
+endpoint with and without the suspect filter — rather than reading the plan.
+
+A marker you match with a hardcoded string belongs in its own indexed column:
+add it, backfill once in a migration, then filter on the column. **A legacy
+compensator on a read path is a backfill you have not done yet, and you pay for
+it on every request until you do.**
+
+Searching a blob against a user-supplied term is different and legitimate —
+full-text search over message history has no cheaper form. `guard:no-blob-column-predicate`
+draws exactly that line: it flags a hardcoded literal and ignores a bound
+parameter.
+
+Related: a `LOWER(col) = ?` access predicate cannot use a plain btree on `col`.
+Add the matching expression index — see `org/migrations.ts` for the pattern —
+or the list scans the whole shared table.
 
 ## 2. Index the hot paths
 
@@ -78,14 +113,14 @@ on. The recurring ones:
 - **Status-filtered lists** → match the real `WHERE`, e.g. `(owner_email, status)`
   or `(status, <sort>)`.
 
-Keep index DDL **dialect-agnostic and idempotent**:
+Keep index DDL **PostgreSQL-compatible and idempotent**:
 
 ```sql
 CREATE INDEX IF NOT EXISTS forms_owner_org_updated_idx ON forms (owner_email, org_id, updated_at)
 ```
 
-No `DESC`, no partial `WHERE`, no provider-specific syntax — it then runs on
-SQLite and Postgres alike, is safe to re-run, and applies on next startup.
+No `DESC` or partial `WHERE`; keep the index DDL idempotent and apply it through
+the migration path.
 Indexes mostly bite **as data grows** and on **unbounded child tables** (a
 seq-scan of 10 rows is instant; of a shared, ever-growing log it is not), so
 index the growing tables first.
@@ -146,10 +181,17 @@ just one.
 
 If you're debugging a slow first response, check whether something
 re-personalized the shell before concluding the render itself is slow — the
-fix is client-side data loading after the shell paints, never per-user SSR.
+fix is client-side data loading after the shell paints, never per-user SSR. If
+the shell is clean and a cold miss is still seconds long, the cost is upstream
+of the render: see §9.
 See the `authentication` skill for the full model and `guard:ssr-cache-shell`
 plus `ssr-handler.spec.ts` (`packages/core/src/server/ssr-handler.ts`) for the
 enforced contract.
+
+Netlify prerendered HTML/`.data` bypasses the SSR handler, so its build must
+emit the same public SWR policy in `_headers`; run `guard:ssr-cache-artifact`
+against Netlify-mode output. Styling-only work must not alter this cache,
+prerender, or deploy seam without explicit scope expansion.
 
 **Never route mutation-fresh reads through SSR loader data.** Data that changes
 when a user acts belongs in an action, read from the client with
@@ -182,6 +224,99 @@ another visitor's shared CDN entry.
 - **Virtualize** very long rendered lists on the client so off-screen rows aren't
   parsed/rendered every update.
 
+## 8. Don't do data work at startup
+
+A server plugin's body is not "once per deploy." These apps run as serverless
+functions, so it runs **once per cold start** — on the critical path of whichever
+user's request woke the process, and again on the next cold start. An in-process
+`let done = false` memo does not help: the new isolate starts with `false`.
+
+This has already cost real outages and sustained slowness here, not hypothetical
+ones — Slides startup slowness, Analytics paying startup cost on API calls, and a
+production incident. The shape that did it:
+
+```ts
+// templates/<app>/server/plugins/db.ts — every cold start pays all of this
+export default async (nitroApp) => {
+  await migrations(nitroApp);
+  await retypeBooleanColumnsOnPostgres();   // rewrites tables on Postgres
+  await backfillLegacyTables();
+  await syncWorkspacesToOrganizations();
+  await backfillRecordingOrgId();
+};
+```
+
+Schema DDL is **not** exempt, though it reads like it should be. Measured on a
+180-table production database: the migration "fast path" (`SELECT MAX(version)`)
+took **5.5s** and the `information_schema` probe **8.3s** — paid on every cold
+start, until health checks timed out and the app was down. Bounded is not the
+same as fast, and "it short-circuits cheaply" is an assumption until someone
+measures it on the largest database you have.
+
+The same applies doubly to **work whose cost grows with the data** — backfills, retypes, aggregations, recomputes, re-syncs,
+sweeps, cache warming, index rebuilds. Those have three better homes, all of
+which already exist:
+
+- a **scheduled job** (`recurring-jobs`, `automations` skills),
+- a **one-off CLI or release-time script**, run deliberately, once,
+- **lazily behind the first caller that needs it**, memoized — accepting that
+  the memo is per-isolate, so the work must be small enough to repeat.
+
+If it truly must complete before the app can serve a correct response, it is a
+migration, not a backfill — say so on the line and keep it bounded:
+
+```ts
+await backfillOneRow(); // guard:allow-boot-data-work — single row, bounded
+```
+
+`guard:no-boot-data-work` fails on new boot-time data work, scoped to lines this
+branch adds. It cannot see everything — a helper that hides the work one call
+deeper reads as innocent — so the rule matters more than the check.
+
+## 9. Cold start is the artifact, not just the work it does
+
+§8 covers what the process does at boot. This covers how much there is to boot.
+Measured in production: a cold cache miss on `www.agent-native.com` returned in
+**4.5–6.0s** while the in-handler `server-timing: app;dur` was only **~2100ms** —
+the other ~2900ms is platform init, spent before any of our code evaluates. A
+different app with a healthy database measured **13.4s** TTFB on its first cold
+request with `app;dur=1338`, so ~12s of init. Platform init scales with the size
+of the deployed artifact. Every app pays it, and no query tuning can reach it.
+
+- **The `/*` page function is the one every visitor's cache miss wakes.** Nothing
+  belongs in it that a page render cannot call. Headless browsers, ffmpeg, image
+  rasterizers, and other heavy runtimes belong in the function that actually
+  invokes them, or behind a job — not in the default handler. PR #2684, titled
+  "Harden auth and cold-start data paths", put 78MB of headless Chromium into
+  every page function; nothing in the diff looked like a performance change.
+- **Each extra emitted function is a full second copy of the bundle.** Netlify
+  copies the whole server directory per function, so splitting out a
+  `-background` or per-route function multiplies existing weight rather than
+  dividing it. Trim the artifact before you split it.
+- **Already-compressed binaries do not shrink again in the deploy zip.** A
+  Brotli-packed browser or a static ffmpeg build costs close to its full size in
+  upload and in cold-start extraction. Budget from bytes on disk, never from an
+  assumption that compression will absorb it.
+- **Never resolve a copied dependency by walking ancestor `node_modules`.** In a
+  monorepo that walk does not fail — it finds a sibling app's copy and ships
+  that. Resolve from the app's own dependency root and throw when it is missing;
+  a silently-found wrong package is precisely the indistinguishable-from-success
+  failure this repo bans.
+
+`packages/core/src/deploy/build.ts` is what decides all of this: the
+platform/arch filter at `:2384-2410` and the per-preset copy list at
+`:4499-4504`. Adding a package there adds it to every page function.
+
+**Measure a built bundle by timing the import and forcing exit.** Never measure
+by waiting for the process to exit — module scope starts timers and opens
+handles, so process lifetime measures those, not boot cost. That exact mistake
+produced a wrong number during the investigation behind this section.
+
+```sh
+node -e 'const t=Date.now();import(process.argv[1]).then(()=>{console.log(`${Date.now()-t}ms`);process.exit(0)})' \
+  ./.netlify/functions-internal/server/main.mjs
+```
+
 ## Checklist — run before shipping a list/read or a new table
 
 - [ ] List selects only displayed columns; heavy blobs excluded or `substr`-truncated.
@@ -193,5 +328,10 @@ another visitor's shared CDN entry.
 - [ ] Unbounded lists are paginated/windowed; large blobs aren't inlined on the hot path.
 - [ ] SSR HTML/`.data` path stays session-blind and cacheable — no `private`,
       `no-store`, `Vary: Cookie`, or auth branch added to it.
+- [ ] No data work added to a server plugin body / module scope — backfills,
+      aggregations and re-syncs run on every cold start there (see §8).
 - [ ] Mutation-fresh reads go through actions + `useActionQuery`, not SSR loader
       data.
+- [ ] No heavy runtime (browser, ffmpeg, rasterizer) added to what the `/*` page
+      function ships, and no new copied dependency resolved by walking ancestor
+      `node_modules` (see §9).

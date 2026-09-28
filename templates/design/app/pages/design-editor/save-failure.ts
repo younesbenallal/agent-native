@@ -17,19 +17,24 @@ function errorField(error: unknown, field: string): unknown {
 }
 
 export function designSaveErrorMessage(error: unknown): string | null {
-  // Integrity errors carry located, agent-facing guidance in `message`. Toasts
-  // get the summary instead; the two audiences need different text.
   if (isDesignHtmlIntegrityError(error)) return DESIGN_HTML_INTEGRITY_SUMMARY;
   const message = errorField(error, "message");
   if (typeof message !== "string" || !message.trim()) return null;
   return message.replace(/^DESIGN_HTML_INTEGRITY:\s*/, "");
 }
 
-/**
- * Only true transport failures deserve the “save when reconnected” warning.
- * HMR/editor reload aborts, optimistic conflicts, IndexedDB/outbox failures,
- * and HTML-integrity rejections are not connectivity failures.
- */
+export function isDesignSaveSuccessConflict(
+  persistedContentMatches: boolean,
+): boolean {
+  return !persistedContentMatches;
+}
+
+export function patchProofStatusAfterPersistedSave(
+  persistedContentMatches: boolean,
+): "applied" | "failed" {
+  return persistedContentMatches ? "applied" : "failed";
+}
+
 export function classifyDesignSaveFailure(
   error: unknown,
   navigatorOnline: boolean,

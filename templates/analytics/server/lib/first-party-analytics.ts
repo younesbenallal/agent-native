@@ -1,6 +1,6 @@
 import { getDbExec } from "@agent-native/core/db";
 import { runWithRequestContext } from "@agent-native/core/server";
-import { and, eq, isNull, or } from "drizzle-orm";
+import { and, eq, isNull, lt, or, sql } from "drizzle-orm";
 
 import { FIRST_PARTY_ANALYTICS_QUERY_TIMEOUT_MS } from "../../shared/dashboard-report-timeouts.js";
 import { getDb, schema } from "../db/index.js";
@@ -10,9 +10,12 @@ import {
   type DerivedExceptionFields,
 } from "./error-capture.js";
 import {
+  assertFirstPartyAnalyticsBigQuerySql,
+  type FirstPartyAnalyticsSink,
   getFirstPartyAnalyticsBackend,
   getFirstPartyAnalyticsTable,
   insertFirstPartyAnalyticsRows,
+  insertFirstPartyAnalyticsRowsWithResults,
   queryFirstPartyAnalyticsInBigQuery,
 } from "./first-party-analytics-backend.js";
 import {
@@ -20,15 +23,21 @@ import {
   withFirstPartyCache,
 } from "./first-party-analytics-cache.js";
 import {
+  firstPartyAnalyticsDeliveryFallbackKey,
+  isFirstPartyAnalyticsDeliveryQueueMissingError,
+} from "./first-party-analytics-delivery.js";
+import {
   classifyFirstPartyAnalyticsQuery,
   queryOutcomeFromError,
   recordFirstPartyAnalyticsQueryPressure,
 } from "./first-party-analytics-health.js";
 import { upsertFirstPartyAnalyticsRollups } from "./first-party-analytics-rollups.js";
+import { reserveFirstPartyPostgresEventVolume } from "./first-party-analytics-volume.js";
 
 export interface AnalyticsScope {
   userEmail: string;
   orgId: string | null;
+  credentialScope?: "org";
 }
 
 export interface IncomingAnalyticsEvent {
@@ -44,17 +53,17 @@ export interface IncomingAnalyticsEvent {
 export interface AnalyticsQueryResult {
   rows: Record<string, unknown>[];
   schema: { name: string; type: string }[];
+  truncated?: boolean;
 }
 
 export interface AnalyticsQueryOptions {
-  /** Cache only callers with a stable dashboard-panel lifecycle. */
   cache?: boolean;
-  /** Bound the database work for callers with a smaller delivery deadline. */
   timeoutMs?: number;
 }
 
 const MAX_EVENTS_PER_REQUEST = 100;
 const MAX_QUERY_ROWS = 5_000;
+const MAX_ANALYTICS_TIMESTAMP_AGE_MS = (3_650 - 7) * 24 * 60 * 60 * 1_000;
 const FIRST_PARTY_QUERY_TABLE_NAMES = [
   "analytics_events",
   "analytics_event_daily_rollups",
@@ -104,6 +113,119 @@ function randomHex(bytes: number): string {
 
 function id(prefix: string): string {
   return `${prefix}_${randomHex(12)}`;
+}
+
+async function persistBigQueryRowsWithMigrationFallback(
+  db: any,
+  rows: Array<{
+    id: string;
+    ownerEmail: string;
+    orgId: string | null;
+    [key: string]: unknown;
+  }>,
+  table: string | null,
+  scope: AnalyticsScope,
+  receivedAt: string,
+): Promise<void> {
+  try {
+    await db.transaction(async (tx: any) => {
+      await tx.insert(schema.analyticsEvents).values(rows);
+      await tx.insert(schema.analyticsBigQueryDeliveryQueue).values(
+        rows.map((row) => ({
+          eventId: row.id,
+          ownerEmail: row.ownerEmail,
+          orgId: row.orgId,
+          tableRef: table,
+          nextAttemptAt: receivedAt,
+          createdAt: receivedAt,
+          updatedAt: receivedAt,
+        })),
+      );
+    });
+  } catch (error) {
+    if (!isFirstPartyAnalyticsDeliveryQueueMissingError(error)) throw error;
+
+    console.error(
+      "[first-party-analytics] Delivery queue migration is pending; retaining event in Postgres and attempting direct BigQuery delivery:",
+      error,
+    );
+    await db.transaction(async (tx: any) => {
+      await tx.insert(schema.analyticsEvents).values(rows);
+      const marker = JSON.stringify({
+        deliveryState: "pending",
+        ownerEmail: scope.userEmail,
+        orgId: scope.orgId,
+        tableRef: table,
+        receivedAt,
+      });
+      for (const row of rows) {
+        await tx.execute(
+          sql`INSERT INTO settings (key, value, updated_at)
+              VALUES (${firstPartyAnalyticsDeliveryFallbackKey(row.id)}, ${marker}, ${Date.now()})
+              ON CONFLICT (key) DO NOTHING`,
+        );
+      }
+    });
+    try {
+      const result = await runWithRequestContext(
+        {
+          userEmail: scope.userEmail,
+          orgId: scope.orgId ?? undefined,
+        },
+        () => insertFirstPartyAnalyticsRowsWithResults(rows, table),
+      );
+      const acceptedIds = new Set(result.acceptedIds);
+      const rejectedIds = new Set(result.rejectedIds);
+      const rowIds = new Set(rows.map((row) => row.id));
+      if (
+        acceptedIds.size + rejectedIds.size !== rows.length ||
+        [...acceptedIds, ...rejectedIds].some((id) => !rowIds.has(id)) ||
+        [...acceptedIds].some((id) => rejectedIds.has(id)) ||
+        rows.some((row) => !acceptedIds.has(row.id) && !rejectedIds.has(row.id))
+      ) {
+        throw new Error(
+          "BigQuery fallback delivery returned an incomplete row result",
+        );
+      }
+      if (acceptedIds.size) {
+        const deliveredAt = new Date().toISOString();
+        await db.transaction(async (tx: any) => {
+          for (const row of rows) {
+            if (!acceptedIds.has(row.id)) continue;
+            const deliveredMarker = JSON.stringify({
+              deliveryState: "delivered",
+              deliveredAt,
+              ownerEmail: scope.userEmail,
+              orgId: scope.orgId,
+              tableRef: table,
+              receivedAt,
+            });
+            const updated = await tx.execute(
+              sql`UPDATE settings
+                     SET value = ${deliveredMarker}, updated_at = ${Date.now()}
+                   WHERE key = ${firstPartyAnalyticsDeliveryFallbackKey(row.id)}`,
+            );
+            if (Number(updated.rowsAffected) !== 1) {
+              throw new Error(
+                `BigQuery fallback marker for ${row.id} was not updated`,
+              );
+            }
+          }
+        });
+      }
+      if (rejectedIds.size) {
+        console.error(
+          "[first-party-analytics] BigQuery fallback rejected rows; retaining markers for retry:",
+          result.error ?? `BigQuery rejected ${rejectedIds.size} event row(s)`,
+        );
+      }
+    } catch (deliveryError) {
+      console.error(
+        "[first-party-analytics] BigQuery fallback delivery failed; Postgres event retained:",
+        deliveryError,
+      );
+    }
+  }
 }
 
 export function generateAnalyticsPublicKey(): string {
@@ -181,6 +303,43 @@ export async function listAnalyticsPublicKeys(
   }));
 }
 
+const LAST_USED_AT_REFRESH_MS = 60_000;
+
+export async function touchPublicKeyLastUsedAt(
+  keyId: string,
+  receivedAt: string,
+): Promise<void> {
+  const parsed = Date.parse(receivedAt);
+  if (!Number.isFinite(parsed)) {
+    console.warn(
+      "[first-party-analytics] Skipping last-used stamp: unparseable receivedAt",
+      receivedAt,
+    );
+    return;
+  }
+  const staleBefore = new Date(parsed - LAST_USED_AT_REFRESH_MS).toISOString();
+  try {
+    const db = getDb();
+    await db
+      .update(schema.analyticsPublicKeys)
+      .set({ lastUsedAt: receivedAt })
+      .where(
+        and(
+          eq(schema.analyticsPublicKeys.id, keyId),
+          or(
+            isNull(schema.analyticsPublicKeys.lastUsedAt),
+            lt(schema.analyticsPublicKeys.lastUsedAt, staleBefore),
+          ),
+        ),
+      );
+  } catch (error) {
+    console.warn(
+      "[first-party-analytics] Failed to refresh key last-used stamp:",
+      error,
+    );
+  }
+}
+
 function parseReplayAllowedOrigins(value: unknown): string[] {
   if (Array.isArray(value)) {
     return value.filter((item): item is string => typeof item === "string");
@@ -256,9 +415,12 @@ export function normalizeAnalyticsTimestamp(
     return Number.isNaN(date.getTime()) ? nowIso() : date.toISOString();
   })();
   const fallbackTime = new Date(fallback).getTime();
+  const earliestAllowedTime = fallbackTime - MAX_ANALYTICS_TIMESTAMP_AGE_MS;
   const normalize = (date: Date) => {
     if (Number.isNaN(date.getTime())) return fallback;
-    return date.getTime() > fallbackTime ? fallback : date.toISOString();
+    return date.getTime() > fallbackTime || date.getTime() < earliestAllowedTime
+      ? fallback
+      : date.toISOString();
   };
 
   if (value instanceof Date) return normalize(value);
@@ -306,6 +468,7 @@ export function resolveAnalyticsEventDimensions({
   hostname: string | null;
 }): { app: string | null; template: string | null } {
   const app =
+    asString(properties.app_name) ||
     asString(properties.app) ||
     asString((properties as any).agent_native_app) ||
     asString((properties as any).agentNativeApp) ||
@@ -314,6 +477,7 @@ export function resolveAnalyticsEventDimensions({
     asString((context as any).agentNativeApp) ||
     (hostname ? hostname.split(".")[0] : null);
   const template =
+    asString(properties.template_name) ||
     asString(properties.template) ||
     asString((properties as any).templateId) ||
     asString((properties as any).agent_native_template) ||
@@ -326,12 +490,6 @@ export function resolveAnalyticsEventDimensions({
   return { app, template };
 }
 
-/**
- * The public marketing site does not have a product sign-in surface. It shares
- * the browser analytics write key, though, so its host-derived `www` dimension
- * must never enter signed-in product cohorts when a client sends session
- * telemetry.
- */
 export function isMarketingWebsiteSessionEvent({
   eventName,
   hostname,
@@ -343,7 +501,9 @@ export function isMarketingWebsiteSessionEvent({
   app: string | null;
   template: string | null;
 }): boolean {
-  if (eventName !== "session status") return false;
+  if (eventName !== "session status" && eventName !== "session_status") {
+    return false;
+  }
   const normalizedHostname = hostname?.trim().toLowerCase().replace(/\.$/, "");
   if (
     normalizedHostname === "agent-native.com" ||
@@ -351,8 +511,6 @@ export function isMarketingWebsiteSessionEvent({
   ) {
     return true;
   }
-  // Some older browser events do not include a URL/hostname. Their only
-  // available attribution is the host-derived app/template dimension.
   const normalizedApp = app?.trim().toLowerCase();
   const normalizedTemplate = template?.trim().toLowerCase();
   return (
@@ -451,7 +609,10 @@ export async function recordAnalyticsEvents(
       asString((properties as any).signedIn) ||
       asString((context as any).signed_in) ||
       asString((context as any).signedIn);
-    const userId = event.userId ?? asString((properties as any).userId);
+    const userId =
+      event.userId ??
+      asString((properties as any).user_id) ??
+      asString((properties as any).userId);
     const anonymousId =
       event.anonymousId ??
       asString((properties as any).anonymousId) ??
@@ -459,7 +620,9 @@ export async function recordAnalyticsEvents(
     const userKey = userId || anonymousId;
     const timestamp = normalizeAnalyticsTimestamp(event.timestamp, receivedAt);
     const sessionId =
-      event.sessionId ?? asString((properties as any).sessionId);
+      event.sessionId ??
+      asString((properties as any).session_id) ??
+      asString((properties as any).sessionId);
     const signedIn = isMarketingWebsiteSessionEvent({
       eventName: event.event,
       hostname,
@@ -516,7 +679,7 @@ export async function recordAnalyticsEvents(
     orgId: key.orgId ?? null,
   });
 
-  if (rows.length && (backend.sink === "dual" || backend.sink === "bigquery")) {
+  if (rows.length && backend.sink === "dual") {
     try {
       await runWithRequestContext(
         {
@@ -526,9 +689,6 @@ export async function recordAnalyticsEvents(
         () => insertFirstPartyAnalyticsRows(rows, backend.table),
       );
     } catch (error) {
-      if (backend.sink === "bigquery") throw error;
-      // Dual-write mode keeps Postgres as the recoverable source until the
-      // backfill has completed. A BigQuery outage must not lose live events.
       console.error(
         "[first-party-analytics] BigQuery dual-write failed; retaining Postgres event:",
         error,
@@ -536,27 +696,42 @@ export async function recordAnalyticsEvents(
     }
   }
 
-  if (rows.length && backend.sink !== "bigquery") {
-    await db.transaction(async (tx: any) => {
-      await tx.insert(schema.analyticsEvents).values(rows);
-      await tx
-        .update(schema.analyticsPublicKeys)
-        .set({ lastUsedAt: receivedAt })
-        .where(eq(schema.analyticsPublicKeys.id, key.id));
-      await upsertFirstPartyAnalyticsRollups(rows, tx);
-    });
+  let persistenceError: unknown = null;
+  if (rows.length) {
+    try {
+      if (backend.sink === "bigquery") {
+        await persistBigQueryRowsWithMigrationFallback(
+          db,
+          rows,
+          backend.table,
+          { userEmail: key.ownerEmail, orgId: key.orgId ?? null },
+          receivedAt,
+        );
+      } else {
+        await db.transaction(async (tx: any) => {
+          if (backend.sink === "postgres" || backend.sink === "dual") {
+            await reserveFirstPartyPostgresEventVolume(
+              tx,
+              {
+                ownerEmail: key.ownerEmail,
+                orgId: key.orgId ?? null,
+                receivedAt,
+              },
+              rows.length,
+            );
+          }
+          await tx.insert(schema.analyticsEvents).values(rows);
+          await upsertFirstPartyAnalyticsRollups(rows, tx);
+        });
+      }
+    } catch (error) {
+      persistenceError = error;
+    }
   }
-  if (rows.length && backend.sink === "bigquery") {
-    await db
-      .update(schema.analyticsPublicKeys)
-      .set({ lastUsedAt: receivedAt })
-      .where(eq(schema.analyticsPublicKeys.id, key.id));
+  if (rows.length) {
+    await touchPublicKeyLastUsedAt(key.id, receivedAt);
   }
 
-  // Fork captured exceptions into the dedicated error-capture tables. This is
-  // best-effort: a malformed `$exception` payload must never reject the whole
-  // analytics ingest (the event is still recorded in analytics_events above,
-  // which keeps alerting working).
   if (exceptionSources.length) {
     try {
       await ingestAnalyticsExceptionEvents(
@@ -571,6 +746,8 @@ export async function recordAnalyticsEvents(
       console.warn("[first-party-analytics] Exception ingest failed:", error);
     }
   }
+
+  if (persistenceError) throw persistenceError;
 
   return { accepted: rows.length, keyId: key.id };
 }
@@ -856,7 +1033,7 @@ export function validateFirstPartyAnalyticsSql(sql: string): void {
     throw new Error("Only a single SELECT statement is allowed");
   }
   if (
-    /\b(insert|update|delete|drop|alter|truncate|create|replace|pragma|attach|detach|vacuum|grant|revoke)\b/i.test(
+    /\b(insert|update|delete|drop|alter|truncate|create|replace|grant|revoke)\b/i.test(
       stripped,
     )
   ) {
@@ -911,47 +1088,67 @@ function scopedTableSource(
   tableName: string,
   scope: AnalyticsScope,
   today: string,
+  parameterOffset: number,
 ): {
   sql: string;
   args: Array<string | null>;
 } {
   if (FIRST_PARTY_ROLLUP_TABLES.has(tableName)) {
+    if (scope.credentialScope === "org" && !scope.orgId) {
+      return {
+        sql: `(SELECT * FROM ${tableName} WHERE 1 = 0)`,
+        args: [],
+      };
+    }
     const tenantKeys = scope.orgId
-      ? [`org:${scope.orgId}`, `user:${scope.userEmail}`]
-      : [`user:${scope.userEmail}`];
-    const branches = tenantKeys.map(
-      () =>
-        `SELECT * FROM ${tableName} WHERE tenant_key = ? AND event_date <= ?`,
-    );
+      ? [
+          `org:${scope.orgId}`,
+          ...(scope.credentialScope === "org"
+            ? []
+            : [`user:${scope.userEmail}`]),
+        ]
+      : scope.credentialScope === "org"
+        ? []
+        : [`user:${scope.userEmail}`];
+    const branches = tenantKeys.map((_, index) => {
+      const tenantKeyParameter = parameterOffset + index * 2 + 1;
+      return `SELECT * FROM ${tableName} WHERE tenant_key = $${tenantKeyParameter} AND event_date <= $${tenantKeyParameter + 1}`;
+    });
     return {
-      // Rollups have a tenant_key/event_date index. Keep the org and personal
-      // fallback branches separate so rollup reads stay indexable as well.
       sql: `(${branches.join(" UNION ALL ")})`,
       args: tenantKeys.flatMap((tenantKey) => [tenantKey, today]),
     };
   }
 
-  const freshness = freshnessClause(tableName);
+  const ownerEmail = scope.userEmail.trim().toLowerCase();
   if (scope.orgId) {
+    const orgParameter = parameterOffset + 1;
+    if (scope.credentialScope === "org") {
+      return {
+        sql: `(SELECT * FROM ${tableName} WHERE org_id = $${orgParameter} AND ${freshnessClause(tableName, orgParameter + 1)})`,
+        args: [scope.orgId, today],
+      };
+    }
+    const ownerParameter = parameterOffset + 3;
     return {
-      // Keep the org and personal fallback as separate branches so Postgres can
-      // use each branch's composite tenant/date indexes instead of scanning one
-      // broad org index for an OR predicate.
-      sql: `(SELECT * FROM ${tableName} WHERE org_id = ? AND ${freshness} UNION ALL SELECT * FROM ${tableName} WHERE org_id IS NULL AND owner_email = ? AND ${freshness})`,
-      args: [scope.orgId, today, scope.userEmail, today],
+      sql: `(SELECT * FROM ${tableName} WHERE org_id = $${orgParameter} AND ${freshnessClause(tableName, orgParameter + 1)} UNION ALL SELECT * FROM ${tableName} WHERE org_id IS NULL AND owner_email = $${ownerParameter} AND ${freshnessClause(tableName, ownerParameter + 1)})`,
+      args: [scope.orgId, today, ownerEmail, today],
     };
   }
+  if (scope.credentialScope === "org") {
+    return { sql: `(SELECT * FROM ${tableName} WHERE 1 = 0)`, args: [] };
+  }
   return {
-    sql: `(SELECT * FROM ${tableName} WHERE org_id IS NULL AND owner_email = ? AND ${freshness})`,
-    args: [scope.userEmail, today],
+    sql: `(SELECT * FROM ${tableName} WHERE org_id IS NULL AND owner_email = $${parameterOffset + 1} AND ${freshnessClause(tableName, parameterOffset + 2)})`,
+    args: [ownerEmail, today],
   };
 }
 
-function freshnessClause(tableName: string): string {
+function freshnessClause(tableName: string, parameter: number): string {
   if (tableName === "analytics_events") {
-    return "(COALESCE(NULLIF(event_date, ''), substr(timestamp, 1, 10)) <= ?)";
+    return `(COALESCE(NULLIF(event_date, ''), substr(timestamp, 1, 10)) <= $${parameter})`;
   }
-  return "(substr(started_at, 1, 10) <= ?)";
+  return `(substr(started_at, 1, 10) <= $${parameter})`;
 }
 
 export function scopedAnalyticsSql(
@@ -976,7 +1173,12 @@ export function scopedAnalyticsSql(
         !RESERVED_ALIAS_WORDS.has(normalizedAlias)
           ? aliasPart
           : ` AS ${normalizedTable}`;
-      const scopedSource = scopedTableSource(normalizedTable, scope, today);
+      const scopedSource = scopedTableSource(
+        normalizedTable,
+        scope,
+        today,
+        args.length,
+      );
       args.push(...scopedSource.args);
       return `${keyword} ${scopedSource.sql}${usableAlias}`;
     },
@@ -1002,6 +1204,34 @@ function inferSchema(rows: Record<string, unknown>[]): {
   }));
 }
 
+function firstPartyAnalyticsQueryTarget(
+  sql: string,
+  sink: FirstPartyAnalyticsSink,
+): "sql-store" | "bigquery" {
+  if (sink !== "bigquery") return "sql-store";
+  const usesSessionRecordings = /\bsession_recordings\b/i.test(sql);
+  const usesEventTables =
+    /\banalytics_events\b|\banalytics_event_daily_rollups\b|\banalytics_user_days\b/i.test(
+      sql,
+    );
+  if (usesSessionRecordings && usesEventTables) {
+    throw new Error(
+      "Cross-backend joins are not supported; query first-party event tables in BigQuery and session_recordings in the Analytics SQL store separately.",
+    );
+  }
+  return usesSessionRecordings ? "sql-store" : "bigquery";
+}
+
+export async function validateFirstPartyAnalyticsSqlForScope(
+  sql: string,
+  scope: AnalyticsScope,
+): Promise<void> {
+  validateFirstPartyAnalyticsSql(sql);
+  const backend = await getFirstPartyAnalyticsBackend(scope);
+  if (firstPartyAnalyticsQueryTarget(sql, backend.sink) !== "bigquery") return;
+  assertFirstPartyAnalyticsBigQuerySql(sql);
+}
+
 export async function queryFirstPartyAnalytics(
   sql: string,
   scope: AnalyticsScope,
@@ -1009,32 +1239,18 @@ export async function queryFirstPartyAnalytics(
 ): Promise<AnalyticsQueryResult> {
   validateFirstPartyAnalyticsSql(sql);
   const backend = await getFirstPartyAnalyticsBackend(scope);
-  if (backend.sink === "bigquery") {
-    const usesSessionRecordings = /\bsession_recordings\b/i.test(sql);
-    const usesEventTables =
-      /\banalytics_events\b|\banalytics_event_daily_rollups\b|\banalytics_user_days\b/i.test(
-        sql,
-      );
-    if (usesSessionRecordings && usesEventTables) {
-      throw new Error(
-        "Cross-backend joins are not supported; query first-party event tables in BigQuery and session_recordings in the Analytics SQL store separately.",
-      );
-    }
-    if (!usesSessionRecordings) {
-      const table = await getFirstPartyAnalyticsTable(backend.table);
-      const scoped = scopedAnalyticsSql(sql, scope);
-      return queryFirstPartyAnalyticsInBigQuery(scoped.sql, scoped.args, table);
-    }
+  if (firstPartyAnalyticsQueryTarget(sql, backend.sink) === "bigquery") {
+    const table = await getFirstPartyAnalyticsTable(backend.table);
+    const scoped = scopedAnalyticsSql(sql, scope);
+    return queryFirstPartyAnalyticsInBigQuery(scoped.sql, scoped.args, table);
   }
   const scoped = scopedAnalyticsSql(sql, scope);
-  const wrappedSql = `SELECT * FROM (${scoped.sql}) AS first_party_analytics_query LIMIT ${MAX_QUERY_ROWS}`;
+  const scopedSql = scoped.sql;
+  const wrappedSql = `SELECT * FROM (${scopedSql}) AS first_party_analytics_query LIMIT ${MAX_QUERY_ROWS + 1}`;
   const timeoutMs = Math.max(
     1,
     options.timeoutMs ?? FIRST_PARTY_ANALYTICS_QUERY_TIMEOUT_MS,
   );
-  // The cache key is the fully scoped SQL + args, which already embeds
-  // org_id/owner_email (see scopeClause) — a cache hit can only ever return
-  // rows the same tenant was already entitled to query.
   const cacheKey = firstPartyCacheKey(wrappedSql, scoped.args);
   const queryClass = classifyFirstPartyAnalyticsQuery(sql);
   const compute = async (
@@ -1060,8 +1276,14 @@ export async function queryFirstPartyAnalytics(
           error,
         );
       });
-      const rows = result.rows as Record<string, unknown>[];
-      return { rows, schema: inferSchema(rows) };
+      const resultRows = result.rows as Record<string, unknown>[];
+      const truncated = resultRows.length > MAX_QUERY_ROWS;
+      const rows = truncated ? resultRows.slice(0, MAX_QUERY_ROWS) : resultRows;
+      return {
+        rows,
+        schema: inferSchema(rows),
+        ...(truncated ? { truncated: true } : {}),
+      };
     } catch (error) {
       void recordFirstPartyAnalyticsQueryPressure(scope, {
         durationMs: Date.now() - startedAt,

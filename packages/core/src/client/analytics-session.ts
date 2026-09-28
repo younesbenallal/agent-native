@@ -2,10 +2,11 @@ import { serializeAnalyticsAnonymousIdCookie } from "../shared/analytics-anonymo
 
 const ANONYMOUS_ID_STORAGE_KEY = "agent-native.anonymous_id";
 const SESSION_ID_STORAGE_KEY = "agent-native.session_id";
+const SESSION_ID_PIN_STORAGE_KEY = "agent-native.session_id_pin";
 const SESSION_LAST_ACTIVITY_STORAGE_KEY = "agent-native.session_last_activity";
-// 30-minute idle timeout matches GA4 / Mixpanel defaults: a tab left open
-// overnight starts a new session in the morning instead of stretching one visit.
 const SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_SESSION_ID_LENGTH = 127;
+const SAFE_SESSION_ID = /^[!-~]+$/;
 
 function generateVisitorId(): string {
   try {
@@ -41,6 +42,15 @@ function safeStorageSet(key: string, value: string): void {
   }
 }
 
+function safeStorageRemove(key: string): void {
+  try {
+    window.localStorage.removeItem(key);
+    // coercion-ok: storage that refuses writes holds no key to clear, so the caller's end state already holds
+  } catch {
+    // private browsing / storage disabled -- best-effort
+  }
+}
+
 function syncAnalyticsAnonymousIdCookie(id: string): void {
   try {
     const cookie = serializeAnalyticsAnonymousIdCookie(id);
@@ -62,9 +72,40 @@ export function getOrCreateAnalyticsAnonymousId(): string | undefined {
   return id;
 }
 
+export function setAnalyticsSessionId(sessionId: string): string | undefined {
+  const trimmed = typeof sessionId === "string" ? sessionId.trim() : "";
+  if (
+    !trimmed ||
+    trimmed.length > MAX_SESSION_ID_LENGTH ||
+    !SAFE_SESSION_ID.test(trimmed)
+  ) {
+    throw new Error(
+      `Invalid analytics session id: expected 1-${MAX_SESSION_ID_LENGTH} printable ASCII characters with no whitespace`,
+    );
+  }
+  if (typeof window === "undefined") return undefined;
+  safeStorageSet(SESSION_ID_PIN_STORAGE_KEY, trimmed);
+  safeStorageSet(SESSION_ID_STORAGE_KEY, trimmed);
+  safeStorageSet(SESSION_LAST_ACTIVITY_STORAGE_KEY, String(Date.now()));
+  return trimmed;
+}
+
+export function clearAnalyticsSessionId(): void {
+  if (typeof window === "undefined") return;
+  safeStorageRemove(SESSION_ID_PIN_STORAGE_KEY);
+  safeStorageRemove(SESSION_ID_STORAGE_KEY);
+  safeStorageRemove(SESSION_LAST_ACTIVITY_STORAGE_KEY);
+}
+
 export function getOrCreateAnalyticsSessionId(): string | undefined {
   if (typeof window === "undefined") return undefined;
   const now = Date.now();
+  const pinned = safeStorageGet(SESSION_ID_PIN_STORAGE_KEY);
+  if (pinned) {
+    safeStorageSet(SESSION_ID_STORAGE_KEY, pinned);
+    safeStorageSet(SESSION_LAST_ACTIVITY_STORAGE_KEY, String(now));
+    return pinned;
+  }
   const lastActivityRaw = safeStorageGet(SESSION_LAST_ACTIVITY_STORAGE_KEY);
   const lastActivity = lastActivityRaw
     ? Number.parseInt(lastActivityRaw, 10)

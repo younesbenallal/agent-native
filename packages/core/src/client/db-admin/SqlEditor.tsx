@@ -18,18 +18,6 @@ import CodeMirror, {
   keymap,
   Prec,
 } from "@uiw/react-codemirror";
-/**
- * Production-grade SQL editor for the dev-mode database admin.
- *
- * Layout: a CodeMirror editor pane on top, a resizable results panel below.
- * Features schema-aware autocomplete, keyboard run shortcuts, history, named
- * snippets, CSV/JSON export, and a confirm modal for destructive statements.
- *
- * Data access goes through `runQuery` from `./useDbAdmin.js` (the shared
- * contract). On a destructive statement without confirmation, `runQuery` throws
- * an Error whose `needsConfirm` flag is `true`; we catch that and re-run after
- * the user confirms in a locally-built modal.
- */
 import {
   useCallback,
   useEffect,
@@ -39,7 +27,6 @@ import {
   type ReactNode,
 } from "react";
 
-import type { DbAdminDialect } from "../../db-admin/types.js";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -66,7 +53,6 @@ import {
 import { runQuery, type DbAdminRequestConfig } from "./useDbAdmin.js";
 
 export interface SqlEditorProps {
-  dialect: DbAdminDialect;
   tableNames: string[];
   columnsByTable: Record<string, string[]>;
   requestConfig?: DbAdminRequestConfig;
@@ -78,8 +64,6 @@ interface QueryResult {
   rowsAffected: number;
   durationMs: number;
 }
-
-// ─── Dark-mode detection ─────────────────────────────────────────────────────
 
 function useIsDark(): boolean {
   const [isDark, setIsDark] = useState(false);
@@ -95,13 +79,6 @@ function useIsDark(): boolean {
   return isDark;
 }
 
-// ─── Statement-under-cursor helpers ──────────────────────────────────────────
-
-/**
- * Best-effort split of a SQL buffer into statements by top-level `;`, ignoring
- * semicolons inside single/double quotes or line/block comments. Returns each
- * statement with its character offsets so we can pick the one under the cursor.
- */
 function splitStatements(
   text: string,
 ): { sql: string; start: number; end: number }[] {
@@ -165,7 +142,6 @@ function splitStatements(
   return out;
 }
 
-/** Resolve which SQL to run given the current selection and cursor position. */
 function resolveRunTarget(
   view: EditorView | undefined,
   buffer: string,
@@ -180,8 +156,6 @@ function resolveRunTarget(
   const hit = statements.find((s) => cursor >= s.start && cursor <= s.end);
   return (hit?.sql ?? buffer).trim() || buffer;
 }
-
-// ─── Local modal primitive ───────────────────────────────────────────────────
 
 function Modal({
   title,
@@ -225,8 +199,6 @@ function Modal({
   );
 }
 
-// ─── Toolbar button ──────────────────────────────────────────────────────────
-
 function ToolbarButton({
   children,
   onClick,
@@ -261,10 +233,7 @@ const isMac =
   /Mac|iPhone|iPad/.test(navigator.platform);
 const MOD = isMac ? "Cmd" : "Ctrl";
 
-// ─── Main component ──────────────────────────────────────────────────────────
-
 export function SqlEditor({
-  dialect,
   tableNames,
   columnsByTable,
   requestConfig,
@@ -285,13 +254,11 @@ export function SqlEditor({
   const [saveModalOpen, setSaveModalOpen] = useState(false);
   const [snippetName, setSnippetName] = useState("");
 
-  // Editor height (px) — draggable splitter between editor and results.
   const [editorHeight, setEditorHeight] = useState(240);
   const dragState = useRef<{ startY: number; startHeight: number } | null>(
     null,
   );
 
-  // Keep the latest buffer accessible inside CodeMirror keymap closures.
   const valueRef = useRef(value);
   valueRef.current = value;
 
@@ -299,8 +266,6 @@ export function SqlEditor({
     setHistory(loadHistory());
     setSnippets(loadSnippets());
   }, []);
-
-  // ─── Run logic ────────────────────────────────────────────────────────────
 
   const execute = useCallback(
     async (sqlText: string, confirmDestructive?: boolean) => {
@@ -360,11 +325,9 @@ export function SqlEditor({
     if (sqlText) void execute(sqlText, true);
   }, [confirmSql, execute]);
 
-  // ─── CodeMirror extensions ──────────────────────────────────────────────
-
   const extensions = useMemo(() => {
     const langExt = sql({
-      dialect: dialect === "postgres" ? PostgreSQL : undefined,
+      dialect: PostgreSQL,
       schema: columnsByTable,
       tables: tableNames.map((t) => ({ label: t })),
       upperCaseKeywords: true,
@@ -393,10 +356,8 @@ export function SqlEditor({
 
     return [runKeymap, langExt, EditorView.lineWrapping];
     // tableNames / columnsByTable identity is stable enough for our purposes;
-    // re-derive when the dialect or schema reference changes.
-  }, [dialect, columnsByTable, tableNames, runActiveStatement, runWholeBuffer]);
-
-  // ─── Splitter drag ───────────────────────────────────────────────────────
+    // Re-derive when the schema reference changes.
+  }, [columnsByTable, tableNames, runActiveStatement, runWholeBuffer]);
 
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
@@ -412,12 +373,6 @@ export function SqlEditor({
       dragState.current = null;
       document.body.style.userSelect = "";
     };
-    // mouseup covers the normal release-inside-the-page case; window blur
-    // covers releasing the button outside the browser window/iframe, which
-    // never delivers a mouseup to this document. The cleanup also resets
-    // userSelect unconditionally so an unmount mid-drag can't leave
-    // `document.body.style.userSelect` stuck at "none", which would
-    // silently break text selection/copy everywhere in the app.
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", endDrag);
     window.addEventListener("blur", endDrag);
@@ -435,11 +390,8 @@ export function SqlEditor({
     document.body.style.userSelect = "none";
   };
 
-  // ─── Loading editor content from history / snippets ───────────────────────
-
   const loadIntoEditor = useCallback((sqlText: string) => {
     setValue(sqlText);
-    // Focus and place cursor at end after the controlled value updates.
     requestAnimationFrame(() => {
       const view = editorRef.current?.view;
       if (view) {
@@ -448,8 +400,6 @@ export function SqlEditor({
       }
     });
   }, []);
-
-  // ─── Export ────────────────────────────────────────────────────────────────
 
   const exportAs = (format: "csv" | "json") => {
     if (!result || result.columns.length === 0) return;
@@ -469,8 +419,6 @@ export function SqlEditor({
     }
   };
 
-  // ─── Snippet save ────────────────────────────────────────────────────────
-
   const openSaveModal = () => {
     if (!value.trim()) return;
     setSnippetName("");
@@ -488,8 +436,6 @@ export function SqlEditor({
     setSnippets(deleteSnippet(id));
   };
 
-  // ─── Example queries (empty state) ─────────────────────────────────────────
-
   const firstTable = tableNames[0];
   const examples = useMemo(() => {
     const list: { label: string; sql: string }[] = [];
@@ -501,10 +447,7 @@ export function SqlEditor({
     }
     list.push({
       label: "List tables",
-      sql:
-        dialect === "postgres"
-          ? "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name;"
-          : "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;",
+      sql: "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name;",
     });
     if (firstTable) {
       list.push({
@@ -513,12 +456,10 @@ export function SqlEditor({
       });
     }
     return list;
-  }, [firstTable, dialect]);
+  }, [firstTable]);
 
   const hasResults = result !== null;
   const canExport = hasResults && result!.columns.length > 0;
-
-  // ─── Render ──────────────────────────────────────────────────────────────
 
   return (
     <div className="flex h-full flex-col">
@@ -528,7 +469,7 @@ export function SqlEditor({
           type="button"
           onClick={runActiveStatement}
           disabled={running || !value.trim()}
-          title={`Run selection / statement (${MOD}+Enter)`}
+          title={`Run selection / statement (${MOD} Enter)`}
           className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {running ? (
@@ -540,7 +481,7 @@ export function SqlEditor({
         </button>
 
         <span className="hidden text-[11px] text-muted-foreground sm:inline">
-          {MOD}+Enter runs selection / statement · {MOD}+Shift+Enter runs all
+          {MOD} Enter runs selection / statement · {MOD} Shift Enter runs all
         </span>
 
         <div className="ml-auto flex items-center gap-2">

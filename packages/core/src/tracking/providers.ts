@@ -1,18 +1,6 @@
-/**
- * Built-in tracking providers that auto-register from env vars.
- *
- * No SDK dependencies — uses raw HTTP to keep core lightweight.
- * Set the env var and tracking starts automatically.
- *
- * POSTHOG_API_KEY + POSTHOG_HOST  → PostHog
- * MIXPANEL_TOKEN                  → Mixpanel
- * AMPLITUDE_API_KEY               → Amplitude
- * AGENT_NATIVE_ANALYTICS_PUBLIC_KEY → Agent Native Analytics
- *
- * Call `registerBuiltinProviders()` at server startup (done
- * automatically by the core-routes plugin).
- */
-
+import { getAppConfig } from "../app-config/index.js";
+import { getRequestContext } from "../server/request-context.js";
+import { isQaTestEmail } from "../shared/qa-test-email.js";
 import { reshapeTrackedExceptionProperties } from "./posthog-exception.js";
 import { registerTrackingProvider } from "./registry.js";
 import type { TrackingProvider, TrackingEvent } from "./types.js";
@@ -22,8 +10,6 @@ const AGENT_NATIVE_ANALYTICS_DEFAULT_ENDPOINT =
   "https://analytics.agent-native.com/track";
 const BATCH_INTERVAL_MS = 10_000;
 const MAX_BATCH_SIZE = 50;
-
-// ─── Batched sender ────────────────────────────────────────────────────────
 
 interface QueuedEvent {
   url: string;
@@ -35,8 +21,6 @@ interface EnqueueOptions {
   flushImmediately?: boolean;
 }
 
-// Use globalThis so multiple ESM graph instances (Vite dev + Nitro symlinks)
-// share one queue, matching the same pattern as the tracking registry.
 const QUEUE_KEY = Symbol.for("@agent-native/core/tracking.queue");
 const TIMER_KEY = Symbol.for("@agent-native/core/tracking.timer");
 
@@ -68,7 +52,8 @@ function enqueue(
 ): void {
   const queue = getQueue();
   queue.push({ url, body, headers });
-  if (options?.flushImmediately || queue.length >= MAX_BATCH_SIZE) {
+  const flushImmediately = options?.flushImmediately ?? isServerlessRuntime();
+  if (flushImmediately || queue.length >= MAX_BATCH_SIZE) {
     void drainQueue();
   } else if (!getTimer()) {
     const timer = setTimeout(() => {
@@ -157,18 +142,24 @@ function agentNativeAnalyticsFlushesImmediately(): boolean {
   return isServerlessRuntime();
 }
 
-// ─── PostHog ───────────────────────────────────────────────────────────────
-
 function isPostHogAiObservabilityEvent(eventName: string): boolean {
   return eventName.startsWith("$ai_");
 }
 
-/**
- * `$ai_*` and `$exception` are ingested through PostHog's dedicated endpoint
- * rather than `/capture/`, and `$exception` additionally has to carry
- * `$exception_list` — the framework's own `captureException()` emits camelCase
- * fields that PostHog would otherwise render as an empty, ungroupable issue.
- */
+function postHogAiEndTimestamp(event: TrackingEvent): string | undefined {
+  const latencySeconds = Number(event.properties?.["$ai_latency"]);
+  if (
+    !event.timestamp ||
+    !Number.isFinite(latencySeconds) ||
+    latencySeconds <= 0
+  ) {
+    return event.timestamp;
+  }
+  const startedAt = Date.parse(event.timestamp);
+  if (Number.isNaN(startedAt)) return event.timestamp;
+  return new Date(startedAt + Math.round(latencySeconds * 1000)).toISOString();
+}
+
 function createPostHogProvider(
   apiKey: string,
   host: string,
@@ -184,10 +175,11 @@ function createPostHogProvider(
       JSON.stringify({
         api_key: apiKey,
         event: event.name,
+        timestamp: postHogAiEndTimestamp(event),
         properties: {
           distinct_id: distinctId,
           ...properties,
-          timestamp: event.timestamp,
+          ...(event.sessionId ? { $session_id: event.sessionId } : {}),
         },
       }),
     );
@@ -203,10 +195,6 @@ function createPostHogProvider(
       }
 
       if (event.name === "$exception") {
-        // `POSTHOG_ERROR_TRACKING=false` keeps product analytics flowing while
-        // another backend owns crashes. Drop rather than downgrade to
-        // `/capture/`: a malformed exception is what this branch exists to
-        // prevent.
         if (!errorTracking) return;
         const reshaped = reshapeTrackedExceptionProperties(event.properties);
         if (reshaped) {
@@ -224,9 +212,10 @@ function createPostHogProvider(
           api_key: apiKey,
           event: event.name,
           distinct_id: distinctId,
+          timestamp: event.timestamp,
           properties: {
             ...event.properties,
-            timestamp: event.timestamp,
+            ...(event.sessionId ? { $session_id: event.sessionId } : {}),
           },
         }),
       );
@@ -248,24 +237,22 @@ function createPostHogProvider(
   };
 }
 
-/**
- * Send one event to PostHog only, bypassing the provider fan-out.
- *
- * For payloads whose *shape* is PostHog-specific and whose *content* other
- * backends must not receive. `track()` broadcasts to every configured provider,
- * so a PostHog-only integration (e.g. enabling a survey id) would otherwise
- * start exporting that integration's content — including user-authored text —
- * to Mixpanel, Amplitude, webhooks, and Agent Native Analytics as a side
- * effect nobody opted into.
- *
- * Returns `false` when PostHog is not configured, so callers can tell "not
- * sent" from "sent".
- */
 export function sendPostHogEvent(
   name: string,
   properties: Record<string, unknown>,
   distinctId: string,
 ): boolean {
+  const requestContext = getRequestContext();
+  if (
+    requestContext?.isSyntheticTraffic === true ||
+    isQaTestEmail(distinctId) ||
+    isQaTestEmail(requestContext?.userEmail) ||
+    isQaTestEmail(properties.email) ||
+    isQaTestEmail(properties.userEmail) ||
+    isQaTestEmail(properties.user_email)
+  ) {
+    return false;
+  }
   const apiKey = process.env.POSTHOG_API_KEY;
   if (!apiKey) return false;
   const host = (process.env.POSTHOG_HOST || POSTHOG_DEFAULT_HOST).replace(
@@ -278,13 +265,12 @@ export function sendPostHogEvent(
       api_key: apiKey,
       event: name,
       distinct_id: distinctId,
-      properties: { ...properties, timestamp: new Date().toISOString() },
+      timestamp: new Date().toISOString(),
+      properties,
     }),
   );
   return true;
 }
-
-// ─── Mixpanel ──────────────────────────────────────────────────────────────
 
 function createMixpanelProvider(token: string): TrackingProvider {
   return {
@@ -299,6 +285,7 @@ function createMixpanelProvider(token: string): TrackingProvider {
             ? new Date(event.timestamp).getTime() / 1000
             : undefined,
           ...event.properties,
+          ...(event.sessionId ? { session_id: event.sessionId } : {}),
         },
       };
       enqueue("https://api.mixpanel.com/track", JSON.stringify([data]));
@@ -317,7 +304,27 @@ function createMixpanelProvider(token: string): TrackingProvider {
   };
 }
 
-// ─── Amplitude ─────────────────────────────────────────────────────────────
+function stripExceptionContextForAmplitude(
+  properties: Record<string, unknown>,
+): Record<string, unknown> {
+  const {
+    exceptionTags: _exceptionTags,
+    exceptionExtra: _exceptionExtra,
+    ...stableProperties
+  } = properties;
+  return stableProperties;
+}
+
+function amplitudeEventProperties(
+  event: TrackingEvent,
+): Record<string, unknown> | undefined {
+  const properties =
+    event.name === "$exception" && event.properties
+      ? stripExceptionContextForAmplitude(event.properties)
+      : event.properties;
+  if (!event.sessionId) return properties;
+  return { ...(properties ?? {}), session_id: event.sessionId };
+}
 
 function createAmplitudeProvider(apiKey: string): TrackingProvider {
   return {
@@ -329,7 +336,7 @@ function createAmplitudeProvider(apiKey: string): TrackingProvider {
           {
             event_type: event.name,
             user_id: event.userId || "anonymous",
-            event_properties: event.properties,
+            event_properties: amplitudeEventProperties(event),
             time: event.timestamp
               ? new Date(event.timestamp).getTime()
               : undefined,
@@ -357,8 +364,6 @@ function createAmplitudeProvider(apiKey: string): TrackingProvider {
   };
 }
 
-// ─── Webhook (custom HTTP endpoint) ───────────────────────────────────────
-
 function createWebhookProvider(
   url: string,
   authHeader?: string,
@@ -373,6 +378,8 @@ function createWebhookProvider(
           event: event.name,
           properties: event.properties,
           userId: event.userId,
+          anonymousId: event.anonymousId,
+          sessionId: event.sessionId,
           timestamp: event.timestamp,
         }),
         extra,
@@ -396,8 +403,6 @@ function createWebhookProvider(
   };
 }
 
-// ─── Agent Native Analytics ───────────────────────────────────────────────
-
 function createAgentNativeAnalyticsProvider(
   publicKey: string,
   endpoint: string,
@@ -414,6 +419,7 @@ function createAgentNativeAnalyticsProvider(
           properties: event.properties ?? {},
           userId: event.userId,
           anonymousId: event.anonymousId,
+          sessionId: event.sessionId,
           timestamp: event.timestamp,
         }),
         undefined,
@@ -439,8 +445,6 @@ function createAgentNativeAnalyticsProvider(
     },
   };
 }
-
-// ─── Auto-registration ────────────────────────────────────────────────────
 
 let _registered = false;
 
@@ -473,19 +477,14 @@ export function registerBuiltinProviders(): void {
     registerTrackingProvider(createAmplitudeProvider(amplitudeKey));
   }
 
-  const agentNativeAnalyticsKey =
-    process.env.AGENT_NATIVE_ANALYTICS_PUBLIC_KEY ||
-    process.env.VITE_AGENT_NATIVE_ANALYTICS_PUBLIC_KEY;
-  if (
-    agentNativeAnalyticsKey &&
-    !shouldSkipAgentNativeAnalyticsForLocalhost()
-  ) {
+  const { agentNativePublicKey, agentNativeEndpoint } =
+    getAppConfig().analytics;
+  if (agentNativePublicKey && !shouldSkipAgentNativeAnalyticsForLocalhost()) {
     registerTrackingProvider(
       createAgentNativeAnalyticsProvider(
-        agentNativeAnalyticsKey,
+        agentNativePublicKey,
         (
-          process.env.AGENT_NATIVE_ANALYTICS_ENDPOINT ||
-          AGENT_NATIVE_ANALYTICS_DEFAULT_ENDPOINT
+          agentNativeEndpoint || AGENT_NATIVE_ANALYTICS_DEFAULT_ENDPOINT
         ).replace(/\/+$/, ""),
       ),
     );

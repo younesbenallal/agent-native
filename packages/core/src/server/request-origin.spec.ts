@@ -5,11 +5,116 @@ vi.mock("h3", () => ({
     event.headers?.[name] ?? event.headers?.[name.toLowerCase()],
 }));
 
-import { isSameOriginRequest } from "./request-origin.js";
+import {
+  getForwardedRequestHostname,
+  getForwardedRequestHostnameFromHeaders,
+  getForwardedRequestOrigin,
+  isSameOriginRequest,
+} from "./request-origin.js";
 
 function fakeEvent(headers: Record<string, string> = {}) {
   return { headers } as any;
 }
+
+describe("getForwardedRequestOrigin", () => {
+  it.each([
+    {
+      name: "forwarded gateway host behind an internal dev proxy",
+      headers: {
+        host: "127.0.0.1:8092",
+        "x-forwarded-host": "127.0.0.1:8080",
+        "x-forwarded-proto": "http",
+      },
+      expected: "http://127.0.0.1:8080",
+    },
+    {
+      name: "direct host when no proxy forwarded headers are present",
+      headers: { host: "dispatch.agent-native.com" },
+      expected: "http://dispatch.agent-native.com",
+    },
+    {
+      name: "first forwarded host when a proxy appends its internal host",
+      headers: {
+        host: "internal.gateway:3000",
+        "x-forwarded-host":
+          "beta.design.agent-native.com, internal.gateway:3000",
+        "x-forwarded-proto": "https",
+      },
+      expected: "https://beta.design.agent-native.com",
+    },
+    {
+      name: "first forwarded protocol when a proxy appends its internal protocol",
+      headers: {
+        host: "internal.gateway:3000",
+        "x-forwarded-host": "beta.design.agent-native.com",
+        "x-forwarded-proto": "https, http",
+      },
+      expected: "https://beta.design.agent-native.com",
+    },
+  ])("handles $name", ({ headers, expected }) => {
+    expect(getForwardedRequestOrigin(fakeEvent(headers))).toBe(expected);
+  });
+
+  it("normalizes forwarded hostnames, including terminal dots", () => {
+    expect(
+      getForwardedRequestHostname(
+        fakeEvent({
+          host: "internal.gateway:3000",
+          "x-forwarded-host": "BETA.CALENDAR.AGENT-NATIVE.COM.",
+          "x-forwarded-proto": "https, http",
+        }),
+      ),
+    ).toBe("beta.calendar.agent-native.com");
+  });
+
+  it("rejects a malformed first forwarded protocol value", () => {
+    expect(() =>
+      getForwardedRequestHostname(
+        fakeEvent({
+          host: "internal.gateway:3000",
+          "x-forwarded-host": "beta.calendar.agent-native.com",
+          "x-forwarded-proto": ", https",
+        }),
+      ),
+    ).toThrow("Invalid forwarded request protocol");
+  });
+
+  it("rejects a forwarded hostname containing a path", () => {
+    expect(() =>
+      getForwardedRequestOrigin(
+        fakeEvent({
+          host: "internal.gateway:3000",
+          "x-forwarded-host": "beta.calendar.agent-native.com/path",
+          "x-forwarded-proto": "https",
+        }),
+      ),
+    ).toThrow("Invalid forwarded request hostname");
+  });
+
+  it("resolves the same normalized hostname from Node and Fetch headers", () => {
+    expect(
+      getForwardedRequestHostnameFromHeaders({
+        host: "internal.gateway:3000",
+        "x-forwarded-host":
+          "BETA.CALENDAR.AGENT-NATIVE.COM., internal.gateway:3000",
+      }),
+    ).toBe("beta.calendar.agent-native.com");
+    expect(
+      getForwardedRequestHostnameFromHeaders(
+        new Headers({ "x-forwarded-host": "beta.calendar.agent-native.com" }),
+      ),
+    ).toBe("beta.calendar.agent-native.com");
+  });
+
+  it("rejects malformed Node forwarded hostnames", () => {
+    expect(() =>
+      getForwardedRequestHostnameFromHeaders({
+        host: "app.example.com",
+        "x-forwarded-host": "app.example.com/path",
+      }),
+    ).toThrow("Invalid forwarded request hostname");
+  });
+});
 
 describe("isSameOriginRequest", () => {
   it.each([

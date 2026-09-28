@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AppSyncState, type ChangeEvent } from "./poll.js";
 
-/** Minimal DbExec-shaped mock that records the ids inserted into sync_events. */
+vi.mock("../db/ddl-guard.js", () => ({
+  ensureIndexExists: vi.fn().mockResolvedValue(undefined),
+  ensureIndexExistsConcurrently: vi.fn().mockResolvedValue(undefined),
+  ensureTableExists: vi.fn().mockResolvedValue(undefined),
+}));
+
 function makeDb(insertedIds?: string[]) {
   return {
     execute: vi.fn(
@@ -45,18 +50,15 @@ describe("AppSyncState multi-app isolation", () => {
   it("does not leak in-memory events or versions across apps", () => {
     const a = new AppSyncState({
       getDb: () => makeDb(),
-      isPostgres: () => false,
     });
     const b = new AppSyncState({
       getDb: () => makeDb(),
-      isPostgres: () => false,
     });
 
     a.recordChange({ source: "action", type: "change", key: "a1" });
     a.recordChange({ source: "action", type: "change", key: "a2" });
 
     expect(a.getChangesSince(0).events.map((e) => e.key)).toEqual(["a1", "a2"]);
-    // App B shares no buffer and no version space with A.
     expect(b.getChangesSince(0).events).toEqual([]);
     expect(b.getVersion()).toBe(0);
     expect(a.getVersion()).toBeGreaterThan(0);
@@ -65,7 +67,6 @@ describe("AppSyncState multi-app isolation", () => {
   it("filters durable-independent per-user delivery per instance", () => {
     const a = new AppSyncState({
       getDb: () => makeDb(),
-      isPostgres: () => false,
     });
     a.recordChange({
       source: "action",
@@ -93,21 +94,18 @@ describe("AppSyncState multi-app isolation", () => {
     const idsB: string[] = [];
     const a = new AppSyncState({
       getDb: () => makeDb(idsA),
-      isPostgres: () => false,
       deterministicEventIds: true,
     });
     const b = new AppSyncState({
       getDb: () => makeDb(idsB),
-      isPostgres: () => false,
       deterministicEventIds: true,
     });
 
-    // Same logical event + dedupe signal, but different per-instance versions.
     await a.persistSyncEvent(baseEvent({ version: 111 }), "app-state|500");
     await b.persistSyncEvent(baseEvent({ version: 999 }), "app-state|500");
 
     expect(idsA[0]).toBeTruthy();
-    expect(idsA[0]).toBe(idsB[0]); // version excluded → collides → ON CONFLICT dedupes
+    expect(idsA[0]).toBe(idsB[0]);
   });
 
   it("keeps random ids when deterministic mode is off (default)", async () => {
@@ -115,7 +113,6 @@ describe("AppSyncState multi-app isolation", () => {
     const ids: string[] = [];
     const s = new AppSyncState({
       getDb: () => makeDb(ids),
-      isPostgres: () => false,
     });
 
     await s.persistSyncEvent(baseEvent({ version: 1 }), "app-state|500");
@@ -125,28 +122,56 @@ describe("AppSyncState multi-app isolation", () => {
     expect(ids[0]).not.toBe(ids[1]);
   });
 
+  it("persists a transactional change before publishing it", async () => {
+    process.env.AGENT_NATIVE_SYNC_EVENTS_ENABLE_IN_TESTS = "1";
+    const schemaDb = makeDb();
+    const transaction = {
+      execute: vi.fn(async () => ({ rows: [], rowsAffected: 1 })),
+    };
+    const state = new AppSyncState({
+      getDb: () => schemaDb,
+      isPostgres: () => false,
+    });
+    const change = await state.prepareTransactionalChange({
+      source: "collab",
+      type: "change",
+      key: "doc-1",
+      resourceType: "document",
+      resourceId: "doc-1",
+    });
+    expect(change.isPersisted()).toBe(false);
+
+    expect(state.getChangesSince(0).events).toEqual([]);
+    const persisted = await change.persist(transaction);
+    expect(change.isPersisted()).toBe(true);
+    expect(state.getChangesSince(0).events).toEqual([]);
+    expect(transaction.execute).toHaveBeenCalledOnce();
+    expect(persisted.resourceId).toBe("doc-1");
+
+    change.publish();
+    expect(state.getChangesSince(0).events).toMatchObject([
+      { source: "collab", resourceId: "doc-1" },
+    ]);
+  });
+
   it("does not reuse an org-A access decision under an org-B session", async () => {
     const flush = async () => {
       for (let i = 0; i < 5; i++) await Promise.resolve();
     };
-    // Resource is allowed only in org-a.
     const resolveAccess = vi.fn(
       async (_rt: string, _rid: string, ctx: { orgId: string | undefined }) =>
         ctx.orgId === "org-a" ? { ok: true } : null,
     );
     const s = new AppSyncState({
       getDb: () => makeDb(),
-      isPostgres: () => false,
       resolveAccess,
     });
-    // Owned by someone else + resource-scoped → forces the access-aware branch.
     const event = {
       owner: "other@x",
       resourceType: "doc",
       resourceId: "d1",
     };
 
-    // org-a: first call misses (fail-closed), then the cached allow lands.
     expect(s.canSeeChangeForUser(event, "u@x", "org-a")).toBe(false);
     await flush();
     expect(s.canSeeChangeForUser(event, "u@x", "org-a")).toBe(true);
@@ -164,5 +189,40 @@ describe("AppSyncState multi-app isolation", () => {
       userEmail: "u@x",
       orgId: "org-b",
     });
+  });
+
+  it("matches owner-scoped events case-insensitively", () => {
+    const s = new AppSyncState({
+      getDb: () => makeDb(),
+    });
+
+    expect(
+      s.canSeeChangeForUser(
+        { owner: "owner@example.com", resourceType: "deck", resourceId: "d1" },
+        "Owner@Example.com",
+        undefined,
+      ),
+    ).toBe(true);
+  });
+
+  it("delivers public resource tombstones without resolving the deleted row", () => {
+    const resolveAccess = vi.fn(async () => null);
+    const s = new AppSyncState({
+      getDb: () => makeDb(),
+      resolveAccess,
+    });
+
+    expect(
+      s.canSeeChangeForUser(
+        {
+          resourceType: "deck",
+          resourceId: "d1",
+          visibility: "public",
+        },
+        "viewer@example.com",
+        undefined,
+      ),
+    ).toBe(true);
+    expect(resolveAccess).not.toHaveBeenCalled();
   });
 });

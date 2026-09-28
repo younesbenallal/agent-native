@@ -4,6 +4,11 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  clearActiveRun,
+  setActiveRun,
+  updateActiveRunSeq,
+} from "./active-run-state.js";
 import { RunStuckBanner } from "./RunStuckBanner.js";
 import { useRunStuckDetection } from "./use-run-stuck-detection.js";
 
@@ -54,6 +59,7 @@ describe("RunStuckBanner", () => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     window.localStorage.clear();
+    clearActiveRun();
     vi.useRealTimers();
   });
 
@@ -152,6 +158,70 @@ describe("RunStuckBanner", () => {
       await vi.advanceTimersByTimeAsync(1);
     });
     expect(fetchSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it("trusts fresh real SSE progress while durable progress catches up", async () => {
+    const fetchSpy = vi.fn(async () =>
+      jsonResponse({
+        active: true,
+        runId: "run-streaming",
+        status: "running",
+        heartbeatAt: 390_000,
+        lastProgressAt: 10_000,
+        serverNow: 400_000,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    setActiveRun({
+      threadId: "thread-1",
+      runId: "run-streaming",
+      lastSeq: 1,
+    });
+
+    await act(async () => {
+      root.render(<RunStuckProbe liveBackgroundStuckThresholdMs={60_000} />);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(container.textContent).toBe("stuck");
+
+    await act(async () => {
+      updateActiveRunSeq("thread-1", "run-streaming", 2, true);
+    });
+    expect(container.textContent).toBe("healthy");
+  });
+
+  it("does not trust keepalive-only SSE cursor advancement as real progress", async () => {
+    const fetchSpy = vi.fn(async () =>
+      jsonResponse({
+        active: true,
+        runId: "run-keepalive-only",
+        status: "running",
+        heartbeatAt: 390_000,
+        lastProgressAt: 10_000,
+        serverNow: 400_000,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    setActiveRun({
+      threadId: "thread-1",
+      runId: "run-keepalive-only",
+      lastSeq: 1,
+    });
+
+    await act(async () => {
+      root.render(<RunStuckProbe liveBackgroundStuckThresholdMs={60_000} />);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(container.textContent).toBe("stuck");
+
+    await act(async () => {
+      updateActiveRunSeq(2, false);
+    });
+    expect(container.textContent).toBe("stuck");
   });
 
   it("automatically aborts and retries a stuck active run once", async () => {
@@ -291,7 +361,6 @@ describe("RunStuckBanner", () => {
           status: "running",
           dispatchMode: "background-processing",
           heartbeatAt: 295_000,
-          // Just below the 180s background threshold at observation time.
           lastProgressAt: 121_000,
           serverNow: 300_000,
         });
@@ -331,7 +400,6 @@ describe("RunStuckBanner", () => {
           status: "running",
           dispatchMode: "background-processing",
           heartbeatAt: 99_000,
-          // Far enough below 180s that heartbeat freshness expires first.
           lastProgressAt: 10_000,
           serverNow: 100_000,
         });
@@ -392,10 +460,6 @@ describe("RunStuckBanner", () => {
   });
 
   it("never auto-retries a background-dispatched run even with a stale heartbeat", async () => {
-    // The server owns recovery for background runs (chained continuations +
-    // lost-handoff sweep). Even when the worker heartbeat looks dead, an
-    // automatic client abort could kill a live server-chained successor —
-    // only the manual controls remain.
     const onRetry = vi.fn();
     const fetchSpy = vi.fn(async (url: string) => {
       if (url.includes("/runs/active")) {
@@ -474,9 +538,6 @@ describe("RunStuckBanner", () => {
   });
 
   it("uses the wider 180s stuck threshold for server-continued runs", async () => {
-    // 120s without progress marks a client-continued foreground run stuck (90s
-    // threshold) but must not mark a server-continued run stuck — the server's
-    // recovery machinery is still within its own windows.
     const fetchSpy = vi.fn(async (url: string) => {
       if (url.includes("/runs/active")) {
         return jsonResponse({
@@ -686,10 +747,6 @@ describe("RunStuckBanner", () => {
   });
 
   it("re-checks hasInFlightWork on every render instead of caching the first value", async () => {
-    // The A2A call finishes between two polls — the banner must recompute
-    // from the live source (e.g. chatHandle.hasInFlightWork()) rather than
-    // freezing whatever it saw when the banner first mounted, or Retry would
-    // stay hidden (or shown) forever after work actually changes state.
     let inFlight = true;
     const fetchSpy = vi.fn(async (url: string) => {
       if (url.includes("/runs/active")) {
@@ -787,10 +844,6 @@ describe("RunStuckBanner", () => {
   });
 
   it("stays hidden when the chat is not waiting on a reply", async () => {
-    // A turn that finished normally can leave the run row in `running` until
-    // the stale-run reaper catches it. That is server hygiene, not a stuck
-    // chat: warning about it - and auto-retrying, which re-prompts a thread
-    // the user considers done - is the bug.
     const onRetry = vi.fn();
     const fetchSpy = vi.fn(async (url: string) => {
       if (url.includes("/runs/active")) {

@@ -8,6 +8,7 @@ import {
   appPath,
 } from "@agent-native/core/client/api-path";
 import { extensionIdFromPathname } from "@agent-native/core/client/extensions";
+import { getBrowserTabId } from "@agent-native/core/client/hooks";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { useLocation, useNavigate } from "react-router";
@@ -16,10 +17,16 @@ import type {
   DispatchExtensionConfig,
   DispatchNavItem,
 } from "../components/index.js";
+import {
+  workspaceAppIdFromRoute,
+  workspaceAppRoute,
+} from "../lib/workspace-apps.js";
 
 export interface NavigationState {
   view: string;
   path?: string;
+  workspaceAppId?: string;
+  workspaceAppPath?: string;
   extensionId?: string;
   extensionSlug?: string;
   dreamId?: string;
@@ -32,14 +39,21 @@ export interface NavigationState {
   query?: string;
   runId?: string;
   threadId?: string;
+  agentPath?: string;
+  usageScope?: "me" | "workspace" | "app";
+  usageUserEmail?: string;
+  usageAppId?: string;
+  automationId?: string;
 }
 
-export function useNavigationState(extensions?: DispatchExtensionConfig) {
+export function useNavigationState(
+  extensions?: DispatchExtensionConfig,
+  browserTabId = getBrowserTabId(),
+) {
   const location = useLocation();
   const navigate = useNavigate();
   const qc = useQueryClient();
 
-  // Sync current route to application state
   useEffect(() => {
     const localPathname = routerPath(location.pathname);
     const state = buildDispatchNavigationState(
@@ -48,25 +62,26 @@ export function useNavigationState(extensions?: DispatchExtensionConfig) {
       extensions,
     );
 
-    fetch(agentNativePath("/_agent-native/application-state/navigation"), {
+    fetch(dispatchApplicationStatePath("navigation", browserTabId), {
       method: "PUT",
       keepalive: true,
-      headers: { "Content-Type": "application/json" },
+      headers: dispatchApplicationStateHeaders(browserTabId, {
+        "Content-Type": "application/json",
+      }),
       body: JSON.stringify(state),
     }).catch(() => {});
-  }, [extensions, location.pathname, location.search]);
+  }, [browserTabId, extensions, location.pathname, location.search]);
 
-  // Listen for navigate commands from agent
   const { data: navCommand } = useQuery({
-    queryKey: ["navigate-command"],
+    queryKey: dispatchNavigationQueryKey(browserTabId),
     queryFn: async () => {
       const res = await fetch(
-        agentNativePath("/_agent-native/application-state/navigate"),
+        dispatchApplicationStatePath("navigate", browserTabId),
+        { headers: dispatchApplicationStateHeaders(browserTabId) },
       );
       if (!res.ok) return null;
       const data = await res.json();
       if (data) {
-        // Return with a timestamp to ensure uniqueness
         return { ...data, _ts: Date.now() };
       }
       return null;
@@ -76,14 +91,14 @@ export function useNavigationState(extensions?: DispatchExtensionConfig) {
 
   useEffect(() => {
     if (!navCommand) return;
-    // Delete the one-shot command AFTER reading it
-    fetch(agentNativePath("/_agent-native/application-state/navigate"), {
+    fetch(dispatchApplicationStatePath("navigate", browserTabId), {
       method: "DELETE",
-      headers: { "X-Agent-Native-CSRF": "1" },
+      headers: dispatchApplicationStateHeaders(browserTabId, {
+        "X-Agent-Native-CSRF": "1",
+      }),
     }).catch(() => {});
     const cmd = navCommand as NavigationState;
 
-    // Navigate to a specific path or resolve view name to path
     const resolvedPath =
       cmd.path || resolvePath(cmd.view, extensions, cmd) || "/overview";
     const path =
@@ -99,9 +114,31 @@ export function useNavigationState(extensions?: DispatchExtensionConfig) {
         markAgentChatHomeHandoff("dispatch");
       }
     }
-    navigate(nextPath);
-    qc.setQueryData(["navigate-command"], null);
-  }, [extensions, location.pathname, navCommand, navigate, qc]);
+    void navigate(nextPath);
+    qc.setQueryData(dispatchNavigationQueryKey(browserTabId), null);
+  }, [browserTabId, extensions, location.pathname, navCommand, navigate, qc]);
+}
+
+export function dispatchNavigationQueryKey(
+  browserTabId: string,
+): readonly [string, string] {
+  return ["navigate-command", browserTabId];
+}
+
+export function dispatchApplicationStatePath(
+  key: string,
+  browserTabId: string,
+): string {
+  return agentNativePath(
+    `/_agent-native/application-state/${key}:${browserTabId}`,
+  );
+}
+
+function dispatchApplicationStateHeaders(
+  browserTabId: string,
+  extra: Record<string, string> = {},
+): Record<string, string> {
+  return { "X-Request-Source": browserTabId, ...extra };
 }
 
 function pathnameFromPath(path: string): string {
@@ -136,6 +173,11 @@ export function buildDispatchNavigationState(
   const threadId = threadIdFromPath(pathname);
   if (threadId) state.threadId = threadId;
 
+  if (state.view === "chat") {
+    const agentPath = new URLSearchParams(search).get("agent")?.trim();
+    if (agentPath) state.agentPath = agentPath;
+  }
+
   const extensionId = extensionIdFromPathname(pathname);
   if (extensionId) {
     state.view = "extensions";
@@ -143,6 +185,14 @@ export function buildDispatchNavigationState(
     const slug = extensionSlugFromPathname(pathname);
     if (slug) state.extensionSlug = slug;
     return state;
+  }
+
+  if (state.view === "workspace-app") {
+    const workspaceAppId = workspaceAppIdFromRoute(pathname);
+    if (workspaceAppId) {
+      state.workspaceAppId = workspaceAppId;
+      state.workspaceAppPath = pathname.replace(/^\/apps\/[^/]+/, "") || "/";
+    }
   }
 
   if (state.view === "dreams") {
@@ -177,6 +227,25 @@ export function buildDispatchNavigationState(
     if (selectedThreadId) state.threadId = selectedThreadId;
   }
 
+  if (state.view === "metrics") {
+    const params = new URLSearchParams(search);
+    const usageScope = params.get("scope");
+    const usageUserEmail = params.get("user");
+    const usageAppId = params.get("app");
+    if (usageAppId) {
+      state.usageScope = "app";
+      state.usageAppId = usageAppId;
+    } else if (usageScope === "me" || usageScope === "workspace") {
+      state.usageScope = usageScope;
+    }
+    if (usageUserEmail) state.usageUserEmail = usageUserEmail;
+  }
+
+  if (state.view === "automations") {
+    const automationId = new URLSearchParams(search).get("automationId");
+    if (automationId) state.automationId = automationId;
+  }
+
   return state;
 }
 
@@ -184,10 +253,6 @@ function routerPath(path: string): string {
   const basePath = appBasePath();
   if (!basePath) return path;
   let result = path;
-  // Iteratively strip basename. A path that arrives doubly-prefixed
-  // (e.g. "/dispatch/dispatch/overview", possibly from a stale link or a
-  // prior bug) would otherwise get partially stripped here and then
-  // re-prefixed by react-router's basename, restoring the bad URL.
   for (let i = 0; i < 4; i += 1) {
     if (result === basePath) return "/";
     if (!result.startsWith(`${basePath}/`)) break;
@@ -224,7 +289,8 @@ function resolveExtensionPath(
   extensions?: DispatchExtensionConfig,
 ): string | undefined {
   if (!view) return undefined;
-  return extensions?.navItems?.find((item) => item.id === view)?.to;
+  const item = extensions?.navItems?.find((candidate) => candidate.id === view);
+  return item?.adminTo ?? item?.to;
 }
 
 function resolveView(
@@ -236,9 +302,21 @@ function resolveView(
   if (pathname === "/extensions" || pathname.startsWith("/extensions/")) {
     return "extensions";
   }
+  if (pathname === "/admin") return "admin";
+  if (pathname === "/admin/agents" || pathname.startsWith("/admin/agents/")) {
+    return "connected-agents";
+  }
+  if (pathname.startsWith("/admin/")) {
+    const adminView = resolveView(pathname.slice("/admin".length), extensions);
+    return adminView === "overview" ? "admin" : adminView;
+  }
   if (pathname.startsWith("/browser-chat")) return "browser-chat";
   if (pathname.startsWith("/chat")) return "chat";
+  if (pathname.startsWith("/apps/") && pathname !== "/apps/") {
+    return "workspace-app";
+  }
   if (pathname.startsWith("/apps")) return "apps";
+  if (pathname.startsWith("/operations")) return "operations";
   if (pathname.startsWith("/metrics")) return "metrics";
   if (pathname.startsWith("/new-app")) return "new-app";
   if (pathname.startsWith("/vault")) return "vault";
@@ -250,6 +328,9 @@ function resolveView(
   if (pathname.startsWith("/identities")) return "identities";
   if (pathname.startsWith("/approvals")) return "approvals";
   if (pathname.startsWith("/automations")) return "automations";
+  if (pathname.startsWith("/transactional-email")) {
+    return "transactional-email";
+  }
   if (pathname.startsWith("/audit")) return "audit";
   if (pathname.startsWith("/dreams")) return "dreams";
   if (pathname.startsWith("/thread-debug")) return "thread-debug";
@@ -260,9 +341,14 @@ function resolveView(
 function resolvePath(
   view?: string,
   extensions?: DispatchExtensionConfig,
-  command?: Pick<NavigationState, "extensionId" | "threadId">,
+  command?: Pick<
+    NavigationState,
+    "extensionId" | "threadId" | "workspaceAppId"
+  >,
 ): string | undefined {
   switch (view) {
+    case "admin":
+      return "/admin";
     case "chat":
     case "ask":
       return command?.threadId && command.threadId.trim()
@@ -272,41 +358,56 @@ function resolvePath(
       return "/overview";
     case "apps":
       return "/apps";
+    case "workspace-app":
+      return command?.workspaceAppId
+        ? workspaceAppRoute(command.workspaceAppId)
+        : "/apps";
+    case "operations":
+    case "monitoring":
+    case "observability":
+    case "database":
+      return view === "database"
+        ? "/admin/operations?view=database"
+        : "/admin/operations";
     case "metrics":
     case "usage":
-      return "/metrics";
+      return "/admin/metrics";
     case "new-app":
     case "create-app":
-      return "/new-app";
+      return "/admin/new-app";
     case "vault":
     case "secrets":
-      return "/vault";
+      return "/admin/vault";
     case "integrations":
-      return "/integrations";
+      return "/admin/integrations";
     case "workspace":
     case "resources":
-      return "/workspace";
+      return "/admin/workspace";
     case "agents":
       return "/agents";
+    case "connected-agents":
+      return "/admin/agents";
     case "messaging":
-      return "/messaging";
+      return "/admin/messaging";
     case "destinations":
     case "routes":
-      return "/destinations";
+      return "/admin/destinations";
     case "identities":
-      return "/identities";
+      return "/admin/identities";
     case "approvals":
-      return "/approvals";
+      return "/admin/approvals";
     case "automations":
     case "jobs":
-      return "/automations";
+      return "/admin/automations";
+    case "transactional-email":
+      return "/admin/transactional-email";
     case "audit":
-      return "/audit";
+      return "/admin/audit";
     case "dreams":
-      return "/dreams";
+      return "/admin/dreams";
     case "thread-debug":
     case "threads":
-      return "/thread-debug";
+      return "/admin/thread-debug";
     case "team":
       return "/settings/organization";
     case "extensions":

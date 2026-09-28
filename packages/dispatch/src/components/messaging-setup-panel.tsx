@@ -1,6 +1,8 @@
 import { useFormatters, useT } from "@agent-native/core/client/i18n";
 import {
+  channelIcon,
   disconnectManagedIntegrationInstallation,
+  hasMissingRequiredCredentials,
   listManagedIntegrationBudgets,
   listManagedIntegrationInstallations,
   listManagedIntegrationScopes,
@@ -23,14 +25,9 @@ import {
 import {
   listBuiltInChannelIntegrations,
   type IntegrationCatalogEntry,
-  type IntegrationCredentialRequirement,
 } from "@agent-native/core/integrations";
 import {
-  IconBrandDiscord,
   IconBrandSlack,
-  IconBrandTelegram,
-  IconBrandTeams,
-  IconBrandWhatsapp,
   IconCheck,
   IconChevronRight,
   IconCopy,
@@ -38,8 +35,6 @@ import {
   IconFileDescription,
   IconInfoCircle,
   IconLoader2,
-  IconMail,
-  IconPlug,
 } from "@tabler/icons-react";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
@@ -57,45 +52,15 @@ import {
   CollapsibleTrigger,
 } from "./ui/collapsible";
 import { Input } from "./ui/input";
+import { Skeleton } from "./ui/skeleton";
 import { Switch } from "./ui/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 
-const CHANNELS = listBuiltInChannelIntegrations();
-
-const PLATFORM_ICONS: Partial<Record<string, typeof IconBrandSlack>> = {
-  slack: IconBrandSlack,
-  "microsoft-teams": IconBrandTeams,
-  discord: IconBrandDiscord,
-  telegram: IconBrandTelegram,
-  whatsapp: IconBrandWhatsapp,
-  email: IconMail,
-};
-
-function hasMissingRequiredCredentials(
-  credentials: readonly IntegrationCredentialRequirement[],
-  envStatusByKey: Map<string, IntegrationEnvStatus>,
-) {
-  const alternatives = new Map<
-    string,
-    readonly IntegrationCredentialRequirement[]
-  >();
-
-  for (const credential of credentials) {
-    if (!credential.required) continue;
-    if (!credential.alternativeGroup) {
-      if (!envStatusByKey.get(credential.key)?.configured) return true;
-      continue;
-    }
-    const group = alternatives.get(credential.alternativeGroup) ?? [];
-    alternatives.set(credential.alternativeGroup, [...group, credential]);
-  }
-
-  return [...alternatives.values()].some((group) =>
-    group.every(
-      (credential) => !envStatusByKey.get(credential.key)?.configured,
-    ),
-  );
-}
+// Google Docs reads its service account key from the deployment environment
+// only, so this credential form can't set it up; apps list it in Channels.
+const CHANNELS = listBuiltInChannelIntegrations().filter(
+  (entry) => entry.id !== "google-docs",
+);
 
 function HelpTooltip({ content }: { content: string }) {
   return (
@@ -201,7 +166,8 @@ function ConnectionStatus({
 
 export function MessagingSetupPanel() {
   const t = useT();
-  const { formatDate } = useFormatters();
+  const formatters = useFormatters();
+  const formatDate = formatters.formatDate.bind(formatters);
   const [statuses, setStatuses] = useState<ClientIntegrationStatus[]>([]);
   const [loading, setLoading] = useState(true);
   const [envStatuses, setEnvStatuses] = useState<IntegrationEnvStatus[]>([]);
@@ -503,7 +469,7 @@ export function MessagingSetupPanel() {
           );
           const missingRequiredCredentials = hasMissingRequiredCredentials(
             envKeys,
-            envStatusByKey,
+            (key) => Boolean(envStatusByKey.get(key)?.configured),
           );
           const configuredCredentialCount = envKeys.filter(
             (envKey) => envStatusByKey.get(envKey.key)?.configured,
@@ -513,7 +479,7 @@ export function MessagingSetupPanel() {
             : missingRequiredCredentials
               ? "Required credentials are missing"
               : `${configuredCredentialCount} saved`;
-          const Icon = PLATFORM_ICONS[platform.iconKey] ?? IconPlug;
+          const Icon = channelIcon(platform.iconKey);
 
           return (
             <AccordionItem
@@ -553,7 +519,11 @@ export function MessagingSetupPanel() {
                             : "Finish setup to connect"}
                       </p>
                       <p className="mt-0.5 text-xs text-muted-foreground">
-                        {credentialSummary}
+                        {envLoading ? (
+                          <Skeleton className="h-3 w-32" />
+                        ) : (
+                          credentialSummary
+                        )}
                       </p>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
@@ -889,8 +859,6 @@ export function MessagingSetupPanel() {
                         const helpText = envKey.helpText ?? envStatus?.helpText;
                         const label =
                           envKey.label || envStatus?.label || envKey.key;
-                        // Email agent address is not a secret — show it plainly
-                        // so users can copy and share it.
                         const isPublicValue =
                           envKey.key === "EMAIL_AGENT_ADDRESS";
                         return (
@@ -1115,8 +1083,10 @@ export function MessagingSetupPanel() {
       </Accordion>
 
       {loading ? (
-        <div className="rounded-2xl border border-dashed px-4 py-6 text-sm text-muted-foreground">
-          Loading messaging status...
+        <div className="space-y-3 rounded-2xl border border-dashed px-4 py-6">
+          <Skeleton className="h-4 w-40" />
+          <Skeleton className="h-3 w-2/3 max-w-md" />
+          <Skeleton className="h-9 w-full max-w-sm" />
         </div>
       ) : null}
     </div>

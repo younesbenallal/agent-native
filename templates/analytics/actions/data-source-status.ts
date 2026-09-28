@@ -1,4 +1,4 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import {
   getWorkspaceConnectionProvider,
   listWorkspaceConnectionProvidersForTemplate,
@@ -68,7 +68,10 @@ async function listWorkspaceConnectionsForStatus(): Promise<{
 }> {
   try {
     return {
-      connections: await listWorkspaceConnections({ includeDisabled: true }),
+      connections: await listWorkspaceConnections({
+        appId: APP_ID,
+        includeDisabled: true,
+      }),
       grants: await listWorkspaceConnectionGrants({ appId: APP_ID }),
       error: null,
     };
@@ -96,8 +99,6 @@ export default defineAction({
   run: async (args) => {
     const ctx = tryRequestCredentialContext();
     if (!ctx) {
-      // Returning 200 here let callers read "signed out" as an authoritative
-      // "nothing is configured".
       throw Object.assign(new Error("Sign in to view credential status."), {
         statusCode: 401,
       });
@@ -208,9 +209,6 @@ export default defineAction({
           provider: provider.provider,
           label: provider.label,
           setupLink: dataSourceSetupLink(provider.provider),
-          // A failed workspace-connection lookup cannot prove a provider is
-          // disconnected — a workspace-held connection lives in exactly the
-          // data we could not read. Report null, never false.
           configured: configured ? true : workspace.error ? null : false,
           configuredKeys: configuredProviderKeys,
           missingRequiredKeys,

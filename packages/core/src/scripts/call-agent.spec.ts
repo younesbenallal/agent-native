@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { RemoteAgentCredentialRejectedError } from "../a2a/remote-agent-auth.js";
+import type { ActionRunContext } from "../action.js";
 import {
   registerTrackingProvider,
   unregisterTrackingProvider,
@@ -7,7 +9,15 @@ import {
 import type { TrackingEvent } from "../tracking/types.js";
 
 const callAgentMock = vi.hoisted(() => vi.fn());
+const managedHandlerMock = vi.hoisted(() => vi.fn());
 const invokeActionMock = vi.hoisted(() => vi.fn());
+const findAgentMock = vi.hoisted(() =>
+  vi.fn(async () => ({
+    name: "Slides",
+    url: "https://slides.agent-native.test",
+  })),
+);
+const resolveRemoteAgentTokenMock = vi.hoisted(() => vi.fn());
 const insertA2AContinuationMock = vi.hoisted(() => vi.fn());
 const getA2AContinuationsMock = vi.hoisted(() => vi.fn());
 const dispatchA2AContinuationMock = vi.hoisted(() => vi.fn());
@@ -30,11 +40,19 @@ const slackIntegrationContext = {
 };
 
 vi.mock("../server/agent-discovery.js", () => ({
-  findAgent: vi.fn(async () => ({
-    name: "Slides",
-    url: "https://slides.agent-native.test",
-  })),
+  findAgent: findAgentMock,
   discoverAgents: vi.fn(async () => []),
+}));
+
+vi.mock("../a2a/remote-agent-auth.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../a2a/remote-agent-auth.js")>()),
+  resolveRemoteAgentToken: resolveRemoteAgentTokenMock,
+}));
+
+vi.mock("../a2a/anthropic-managed-agents.js", () => ({
+  ANTHROPIC_MANAGED_AGENTS_METADATA_KEY:
+    "agent-native/anthropic-managed-agents",
+  createAnthropicManagedAgentsHandler: managedHandlerMock,
 }));
 
 vi.mock("../a2a/client.js", () => ({
@@ -63,6 +81,7 @@ vi.mock("../server/request-context.js", () => ({
   getRequestUserEmail: () => "alice+qa@agent-native.test",
   getRequestOrgId: () => "org-qa",
   getRequestRunContext: () => ({ model: "claude-opus-4-8" }),
+  getRequestContext: () => ({ userEmail: "alice+qa@agent-native.test" }),
   isIntegrationCallerRequest: () => true,
   getIntegrationRequestContext: integrationRequestContextMock,
 }));
@@ -76,14 +95,6 @@ vi.mock("../integrations/a2a-continuation-processor.js", () => ({
   dispatchA2AContinuation: dispatchA2AContinuationMock,
 }));
 
-// Full mock of run-store.js so the real run-manager.js can be imported and
-// driven end-to-end in the "progress heartbeat" tests below (see that
-// describe block for why: shouldBumpProgressForEvent, the predicate that
-// decides whether an event counts as real progress, is an unexported closure
-// inside run-manager.ts's startRun(), so the only faithful way to assert
-// against the REAL predicate — not a reimplemented copy — is to run a real
-// managed run and observe whether the mocked bumpRunProgress gets called.
-// This mirrors the mock shape in agent/run-manager.spec.ts.
 vi.mock("../agent/run-store.js", () => ({
   insertRun: vi.fn(() => Promise.resolve()),
   insertRunEvent: vi.fn(() => Promise.resolve()),
@@ -135,6 +146,12 @@ vi.mock("../agent/run-store.js", () => ({
 describe("call-agent action", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    findAgentMock.mockResolvedValue({
+      name: "Slides",
+      url: "https://slides.agent-native.test",
+    });
+    resolveRemoteAgentTokenMock.mockResolvedValue(undefined);
+    managedHandlerMock.mockReset();
     delete process.env.NETLIFY;
     delete process.env.NETLIFY_LOCAL;
     delete process.env.SITE_ID; // guard:allow-env-credential -- tests isolate Netlify's public runtime host marker.
@@ -157,6 +174,110 @@ describe("call-agent action", () => {
     expect(tool.description).toContain(
       "never expose or call a direct action to work around",
     );
+    expect(tool.description).toContain(
+      "Never put a create, update, delete, send, save, publish, or any other side effect in action",
+    );
+  });
+
+  it("routes a managed-agent manifest through its A2A handler adapter", async () => {
+    const handler = vi.fn(async () => ({
+      message: {
+        role: "agent" as const,
+        parts: [{ type: "text" as const, text: "managed answer" }],
+      },
+    }));
+    managedHandlerMock.mockReturnValueOnce(handler);
+    findAgentMock.mockResolvedValueOnce({
+      id: "anthropic-research",
+      name: "Anthropic Research",
+      url: "https://api.anthropic.com",
+      kind: {
+        provider: "anthropic-managed-agents",
+        agentId: "agt_fixture",
+        environmentId: "env_fixture",
+        credentialRef: "ANTHROPIC_API_KEY",
+      },
+    });
+    const { run } = await import("./call-agent.js");
+    const send = vi.fn();
+    const actionContext: ActionRunContext = {
+      caller: "tool",
+      send,
+      threadId: "thread-managed",
+      turnId: "turn-managed",
+    };
+
+    const result = await run(
+      { agent: "anthropic-research", message: "Summarize this repository." },
+      actionContext,
+      "dispatch",
+    );
+
+    expect(result).toBe("managed answer");
+    expect(callAgentMock).not.toHaveBeenCalled();
+    expect(managedHandlerMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "agt_fixture",
+        environmentId: "env_fixture",
+        credentialRef: "ANTHROPIC_API_KEY",
+        apiBaseUrl: "https://api.anthropic.com",
+      }),
+    );
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        role: "user",
+        parts: [{ type: "text", text: "Summarize this repository." }],
+      }),
+      expect.objectContaining({
+        taskId: "turn-managed",
+        contextId: "thread-managed",
+      }),
+    );
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "agent_call",
+        agent: "Anthropic Research",
+        status: "done",
+      }),
+    );
+  });
+
+  it("passes a managed continuation token without exposing the session ID", async () => {
+    const handler = vi.fn(async () => ({
+      message: {
+        role: "agent" as const,
+        parts: [{ type: "text" as const, text: "Approval required" }],
+        metadata: {
+          "agent-native/anthropic-managed-agents": {
+            continuationToken: "opaque-fixture-token",
+            pendingToolUseIds: ["tool_fixture"],
+          },
+        },
+      },
+      taskState: "input-required" as const,
+    }));
+    managedHandlerMock.mockReturnValueOnce(handler);
+    findAgentMock.mockResolvedValueOnce({
+      id: "anthropic-research",
+      name: "Anthropic Research",
+      url: "https://api.anthropic.com",
+      kind: {
+        provider: "anthropic-managed-agents",
+        agentId: "agt_fixture",
+        environmentId: "env_fixture",
+        credentialRef: "ANTHROPIC_API_KEY",
+      },
+    });
+
+    const { run } = await import("./call-agent.js");
+    const result = await run({
+      agent: "anthropic-research",
+      message: "Inspect the working tree.",
+    });
+
+    expect(result).toContain('taskId="opaque-fixture-token"');
+    expect(result).not.toContain("ses_fixture");
+    expect(result).not.toContain("in session");
   });
 
   it("forwards the user's exact downstream action authorization", async () => {
@@ -182,6 +303,51 @@ describe("call-agent action", () => {
     );
     expect(callAgentMock.mock.calls[0]?.[1]).toContain("<a2a-caller-hint>");
     expect(callAgentMock.mock.calls[0]?.[1]).toContain("</a2a-caller-hint>");
+    expect(callAgentMock.mock.calls[0]?.[2]).not.toHaveProperty("cardUrl");
+  });
+
+  it("labels an ordinary peer's rejected A2A credentials clearly", async () => {
+    callAgentMock.mockRejectedValueOnce(
+      new RemoteAgentCredentialRejectedError({ status: 401 }),
+    );
+    const { run } = await import("./call-agent.js");
+
+    await expect(
+      run({ agent: "slides", message: "make a deck" }),
+    ).rejects.toMatchObject({
+      errorCode: "a2a_auth_rejected",
+      message: expect.stringContaining("HTTP 401"),
+    });
+  });
+
+  it("uses the resolved token and lets the client derive the hosted card root", async () => {
+    findAgentMock.mockResolvedValueOnce({
+      name: "Hosted Slides",
+      url: "https://slides.agent-native.test/_agent-native/a2a",
+      auth: { type: "bearer", credentialRef: "slides-token" },
+    });
+    resolveRemoteAgentTokenMock.mockResolvedValueOnce("resolved-token");
+    callAgentMock.mockResolvedValueOnce("sent");
+    const { run } = await import("./call-agent.js");
+
+    await run({ agent: "hosted-slides", message: "make a deck" });
+
+    expect(resolveRemoteAgentTokenMock).toHaveBeenCalledWith(
+      { type: "bearer", credentialRef: "slides-token" },
+      expect.objectContaining({
+        userEmail: "alice+qa@agent-native.test",
+        orgId: "org-qa",
+      }),
+    );
+    expect(callAgentMock).toHaveBeenCalledWith(
+      "https://slides.agent-native.test/_agent-native/a2a",
+      expect.any(String),
+      expect.objectContaining({
+        apiKey: "resolved-token",
+      }),
+    );
+    expect(callAgentMock.mock.calls[0]?.[2]).not.toHaveProperty("cardUrl");
+    expect(callAgentMock.mock.calls[0]?.[2]).not.toHaveProperty("orgSecret");
   });
 
   it("forwards Slack source context as structured A2A data", async () => {
@@ -284,12 +450,12 @@ describe("call-agent action", () => {
       contextId: "thread-qa",
       correlation: {
         callerApp: "mail",
+        selectedReceiverApp: "slides",
         callerThreadId: "thread-qa",
         parentRunId: "run-qa",
         parentTurnId: "turn-qa",
         delegationDepth: 1,
         visitedApps: ["mail"],
-        // Preference hint: the receiver only uses it when it has no model.
         callerModel: "claude-opus-4-8",
       },
       idempotencyKey: expect.stringMatching(/^v1:[a-f0-9]{64}$/),
@@ -316,6 +482,7 @@ describe("call-agent action", () => {
 
     expect(callAgentMock.mock.calls[0]?.[2]?.correlation).toMatchObject({
       callerApp: "mail",
+      selectedReceiverApp: "slides",
       delegationDepth: 2,
       visitedApps: ["dispatch", "mail"],
     });
@@ -494,13 +661,20 @@ describe("call-agent action", () => {
       const { run } = await import("./call-agent.js");
       const send = vi.fn();
 
-      const result = await run(
-        { agent: "analytics", message: "analyze customers" },
-        { send } as any,
-      );
+      const result = run({ agent: "analytics", message: "analyze customers" }, {
+        send,
+      } as any);
 
-      expect(result).toContain(responseText);
-      if (state === "failed") expect(result).toMatch(/^Error:/);
+      if (state === "failed") {
+        await expect(result).rejects.toThrow(responseText);
+      } else {
+        const resolved = await result;
+        expect(resolved).toContain(responseText);
+        if (state === "input-required") {
+          expect(resolved).toContain(`taskId "task-${state}"`);
+          expect(resolved).toContain(`taskId="task-${state}" (omit message)`);
+        }
+      }
       expect(send).toHaveBeenCalledWith(
         expect.objectContaining({
           type: "agent_call",
@@ -511,8 +685,6 @@ describe("call-agent action", () => {
         expect.objectContaining({ type: "agent_call", status: "done" }),
       );
       if (state === "input-required") {
-        expect(result).toContain(`taskId "task-${state}"`);
-        expect(result).toContain(`taskId="task-${state}" (omit message)`);
         expect(send).toHaveBeenCalledWith(
           expect.objectContaining({
             type: "agent_call",
@@ -550,9 +722,6 @@ describe("call-agent action", () => {
     expect(send).not.toHaveBeenCalledWith(
       expect.objectContaining({ type: "agent_call", status: "done" }),
     );
-    // The reason has to ride on the event, not only on the telemetry call.
-    // This event is what lands in agent_run_events, and without a code the
-    // stored record says a cross-app call failed after N ms and never why.
     expect(send).toHaveBeenCalledWith(
       expect.objectContaining({
         type: "agent_call",
@@ -582,16 +751,18 @@ describe("call-agent action", () => {
       );
       const { run } = await import("./call-agent.js");
 
-      await run(
-        { agent: "analytics", message: "private customer request" },
-        {
-          send: vi.fn(),
-          threadId: "thread-qa",
-          runId: "run-qa",
-          turnId: "turn-qa",
-        } as any,
-        "mail",
-      );
+      await expect(
+        run(
+          { agent: "analytics", message: "private customer request" },
+          {
+            send: vi.fn(),
+            threadId: "thread-qa",
+            runId: "run-qa",
+            turnId: "turn-qa",
+          } as any,
+          "mail",
+        ),
+      ).rejects.toThrow("provider retries exhausted");
 
       const event = tracked.find(
         (candidate) => candidate.name === "$a2a_invocation",
@@ -615,17 +786,117 @@ describe("call-agent action", () => {
     }
   });
 
+  it("fails loudly when the delegation target cannot be resolved", async () => {
+    const discovery = await import("../server/agent-discovery.js");
+    vi.mocked(discovery.findAgent).mockResolvedValueOnce(undefined);
+    vi.mocked(discovery.discoverAgents).mockResolvedValueOnce([
+      { id: "plan", name: "Plan", description: "", url: "", color: "" },
+    ]);
+    const logged: string[] = [];
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation((...args: unknown[]) => {
+        logged.push(args.join(" "));
+      });
+    const tracked: TrackingEvent[] = [];
+    registerTrackingProvider({
+      name: "qa-a2a-not-found",
+      track(event) {
+        tracked.push(event);
+      },
+    });
+
+    try {
+      const { run } = await import("./call-agent.js");
+      const outcome = await run(
+        { agent: "nosuchapp", message: "Create the rollout plan" },
+        { send: vi.fn(), threadId: "t", runId: "r", turnId: "u" } as any,
+        "brain",
+      ).then(
+        (resolved) => ({ resolved }) as const,
+        (error) => ({ error }) as const,
+      );
+
+      expect("error" in outcome).toBe(true);
+      const error = (outcome as { error: any }).error;
+      expect(error.name).toBe("A2AInvocationError");
+      expect(error.errorCode).toBe("agent_not_found");
+      expect(error.message).toContain("nosuchapp");
+      expect(error.message).toContain("plan");
+      expect(error.message).toMatch(/not an outage/i);
+
+      expect(
+        logged.some((line) => line.includes("Unresolvable delegation target")),
+      ).toBe(true);
+      expect(
+        tracked.find((event) => event.name === "$a2a_invocation")?.properties,
+      ).toMatchObject({
+        caller_app: "brain",
+        target_app: "nosuchapp",
+        status: "error",
+        terminal_code: "agent_not_found",
+        mode: "message",
+      });
+    } finally {
+      unregisterTrackingProvider("qa-a2a-not-found");
+      consoleError.mockRestore();
+    }
+  });
+
+  it.each([
+    {
+      label: "direct action",
+      args: { action: "gong-calls" },
+      mode: "direct_action",
+    },
+    { label: "task poll", args: { taskId: "task-1" }, mode: "task_poll" },
+  ])(
+    "reports the caller's own mode when a $label target cannot be resolved",
+    async ({ args, mode }) => {
+      const discovery = await import("../server/agent-discovery.js");
+      vi.mocked(discovery.findAgent).mockResolvedValueOnce(undefined);
+      vi.mocked(discovery.discoverAgents).mockResolvedValueOnce([]);
+      const consoleError = vi
+        .spyOn(console, "error")
+        .mockImplementation(() => {});
+      const tracked: TrackingEvent[] = [];
+      registerTrackingProvider({
+        name: "qa-a2a-not-found-mode",
+        track(event) {
+          tracked.push(event);
+        },
+      });
+
+      try {
+        const { run } = await import("./call-agent.js");
+        await expect(
+          run(
+            { agent: "nosuchapp", ...args },
+            { send: vi.fn() } as any,
+            "brain",
+          ),
+        ).rejects.toMatchObject({ errorCode: "agent_not_found" });
+
+        expect(
+          tracked.find((event) => event.name === "$a2a_invocation")?.properties,
+        ).toMatchObject({ mode, terminal_code: "agent_not_found" });
+      } finally {
+        unregisterTrackingProvider("qa-a2a-not-found-mode");
+        consoleError.mockRestore();
+      }
+    },
+  );
+
   it("does not report an empty delegated response as success", async () => {
     callAgentMock.mockResolvedValueOnce("");
     const { run } = await import("./call-agent.js");
     const send = vi.fn();
 
-    const result = await run(
-      { agent: "analytics", message: "analyze customers" },
-      { send } as any,
-    );
-
-    expect(result).toBe("Error: The Slides agent returned no result.");
+    await expect(
+      run({ agent: "analytics", message: "analyze customers" }, {
+        send,
+      } as any),
+    ).rejects.toThrow("The Slides agent returned no result.");
     expect(send).toHaveBeenCalledWith(
       expect.objectContaining({ type: "agent_call", status: "error" }),
     );
@@ -853,7 +1124,6 @@ describe("call-agent action", () => {
   });
 
   describe("poll-driven progress", () => {
-    // Minimal A2A Task shaped like what callAgent()'s poll passes to onUpdate.
     const makeTask = (
       state: string,
       detailText?: string,
@@ -891,7 +1161,6 @@ describe("call-agent action", () => {
       expect(
         events.filter((e: any) => e.type === "agent_call_progress"),
       ).toHaveLength(0);
-      // The normal start/done bracket still fires unchanged.
       expect(events).toContainEqual(
         expect.objectContaining({ type: "agent_call", status: "start" }),
       );
@@ -918,11 +1187,8 @@ describe("call-agent action", () => {
           send,
         } as any);
 
-        // Flush setup awaits (findAgent, org lookups, token signing) until
-        // callAgent has been invoked and registered onUpdate.
         while (!onUpdate) await vi.advanceTimersByTimeAsync(1);
 
-        // 40 successful poll round-trips at 2s each = 80s of live remote work.
         for (let i = 0; i < 40; i++) {
           await vi.advanceTimersByTimeAsync(2_000);
           onUpdate!(makeTask("working", "Generating slides…"));
@@ -933,12 +1199,9 @@ describe("call-agent action", () => {
         const progress = send.mock.calls
           .map(([e]) => e)
           .filter((e: any) => e.type === "agent_call_progress");
-        // 80s under a 30s throttle -> ticks at ~30s and ~60s only.
         expect(progress.length).toBeGreaterThanOrEqual(2);
         expect(progress.length).toBeLessThanOrEqual(3);
-        // Emphatically NOT one-per-poll: far fewer than the 40 round-trips.
         expect(progress.length).toBeLessThan(10);
-        // Carries the real remote state and surfaced detail, not a bare tick.
         expect(progress[0]).toMatchObject({
           type: "agent_call_progress",
           agent: "Slides",
@@ -1004,11 +1267,6 @@ describe("call-agent action", () => {
         const { run: callAgentAction } = await import("./call-agent.js");
         const { startRun } = await import("../agent/run-manager.js");
 
-        // shouldBumpProgressForEvent is an unexported closure inside
-        // startRun(); the only faithful way to assert against the REAL
-        // predicate is to run a real managed run and observe whether the
-        // (mocked) bumpRunProgress fires. softTimeoutMs:0 keeps the run from
-        // auto-continuing during our time advances.
         const managedRun = startRun(
           "run-progress-1",
           "thread-progress-1",
@@ -1025,7 +1283,6 @@ describe("call-agent action", () => {
 
         while (!onUpdate) await vi.advanceTimersByTimeAsync(1);
 
-        // Two well-spaced successful polls -> two emitted progress events.
         await vi.advanceTimersByTimeAsync(30_000);
         onUpdate!(makeTask("working"));
         await vi.advanceTimersByTimeAsync(30_000);
@@ -1034,9 +1291,6 @@ describe("call-agent action", () => {
         resolveCall!("final");
         await vi.advanceTimersByTimeAsync(2_000);
 
-        // start + 2 progress + done = 4 events. A start+done-only run (zero
-        // progress) can bump at most twice, so >=4 proves the two
-        // agent_call_progress events themselves moved last_progress_at.
         expect(bumpRunProgressMock.mock.calls.length).toBeGreaterThanOrEqual(4);
       } finally {
         vi.useRealTimers();
@@ -1044,10 +1298,6 @@ describe("call-agent action", () => {
     });
 
     it("emits NOTHING when the remote hangs so the stuck-detector can still fire (onUpdate never called)", async () => {
-      // Remote is unresponsive: callAgent's poll fetch keeps throwing, so the
-      // client never invokes onUpdate. callAgent ultimately returns a
-      // took-too-long message. The regression this guards: a wall-clock
-      // heartbeat would keep emitting progress here and mask the hang.
       callAgentMock.mockImplementation(async (_url, _msg, opts) => {
         expect(typeof opts.onUpdate).toBe("function");
         return "The Slides agent is taking longer than expected and didn't reply in time.";
@@ -1061,7 +1311,6 @@ describe("call-agent action", () => {
       expect(
         events.filter((e: any) => e.type === "agent_call_progress"),
       ).toHaveLength(0);
-      // The call still bracketed start/done so the parent knows it ran.
       expect(events).toContainEqual(
         expect.objectContaining({ type: "agent_call", status: "start" }),
       );
@@ -1118,7 +1367,9 @@ describe("call-agent action", () => {
       const { run } = await import("./call-agent.js");
       const send = vi.fn();
 
-      await run({ agent: "slides", message: "x" }, { send } as any);
+      await expect(
+        run({ agent: "slides", message: "x" }, { send } as any),
+      ).rejects.toThrow("fetch failed");
 
       const events = send.mock.calls.map(([e]) => e);
       expect(
@@ -1143,8 +1394,6 @@ describe("call-agent action", () => {
         const p = run({ agent: "slides", message: "x" }, { send } as any);
         while (!onUpdate) await vi.advanceTimersByTimeAsync(1);
 
-        // Advance well past the 30s throttle so a working state WOULD emit —
-        // proving it's the terminal-state gate, not the throttle, suppressing.
         await vi.advanceTimersByTimeAsync(40_000);
         onUpdate!(makeTask("completed"));
         resolveCall!("done");
@@ -1246,7 +1495,6 @@ describe("call-agent action", () => {
         send: vi.fn(),
       } as any);
 
-      // NETLIFY_INTEGRATION_A2A_TIMEOUT_MS unchanged; onUpdate now threaded.
       expect(callAgentMock).toHaveBeenCalledWith(
         "https://slides.agent-native.test",
         expect.any(String),

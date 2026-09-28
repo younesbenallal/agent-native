@@ -3,8 +3,8 @@
  *
  * Owner-scoped throughout: every read and write takes an `ownerEmail` and the
  * SQL always filters by it, so the ownable table is never read or written
- * cross-owner (per the `security` skill). Dialect-agnostic — only `getDbExec()`
- * and parameterized SQL, never raw SQLite/Postgres types or string interpolation
+ * cross-owner (per the `security` skill). Uses `getDbExec()` and
+ * parameterized SQL, never string interpolation of user data.
  * of user data.
  *
  * `ensureTable()` lazily creates the table on first use (the same belt-and-
@@ -12,7 +12,7 @@
  * runtime even before the migration plugin is registered.
  */
 
-import { getDbExec, isPostgres } from "../../db/client.js";
+import { getDbExec } from "../../db/client.js";
 import { ensureTableExists, ensureIndexExists } from "../../db/ddl-guard.js";
 import type {
   ObservationalMemoryEntry,
@@ -22,30 +22,27 @@ import type {
 
 let tableReady: Promise<void> | null = null;
 
-async function ensureTable(): Promise<void> {
+export async function ensureTable(): Promise<void> {
   if (tableReady) return tableReady;
   tableReady = (async () => {
-    const client = getDbExec();
-    const intType = isPostgres() ? "BIGINT" : "INTEGER";
+    const integerType = "BIGINT";
     const createSql = `CREATE TABLE IF NOT EXISTS observational_memory (
         id TEXT PRIMARY KEY,
         thread_id TEXT NOT NULL,
         tier TEXT NOT NULL,
         text TEXT NOT NULL,
-        token_estimate ${intType} NOT NULL DEFAULT 0,
-        source_start_index ${intType},
-        source_end_index ${intType},
-        source_message_count ${intType} NOT NULL DEFAULT 0,
-        created_at ${intType} NOT NULL,
-        updated_at ${intType} NOT NULL,
+        token_estimate ${integerType} NOT NULL DEFAULT 0,
+        source_start_index ${integerType},
+        source_end_index ${integerType},
+        source_message_count ${integerType} NOT NULL DEFAULT 0,
+        created_at ${integerType} NOT NULL,
+        updated_at ${integerType} NOT NULL,
         owner_email TEXT NOT NULL,
         org_id TEXT,
         visibility TEXT NOT NULL DEFAULT 'private'
       )`;
 
-    if (isPostgres()) {
-      // PG-guard: probe information_schema / pg_indexes before issuing DDL to
-      // avoid ACCESS EXCLUSIVE lock contention in fresh background-worker processes.
+    {
       await ensureTableExists("observational_memory", createSql);
       await ensureIndexExists(
         "observational_memory_thread_tier_idx",
@@ -59,34 +56,13 @@ async function ensureTable(): Promise<void> {
       );
       return;
     }
-
-    // SQLite (local dev): no lock problem — keep the original behaviour.
-    await client.execute(createSql);
-    try {
-      await client.execute(
-        `CREATE INDEX IF NOT EXISTS observational_memory_thread_tier_idx
-          ON observational_memory(thread_id, tier, created_at)`,
-      );
-    } catch {
-      // Index already exists.
-    }
-    try {
-      await client.execute(
-        `CREATE INDEX IF NOT EXISTS observational_memory_thread_owner_idx
-          ON observational_memory(thread_id, owner_email)`,
-      );
-    } catch {
-      // Index already exists.
-    }
   })().catch((err) => {
-    // Reset so a transient failure (e.g. SQLITE_BUSY on HMR) can retry.
     tableReady = null;
     throw err;
   });
   return tableReady;
 }
 
-/** Reset the cached ensureTable promise — test-only seam. */
 export function __resetObservationalMemoryTableCache(): void {
   tableReady = null;
 }
@@ -153,7 +129,6 @@ export interface InsertObservationalMemoryInput extends ObservationalMemoryOwner
   visibility?: "private" | "org" | "public";
 }
 
-/** Insert one OM entry, returning the persisted row. */
 export async function insertObservationalMemory(
   input: InsertObservationalMemoryInput,
 ): Promise<ObservationalMemoryEntry> {
@@ -201,15 +176,9 @@ export async function insertObservationalMemory(
 
 export interface ListObservationalMemoryOptions extends ObservationalMemoryOwner {
   threadId: string;
-  /** When set, only entries of this tier are returned. */
   tier?: ObservationalMemoryTier;
 }
 
-/**
- * List a thread's OM entries for an owner, oldest → newest. Always
- * owner-scoped; `org_id` is matched too when supplied so org-visible rows
- * don't leak across orgs.
- */
 export async function listObservationalMemory(
   options: ListObservationalMemoryOptions,
 ): Promise<ObservationalMemoryEntry[]> {
@@ -231,11 +200,6 @@ export async function listObservationalMemory(
   return (result.rows as Record<string, unknown>[]).map(rowToEntry);
 }
 
-/**
- * The highest source-message index already folded into an observation for this
- * thread/owner, or -1 if none. The Observer uses this to know which messages
- * are still unobserved.
- */
 export async function getObservedThroughIndex(
   options: ObservationalMemoryOwner & { threadId: string },
 ): Promise<number> {
@@ -255,7 +219,6 @@ export async function getObservedThroughIndex(
   return max == null ? -1 : max;
 }
 
-/** Sum the token estimates of a thread's observation entries for an owner. */
 export async function getObservationLogTokens(
   options: ObservationalMemoryOwner & { threadId: string },
 ): Promise<number> {

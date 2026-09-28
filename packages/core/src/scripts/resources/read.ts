@@ -1,20 +1,13 @@
-/**
- * Core script: resource-read
- *
- * Read a resource and output its content to stdout.
- *
- * Usage:
- *   pnpm action resource-read --path <path> [--scope personal|shared|workspace]
- */
-
 import {
+  SHARED_OWNER,
   resourceGetByPath,
   ensurePersonalDefaults,
-  SHARED_OWNER,
+  sharedResourceOwner,
   WORKSPACE_OWNER,
 } from "../../resources/store.js";
 import {
   getAmbientUserEmail,
+  getRequestOrgId,
   getRequestUserEmail,
 } from "../../server/request-context.js";
 import { parseArgs, fail } from "../utils.js";
@@ -48,13 +41,15 @@ Options:
     );
   }
 
-  // Seed personal AGENTS.md + LEARNINGS.md on first access
   if (scope !== "shared" && scope !== "workspace") {
     await ensurePersonalDefaults(owner);
   }
 
   if (scope === "workspace") {
-    const resource = await resourceGetByPath(WORKSPACE_OWNER, resourcePath);
+    const orgId = getRequestOrgId() ?? null;
+    const resource = await resourceGetByPath(WORKSPACE_OWNER, resourcePath, {
+      orgId,
+    });
     if (!resource) {
       console.log(
         `Resource not found: ${resourcePath} (scope: workspace). Workspace resources are managed from Dispatch.`,
@@ -66,7 +61,13 @@ Options:
   }
 
   if (scope === "shared") {
-    const resource = await resourceGetByPath(SHARED_OWNER, resourcePath);
+    const orgId = getRequestOrgId() ?? null;
+    const sharedOwner = sharedResourceOwner(orgId);
+    const resource =
+      (await resourceGetByPath(sharedOwner, resourcePath, { orgId })) ??
+      (sharedOwner === SHARED_OWNER
+        ? null
+        : await resourceGetByPath(SHARED_OWNER, resourcePath, { orgId }));
     if (!resource) {
       console.log(
         `Resource not found: ${resourcePath} (scope: shared). You can create it with resource-write.`,
@@ -77,7 +78,6 @@ Options:
     return;
   }
 
-  // Default: try personal first, then app/organization shared, then workspace.
   const personal = await resourceGetByPath(owner, resourcePath);
   if (personal) {
     process.stdout.write(personal.content);
@@ -85,20 +85,27 @@ Options:
   }
 
   if (scope === "personal") {
-    // Explicit personal scope — don't fall back
     console.log(
       `Resource not found: ${resourcePath} (scope: personal). You can create it with resource-write.`,
     );
     return;
   }
 
-  const shared = await resourceGetByPath(SHARED_OWNER, resourcePath);
+  const orgId = getRequestOrgId() ?? null;
+  const sharedOwner = sharedResourceOwner(orgId);
+  const shared =
+    (await resourceGetByPath(sharedOwner, resourcePath, { orgId })) ??
+    (sharedOwner === SHARED_OWNER
+      ? null
+      : await resourceGetByPath(SHARED_OWNER, resourcePath, { orgId }));
   if (shared) {
     process.stdout.write(shared.content);
     return;
   }
 
-  const workspace = await resourceGetByPath(WORKSPACE_OWNER, resourcePath);
+  const workspace = await resourceGetByPath(WORKSPACE_OWNER, resourcePath, {
+    orgId,
+  });
   if (workspace) {
     process.stdout.write(workspace.content);
     return;

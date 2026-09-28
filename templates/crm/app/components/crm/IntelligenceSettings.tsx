@@ -39,8 +39,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+
+import {
+  CrmSettingsPanelHeader,
+  crmSettingsPanelClassName,
+  type CrmSettingsPanelProps,
+} from "./settings/SettingsPanelHeader";
 
 type TrackerKind = "keyword" | "smart";
 
@@ -73,7 +80,7 @@ interface ManageTrackerInput {
   enabled?: boolean;
 }
 
-export function IntelligenceSettings() {
+export function IntelligenceSettings({ embedded }: CrmSettingsPanelProps = {}) {
   const t = useT();
   const trackersQuery = useActionQuery<SignalTrackersResult>(
     "list-crm-signal-trackers" as never,
@@ -117,23 +124,36 @@ export function IntelligenceSettings() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-2xl">
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div className="min-w-0">
-          <h1 className="text-xl font-semibold tracking-tight">
-            {t("intelligence.title")}
-          </h1>
-          <p className="mt-1 max-w-xl text-sm leading-6 text-muted-foreground">
-            {t("intelligence.description")}
-          </p>
-        </div>
-        <CreateTrackerDialog mutation={createTracker} />
-      </div>
+    <div className={crmSettingsPanelClassName(embedded)}>
+      <CrmSettingsPanelHeader
+        embedded={embedded}
+        title={t("intelligence.title")}
+        description={t("intelligence.description")}
+        descriptionClassName="max-w-xl"
+        action={<CreateTrackerDialog mutation={createTracker} />}
+      />
 
       {trackersQuery.isLoading ? (
-        <p className="mt-8 text-sm text-muted-foreground">
-          {t("intelligence.loading")}
-        </p>
+        <div
+          className="mt-8 space-y-2"
+          role="status"
+          aria-busy="true"
+          aria-label={t("intelligence.loading")}
+        >
+          {[0, 1, 2].map((item) => (
+            <div
+              key={item}
+              className="flex items-center gap-4 rounded-lg border border-border/70 bg-card px-4 py-3.5"
+            >
+              <Skeleton className="size-4" />
+              <div className="flex-1 space-y-2">
+                <Skeleton className="h-4 w-40" />
+                <Skeleton className="h-3 w-56" />
+              </div>
+              <Skeleton className="size-5 rounded-full" />
+            </div>
+          ))}
+        </div>
       ) : trackers.length ? (
         <div className="mt-8 divide-y divide-border/70 rounded-lg border border-border/70 bg-card">
           {trackers.map((tracker) => {

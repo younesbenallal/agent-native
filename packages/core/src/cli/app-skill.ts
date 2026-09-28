@@ -1,18 +1,13 @@
-/**
- * `agent-native app-skill` packages an agent-native app as a distributable
- * skill bundle: instructions + MCP connector + embeddable app surfaces.
- *
- * The manifest intentionally contains no user secrets. Hosted installs write
- * URL-only MCP entries; clients that need auth complete OAuth/device setup in
- * the host. Local installs point at a developer-owned app process.
- */
-
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import {
+  AGENT_PLUGIN_MCP_SCHEMA,
+  AGENT_PLUGIN_SCHEMA,
+} from "./agent-plugin.js";
 import {
   resolveClients,
   supportsRemoteMcpOAuth,
@@ -53,11 +48,6 @@ export interface AppSkillManifest {
   id: string;
   displayName: string;
   description: string;
-  /**
-   * Optional semver base for generated plugin manifests. Codex keys its plugin
-   * cache on the version string, so the packer appends a content hash to this
-   * base; leave it unset to default to "1.0.0".
-   */
   version?: string;
   hosted: {
     url: string;
@@ -168,7 +158,7 @@ Usage:
 Commands:
   ensure   Register the app skill MCP connector for your local agent clients.
   launch   Open the hosted app, or materialize and start a local editable app.
-  pack     Create marketplace-ready skill, MCP, Codex/Claude plugin, and Vercel skills adapters.
+  pack     Create a standard Agent Plugin plus marketplace-ready skill, MCP, and host adapters.
 
 Hosted is the default. Use --local when you want editable source, offline work,
 or a privacy-sensitive local app instance.`;
@@ -311,7 +301,7 @@ export function normalizeAppSkillManifest(raw: unknown): AppSkillManifest {
     displayName: stringValue(raw.displayName) ?? id,
     description:
       stringValue(raw.description) ??
-      `Agent-native app-backed skill for ${id}.`,
+      `Agent-Native app-backed skill for ${id}.`,
     ...(stringValue(raw.version) ? { version: stringValue(raw.version) } : {}),
     hosted: {
       url: hostedUrl,
@@ -571,9 +561,6 @@ function copyDirFiltered(source: string, dest: string): void {
         !base.startsWith(".env") &&
         base !== ".dev.vars" &&
         base !== ".npmrc" &&
-        !lower.endsWith(".db") &&
-        !lower.endsWith(".sqlite") &&
-        !lower.endsWith(".sqlite3") &&
         !lower.endsWith(".pem") &&
         !lower.endsWith(".key") &&
         !lower.endsWith(".crt") &&
@@ -649,8 +636,48 @@ function mcpServerConfig(manifest: AppSkillManifest, serverName?: string) {
   };
 }
 
+function standardAgentPluginManifest(
+  manifest: AppSkillManifest,
+  version: string,
+) {
+  return {
+    $schema: AGENT_PLUGIN_SCHEMA,
+    name: pluginName(manifest),
+    version,
+    description: manifest.description,
+    author: {
+      name: "Agent-Native",
+      url: "https://agent-native.com",
+    },
+    homepage: manifest.hosted.url,
+    repository: "https://github.com/BuilderIO/agent-native",
+    license: "MIT",
+    keywords: [
+      "agent-native",
+      manifest.id,
+      "mcp",
+      "skills",
+      "app-backed-skill",
+    ],
+  };
+}
+
+function standardAgentPluginMcpConfig(manifest: AppSkillManifest) {
+  return {
+    $schema: AGENT_PLUGIN_MCP_SCHEMA,
+    mcpServers: {
+      [manifest.mcp.serverName]: {
+        type: "streamable-http",
+        url: manifest.hosted.mcpUrl,
+      },
+    },
+  };
+}
+
 function pluginName(manifest: AppSkillManifest): string {
-  return `agent-native-${manifest.id}`;
+  return manifest.id === "agent-native"
+    ? manifest.id
+    : `agent-native-${manifest.id}`;
 }
 
 function claudeMarketplaceName(): string {
@@ -665,9 +692,6 @@ export function exportedSkillContentHash(
   const parts = skills
     .map((skill) => {
       const skillDir = path.join(manifestDir, skill.path);
-      // Hash SKILL.md plus every sibling file under the skill dir (e.g.
-      // references/*), so a progressive-disclosure reference edit still changes
-      // the content hash and bumps the Codex plugin version for auto-upgrade.
       const body = collectSkillFiles(skillDir)
         .map(
           (rel) =>
@@ -686,11 +710,6 @@ export function exportedSkillContentHash(
     .slice(0, 12);
 }
 
-/**
- * List a skill dir's files (SKILL.md + any siblings like references/*) as
- * skill-relative POSIX paths, sorted for a stable content hash. A bare SKILL.md
- * source (file, not dir) falls back to just "SKILL.md".
- */
 function collectSkillFiles(skillDir: string): string[] {
   const out: string[] = [];
   const walk = (dir: string, prefix: string): void => {
@@ -703,21 +722,11 @@ function collectSkillFiles(skillDir: string): string[] {
   };
   walk(skillDir, "");
   if (out.length === 0) {
-    // Source resolved to a single SKILL.md file rather than a dir, or is empty.
     return ["SKILL.md"];
   }
   return out.sort();
 }
 
-/**
- * Plugin version embeds a content hash of the exported skills + MCP server
- * identity/endpoint.
- * Codex keys its plugin cache on the version string, so a changed skill or MCP
- * URL yields a new version and `codex plugin marketplace upgrade` (which runs
- * on startup) delivers the update automatically — no manual semver bump per
- * edit. Claude Code uses commit-SHA versioning instead (plugin.json omits
- * version), so it auto-updates on every push.
- */
 export function resolvePluginVersion(
   manifest: AppSkillManifest,
   manifestDir: string,
@@ -955,6 +964,14 @@ export function buildAppSkillPack(
       }
     : manifest;
   writeJson(path.join(target, "agent-native.app-skill.json"), packedManifest);
+  writeJson(
+    path.join(target, "plugin.json"),
+    standardAgentPluginManifest(manifest, pluginVersion),
+  );
+  writeJson(
+    path.join(target, "mcp.json"),
+    standardAgentPluginMcpConfig(manifest),
+  );
   if (appSource) {
     copyDirFiltered(appSource, path.join(target, "app"));
   }
@@ -964,6 +981,8 @@ export function buildAppSkillPack(
 
   const files: string[] = [
     path.join(target, "agent-native.app-skill.json"),
+    path.join(target, "plugin.json"),
+    path.join(target, "mcp.json"),
     ...(appSource ? [path.join(target, "app")] : []),
     ...exportedSkillNames.map((name) =>
       path.join(target, "skills", name, "SKILL.md"),
@@ -1257,11 +1276,6 @@ export async function ensureAppSkill(
     return result;
   }
 
-  // Aliases are intentionally NOT written as separate entries. Instead,
-  // repurpose the alias list as a cleanup list: remove any other entries in
-  // the same config files that point at the same URL (covers legacy alias
-  // names, old default names like 'agent-native-<slug>', and any stale
-  // custom names left from previous installs).
   const allRemovedNames: string[] = [];
   for (const client of writableClients) {
     const removed = removeSameUrlDuplicatesForClient(

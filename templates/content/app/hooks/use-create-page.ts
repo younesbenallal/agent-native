@@ -1,7 +1,7 @@
 import type { Document } from "@shared/api";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback } from "react";
-import { useNavigate } from "react-router";
+import { useLocation, useNavigate } from "react-router";
 import { toast } from "sonner";
 
 import {
@@ -10,7 +10,10 @@ import {
   SELECTED_CONTENT_SPACE_STORAGE_KEY,
 } from "@/components/sidebar/select-content-space";
 import { useContentSpaces } from "@/hooks/use-content-spaces";
-import { useCreateDocument } from "@/hooks/use-documents";
+import {
+  rollbackOptimisticCreatedDocument,
+  useCreateDocument,
+} from "@/hooks/use-documents";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 import { documentQueryFilter } from "@/lib/document-query";
 import { markDocumentCreationPending } from "@/lib/optimistic-document";
@@ -34,6 +37,7 @@ export function useCreatePage(opts?: {
   awaitPersist?: boolean;
 }) {
   const navigate = useNavigate();
+  const location = useLocation();
   const queryClient = useQueryClient();
   const createDocument = useCreateDocument();
   const contentSpacesQuery = useContentSpaces();
@@ -50,7 +54,7 @@ export function useCreatePage(opts?: {
   const shouldAwaitPersist = opts?.awaitPersist ?? true;
 
   return useCallback(
-    async (parentId?: string) => {
+    async (parentId?: string, requestedId?: string) => {
       let spaceId: string | undefined;
       try {
         spaceId = contentSpaceIdForCreate({
@@ -63,7 +67,7 @@ export function useCreatePage(opts?: {
         );
         throw error;
       }
-      const id = nanoid();
+      const id = requestedId ?? nanoid();
       const now = new Date().toISOString();
       const tempDoc = markDocumentCreationPending({
         id,
@@ -78,16 +82,24 @@ export function useCreatePage(opts?: {
         createdAt: now,
         updatedAt: now,
       });
+      const previousDocuments = queryClient.getQueryData(
+        LIST_DOCUMENTS_QUERY_KEY,
+      );
+      const previousPath = `${location.pathname}${location.search}${location.hash}`;
 
       queryClient.setQueryData(LIST_DOCUMENTS_QUERY_KEY, (old: any) => {
         const docs: Document[] =
           old?.documents ?? (Array.isArray(old) ? old : []);
-        return { documents: [...docs, tempDoc] };
+        if (Array.isArray(old)) return [...docs, tempDoc];
+        return {
+          ...(old && typeof old === "object" ? old : {}),
+          documents: [...docs, tempDoc],
+        };
       });
       queryClient.setQueryData(["action", "get-document", { id }], tempDoc);
 
       if (shouldNavigate) {
-        navigate(`/page/${id}`, { flushSync: true });
+        void navigate(`/page/${id}`, { flushSync: true });
         onAfterNavigate?.();
       }
 
@@ -102,20 +114,25 @@ export function useCreatePage(opts?: {
           ["action", "get-document", { id: created.id }],
           created,
         );
-        // Replace optimistic doc with real server doc + clear any 404 error
-        // state from the in-flight fetch that ran before create completed.
-        queryClient.invalidateQueries(documentQueryFilter(id));
-        queryClient.invalidateQueries({
+        void queryClient.invalidateQueries(documentQueryFilter(id));
+        void queryClient.invalidateQueries({
           queryKey: ["action", "list-documents"],
         });
       };
 
       const onPersistError = (err: unknown) => {
-        queryClient.invalidateQueries({
+        rollbackOptimisticCreatedDocument(
+          queryClient,
+          id,
+          previousDocuments !== undefined,
+        );
+        void queryClient.invalidateQueries({
           queryKey: ["action", "list-documents"],
         });
         queryClient.removeQueries(documentQueryFilter(id));
-        if (shouldNavigate) navigate("/");
+        if (shouldNavigate) {
+          void navigate(previousPath, { replace: true, flushSync: true });
+        }
         toast.error("Failed to create page", {
           description:
             err instanceof Error ? err.message : "Something went wrong",
@@ -137,6 +154,9 @@ export function useCreatePage(opts?: {
     },
     [
       createDocument,
+      location.hash,
+      location.pathname,
+      location.search,
       navigate,
       onAfterNavigate,
       queryClient,

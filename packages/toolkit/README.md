@@ -21,6 +21,21 @@ Creative Context, and Pinpoint are Toolkit capability modules installed on
 demand. They remain separate npm packages with independent lifecycle manifests
 and docs. Dispatch is a separate product rather than a Toolkit module.
 
+## AgentKit
+
+AgentKit is split at a deliberate seam. Toolkit owns presentation primitives:
+composers, prompt menus, agent-authored next-action bars, queue drawers, and
+design-system adapters. Core owns runtime-backed chat surfaces and registries:
+streaming text, activity traces, approvals, tool and widget renderers, threads,
+attachments, and application-state adapters. Both layers are reusable, and
+Toolkit stays Core-free. The provider-neutral event contract lives in
+[`@agent-native/agentkit/protocol`](../agentkit/README.md).
+
+AgentKit is an independent implementation optimized for Agent-Native workflows.
+The protocol README records the shared product goals and clean implementation
+boundary; it is not a runtime dependency or compatibility layer for another
+chat product.
+
 ## Imports
 
 ```tsx
@@ -39,6 +54,7 @@ import {
   StatsCard,
   buildDashboardPanelGroups,
 } from "@agent-native/toolkit/dashboard";
+import { DataGrid } from "@agent-native/toolkit/data-grid";
 import {
   CanvasCommentPins,
   DrawOverlay,
@@ -55,6 +71,7 @@ import { Toaster } from "@agent-native/toolkit/ui/sonner";
 import { useToast } from "@agent-native/toolkit/hooks/use-toast";
 import {
   SidebarFooterActions,
+  usePersistentSidebarCollapsed,
   useSetHeaderActions,
 } from "@agent-native/toolkit/app-shell";
 ```
@@ -85,6 +102,14 @@ Use `SidebarFooterActions` for the shared left-sidebar utility row. Provide the
 app-owned controls through its slots; the rendered order is feedback, search,
 then collapse, with the same order stacked in collapsed sidebars.
 
+Use `usePersistentSidebarCollapsed` for a collapsible desktop navigation
+sidebar that should remember a person's choice after refresh. Each app supplies
+its own stable storage key and first-use default. The hook restores valid
+browser state immediately after hydration, keeps explicit changes responsive
+when storage is unavailable, and exposes `persistenceStatus` so unavailable or
+malformed storage is distinguishable from a saved preference. Keep temporary
+mobile drawer state separate.
+
 Inside template apps, prefer local adapters such as `@/components/ui/button` so
 apps can replace their primitives without changing every callsite.
 
@@ -109,6 +134,31 @@ than sharing dashboard rows between apps. Resolve panel data with a
 `PanelSourceResolver`; the built-in `program` resolver runs an app-owned data
 program and is the zero-wiring default. Provider-specific resolvers stay in the
 app that owns their credentials and query policy.
+
+## Data grid kit
+
+`@agent-native/toolkit/data-grid` provides the spreadsheet-like interaction
+layer without owning a data model. Supply rows, typed columns, editor slots,
+selection state, and commit callbacks from the app. Keyboard navigation,
+selection, column resizing, and the scroll surface are shared; `renderHeader`,
+`renderBody`, `renderRow`, and `renderFooter` let an app preserve product-
+specific headers, grouping, and row actions while adopting the same grid
+mechanics.
+
+```tsx
+<DataGrid
+  rows={rows}
+  columns={columns}
+  getRowId={(row) => row.id}
+  onCellCommit={({ row, column, value }) =>
+    updateCell(row.id, column.id, value)
+  }
+/>
+```
+
+The kit never fetches data, calls actions, resolves credentials, or persists
+edits. Eject it with `agent-native eject toolkit/data-grid --app <app>` when a
+product needs a deeper local visual or interaction change.
 
 ## Customize Or Take Ownership
 

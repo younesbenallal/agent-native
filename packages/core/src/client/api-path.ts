@@ -1,6 +1,51 @@
+import {
+  FRAMEWORK_INTERNAL_ROUTE_PREFIX,
+  matchesPathPrefix,
+  normalizeFrameworkRoutePrefix,
+  SERVER_ROUTE_PREFIXES,
+  toPublicFrameworkPath,
+} from "../shared/framework-route-prefix.js";
+import { isTruthyRuntimeValue } from "../shared/runtime-config.js";
+import { injectedAgentNativeConfig } from "./app-config.js";
 import { initializeAgentNativeClient } from "./client-bootstrap.js";
 
-const FRAMEWORK_ROUTE_PREFIX = "/_agent-native";
+export function frameworkRoutePrefix(): string {
+  const configured = injectedAgentNativeConfig().runtime?.frameworkRoutePrefix;
+  if (configured !== undefined) {
+    return normalizeFrameworkRoutePrefix(configured);
+  }
+  const projected =
+    typeof window === "undefined"
+      ? undefined
+      : (
+          window as Window & {
+            __AGENT_NATIVE_CONFIG__?: { frameworkRoutePrefix?: unknown };
+          }
+        ).__AGENT_NATIVE_CONFIG__?.frameworkRoutePrefix;
+  return normalizeFrameworkRoutePrefix(
+    projected,
+    "window.__AGENT_NATIVE_CONFIG__.frameworkRoutePrefix",
+  );
+}
+
+export function isFrameworkRoutePath(pathname: string): boolean {
+  return (
+    matchesPathPrefix(pathname, FRAMEWORK_INTERNAL_ROUTE_PREFIX) ||
+    matchesPathPrefix(pathname, frameworkRoutePrefix())
+  );
+}
+
+/**
+ * True when the server answers `pathname` itself (the framework namespace,
+ * `/api`, `/mcp`, `/.well-known`, `/assets`) rather than the app's router.
+ * `pathname` is router-relative: strip the app base path first.
+ */
+export function isServerRoutePath(pathname: string): boolean {
+  return (
+    isFrameworkRoutePath(pathname) ||
+    SERVER_ROUTE_PREFIXES.some((prefix) => matchesPathPrefix(pathname, prefix))
+  );
+}
 
 function normalizeBasePath(value: string | undefined): string {
   if (!value || value === "/") return "";
@@ -31,10 +76,39 @@ function clientEnv(): Record<string, string | boolean | undefined> | undefined {
   return importMetaEnv ?? processEnv;
 }
 
+function frameworkMarkerIndex(pathname: string): number {
+  for (const marker of [
+    frameworkRoutePrefix(),
+    FRAMEWORK_INTERNAL_ROUTE_PREFIX,
+  ]) {
+    for (
+      let index = pathname.indexOf(marker);
+      index > 0;
+      index = pathname.indexOf(marker, index + 1)
+    ) {
+      const end = index + marker.length;
+      if (end === pathname.length || pathname[end] === "/") return index;
+    }
+  }
+  return -1;
+}
+
+function isFrameworkSegment(segment: string): boolean {
+  return (
+    `/${segment}` === FRAMEWORK_INTERNAL_ROUTE_PREFIX ||
+    `/${segment}` === frameworkRoutePrefix()
+  );
+}
+
 function pathDerivedBasePath(): string {
-  if (typeof window === "undefined") return "";
+  if (
+    typeof window === "undefined" ||
+    typeof window.location?.pathname !== "string"
+  ) {
+    return "";
+  }
   const pathname = window.location.pathname;
-  const markerIndex = pathname.indexOf(FRAMEWORK_ROUTE_PREFIX);
+  const markerIndex = frameworkMarkerIndex(pathname);
   if (markerIndex <= 0) return "";
   return normalizeBasePath(pathname.slice(0, markerIndex));
 }
@@ -45,18 +119,31 @@ function pathMatchesBasePath(pathname: string, basePath: string): boolean {
 
 function isWorkspaceRuntime(): boolean {
   const env = clientEnv();
+  const projected =
+    typeof window !== "undefined" &&
+    (
+      window as Window & {
+        __AGENT_NATIVE_CONFIG__?: { workspaceRuntime?: unknown };
+      }
+    ).__AGENT_NATIVE_CONFIG__?.workspaceRuntime === true;
   return (
-    env?.VITE_AGENT_NATIVE_WORKSPACE === "1" ||
-    env?.AGENT_NATIVE_WORKSPACE === "1" ||
+    projected ||
+    isTruthyRuntimeValue(env?.VITE_AGENT_NATIVE_WORKSPACE) ||
+    isTruthyRuntimeValue(env?.AGENT_NATIVE_WORKSPACE) ||
     typeof env?.VITE_AGENT_NATIVE_WORKSPACE_APPS_JSON === "string"
   );
 }
 
 function workspacePathBasePath(): string {
   if (typeof window === "undefined" || !isWorkspaceRuntime()) return "";
-  const segment = window.location.pathname.split("/").find(Boolean);
-  if (!segment || segment === "_agent-native" || segment === "api") return "";
-  return normalizeBasePath(segment);
+  const pathname = window.location?.pathname;
+  if (typeof pathname !== "string") return "";
+  const segment = pathname.split("/").find(Boolean);
+  if (!segment || isFrameworkSegment(segment) || segment === "api") return "";
+  const basePath = normalizeBasePath(segment);
+  const mounts = workspaceAppMountPaths();
+  if (mounts && !mounts.has(basePath)) return "";
+  return basePath;
 }
 
 function externalEmbedTargetBasePath(): string {
@@ -69,13 +156,13 @@ function externalEmbedTargetBasePath(): string {
   if (typeof target !== "string" || !target.startsWith("/")) return "";
   try {
     const url = new URL(target, "http://agent-native.invalid");
-    const markerIndex = url.pathname.indexOf(FRAMEWORK_ROUTE_PREFIX);
+    const markerIndex = frameworkMarkerIndex(url.pathname);
     if (markerIndex > 0) {
       return normalizeBasePath(url.pathname.slice(0, markerIndex));
     }
     if (isWorkspaceRuntime()) {
       const segment = url.pathname.split("/").find(Boolean);
-      if (segment && segment !== "_agent-native" && segment !== "api") {
+      if (segment && !isFrameworkSegment(segment) && segment !== "api") {
         return normalizeBasePath(segment);
       }
     }
@@ -91,14 +178,12 @@ export function appBasePath(): string {
   if (externalEmbed) return externalEmbed;
   const configured = configuredBasePath();
   const derived = pathDerivedBasePath();
-  if (!configured) return derived;
+  if (!configured) return derived || workspacePathBasePath();
   if (typeof window === "undefined") return configured;
 
   const pathname = window.location.pathname;
   if (pathMatchesBasePath(pathname, configured)) return configured;
 
-  // In a multi-app workspace, a globally configured base can bleed from one
-  // app build into another. Prefer the live mount path when they disagree.
   return derived || workspacePathBasePath() || configured;
 }
 
@@ -136,11 +221,6 @@ function workspaceAppMountPaths(): Set<string> | null {
   }
 }
 
-/**
- * Returns true for a same-origin path mounted at a sibling workspace app.
- * React Router treats root paths as local to its basename, so these targets
- * must use the browser location instead of the app-local router.
- */
 export function isWorkspaceAppPath(path: string): boolean {
   if (typeof window === "undefined" || !path.startsWith("/")) return false;
   if (!isWorkspaceRuntime()) return false;
@@ -157,6 +237,56 @@ export function isWorkspaceAppPath(path: string): boolean {
   return [...mounts].some(
     (mount) => targetPath === mount || targetPath.startsWith(`${mount}/`),
   );
+}
+
+export function appMountPath(appLocalRoute: string): string {
+  const basePath = appBasePath();
+  if (typeof window === "undefined") return basePath;
+
+  const pathname = window.location.pathname;
+  if (basePath && pathMatchesBasePath(pathname, basePath)) return basePath;
+
+  const marker = normalizeBasePath(appLocalRoute);
+  if (!marker) {
+    return isWorkspaceRuntime() && pathname !== "/"
+      ? normalizeBasePath(pathname)
+      : basePath;
+  }
+  const markerSegment = marker.slice(1);
+
+  const mounts = workspaceAppMountPaths();
+  const candidates: string[] = [];
+  for (
+    let index = pathname.indexOf(markerSegment);
+    index >= 0;
+    index = pathname.indexOf(markerSegment, index + 1)
+  ) {
+    const boundary = index + markerSegment.length;
+    if (
+      (index === 0 || pathname[index - 1] === "/") &&
+      (boundary === pathname.length || pathname[boundary] === "/")
+    ) {
+      candidates.push(normalizeBasePath(pathname.slice(0, index)));
+    }
+  }
+
+  const knownCandidates = mounts
+    ? candidates.filter((candidate) => mounts.has(candidate))
+    : candidates;
+  if (mounts && knownCandidates.length) {
+    return knownCandidates.sort((a, b) => b.length - a.length)[0];
+  }
+  return candidates[0] ?? basePath;
+}
+
+export function appMountedPath(path: string, appLocalRoute: string): string {
+  if (!path.startsWith("/")) return path;
+  const mountPath = appMountPath(appLocalRoute);
+  if (!mountPath) return path;
+
+  const mounted = `${mountPath}${normalizeBasePath(appLocalRoute)}`;
+  if (path === mounted || path.startsWith(`${mounted}/`)) return path;
+  return `${mountPath}${path}`;
 }
 
 export function appPath(path: string): string {
@@ -176,6 +306,30 @@ export function appApiPath(path: string): string {
 }
 
 export function agentNativePath(path: string): string {
-  if (!path.startsWith(FRAMEWORK_ROUTE_PREFIX)) return path;
-  return appPath(path);
+  const queryOrFragment = path.search(/[?#]/);
+  const pathname =
+    queryOrFragment === -1 ? path : path.slice(0, queryOrFragment);
+  if (!matchesPathPrefix(pathname, FRAMEWORK_INTERNAL_ROUTE_PREFIX))
+    return path;
+  return appPath(
+    toPublicFrameworkPath(path, { publicPrefix: frameworkRoutePrefix() }),
+  );
+}
+
+export function agentChatStreamingUrl(): string | undefined {
+  const value = clientEnv()?.VITE_AGENT_NATIVE_AGENT_CHAT_STREAM_URL;
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const candidate = value.trim();
+  const base =
+    typeof window === "undefined"
+      ? "http://agent-native.invalid"
+      : window.location.href;
+  if (!URL.canParse(candidate, base)) {
+    return undefined;
+  }
+  const url = new URL(candidate, base);
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return undefined;
+  }
+  return candidate;
 }

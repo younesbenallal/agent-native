@@ -3,9 +3,11 @@
  * Compatibility aggregation only; new code must not import this barrel.
  */
 export * from "./agent-chat/index.js";
+export * from "./desktop-local-code-change.js";
 export * from "./hooks/index.js";
 export * from "./navigation/index.js";
 export * from "./host/index.js";
+export * from "./webmcp.js";
 export * from "./widgets/index.js";
 export * from "./ui/index.js";
 
@@ -14,7 +16,10 @@ export {
   AgentNativeI18nProvider,
   LanguagePicker,
   getLocaleInitScript,
+  isLocaleCode,
+  isValidLocaleCode,
   localeDirection,
+  localeMetadataFor,
   normalizeLocaleCode,
   normalizeLocalePreference,
   normalizeLocalizationPreference,
@@ -30,6 +35,7 @@ export {
   SUPPORTED_LOCALES,
   type AgentNativeI18nCatalog,
   type AgentNativeI18nProviderProps,
+  type BuiltinLocaleCode,
   type LocaleCode,
   type LocaleHydrationPayload,
   type LocaleMessages,
@@ -38,6 +44,25 @@ export {
   type LocalizationPreference,
 } from "./i18n.js";
 export { AgentNativeIcon } from "./components/icons/AgentNativeIcon.js";
+export {
+  AppSidebar,
+  AppSidebarHeader,
+  AppSidebarNavItem,
+  AppSidebarNavGroup,
+  AppSidebarSection,
+  AppSidebarFeedbackButton,
+  AppSidebarFooter,
+  useAppSidebar,
+  type AppSidebarProps,
+  type AppSidebarHeaderProps,
+  type AppSidebarNavItemProps,
+  type AppSidebarNavGroupProps,
+  type AppSidebarSectionProps,
+  type AppSidebarFeedbackButtonProps,
+  type AppSidebarFooterProps,
+  type AppSidebarItemDefinition,
+  type AppSidebarContextValue,
+} from "./ui/AppSidebar.js";
 export {
   FeatureFlagsEditor,
   evaluatedFeatureFlagValues,
@@ -49,20 +74,49 @@ export {
   type FeatureFlagRules,
   type SetFeatureFlagInput,
 } from "./feature-flags/index.js";
+export {
+  useLaunchDarklyFlag,
+  useLaunchDarklyFlags,
+} from "./launchdarkly/index.js";
+export {
+  LabsSettings,
+  useLab,
+  useLabState,
+  useLabs,
+  type LabValues,
+  type LabsSettingsProps,
+} from "./labs/index.js";
+export {
+  ExperimentsSettings,
+  useExperiment,
+  useExperimentState,
+  useExperiments,
+  type ExperimentValues,
+  type ExperimentsSettingsProps,
+} from "./experiments/index.js";
 export { withBuilderUtmTrackingParams } from "../shared/builder-link-tracking.js";
 export {
   SettingsPanel,
   SettingsTabsPage,
   SecretsSection,
+  removeManagedSecrets,
+  type ManagedSecretRemoval,
+  BuilderConnectPopover,
   getAgentSettingsSearchTabs,
   openBuilderConnectPopup,
   useAgentSettingsTabs,
+  type AgentSettingsTabFactory,
+  type AgentSettingsTabFactoryContext,
   useBuilderConnectFlow,
   useBuilderStatus,
   withBuilderConnectTrackingParams,
   type BuilderConnectFlow,
   type BuilderConnectFlowOptions,
+  type BuilderConnectionScope,
   type BuilderConnectStartOptions,
+  type BuilderEffectiveConnection,
+  type BuilderGrantStatus,
+  type BuilderGrantsStatus,
   type BuilderStatus,
   type AgentSettingsSearchTab,
   type OpenBuilderConnectPopupOptions,
@@ -71,6 +125,7 @@ export {
   type SettingsSearchEntry,
   type SettingsTabItem,
   type SettingsTabsPageProps,
+  type BuilderConnectPopoverProps,
 } from "./settings/index.js";
 export {
   DevDatabaseLink,
@@ -85,6 +140,8 @@ export {
 export { AgentTerminal, type AgentTerminalProps } from "./terminal/index.js";
 export {
   trackEvent,
+  trackAnonymousEvent,
+  trackLifecycleEvent,
   trackAgentChatLifecycle,
   trackSessionStatus,
   configureTracking,
@@ -94,6 +151,8 @@ export {
   stopSessionReplay,
   getAnalyticsAnonymousId,
   getAnalyticsSessionId,
+  setAnalyticsSessionId,
+  clearAnalyticsSessionId,
   getFirstTouchAttribution,
   setSentryUser,
   setTrackingIdentity,
@@ -101,7 +160,6 @@ export {
   getSessionReplayUrl,
   captureError,
   captureClientException,
-  // First-party, Sentry-style error capture (auto + manual API).
   AGENT_NATIVE_EXCEPTION_EVENT_NAME,
   addErrorBreadcrumb,
   captureException,
@@ -132,6 +190,9 @@ export {
   dedupeCollabUsersByEmail,
   type UseCollaborativeDocOptions,
   type UseCollaborativeDocResult,
+  type CollabInitializationErrorCategory,
+  type CollabInitializationState,
+  type CollaborativeDocSyncResult,
   type CollabUser,
 } from "../collab/client.js";
 export { AGENT_CLIENT_ID } from "../collab/agent-identity.js";
@@ -201,6 +262,9 @@ export {
   useCreateReviewComment,
   useDeleteReviewComment,
   useReplyReviewComment,
+  useReactToReviewComment,
+  useSetReviewThreadUnread,
+  useSetReviewThreadMuted,
   useResolveReviewThread,
   useReviewComments,
   useReviewFeedback,
@@ -214,9 +278,13 @@ export {
   type ListReviewCommentsParams,
   type ListReviewCommentsResult,
   type ReplyReviewCommentInput,
+  type ReactToReviewCommentInput,
+  type SetReviewThreadUnreadInput,
+  type SetReviewThreadMutedInput,
   type ResolveReviewThreadInput,
   type ReviewStatusBadgeProps,
   type ReviewCommentComposerProps,
+  type ReviewCommentFilter,
   type ReviewThread,
   type ReviewThreadPanelProps,
   type SetReviewStatusInput,

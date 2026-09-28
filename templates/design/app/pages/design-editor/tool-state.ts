@@ -1,7 +1,7 @@
 import type { CreationTool } from "@/components/design/design-canvas/creation";
 
 import {
-  SHOW_DESIGN_CODE_LEFT_PANEL,
+  isDesignLeftPanelEnabled,
   type DesignLeftPanel,
   type DesignTool,
   type EditorMode,
@@ -10,18 +10,10 @@ import {
 export function normalizeDesignLeftPanel(
   value: unknown,
 ): DesignLeftPanel | undefined {
-  if (value === "extensions") return "tools";
-  if (value === "code") {
-    return SHOW_DESIGN_CODE_LEFT_PANEL ? "code" : undefined;
+  if (value === "extensions") {
+    return isDesignLeftPanelEnabled("tools") ? "tools" : undefined;
   }
-  return value === "file" ||
-    value === "agent" ||
-    value === "assets" ||
-    value === "tools" ||
-    value === "tokens" ||
-    value === "import"
-    ? value
-    : undefined;
+  return isDesignLeftPanelEnabled(value) ? value : undefined;
 }
 
 export const MOVE_GROUP_TOOL_PRESENTATIONS = {
@@ -74,6 +66,38 @@ export function normalizeDesignTool(value: unknown): DesignTool | null {
     : null;
 }
 
+const DESIGN_EDITOR_MODES = new Set<EditorMode>([
+  "annotate",
+  "edit",
+  "interact",
+]);
+
+export function normalizeDesignMode(value: unknown): EditorMode | null {
+  return typeof value === "string" &&
+    DESIGN_EDITOR_MODES.has(value as EditorMode)
+    ? (value as EditorMode)
+    : null;
+}
+
+export function resolveToolAfterSelection(current: DesignTool): DesignTool {
+  return current === "scale" ? "scale" : "move";
+}
+
+export function resolveSpaceForwardTransition(
+  event: "keydown" | "keyup" | "blur",
+  armed: boolean,
+  dragActive: boolean,
+): { armed: boolean; broadcast: boolean | null } {
+  if (event === "keydown") {
+    return dragActive
+      ? { armed: true, broadcast: true }
+      : { armed, broadcast: null };
+  }
+  return armed
+    ? { armed: false, broadcast: false }
+    : { armed, broadcast: null };
+}
+
 export function isSingleScreenAnnotationTool(tool: DesignTool): boolean {
   return tool === "draw" || tool === "comment";
 }
@@ -102,13 +126,6 @@ export function shouldAutoEnableDrawOverlay(args: {
   );
 }
 
-/**
- * There are only two views: the infinite canvas (where Edit and Annotate
- * live) and the focused responsive screen (where Interact lives). A mode
- * choice that disagrees with the current view is therefore a view change —
- * picking Edit or Annotate from a focused screen must return to the canvas,
- * not strand the screen in the forbidden single-screen editing state.
- */
 export function resolveModeChangeView(args: {
   next: EditorMode;
   viewMode: "single" | "overview";
@@ -121,13 +138,35 @@ export function resolveModeChangeView(args: {
 
 export type DesignBottomToolbarMode = "editor" | "commenter" | "hidden";
 
+export function shouldRevealLayersOnFirstCreate(args: {
+  activeLeftPanel: DesignLeftPanel | null;
+  alreadyRevealed: boolean;
+}): boolean {
+  if (args.alreadyRevealed) return false;
+  return args.activeLeftPanel !== "file";
+}
+
+export function shouldAskOnNewDesignArrival(args: {
+  arrivedFromNewDesign: boolean;
+  alreadyAsked: boolean;
+  canEditDesign: boolean;
+  embedded: boolean;
+  shellMode: boolean;
+}): boolean {
+  if (!args.arrivedFromNewDesign || args.alreadyAsked) return false;
+  if (args.shellMode || args.embedded) return false;
+  return args.canEditDesign;
+}
+
 export function getDesignBottomToolbarMode(args: {
   isSignedIn: boolean;
   canEditDesign: boolean;
+  canCommentDesign: boolean;
   hasActiveFile: boolean;
 }): DesignBottomToolbarMode {
-  if (!args.isSignedIn || !args.hasActiveFile) return "hidden";
-  return args.canEditDesign ? "editor" : "commenter";
+  if (!args.isSignedIn || !args.canCommentDesign) return "hidden";
+  if (args.canEditDesign) return "editor";
+  return args.hasActiveFile ? "commenter" : "hidden";
 }
 
 export function getSingleScreenCreationTool(args: {

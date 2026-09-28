@@ -1,16 +1,24 @@
 import { useActionQuery } from "@agent-native/core/client/hooks";
 import { useT } from "@agent-native/core/client/i18n";
+import { buildSettingsRoute } from "@agent-native/core/client/navigation";
 import { IconAlertTriangle, IconPlugConnected } from "@tabler/icons-react";
 import { Link } from "react-router";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import { cn } from "@/lib/utils";
 
 import {
   connectionModeInfo,
   CRM_CONNECTION_MODE_INFO,
   SELECTABLE_CRM_CONNECTION_MODES,
 } from "./settings-admin";
+import {
+  CrmSettingsPanelHeader,
+  crmSettingsPanelClassName,
+  type CrmSettingsPanelProps,
+} from "./SettingsPanelHeader";
 
 interface CrmConnectionSummary {
   id: string;
@@ -24,7 +32,7 @@ interface CrmConnectionSummary {
   lastError: string | null;
 }
 
-export function ConnectionSettings() {
+export function ConnectionSettings({ embedded }: CrmSettingsPanelProps = {}) {
   const t = useT();
   const connectionsQuery = useActionQuery<{
     connections: CrmConnectionSummary[];
@@ -35,15 +43,19 @@ export function ConnectionSettings() {
   );
 
   return (
-    <div className="mx-auto w-full max-w-2xl">
-      <h1 className="text-xl font-semibold tracking-tight">
-        {t("connection.title")}
-      </h1>
-      <p className="mt-1 text-sm leading-6 text-muted-foreground">
-        {t("connection.description")}
-      </p>
+    <div className={crmSettingsPanelClassName(embedded)}>
+      <CrmSettingsPanelHeader
+        embedded={embedded}
+        title={t("connection.title")}
+        description={t("connection.description")}
+      />
 
-      <div className="mt-5 grid gap-3 rounded-lg border border-border/70 bg-card p-4">
+      <div
+        className={cn(
+          "mt-5 grid gap-3 rounded-lg border border-border/70 bg-card p-4",
+          embedded && "mt-0",
+        )}
+      >
         <p className="text-sm font-medium">{t("connection.modesTitle")}</p>
         {SELECTABLE_CRM_CONNECTION_MODES.map((mode) => (
           <div key={mode} className="grid gap-0.5">
@@ -88,13 +100,30 @@ export function ConnectionSettings() {
             <ConnectionRow key={connection.id} connection={connection} />
           ))}
         </div>
+      ) : connectionsQuery.isLoading ? (
+        <div
+          className="mt-6 space-y-2"
+          role="status"
+          aria-busy="true"
+          aria-label={t("connection.loading")}
+        >
+          {[0, 1, 2].map((item) => (
+            <div
+              key={item}
+              className="flex items-center gap-4 rounded-lg border border-border/70 bg-card px-4 py-3.5"
+            >
+              <Skeleton className="size-4" />
+              <div className="flex-1 space-y-2">
+                <Skeleton className="h-4 w-40" />
+                <Skeleton className="h-3 w-56" />
+              </div>
+              <Skeleton className="h-6 w-20 rounded-full" />
+            </div>
+          ))}
+        </div>
       ) : (
         <div className="mt-6 rounded-lg border border-dashed border-border px-4 py-10 text-center">
-          <p className="text-sm font-medium">
-            {connectionsQuery.isLoading
-              ? t("connection.loading")
-              : t("connection.emptyTitle")}
-          </p>
+          <p className="text-sm font-medium">{t("connection.emptyTitle")}</p>
           <p className="mt-1 text-sm text-muted-foreground">
             {t("connection.emptyDescription")}
           </p>
@@ -109,7 +138,7 @@ export function ConnectionSettings() {
           <Link to="/setup">{t("connection.openSetup")}</Link>
         </Button>
         <Button asChild variant="outline" size="sm">
-          <Link to="/settings/connections">
+          <Link to={buildSettingsRoute("integrations")}>
             {t("connection.openWorkspaceConnections")}
           </Link>
         </Button>
@@ -140,8 +169,6 @@ function ConnectionRow({ connection }: { connection: CrmConnectionSummary }) {
               {mode.deprecated ? ` · ${t("connection.deprecated")}` : ""}
             </Badge>
           ) : (
-            // Never fall back to a default label: an unrecognized mode means
-            // this build cannot read the row, which is not the same as native.
             <Badge variant="destructive" className="font-normal">
               {t("connection.modeUnrecognized", { mode: connection.mode })}
             </Badge>

@@ -52,7 +52,6 @@ export function Layout({ children }: { children: React.ReactNode }) {
           suppressHydrationWarning
           dangerouslySetInnerHTML={{ __html: getLocaleInitScript() }}
         />
-        <link rel="manifest" href={appPath("/manifest.json")} />
         <meta name="theme-color" content="#71717A" />
         <link rel="icon" type="image/svg+xml" href={appPath("/favicon.svg")} />
         <link rel="apple-touch-icon" href={appPath("/icon-180.svg")} />
@@ -75,16 +74,28 @@ function SyncBridge() {
   return null;
 }
 
+function AppContent() {
+  return (
+    <>
+      <SyncBridge />
+      <CrmCommandMenu />
+      <CrmLayout>
+        <Outlet />
+      </CrmLayout>
+    </>
+  );
+}
+
 export default function Root() {
   const [queryClient] = useState(() => createAgentNativeQueryClient());
   return (
     <AppToolkitProvider>
-      <AppProviders queryClient={queryClient} i18n={{ catalog: i18nCatalog }}>
-        <SyncBridge />
-        <CrmCommandMenu />
-        <CrmLayout>
-          <Outlet />
-        </CrmLayout>
+      <AppProviders
+        queryClient={queryClient}
+        skeletonLayout="dashboard"
+        i18n={{ catalog: i18nCatalog }}
+      >
+        <AppContent />
       </AppProviders>
     </AppToolkitProvider>
   );

@@ -47,18 +47,6 @@ interface DeployStatusResult {
   url?: string;
 }
 
-/**
- * Slim, non-blocking banner shown above the canvas for fusion-backed ("full
- * app") designs. Renders only when the design has fusionApp linkage data
- * (see shared/full-app.ts readFusionApp) — invisible otherwise.
- *
- * - "building": polls sync-fusion-app until the container reports ready.
- * - "ready": pending-edit count + apply/push/publish controls.
- * - "error": message + retry.
- *
- * State is communicated inline (this banner's own text), not via toasts —
- * toasts in this app are unreliable for this kind of longer-lived status.
- */
 export function FusionAppBanner({
   designId,
   status,
@@ -80,19 +68,27 @@ export function FusionAppBanner({
   const [pushMessage, setPushMessage] = useState<string | null>(null);
   const [pushError, setPushError] = useState<string | null>(null);
 
-  // ── Building: poll sync-fusion-app on mount + every ~8s while building ────
   const syncMutateRef = useRef(syncMutation.mutate);
   syncMutateRef.current = syncMutation.mutate;
+  const syncInFlightRef = useRef(false);
   useEffect(() => {
     if (status !== "building") return;
-    syncMutateRef.current({ designId } as any);
+    const runSync = (): void => {
+      if (syncInFlightRef.current) return;
+      syncInFlightRef.current = true;
+      syncMutateRef.current(
+        { designId } as any,
+        { onSettled: () => (syncInFlightRef.current = false) } as any,
+      );
+    };
+    runSync();
     const interval = window.setInterval(() => {
-      syncMutateRef.current({ designId } as any);
+      if (document.hidden) return;
+      runSync();
     }, SYNC_POLL_INTERVAL_MS);
     return () => window.clearInterval(interval);
   }, [designId, status]);
 
-  // ── Ready: pending edits count ─────────────────────────────────────────────
   const { data: editsData } = useActionQuery<FusionEditsResult>(
     "list-fusion-edits",
     { designId, status: "pending" } as any,
@@ -103,7 +99,6 @@ export function FusionAppBanner({
   );
   const pendingCount = editsData?.pendingCount ?? 0;
 
-  // ── Publish: poll get-fusion-deploy-status after triggering a deploy ──────
   const deployStatusQuery = useActionQuery<DeployStatusResult>(
     "get-fusion-deploy-status",
     { designId } as any,
@@ -168,7 +163,6 @@ export function FusionAppBanner({
     );
   }
 
-  // status === "ready"
   const publishedUrl = liveDeployUrl ?? deployedUrl;
 
   return (
@@ -269,9 +263,6 @@ export function FusionAppBanner({
             setDeployError(null);
             deployMutation.mutate({ designId } as any, {
               onSuccess: (result: any) => {
-                // Seed from the immediate response in case the deploy is
-                // already terminal (fast/mocked deploys); otherwise the
-                // get-fusion-deploy-status poll below takes over.
                 const initialStatus = result?.status;
                 if (initialStatus === "live" || initialStatus === "success") {
                   setLiveDeployUrl(result?.url);

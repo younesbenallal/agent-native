@@ -1,15 +1,17 @@
-import { callAction } from "@agent-native/core/client/hooks";
+import { callActionWithRetry } from "@agent-native/core/client/hooks";
 import { useT } from "@agent-native/core/client/i18n";
 import {
   isInAgentEmbed,
   postNavigate,
 } from "@agent-native/core/client/navigation";
+import { normalizeDocumentTitle } from "@agent-native/core/shared";
 import { IconExternalLink } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router";
 
 import SlideRenderer from "@/components/deck/SlideRenderer";
 import type { Slide } from "@/context/DeckContext";
+import { useDeckDesignSystem } from "@/hooks/use-deck-design-system";
 import messages from "@/i18n/en-US";
 import type { AspectRatio } from "@/lib/aspect-ratios";
 
@@ -42,8 +44,11 @@ export default function SlideRoute() {
   const [aspectRatio, setAspectRatio] = useState<AspectRatio | undefined>(
     undefined,
   );
+  const [designSystemId, setDesignSystemId] = useState<string | null>(null);
+  const [deckTitle, setDeckTitle] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const { designSystem } = useDeckDesignSystem(designSystemId);
 
   const slideNumber =
     slideNumberParam !== null ? parseInt(slideNumberParam, 10) : null;
@@ -54,6 +59,17 @@ export default function SlideRoute() {
         ? parseInt(slideIndexParam, 10)
         : 0;
   const inEmbed = isInAgentEmbed();
+
+  useEffect(() => {
+    const nextTitle = deckTitle
+      ? `${normalizeDocumentTitle(deckTitle, "Slide")} — Slides`
+      : messages.raw.slidePreviewTitle;
+    const previousTitle = document.title;
+    document.title = nextTitle;
+    return () => {
+      if (document.title === nextTitle) document.title = previousTitle;
+    };
+  }, [deckTitle]);
 
   useEffect(() => {
     if (!deckId) {
@@ -75,11 +91,12 @@ export default function SlideRoute() {
       return;
     }
 
-    callAction<{ slides?: Slide[]; aspectRatio?: AspectRatio }>(
-      "get-deck",
-      { id: deckId },
-      { method: "GET" },
-    )
+    callActionWithRetry<{
+      title?: string;
+      slides?: Slide[];
+      aspectRatio?: AspectRatio;
+      designSystemId?: string | null;
+    }>("get-deck", { id: deckId }, { method: "GET" })
       .then((deck) => {
         const slides: Slide[] = deck.slides ?? [];
         if (slides.length === 0) {
@@ -87,7 +104,9 @@ export default function SlideRoute() {
         }
         const idx = Math.max(0, Math.min(slideIndex, slides.length - 1));
         setSlide(slides[idx]);
+        setDeckTitle(deck.title ?? null);
         setAspectRatio(deck.aspectRatio);
+        setDesignSystemId(deck.designSystemId ?? null);
         setLoading(false);
       })
       .catch((err: unknown) => {
@@ -123,6 +142,7 @@ export default function SlideRoute() {
         slide={slide}
         thumbnail={false}
         aspectRatio={aspectRatio}
+        designSystem={designSystem}
       />
 
       {inEmbed && (

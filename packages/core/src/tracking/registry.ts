@@ -1,8 +1,39 @@
+import type { ActionRunContext } from "../action.js";
+import {
+  queueTrackingEvent,
+  type TrackingEventOrigin,
+} from "../observability/tracing.js";
+import { resolveDeployEnvironment } from "../server/deploy-environment.js";
+import { getRequestContext } from "../server/request-context.js";
+import {
+  canonicalTrackingEvent,
+  legacyLifecycleEvent,
+  withCanonicalTrackingProperties,
+} from "../shared/analytics-events.js";
+import { ANALYTICS_CLIENT_PLATFORM_PROPERTY } from "../shared/analytics-platform.js";
+import { isQaTestEmail } from "../shared/qa-test-email.js";
 import type { TrackingProvider, TrackingEvent } from "./types.js";
+
+export { isQaTestEmail } from "../shared/qa-test-email.js";
 
 const REGISTRY_KEY = Symbol.for("@agent-native/core/tracking.registry");
 interface GlobalWithRegistry {
   [REGISTRY_KEY]?: Map<string, TrackingProvider>;
+}
+
+function isTrackingSuppressed(
+  userId: string | undefined,
+  properties?: Record<string, unknown>,
+): boolean {
+  const requestContext = getRequestContext();
+  return (
+    requestContext?.isSyntheticTraffic === true ||
+    isQaTestEmail(requestContext?.userEmail) ||
+    isQaTestEmail(userId) ||
+    isQaTestEmail(properties?.email) ||
+    isQaTestEmail(properties?.userEmail) ||
+    isQaTestEmail(properties?.user_email)
+  );
 }
 
 function getRegistry(): Map<string, TrackingProvider> {
@@ -31,17 +62,151 @@ export function listTrackingProviders(): string[] {
   return Array.from(getRegistry().keys());
 }
 
+export interface TrackingMeta {
+  userId?: string;
+  authUserId?: string;
+  anonymousId?: string;
+  sessionId?: string;
+  occurredAt?: number;
+  telemetryOrigin?: TrackingEventOrigin;
+}
+
+export type TrackingSource = TrackingMeta | ActionRunContext;
+
+function isActionRunContext(
+  source: TrackingSource,
+): source is ActionRunContext {
+  return typeof (source as ActionRunContext).caller === "string";
+}
+
+function resolveTrackingSource(source: TrackingSource | undefined): {
+  userId?: string;
+  authUserId?: string;
+  anonymousId?: string;
+  sessionId?: string;
+  occurredAt?: number;
+  telemetryOrigin: TrackingEventOrigin;
+} {
+  const requestContext = getRequestContext();
+  const ambientSessionId = requestContext?.browserSessionId;
+  if (!source) {
+    return {
+      authUserId: requestContext?.authUserId,
+      sessionId: ambientSessionId,
+      telemetryOrigin: "server",
+    };
+  }
+  if (isActionRunContext(source)) {
+    const callerMatchesRequest = source.userEmail === requestContext?.userEmail;
+    return {
+      userId: source.userEmail,
+      ...(callerMatchesRequest
+        ? { authUserId: requestContext?.authUserId }
+        : {}),
+      sessionId: callerMatchesRequest ? ambientSessionId : undefined,
+      telemetryOrigin: "server",
+    };
+  }
+  const canUseAmbientIdentity = source.userId
+    ? source.userId === requestContext?.userEmail
+    : !source.anonymousId;
+  const canUseAmbientSession =
+    canUseAmbientIdentity &&
+    (!source.authUserId || source.authUserId === requestContext?.authUserId);
+  return {
+    userId: source.userId,
+    authUserId:
+      source.authUserId ??
+      (canUseAmbientIdentity ? requestContext?.authUserId : undefined),
+    anonymousId: source.anonymousId,
+    sessionId:
+      source.sessionId ?? (canUseAmbientSession ? ambientSessionId : undefined),
+    occurredAt: source.occurredAt,
+    telemetryOrigin: source.telemetryOrigin ?? "server",
+  };
+}
+
 export function track(
   name: string,
   properties?: Record<string, unknown>,
-  meta?: { userId?: string; anonymousId?: string },
+  source?: TrackingSource,
+): void {
+  const {
+    userId,
+    authUserId,
+    anonymousId,
+    sessionId,
+    occurredAt,
+    telemetryOrigin,
+  } = resolveTrackingSource(source);
+  if (isTrackingSuppressed(userId, properties)) return;
+  const clientPlatform = getRequestContext()?.clientPlatform;
+  const actionContext =
+    source && isActionRunContext(source) ? source : undefined;
+  const safeProperties = { ...(properties ?? {}) };
+  delete safeProperties.auth_user_id;
+  delete safeProperties.authUserId;
+  if (authUserId) safeProperties.auth_user_id = authUserId;
+  const trackedProperties = withCanonicalTrackingProperties({
+    ...safeProperties,
+    ...(sessionId ? { session_id: sessionId } : {}),
+    ...(userId ? { user_id: userId } : {}),
+    ...(actionContext?.userEmail
+      ? { user_email: actionContext.userEmail }
+      : {}),
+    ...(actionContext?.orgId ? { workspace_id: actionContext.orgId } : {}),
+    deployment_environment: resolveDeployEnvironment(),
+    ...(clientPlatform
+      ? { [ANALYTICS_CLIENT_PLATFORM_PROPERTY]: clientPlatform }
+      : {}),
+  });
+
+  emitTrackingEvent(name, trackedProperties, {
+    userId,
+    anonymousId,
+    sessionId,
+    occurredAt,
+  });
+  const trackingScope = getRequestContext()?.trackingScope;
+  if (trackingScope) {
+    queueTrackingEvent(name, trackedProperties, telemetryOrigin, trackingScope);
+  } else {
+    queueTrackingEvent(name, trackedProperties, telemetryOrigin);
+  }
+
+  const canonical = canonicalTrackingEvent(name, trackedProperties);
+  if (canonical) {
+    emitTrackingEvent(canonical.name, canonical.properties, {
+      userId,
+      anonymousId,
+      sessionId,
+      occurredAt,
+    });
+  }
+
+  const lifecycle = legacyLifecycleEvent(name, trackedProperties);
+  if (lifecycle) {
+    emitTrackingEvent(lifecycle.name, lifecycle.properties, {
+      userId,
+      anonymousId,
+      sessionId,
+      occurredAt,
+    });
+  }
+}
+
+function emitTrackingEvent(
+  name: string,
+  properties: Record<string, unknown>,
+  source: TrackingMeta,
 ): void {
   const event: TrackingEvent = {
     name,
     properties,
-    timestamp: new Date().toISOString(),
-    userId: meta?.userId,
-    anonymousId: meta?.anonymousId,
+    timestamp: new Date(source.occurredAt || Date.now()).toISOString(),
+    userId: source.userId,
+    anonymousId: source.anonymousId,
+    sessionId: source.sessionId,
   };
 
   for (const provider of getRegistry().values()) {
@@ -65,6 +230,7 @@ export function identify(
   userId: string,
   traits?: Record<string, unknown>,
 ): void {
+  if (isTrackingSuppressed(userId, traits)) return;
   for (const provider of getRegistry().values()) {
     if (!provider.identify) continue;
     try {

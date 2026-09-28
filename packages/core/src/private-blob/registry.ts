@@ -1,6 +1,11 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 
-import { uploadFile } from "../file-upload/index.js";
+import { getAppConfig } from "../app-config/index.js";
+import {
+  deleteUploadedFile,
+  getActiveFileUploadProviderForRequest,
+  uploadFile,
+} from "../file-upload/index.js";
 import {
   decryptSecretValue,
   encryptSecretValue,
@@ -44,6 +49,7 @@ interface PublicUploadDescriptor {
 }
 
 const PUBLIC_UPLOAD_HANDLE_PREFIX = "public-upload:v1:";
+const PUBLIC_UPLOAD_READ_RETRY_DELAYS_MS = [100, 250, 500] as const;
 const globals = globalThis as typeof globalThis & PrivateBlobGlobals;
 const providers: Map<string, PrivateBlobProvider> =
   (globals.__agentNativePrivateBlobProviders ??= new Map());
@@ -115,6 +121,20 @@ function isPublicUploadFallbackHandle(handle: PrivateBlobHandle): boolean {
   return handle.id.startsWith(PUBLIC_UPLOAD_HANDLE_PREFIX);
 }
 
+function isRetryablePublicUploadStatus(status: number): boolean {
+  return (
+    status === 404 ||
+    status === 408 ||
+    status === 425 ||
+    status === 429 ||
+    (status >= 500 && status <= 599)
+  );
+}
+
+function waitForPublicUploadRetry(delayMs: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
 async function putViaEncryptedPublicUpload(
   input: PrivateBlobPutInput,
 ): Promise<PrivateBlobHandle | null> {
@@ -142,7 +162,7 @@ async function putViaEncryptedPublicUpload(
     createdAt: new Date().toISOString(),
   };
 
-  return {
+  const handle: PrivateBlobHandle = {
     id: encodePublicUploadDescriptor(descriptor),
     provider: `public-upload:${uploaded.provider}`,
     opaque: true,
@@ -152,20 +172,86 @@ async function putViaEncryptedPublicUpload(
     createdAt: descriptor.createdAt,
     metadata: input.metadata,
   };
+
+  await readViaEncryptedPublicUpload(handle);
+  return handle;
 }
 
 async function readViaEncryptedPublicUpload(
   handle: PrivateBlobHandle,
 ): Promise<PrivateBlobReadResult> {
   const descriptor = decodePublicUploadDescriptor(handle.id);
-  const response = await fetch(descriptor.url);
-  if (!response.ok) {
+  const startedAt = Date.now();
+
+  let response: Response | undefined;
+  let attempts = 0;
+  for (
+    let attempt = 0;
+    attempt <= PUBLIC_UPLOAD_READ_RETRY_DELAYS_MS.length;
+    attempt++
+  ) {
+    attempts = attempt + 1;
+    try {
+      response = await fetch(descriptor.url);
+    } catch (error) {
+      if (attempt === PUBLIC_UPLOAD_READ_RETRY_DELAYS_MS.length) {
+        console.warn("[private-blob] public-upload read failed", {
+          attempts: attempt + 1,
+          elapsedMs: Date.now() - startedAt,
+          provider: handle.provider,
+          reason: "network",
+        });
+        throw new Error(
+          `Private blob public-upload read failed: ${
+            error instanceof Error ? error.message : "network error"
+          }`,
+          { cause: error },
+        );
+      }
+      await waitForPublicUploadRetry(
+        PUBLIC_UPLOAD_READ_RETRY_DELAYS_MS[attempt],
+      );
+      continue;
+    }
+
+    if (response.ok) break;
+
+    if (
+      !isRetryablePublicUploadStatus(response.status) ||
+      attempt === PUBLIC_UPLOAD_READ_RETRY_DELAYS_MS.length
+    ) {
+      console.warn("[private-blob] public-upload read failed", {
+        attempts: attempt + 1,
+        elapsedMs: Date.now() - startedAt,
+        provider: handle.provider,
+        status: response.status,
+      });
+      throw new Error(
+        `Private blob public-upload read failed (${response.status}): ${response.statusText}`,
+      );
+    }
+
+    await waitForPublicUploadRetry(PUBLIC_UPLOAD_READ_RETRY_DELAYS_MS[attempt]);
+  }
+
+  if (!response?.ok) {
+    console.warn("[private-blob] public-upload read failed", {
+      attempts: PUBLIC_UPLOAD_READ_RETRY_DELAYS_MS.length + 1,
+      elapsedMs: Date.now() - startedAt,
+      provider: handle.provider,
+      reason: "no-response",
+    });
     throw new Error(
-      `Private blob public-upload read failed (${response.status}): ${response.statusText}`,
+      "Private blob public-upload read failed without a response",
     );
   }
-  // The uploaded ciphertext is intentionally opaque; the descriptor carries
-  // auth tag + IV separately so the backing public URL is useless by itself.
+  if (attempts > 1) {
+    console.info("[private-blob] public-upload read recovered after retry", {
+      attempts,
+      elapsedMs: Date.now() - startedAt,
+      provider: handle.provider,
+    });
+  }
   const ciphertext = new Uint8Array(await response.arrayBuffer());
   return {
     data: decryptBytes(descriptor.encryption, ciphertext),
@@ -190,10 +276,58 @@ export function listPrivateBlobProviders(): PrivateBlobProvider[] {
 }
 
 export function getActivePrivateBlobProvider(): PrivateBlobProvider | null {
+  const selectedId = getAppConfig().privateBlob.provider;
+  if (selectedId) {
+    const selected = providers.get(selectedId);
+    if (!selected) {
+      throw new Error(
+        `Private blob config selects '${selectedId}', but no provider with that id is registered`,
+      );
+    }
+    if (!selected.isConfigured()) {
+      throw new Error(
+        `Private blob provider '${selectedId}' is selected but not configured`,
+      );
+    }
+    return selected;
+  }
   for (const provider of providers.values()) {
     if (provider.isConfigured()) return provider;
   }
   return null;
+}
+
+export async function getActivePrivateBlobProviderForRequest(): Promise<PrivateBlobProvider | null> {
+  const selectedId = getAppConfig().privateBlob.provider;
+  if (selectedId) {
+    const selected = providers.get(selectedId);
+    if (!selected) {
+      throw new Error(
+        `Private blob config selects '${selectedId}', but no provider with that id is registered`,
+      );
+    }
+    if (
+      !selected.isConfigured() &&
+      !(await selected.isConfiguredForRequest?.())
+    ) {
+      throw new Error(
+        `Private blob provider '${selectedId}' is selected but not configured`,
+      );
+    }
+    return selected;
+  }
+  for (const provider of providers.values()) {
+    if (provider.isConfigured()) return provider;
+    if (await provider.isConfiguredForRequest?.()) return provider;
+  }
+  return null;
+}
+
+export async function isPrivateBlobConfiguredForRequest(): Promise<boolean> {
+  if (await getActivePrivateBlobProviderForRequest()) return true;
+  if (!publicUploadFallbackRef.enabled) return false;
+  if (!getAppConfig().privateBlob.publicUploadFallback) return false;
+  return Boolean(await getActiveFileUploadProviderForRequest());
 }
 
 export function setPrivateBlobPublicUploadFallbackEnabled(
@@ -205,12 +339,10 @@ export function setPrivateBlobPublicUploadFallbackEnabled(
 export async function putPrivateBlob(
   input: PrivateBlobPutInput,
 ): Promise<PrivateBlobHandle | null> {
-  const provider = getActivePrivateBlobProvider();
+  const provider = await getActivePrivateBlobProviderForRequest();
   if (provider) return provider.put(input);
   if (!publicUploadFallbackRef.enabled) return null;
-  if (process.env.AGENT_NATIVE_PRIVATE_BLOB_PUBLIC_UPLOAD_FALLBACK === "0") {
-    return null;
-  }
+  if (!getAppConfig().privateBlob.publicUploadFallback) return null;
   return putViaEncryptedPublicUpload(input);
 }
 
@@ -231,11 +363,17 @@ export async function deletePrivateBlob(
   const provider = providers.get(handle.provider);
   if (provider) return provider.delete(handle);
   if (isPublicUploadFallbackHandle(handle)) {
+    const descriptor = decodePublicUploadDescriptor(handle.id);
+    const deleted = await deleteUploadedFile(descriptor.uploadProvider, {
+      url: descriptor.url,
+      id: descriptor.uploadId,
+    });
     return {
-      deleted: false,
+      deleted,
       provider: handle.provider,
-      reason:
-        "delete is not supported by the encrypted public-upload fallback provider",
+      ...(deleted
+        ? {}
+        : { reason: "backing upload provider could not delete the asset" }),
     };
   }
   throw new Error(`No private blob provider registered for ${handle.provider}`);

@@ -1,9 +1,9 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
 
 import {
-  getCallDetail,
-  getCallTranscript,
+  getCallDetails,
+  getCallTranscripts,
   searchCallsForQueries,
   type GongCall,
 } from "../server/lib/gong";
@@ -193,9 +193,13 @@ function buildGongSearchQueries(input: {
   const dealTerms = input.deals.flatMap((deal) => {
     const properties = deal.properties as Record<string, unknown>;
     return [
-      String(properties.dealname ?? ""),
-      String(properties.company_name ?? ""),
-      String(properties.hs_primary_company_name ?? ""),
+      typeof properties.dealname === "string" ? properties.dealname : "",
+      typeof properties.company_name === "string"
+        ? properties.company_name
+        : "",
+      typeof properties.hs_primary_company_name === "string"
+        ? properties.hs_primary_company_name
+        : "",
     ];
   });
   const companyTerms = input.companies.flatMap((company) => [
@@ -228,6 +232,20 @@ function recordTimestampMs(record: HubSpotObjectRecord) {
     "";
   const time = Date.parse(value);
   return Number.isFinite(time) ? time : 0;
+}
+
+function transcriptRowsByCallId(payload: unknown): Map<string, unknown> {
+  const rows = new Map<string, unknown>();
+  if (!payload || typeof payload !== "object") return rows;
+  const callTranscripts = (payload as { callTranscripts?: unknown })
+    .callTranscripts;
+  if (!Array.isArray(callTranscripts)) return rows;
+  for (const row of callTranscripts) {
+    if (!row || typeof row !== "object") continue;
+    const callId = (row as { callId?: unknown }).callId;
+    if (typeof callId === "string" && callId) rows.set(callId, row);
+  }
+  return rows;
 }
 
 async function loadGongEvidence(options: {
@@ -269,55 +287,77 @@ async function loadGongEvidence(options: {
     );
   }
 
-  const callDetails = await Promise.all(
-    calls.slice(0, Math.min(5, options.gongLimit)).map(async (call) => {
-      try {
-        return await getCallDetail(call.id);
-      } catch (err) {
-        gaps.push(
-          `Gong call detail ${call.id}: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-        return null;
-      }
-    }),
-  );
+  const detailCalls = calls.slice(0, Math.min(5, options.gongLimit));
+  let callDetails: Awaited<ReturnType<typeof getCallDetails>> = [];
+  if (detailCalls.length) {
+    try {
+      const details = await getCallDetails(detailCalls.map((call) => call.id));
+      const detailsById = new Map(details.map((detail) => [detail.id, detail]));
+      callDetails = detailCalls.flatMap((call) => {
+        const detail = detailsById.get(call.id);
+        if (!detail) {
+          gaps.push(`Gong call detail ${call.id}: no detail was returned.`);
+          return [];
+        }
+        return [detail];
+      });
+    } catch (err) {
+      gaps.push(
+        `Gong call details: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
 
-  const transcripts = options.includeTranscripts
-    ? await Promise.all(
-        calls.slice(0, options.transcriptLimit).map(async (call) => {
-          try {
-            const transcript = await getCallTranscript(call.id);
-            return {
-              callId: call.id,
-              title: call.title,
-              started: call.started,
-              ...extractTranscriptText(transcript, options.transcriptMaxChars),
-            };
-          } catch (err) {
-            gaps.push(
-              `Gong transcript ${call.id}: ${
-                err instanceof Error ? err.message : String(err)
-              }`,
-            );
-            return {
-              callId: call.id,
-              title: call.title,
-              started: call.started,
-              text: "",
-              sentenceCount: 0,
-              truncated: false,
-              error: err instanceof Error ? err.message : String(err),
-            };
-          }
-        }),
-      )
-    : [];
+  const transcripts: Array<Record<string, unknown>> = [];
+  if (options.includeTranscripts) {
+    const transcriptCalls = calls.slice(0, options.transcriptLimit);
+    try {
+      const rows = transcriptRowsByCallId(
+        await getCallTranscripts(transcriptCalls.map((call) => call.id)),
+      );
+      for (const call of transcriptCalls) {
+        const transcript = rows.get(call.id);
+        if (transcript) {
+          transcripts.push({
+            callId: call.id,
+            title: call.title,
+            started: call.started,
+            ...extractTranscriptText(transcript, options.transcriptMaxChars),
+          });
+        } else {
+          const error = "Gong did not return a transcript for this call.";
+          gaps.push(`Gong transcript ${call.id}: ${error}`);
+          transcripts.push({
+            callId: call.id,
+            title: call.title,
+            started: call.started,
+            text: "",
+            sentenceCount: 0,
+            truncated: false,
+            error,
+          });
+        }
+      }
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      for (const call of transcriptCalls) {
+        gaps.push(`Gong transcript ${call.id}: ${error}`);
+        transcripts.push({
+          callId: call.id,
+          title: call.title,
+          started: call.started,
+          text: "",
+          sentenceCount: 0,
+          truncated: false,
+          error,
+        });
+      }
+    }
+  }
 
   return {
     calls,
-    callDetails: callDetails.filter((detail) => detail !== null),
+    callDetails,
     transcripts,
     searchCoverage,
     gaps,
@@ -326,7 +366,7 @@ async function loadGongEvidence(options: {
 
 export default defineAction({
   description:
-    "Build a Fusion-quality account/deal deep-dive evidence bundle from HubSpot and Gong in one bounded read-only call. Use this first for named account, customer, deal, opportunity, renewal, risk, or 'deep dive' prompts before synthesizing the answer.",
+    "Build a bounded CRM/Gong account or deal evidence bundle from HubSpot and Gong. Use this first for named account, customer, deal, opportunity, renewal, risk, or deep-dive prompts. This is not a complete account-health result: for account health, follow it with verified product-usage queries for the resolved customer using the account-health skill.",
   schema: z.object({
     query: z
       .string()
@@ -378,6 +418,7 @@ export default defineAction({
   http: { method: "GET" },
   readOnly: true,
   publicAgent: { expose: true, readOnly: true, requiresAuth: true },
+  grounding: true,
   run: async (args) => {
     const trimmedQuery = args.query.trim();
     const gaps: string[] = [];
@@ -565,10 +606,11 @@ export default defineAction({
         emailCount: emails.length,
         gongCallCount: gong.calls.length,
         transcriptCount: gong.transcripts.length,
+        productUsageIncluded: false,
         gaps,
       },
       guidance:
-        "Synthesize a Fusion-style deal deep dive from this evidence. Include: executive summary, company/deal overview, key contacts and roles, dated timeline, Gong conversation evidence with call dates/titles, current state and risk assessment, likely blockers, recommended next steps, and methodology/gaps. Attribute every claim to HubSpot or Gong evidence and distinguish customer statements from internal notes.",
+        "Synthesize a CRM/Gong deal deep dive from this evidence. Include: executive summary, company/deal overview, key contacts and roles, dated timeline, Gong conversation evidence with call dates/titles, current state and risk assessment, likely blockers, recommended next steps, and methodology/gaps. Attribute every claim to HubSpot or Gong evidence and distinguish customer statements from internal notes. This bundle does not include product usage, contract utilization, adoption, or cross-source identity validation; for account health, run the account-health checks and report those gaps until verified usage evidence is present.",
     };
   },
 });

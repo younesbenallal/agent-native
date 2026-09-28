@@ -1,86 +1,103 @@
+import {
+  isArtifactReceipt,
+  type ArtifactReceipt,
+} from "../../artifacts/detect.js";
 import { getCurrentTurnEventsForThread } from "../run-store.js";
 import {
   classifyToolCallJournal,
   type ToolCallJournal,
 } from "../tool-call-journal.js";
+import type { AgentChatEvent } from "../types.js";
 
-/**
- * Minimal shape `runAgentLoop` needs from a prior tool call — kept local
- * (rather than importing `AgentLoopToolCallSummary` from `production-agent.js`)
- * so this module has no runtime dependency back on the file that calls it.
- */
 export interface PriorTurnToolCallSummary {
   name: string;
   input: unknown;
 }
 
-/** Minimal shape `runAgentLoop` needs from a prior tool result. See
- * `PriorTurnToolCallSummary` for why this is a local shape, not an import. */
 export interface PriorTurnToolResultSummary {
   name: string;
+  input?: unknown;
   content: string;
   isError: boolean;
+  artifacts?: ArtifactReceipt[];
 }
 
-/**
- * Tool-call journal hard-block (resume safety). Snapshot the per-turn journal
- * ONCE here, before any tool runs in this chunk, so it reflects only PRIOR
- * run chunks of this logical turn. A write tool whose exact call already
- * completed in an earlier interrupted chunk must not re-fire its side effect;
- * when matched, `runToolCall` returns the journaled result instead of
- * executing.
- *
- * Loaded eagerly (not lazily mid-loop) so the current chunk's own
- * asynchronously-persisted tool_done events can never leak in and make a
- * same-chunk call wrongly short-circuit. Best-effort: any ledger failure
- * leaves the journal empty and all calls run normally. Fresh first-turn calls
- * see an empty journal and are unaffected.
- *
- * Also returns the prior chunks' tool calls/results so the caller can seed
- * its own `toolCallHistory` / `toolResultHistory` accumulators — final
- * response guards must see successful reads from earlier chunks, not only
- * tools executed after the latest handoff. Otherwise a guard can reject a
- * grounded answer (or a successfully-created artifact) after the
- * evidence-producing query completed in a predecessor run.
- *
- * Moved verbatim out of `runAgentLoop`'s per-turn setup — behavior unchanged.
- */
+export type PriorTurnToolCallJournalRead =
+  | {
+      status: "read";
+      toolCallJournal: ToolCallJournal | null;
+      priorToolCalls: PriorTurnToolCallSummary[];
+      priorToolResults: PriorTurnToolResultSummary[];
+    }
+  | { status: "unreadable"; error: string };
+
+const LEDGER_READ_RETRY_MS = 250;
+
+async function readCurrentTurnEventsWithRetry(
+  threadId: string,
+  turnId?: string,
+): Promise<AgentChatEvent[]> {
+  try {
+    return await getCurrentTurnEventsForThread(threadId, turnId);
+  } catch (err) {
+    console.warn(
+      `[tool-call-journal] per-turn ledger read failed for thread ${threadId}, retrying once: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, LEDGER_READ_RETRY_MS));
+    return await getCurrentTurnEventsForThread(threadId, turnId);
+  }
+}
+
 export async function loadPriorTurnToolCallJournal(
   threadId: string | undefined,
   turnId?: string,
-): Promise<{
-  toolCallJournal: ToolCallJournal | null;
-  priorToolCalls: PriorTurnToolCallSummary[];
-  priorToolResults: PriorTurnToolResultSummary[];
-}> {
+): Promise<PriorTurnToolCallJournalRead> {
+  if (!threadId) {
+    return {
+      status: "read",
+      toolCallJournal: null,
+      priorToolCalls: [],
+      priorToolResults: [],
+    };
+  }
+  let priorEvents: AgentChatEvent[];
+  try {
+    priorEvents = await readCurrentTurnEventsWithRetry(threadId, turnId);
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `[tool-call-journal] per-turn ledger read failed for thread ${threadId}: ${error}`,
+    );
+    return { status: "unreadable", error };
+  }
   const priorToolCalls: PriorTurnToolCallSummary[] = [];
   const priorToolResults: PriorTurnToolResultSummary[] = [];
-  let toolCallJournal: ToolCallJournal | null = null;
-  if (!threadId) {
-    return { toolCallJournal, priorToolCalls, priorToolResults };
-  }
-  try {
-    const priorEvents = await getCurrentTurnEventsForThread(threadId, turnId);
-    if (priorEvents.length > 0) {
-      for (const event of priorEvents) {
-        if (event.type === "tool_start") {
-          priorToolCalls.push({
-            name: event.tool,
-            input: event.input,
-          });
-        } else if (event.type === "tool_done") {
-          priorToolResults.push({
-            name: event.tool,
-            content: event.result,
-            isError: event.isError === true,
-          });
-        }
-      }
-      toolCallJournal = classifyToolCallJournal(priorEvents);
+  const openInputsByTool = new Map<string, unknown[]>();
+  for (const event of priorEvents) {
+    if (event.type === "tool_start") {
+      priorToolCalls.push({ name: event.tool, input: event.input });
+      const queue = openInputsByTool.get(event.tool);
+      if (queue) queue.push(event.input);
+      else openInputsByTool.set(event.tool, [event.input]);
+    } else if (event.type === "tool_done") {
+      const fifoInput = openInputsByTool.get(event.tool)?.shift();
+      const artifacts = event.artifacts?.filter(isArtifactReceipt);
+      priorToolResults.push({
+        name: event.tool,
+        input: event.input ?? fifoInput,
+        content: event.result,
+        isError: event.isError === true,
+        ...(artifacts && artifacts.length > 0 ? { artifacts } : {}),
+      });
     }
-  } catch {
-    // Journal is a hardening layer, never a gate — a failed ledger read just
-    // means no hard-block this turn.
   }
-  return { toolCallJournal, priorToolCalls, priorToolResults };
+  return {
+    status: "read",
+    toolCallJournal:
+      priorEvents.length > 0 ? classifyToolCallJournal(priorEvents) : null,
+    priorToolCalls,
+    priorToolResults,
+  };
 }

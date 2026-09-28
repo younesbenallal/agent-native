@@ -1,14 +1,3 @@
-/**
- * AgentTerminal — Embeddable CLI terminal component
- *
- * Renders an xterm.js terminal connected to a PTY WebSocket server.
- * When running inside a frame, renders nothing (the frame manages the terminal).
- *
- * Usage:
- *   import { AgentTerminal } from "@agent-native/core/terminal";
- *   <AgentTerminal className="w-full h-[400px]" />
- */
-
 import { useRef, useEffect, useState, type CSSProperties } from "react";
 
 import { parseSubmitChatMessage } from "../agent-chat.js";
@@ -16,29 +5,26 @@ import { agentNativePath } from "../api-path.js";
 import { getFrameOrigin, isTrustedFrameMessage } from "../frame.js";
 
 export interface AgentTerminalProps {
-  /** CLI command to run. Default: 'builder' */
   command?: string;
-  /** Additional CLI flags */
   flags?: string;
-  /** Custom WebSocket URL (overrides auto-discovery) */
   wsUrl?: string;
-  /** Hide when running inside frame. Default: true */
   hideInFrame?: boolean;
-  /** Terminal theme overrides */
   theme?: Record<string, string>;
-  /** Font size. Default: 12 */
   fontSize?: number;
-  /** CSS class for the container */
+  autoFocus?: boolean;
   className?: string;
-  /** Inline styles for the container */
   style?: CSSProperties;
-  /** Callback when connection state changes */
   onConnectionChange?: (connected: boolean) => void;
-  /** Callback when agent running state changes */
   onAgentRunningChange?: (running: boolean) => void;
+  submitRequest?: AgentTerminalSubmitRequest;
+  onPromptSubmitted?: (request: AgentTerminalSubmitRequest) => void;
 }
 
-// Inject xterm CSS once
+export interface AgentTerminalSubmitRequest {
+  id: string | number;
+  text: string;
+}
+
 let cssInjected = false;
 function injectXtermCss() {
   if (cssInjected || typeof document === "undefined") return;
@@ -57,8 +43,19 @@ function injectXtermCss() {
     .xterm .composition-view { display: none; position: absolute; white-space: nowrap; z-index: 1; }
     .xterm .composition-view.active { display: block; }
     .xterm .xterm-viewport {
-      background-color: #000; overflow-y: scroll;
+      background-color: var(--agent-terminal-background); overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: hsl(var(--muted-foreground) / 0.22) transparent;
       cursor: default; position: absolute; right: 0; left: 0; top: 0; bottom: 0;
+    }
+    .xterm .xterm-viewport::-webkit-scrollbar { width: 8px; height: 8px; }
+    .xterm .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
+    .xterm .xterm-viewport::-webkit-scrollbar-thumb {
+      background: hsl(var(--muted-foreground) / 0.22);
+      border-radius: 999px;
+    }
+    .xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
+      background: hsl(var(--muted-foreground) / 0.36);
     }
     .xterm .xterm-screen { position: relative; }
     .xterm .xterm-screen canvas { position: absolute; left: 0; top: 0; }
@@ -126,20 +123,32 @@ export function AgentTerminal({
   hideInFrame = true,
   theme,
   fontSize = 12,
+  autoFocus = true,
   className,
   style,
   onConnectionChange,
   onAgentRunningChange,
+  submitRequest,
+  onPromptSubmitted,
 }: AgentTerminalProps) {
   const termRef = useRef<HTMLDivElement>(null);
+  const submitPromptRef = useRef<
+    ((request: AgentTerminalSubmitRequest) => void) | null
+  >(null);
+  const pendingSubmitRequestRef = useRef<AgentTerminalSubmitRequest | null>(
+    null,
+  );
+  const autoFocusRef = useRef(autoFocus);
+  autoFocusRef.current = autoFocus;
+  const focusTerminalRef = useRef<(() => void) | null>(null);
+  const onPromptSubmittedRef = useRef(onPromptSubmitted);
+  onPromptSubmittedRef.current = onPromptSubmitted;
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [inFrame, setInFrame] = useState(false);
 
-  // Check frame state after mount (postMessage is async)
   useEffect(() => {
     if (!hideInFrame) return;
-    // Check immediately and also after a short delay for the postMessage to arrive
     const check = () => {
       if (getFrameOrigin()) setInFrame(true);
     };
@@ -148,19 +157,30 @@ export function AgentTerminal({
     return () => clearTimeout(timer);
   }, [hideInFrame]);
 
-  // Notify parent of connection changes
   useEffect(() => {
     onConnectionChange?.(connected);
   }, [connected, onConnectionChange]);
 
-  // Main terminal setup
+  useEffect(() => {
+    if (autoFocus) {
+      focusTerminalRef.current?.();
+      return;
+    }
+    const activeElement = document.activeElement;
+    if (
+      activeElement instanceof HTMLElement &&
+      termRef.current?.contains(activeElement)
+    ) {
+      activeElement.blur();
+    }
+  }, [autoFocus]);
+
   useEffect(() => {
     if (typeof window === "undefined") return;
     if (hideInFrame && inFrame) return;
 
     const containerRaw = termRef.current;
     if (!containerRaw) return;
-    // Non-null assertion: null branch exited above; closures lose the narrowing.
     const container: HTMLDivElement = containerRaw;
 
     let disposed = false;
@@ -168,7 +188,6 @@ export function AgentTerminal({
     let cleanupMessageHandler: (() => void) | null = null;
 
     async function init() {
-      // Dynamic imports for SSR safety
       const [{ Terminal }, { FitAddon }, { WebLinksAddon }] = await Promise.all(
         [
           import("@xterm/xterm"),
@@ -196,6 +215,9 @@ export function AgentTerminal({
       term.loadAddon(fitAddon);
       term.loadAddon(webLinksAddon);
       term.open(container);
+      const focusTerminal = () => term.focus();
+      focusTerminalRef.current = focusTerminal;
+      if (autoFocusRef.current) focusTerminal();
 
       let fitPending = false;
       function fitAndResize() {
@@ -228,7 +250,6 @@ export function AgentTerminal({
       window.addEventListener("focus", handleVisibilityOrFocus);
       document.addEventListener("visibilitychange", handleVisibilityOrFocus);
 
-      // Resize observer for auto-fitting
       const resizeObserver = new ResizeObserver(() => {
         fitAndResize();
       });
@@ -245,10 +266,18 @@ export function AgentTerminal({
           handleVisibilityOrFocus,
         );
         resizeObserver.disconnect();
+        if (focusTerminalRef.current === focusTerminal) {
+          focusTerminalRef.current = null;
+        }
         term.dispose();
       }
 
-      // Discover WebSocket URL
+      function disposeIfCancelled() {
+        if (!disposed) return false;
+        disposeTerminal();
+        return true;
+      }
+
       let wsUrl = wsUrlProp;
       let resolvedCommand = command;
       if (!wsUrl) {
@@ -256,7 +285,9 @@ export function AgentTerminal({
           const res = await fetch(
             agentNativePath("/_agent-native/agent-terminal-info"),
           );
+          if (disposeIfCancelled()) return;
           const info: TerminalInfo = await res.json();
+          if (disposeIfCancelled()) return;
           if (!info.available) {
             setError(info.error || "Agent terminal not available");
             disposeTerminal();
@@ -269,27 +300,38 @@ export function AgentTerminal({
             resolvedCommand = info.command;
           }
         } catch (err) {
+          if (disposeIfCancelled()) return;
           setError("Failed to discover terminal server");
           disposeTerminal();
           return;
         }
       }
 
-      // Build WebSocket URL with query params
-      const qs = new URLSearchParams();
-      if (resolvedCommand) qs.set("command", resolvedCommand);
-      if (flags) qs.set("flags", flags);
-      const qsStr = qs.toString();
-      const fullWsUrl = qsStr ? `${wsUrl}?${qsStr}` : wsUrl;
+      const fullWsUrl = new URL(wsUrl);
+      if (resolvedCommand) {
+        fullWsUrl.searchParams.set("command", resolvedCommand);
+      }
+      if (flags) fullWsUrl.searchParams.set("flags", flags);
 
-      term.write(
-        `\x1b[2m[terminal] Starting ${resolvedCommand || "CLI"}...\x1b[0m\r\n`,
-      );
-
-      // Connect WebSocket
       let agentRunning = false;
       let idleTimer: ReturnType<typeof setTimeout> | null = null;
       let connectionId = 0;
+
+      function submitPrompt(request: AgentTerminalSubmitRequest) {
+        const text = request.text.trim();
+        if (!text) return;
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          pendingSubmitRequestRef.current = request;
+          return;
+        }
+        ws.send(text + "\r");
+        agentRunning = true;
+        notifyAgentRunning(true);
+        if (pendingSubmitRequestRef.current?.id === request.id) {
+          pendingSubmitRequestRef.current = null;
+        }
+        onPromptSubmittedRef.current?.(request);
+      }
 
       function sendResize() {
         if (ws && ws.readyState === WebSocket.OPEN && term) {
@@ -327,6 +369,7 @@ export function AgentTerminal({
         socket.onopen = () => {
           setConnected(true);
           setError(null);
+          if (autoFocusRef.current) focusTerminal();
           socket.send(
             JSON.stringify({
               type: "resize",
@@ -334,6 +377,8 @@ export function AgentTerminal({
               rows: term.rows,
             }),
           );
+          const pendingRequest = pendingSubmitRequestRef.current;
+          if (pendingRequest) submitPrompt(pendingRequest);
         };
 
         socket.onmessage = (event) => {
@@ -342,13 +387,11 @@ export function AgentTerminal({
               ? new TextDecoder().decode(event.data)
               : event.data;
 
-          // Check for setup-status JSON messages
           try {
             const msg = JSON.parse(data);
             if (msg.type === "setup-status") {
               if (msg.status === "not-found" || msg.status === "failed") {
                 setError(msg.message);
-                // Bump connectionId to suppress reconnect on close
                 connectionId++;
               }
               return;
@@ -360,7 +403,6 @@ export function AgentTerminal({
           setError(null);
           term.write(data);
 
-          // Idle detection — prompt or cursor visible means agent stopped
           if (data.includes("❯") || data.includes("\x1b[?25h")) {
             if (idleTimer) clearTimeout(idleTimer);
             idleTimer = setTimeout(() => {
@@ -377,9 +419,6 @@ export function AgentTerminal({
         socket.onclose = () => {
           setConnected(false);
           if (connectionId === thisId && !disposed) {
-            term.write(
-              "\r\n\x1b[31m[terminal] Connection closed. Reconnecting in 3s...\x1b[0m\r\n",
-            );
             setTimeout(() => {
               if (connectionId === thisId && !disposed) {
                 connect(url);
@@ -391,14 +430,12 @@ export function AgentTerminal({
         socket.onerror = () => socket.close();
       }
 
-      // Terminal input → WebSocket
       term.onData((data) => {
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(data);
         }
       });
 
-      // Chat bridge integration — listen for sendToAgentChat messages
       const messageHandler = (event: MessageEvent) => {
         if (!isTrustedFrameMessage(event)) return;
         const parsed = parseSubmitChatMessage(event);
@@ -412,9 +449,11 @@ export function AgentTerminal({
       cleanupMessageHandler = () =>
         window.removeEventListener("message", messageHandler);
 
-      connect(fullWsUrl);
+      submitPromptRef.current = submitPrompt;
+      const initialRequest = pendingSubmitRequestRef.current;
+      if (initialRequest) submitPrompt(initialRequest);
+      connect(fullWsUrl.toString());
 
-      // Store cleanup references
       return () => {
         disposed = true;
         connectionId++;
@@ -424,11 +463,17 @@ export function AgentTerminal({
           ws.close();
           ws = null;
         }
+        submitPromptRef.current = null;
       };
     }
 
     let cleanup: (() => void) | undefined;
-    init().then((fn) => {
+    void init().then((fn) => {
+      if (disposed) {
+        fn?.();
+        cleanupMessageHandler?.();
+        return;
+      }
       cleanup = fn;
     });
 
@@ -440,6 +485,12 @@ export function AgentTerminal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hideInFrame, inFrame, command, flags, wsUrlProp]);
 
+  useEffect(() => {
+    if (!submitRequest) return;
+    pendingSubmitRequestRef.current = submitRequest;
+    submitPromptRef.current?.(submitRequest);
+  }, [submitRequest?.id, submitRequest?.text]);
+
   if (hideInFrame && inFrame) {
     return null;
   }
@@ -449,6 +500,7 @@ export function AgentTerminal({
     ...style,
     background: terminalBackground,
     backgroundColor: terminalBackground,
+    "--agent-terminal-background": terminalBackground,
   };
 
   return (
@@ -471,7 +523,7 @@ export function AgentTerminal({
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            backgroundColor: "#111",
+            backgroundColor: terminalBackground,
             color: "#ff7b72",
             fontSize: "13px",
             fontFamily: "monospace",

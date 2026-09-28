@@ -1,32 +1,7 @@
-/**
- * PostHog LLM-analytics events (`$ai_trace`, `$ai_span`, `$ai_generation`
- * content fields).
- *
- * PostHog models an agent run as a tree: one `$ai_trace` per run, `$ai_span`
- * for non-model work (tool calls), and `$ai_generation` for model round-trips.
- * Every node shares `$ai_trace_id` and links upward through `$ai_parent_id`.
- * Emitting only a generation — which is what this framework did — makes PostHog
- * synthesize a placeholder trace with no tool steps in it.
- *
- * `$ai_session_id` groups traces into a conversation. It is deliberately NOT
- * PostHog's `$session_id`: the latter is the browser session used for session
- * replay, and the two are different lifetimes.
- *
- * Content (`$ai_input` / `$ai_output_choices` / `$ai_input_state` /
- * `$ai_output_state`) is gated on config and always OMITTED when disabled.
- * Sending `[]` instead would be indistinguishable from a run that genuinely had
- * no messages.
- *
- * @see https://posthog.com/docs/ai-observability/traces
- * @see https://posthog.com/docs/ai-observability/spans
- */
-
 import { sendPostHogEvent } from "../tracking/providers.js";
 import { boundedText } from "../tracking/redaction.js";
 
-/** Hard ceiling on serialized content per `$ai_*` field. */
 export const MAX_AI_CONTENT_BYTES = 128 * 1024;
-/** Hard ceiling on emitted `$ai_span` events per run. */
 export const MAX_AI_SPANS_PER_RUN = 100;
 
 export interface AiErrorDetail {
@@ -36,10 +11,23 @@ export interface AiErrorDetail {
   retryable?: boolean;
 }
 
+const UNREPORTED_ERROR: AiErrorDetail = {
+  message: "failed without a reported error message",
+};
+
+export function resolveAiError(
+  isError: boolean,
+  error: AiErrorDetail | undefined,
+): AiErrorDetail | undefined {
+  if (!isError) return undefined;
+  return error ?? UNREPORTED_ERROR;
+}
+
 function trackAiEvent(
   name: string,
   properties: Record<string, unknown>,
   userId: string | null,
+  occurredAt: number,
 ): void {
   for (const key of Object.keys(properties)) {
     if (properties[key] === undefined) delete properties[key];
@@ -47,7 +35,7 @@ function trackAiEvent(
   try {
     void import("../tracking/registry.js")
       .then(({ track }) => {
-        track(name, properties, { userId: userId ?? undefined });
+        track(name, properties, { userId: userId ?? undefined, occurredAt });
       })
       .catch(() => {});
     // coercion-ok: a throw here would break the run it is observing
@@ -56,13 +44,14 @@ function trackAiEvent(
   }
 }
 
-/**
- * Serialize a content value under a byte ceiling.
- *
- * Returns `{ truncated: true }` with a placeholder rather than a silently
- * shortened payload — a trace that shows half a conversation as if it were the
- * whole one is worse than one that says it was cut.
- */
+function utf8Bytes(text: string): number {
+  return typeof Buffer !== "undefined"
+    ? Buffer.byteLength(text, "utf8")
+    : new TextEncoder().encode(text).length;
+}
+
+const OMISSION_MARKER_BYTES = 512;
+
 export function boundAiContent(value: unknown): {
   value: unknown;
   truncated: boolean;
@@ -75,11 +64,39 @@ export function boundAiContent(value: unknown): {
   }
   if (serialized === undefined) return { value: undefined, truncated: false };
 
-  const bytes =
-    typeof Buffer !== "undefined"
-      ? Buffer.byteLength(serialized, "utf8")
-      : new TextEncoder().encode(serialized).length;
+  const bytes = utf8Bytes(serialized);
   if (bytes <= MAX_AI_CONTENT_BYTES) return { value, truncated: false };
+
+  if (Array.isArray(value)) {
+    let lastUser: unknown;
+    for (let i = value.length - 1; i >= 0; i -= 1) {
+      const entry = value[i];
+      if (
+        !!entry &&
+        typeof entry === "object" &&
+        (entry as { role?: unknown }).role === "user"
+      ) {
+        lastUser = entry;
+        break;
+      }
+    }
+    const kept =
+      lastUser !== undefined &&
+      utf8Bytes(JSON.stringify(lastUser) ?? "null") <=
+        MAX_AI_CONTENT_BYTES - OMISSION_MARKER_BYTES
+        ? [lastUser]
+        : [];
+    return {
+      value: [
+        {
+          role: "system",
+          content: `[${value.length - kept.length} message(s) omitted: ${bytes} bytes exceeded the ${MAX_AI_CONTENT_BYTES}-byte trace content limit]`,
+        },
+        ...kept,
+      ],
+      truncated: true,
+    };
+  }
 
   return {
     value: `[truncated: ${bytes} bytes exceeded the ${MAX_AI_CONTENT_BYTES}-byte trace content limit]`,
@@ -87,40 +104,135 @@ export function boundAiContent(value: unknown): {
   };
 }
 
+interface PostHogToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments?: unknown };
+}
+
+interface PostHogMessage {
+  role: unknown;
+  content?: unknown;
+  tool_calls?: PostHogToolCall[];
+  tool_call_id?: string;
+  name?: string;
+}
+
+function contentParts(value: unknown): Record<string, unknown>[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  return value.every(
+    (part) => !!part && typeof part === "object" && !Array.isArray(part),
+  )
+    ? (value as Record<string, unknown>[])
+    : null;
+}
+
+function mediaPlaceholder(part: Record<string, unknown>): unknown {
+  const mediaType =
+    typeof part.mediaType === "string" ? part.mediaType : "unknown";
+  const data = typeof part.data === "string" ? part.data : "";
+  const bytes = Math.floor((data.length * 3) / 4);
+  const filename = typeof part.filename === "string" ? ` ${part.filename}` : "";
+  const label = part.type === "image" ? "image" : `file${filename}`;
+  return { type: "text", text: `[${label}: ${mediaType}, ~${bytes} bytes]` };
+}
+
+export function toPostHogMessages(value: unknown): unknown {
+  if (!Array.isArray(value)) return value;
+
+  const out: PostHogMessage[] = [];
+  for (const message of value) {
+    if (!message || typeof message !== "object" || Array.isArray(message)) {
+      out.push(message as PostHogMessage);
+      continue;
+    }
+    const { role, content } = message as PostHogMessage;
+    const parts = contentParts(content);
+    if (!parts) {
+      out.push(message as PostHogMessage);
+      continue;
+    }
+
+    const toolResults: PostHogMessage[] = [];
+    const toolCalls: PostHogToolCall[] = [];
+    const kept: unknown[] = [];
+    const text: string[] = [];
+    let textOnly = true;
+
+    for (const part of parts) {
+      switch (part.type) {
+        case "tool-result":
+          toolResults.push({
+            role: "tool",
+            tool_call_id:
+              typeof part.toolCallId === "string" ? part.toolCallId : "",
+            ...(typeof part.toolName === "string"
+              ? { name: part.toolName }
+              : {}),
+            content: part.content,
+          });
+          break;
+        case "tool-call":
+          toolCalls.push({
+            id: typeof part.id === "string" ? part.id : "",
+            type: "function",
+            function: {
+              name: typeof part.name === "string" ? part.name : "",
+              ...(part.input !== undefined ? { arguments: part.input } : {}),
+            },
+          });
+          break;
+        case "text":
+          text.push(typeof part.text === "string" ? part.text : "");
+          kept.push({ type: "text", text: part.text });
+          break;
+        case "thinking":
+          textOnly = false;
+          kept.push({ type: "thinking", thinking: part.text ?? "" });
+          break;
+        case "image":
+        case "file":
+          textOnly = false;
+          kept.push(mediaPlaceholder(part));
+          break;
+        default:
+          textOnly = false;
+          kept.push(part);
+      }
+    }
+
+    out.push(...toolResults);
+    if (kept.length > 0 || toolCalls.length > 0) {
+      out.push({
+        role,
+        content: textOnly ? text.join("\n") : kept,
+        ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+      });
+    }
+  }
+  return out;
+}
+
 export interface AiTraceEventInput {
   runId: string;
   threadId: string | null;
   userId: string | null;
-  /** Human-readable name for the run, e.g. the agent or thread name. */
   spanName: string;
   model: string;
   provider: string;
-  latencySeconds: number;
+  durationMs: number;
   isError: boolean;
   error?: AiErrorDetail;
+  errorType?: string;
   inputTokens?: number;
   outputTokens?: number;
   costUsd?: number;
   createdAt: number;
-  /** Browser session id, when the run originated from a page. Links the trace
-   *  to PostHog session replay. */
   browserSessionId?: string;
-  /** Omitted unless `capturePrompts` is on. */
-  inputState?: unknown;
-  outputState?: unknown;
   extraProperties?: Record<string, unknown>;
 }
 
 export function emitAiTraceEvent(input: AiTraceEventInput): void {
-  const inputContent =
-    input.inputState === undefined
-      ? undefined
-      : boundAiContent(input.inputState);
-  const outputContent =
-    input.outputState === undefined
-      ? undefined
-      : boundAiContent(input.outputState);
-
   trackAiEvent(
     "$ai_trace",
     {
@@ -130,20 +242,20 @@ export function emitAiTraceEvent(input: AiTraceEventInput): void {
       $ai_span_name: input.spanName,
       $ai_model: input.model,
       $ai_provider: input.provider,
-      $ai_latency: input.latencySeconds,
       $ai_is_error: input.isError,
-      $ai_error: input.error,
-      $ai_input_tokens: input.inputTokens,
-      $ai_output_tokens: input.outputTokens,
-      $ai_total_cost_usd: input.costUsd,
-      $ai_input_state: inputContent?.value,
-      $ai_output_state: outputContent?.value,
-      $ai_input_truncated: inputContent?.truncated || undefined,
-      $ai_output_truncated: outputContent?.truncated || undefined,
+      $ai_error: resolveAiError(input.isError, input.error),
+      $ai_error_type: input.isError
+        ? (input.errorType ?? "run_error")
+        : undefined,
+      duration_ms: Math.round(input.durationMs),
+      input_tokens: input.inputTokens,
+      output_tokens: input.outputTokens,
+      cost_usd: input.costUsd,
       $session_id: input.browserSessionId,
       created_at: new Date(input.createdAt).toISOString(),
     },
     input.userId,
+    input.createdAt,
   );
 }
 
@@ -152,15 +264,14 @@ export interface AiSpanEventInput {
   threadId: string | null;
   userId: string | null;
   spanId: string;
-  /** Defaults to the run's trace id, which is the tree root. */
   parentId?: string;
   spanName: string;
   latencySeconds: number;
   isError: boolean;
   error?: AiErrorDetail;
+  errorType?: string;
   createdAt: number;
   browserSessionId?: string;
-  /** Omitted unless `captureToolArgs` / `captureToolResults` are on. */
   inputState?: unknown;
   outputState?: unknown;
   extraProperties?: Record<string, unknown>;
@@ -187,15 +298,19 @@ export function emitAiSpanEvent(input: AiSpanEventInput): void {
       $ai_span_name: input.spanName,
       $ai_latency: input.latencySeconds,
       $ai_is_error: input.isError,
-      $ai_error: input.error,
+      $ai_error: resolveAiError(input.isError, input.error),
+      $ai_error_type: input.isError
+        ? (input.errorType ?? "tool_error")
+        : undefined,
       $ai_input_state: inputContent?.value,
       $ai_output_state: outputContent?.value,
-      $ai_input_truncated: inputContent?.truncated || undefined,
-      $ai_output_truncated: outputContent?.truncated || undefined,
+      input_truncated: inputContent?.truncated || undefined,
+      output_truncated: outputContent?.truncated || undefined,
       $session_id: input.browserSessionId,
       created_at: new Date(input.createdAt).toISOString(),
     },
     input.userId,
+    input.createdAt,
   );
 }
 
@@ -204,47 +319,35 @@ export interface AiFeedbackSurveyInput {
   threadId: string | null;
   userId: string | null;
   feedbackType: "thumbs_up" | "thumbs_down" | "category" | "text";
-  /** The submitted value: sentiment label, chosen category, or free text. */
   value: string;
   submissionId: string;
   model?: string;
   browserSessionId?: string;
 }
 
-/**
- * Emit PostHog's documented manual feedback event for an LLM trace.
- *
- * PostHog surfaces feedback in LLM analytics only through `survey sent` keyed
- * to a real survey id — `$ai_feedback` is not a PostHog event and renders
- * nowhere. Returns `false` and emits nothing when no survey id is configured:
- * inventing one would produce events attached to a survey that does not exist.
- *
- * Sent to PostHog ONLY, not through `track()`. The survey response carries the
- * user's free-text feedback verbatim, and configuring a PostHog survey id must
- * not silently start shipping that text to Mixpanel, Amplitude, webhooks, or
- * Agent Native Analytics. Those backends get the content-free `$ai_feedback`
- * event instead.
- *
- * @see https://posthog.com/docs/ai-observability/user-feedback/manual-event-capture
- */
+const THUMB_RESPONSE_INDEX = { thumbs_up: 1, thumbs_down: 2 } as const;
+
 export function emitAiFeedbackSurveyEvent(
   input: AiFeedbackSurveyInput,
 ): boolean {
   const surveyId = process.env.POSTHOG_AI_FEEDBACK_SURVEY_ID?.trim();
   if (!surveyId) return false;
 
-  const questionId = process.env.POSTHOG_AI_FEEDBACK_SURVEY_QUESTION_ID?.trim();
-  // PostHog accepts `$survey_response` for a single-question survey and
-  // `$survey_response_<questionId>` when the survey has named questions.
-  const responseKey = questionId
-    ? `$survey_response_${questionId}`
-    : "$survey_response";
+  const thumbResponse =
+    input.feedbackType === "thumbs_up" || input.feedbackType === "thumbs_down"
+      ? THUMB_RESPONSE_INDEX[input.feedbackType]
+      : undefined;
+
+  const responses =
+    thumbResponse !== undefined
+      ? { $survey_response: thumbResponse }
+      : { $survey_response_1: input.value };
 
   const properties: Record<string, unknown> = {
     $survey_id: surveyId,
-    [responseKey]: input.value,
+    ...responses,
     $survey_submission_id: input.submissionId,
-    $survey_completed: true,
+    $survey_completed: input.feedbackType !== "thumbs_down",
     $ai_trace_id: input.runId ?? undefined,
     $ai_session_id: input.threadId ?? undefined,
     $ai_model: input.model,
@@ -263,12 +366,6 @@ export function emitAiFeedbackSurveyEvent(
   );
 }
 
-/**
- * Build a structured `$ai_error` from the run's failure information.
- *
- * Returns `undefined` when the run did not fail, so `$ai_error` is absent
- * rather than an empty object on healthy traces.
- */
 export function toAiErrorDetail(
   errorMessage: string | null | undefined,
   terminalOutcome?: {

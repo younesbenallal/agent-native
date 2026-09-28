@@ -4,6 +4,7 @@ import {
 } from "@agent-native/core/client/extensions";
 import { useDemoModeStatus } from "@agent-native/core/client/hooks";
 import { useT } from "@agent-native/core/client/i18n";
+import { resolveDashboardFunnelRows } from "@shared/dashboard-funnel";
 import {
   IconArrowsSort,
   IconSortAscending,
@@ -64,10 +65,9 @@ import {
 import { useChartTooltipPortalPosition } from "@/hooks/use-chart-tooltip-portal";
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100];
-import { resolveDashboardFunnelRows } from "@shared/dashboard-funnel";
 
 import { createDemoChartTrendRows } from "@/lib/demo-chart-trend";
-import { useSqlQuery } from "@/lib/sql-query";
+import { useSqlQuery, type SqlQueryResult } from "@/lib/sql-query";
 import {
   resolveDualAxis,
   type ChartAxisSide,
@@ -85,6 +85,25 @@ import type {
 
 import { DashboardPanelSkeleton } from "./DashboardPanelSkeleton";
 
+const MAX_CHART_POINTS = 400;
+
+export function limitChartRows(
+  rows: Record<string, unknown>[],
+  chartType: ChartType,
+): Record<string, unknown>[] {
+  if (
+    rows.length <= MAX_CHART_POINTS ||
+    !["line", "area", "bar", "pie", "heatmap", "funnel", "callout"].includes(
+      chartType,
+    )
+  ) {
+    return rows;
+  }
+  return chartType !== "line" && chartType !== "area" && chartType !== "heatmap"
+    ? rows.slice(0, MAX_CHART_POINTS)
+    : rows.slice(-MAX_CHART_POINTS);
+}
+
 const DEFAULT_COLORS = [
   "var(--brand-blue)",
   "var(--brand-teal)",
@@ -96,8 +115,10 @@ const DEFAULT_COLORS = [
   "#14b8a6",
 ];
 
+const CHART_TOOLTIP_Z_INDEX = 60;
+
 const CHART_TOOLTIP_WRAPPER_STYLE: CSSProperties = {
-  zIndex: 280,
+  zIndex: CHART_TOOLTIP_Z_INDEX,
   pointerEvents: "none",
 };
 
@@ -127,81 +148,16 @@ const CHART_LEGEND_PROPS = {
 } as const;
 
 const CHART_RESIZE_DEBOUNCE_MS = 50;
-// Recharts' default series animation duration, plus room for the debounced
-// resize callback that follows a lazy-loaded panel's first layout pass.
-const CHART_ENTRY_ANIMATION_MS = 1500 + CHART_RESIZE_DEBOUNCE_MS * 2;
 const LEGEND_ACTION_CLOSE_DELAY_MS = 600;
 
-type ChartSize = {
-  width: number;
-  height: number;
-};
-
-export function hasChartSizeChanged(
-  previous: ChartSize | null,
-  next: ChartSize,
-): boolean {
-  return (
-    previous !== null &&
-    (previous.width !== next.width || previous.height !== next.height)
-  );
-}
-
-export function shouldDisableChartAnimation(
-  entryAnimationSettled: boolean,
-  previous: ChartSize | null,
-  next: ChartSize,
-): boolean {
-  return entryAnimationSettled && hasChartSizeChanged(previous, next);
-}
-
-function useChartResizeAnimation() {
-  const [isAnimationActive, setIsAnimationActive] = useState(true);
-  const firstSizeRef = useRef<ChartSize | null>(null);
-  // Switching Recharts to isAnimationActive=false mid-flight freezes the line's
-  // stroke-dasharray at whatever partial length it reached, leaving the series
-  // invisible forever. Lazy-loaded panels reflow right after mounting, so the
-  // entry animation has to be allowed to finish before a resize can disable it.
-  const entryAnimationSettledRef = useRef(false);
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      entryAnimationSettledRef.current = true;
-    }, CHART_ENTRY_ANIMATION_MS);
-    return () => clearTimeout(timer);
-  }, []);
-
-  const handleResize = useCallback((width: number, height: number) => {
-    const nextSize = { width, height };
-    if (
-      shouldDisableChartAnimation(
-        entryAnimationSettledRef.current,
-        firstSizeRef.current,
-        nextSize,
-      )
-    ) {
-      setIsAnimationActive(false);
-    }
-    firstSizeRef.current = nextSize;
-  }, []);
-
-  return { isAnimationActive, handleResize };
-}
-
-function ChartResponsiveContainer({
-  children,
-}: {
-  children: (isAnimationActive: boolean) => ReactNode;
-}) {
-  const { isAnimationActive, handleResize } = useChartResizeAnimation();
-
+function ChartResponsiveContainer({ children }: { children: ReactNode }) {
   return (
     <ResponsiveContainer
       width="100%"
       height="100%"
       debounce={CHART_RESIZE_DEBOUNCE_MS}
-      onResize={handleResize}
     >
-      {children(isAnimationActive)}
+      {children}
     </ResponsiveContainer>
   );
 }
@@ -218,7 +174,7 @@ export function formatSqlChartError(error: unknown): string {
       ? error.message
       : typeof error === "string"
         ? error
-        : String(error ?? "");
+        : stringifyValue(error);
   const readableMessage = message
     .replace(/<[^>]*>/g, " ")
     .replace(/\s+/g, " ")
@@ -227,10 +183,22 @@ export function formatSqlChartError(error: unknown): string {
   if (/inactivity timeout|too much time has passed/i.test(readableMessage)) {
     return "This chart took too long to load. Try again.";
   }
+  if (/abort(?:ed|ing)?|signal is aborted/i.test(readableMessage)) {
+    return "This chart load was interrupted. Try again.";
+  }
   if (/internal server error/i.test(readableMessage)) {
     return "This chart could not be loaded. Try again.";
   }
   return readableMessage || "This chart could not be loaded. Try again.";
+}
+
+function stringifyValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  if (typeof value === "object") return JSON.stringify(value);
+  return typeof value === "number" || typeof value === "boolean"
+    ? String(value)
+    : JSON.stringify(value);
 }
 
 function formatYValue(
@@ -239,7 +207,6 @@ function formatYValue(
 ): string {
   if (formatter === "currency") return `$${value.toLocaleString()}`;
   if (formatter === "percent") {
-    // SQL typically returns rate as 0..1
     const pct = value <= 1 && value >= -1 ? value * 100 : value;
     return `${pct.toFixed(2)}%`;
   }
@@ -267,10 +234,6 @@ function axisLabelProps(value: string, side: ChartAxisSide) {
   };
 }
 
-/**
- * Recharts only discovers axes it finds among a chart's own children, so these
- * come back as an array rather than a wrapper component.
- */
 function renderChartYAxes(
   plan: DualAxisPlan,
   yFormatter?: ChartValueFormatter,
@@ -312,11 +275,6 @@ function seriesAxisId(plan: DualAxisPlan, key: string): string | undefined {
   return plan.enabled ? plan.sideFor(key) : undefined;
 }
 
-/**
- * Tooltip values follow their own axis, so a count and a rate in the same
- * tooltip each read with the right unit. Series arrive named by their display
- * label, which for Prometheus panels differs from the data key.
- */
 export function seriesValueFormatter(
   yKeys: string[],
   plan: DualAxisPlan,
@@ -343,14 +301,6 @@ export function seriesValueFormatter(
   };
 }
 
-/**
- * Format a single metric value for display. Coerces Postgres numeric/bigint
- * columns (returned as strings, e.g. a rate of "0.00000000000000000000") to a
- * number so the formatter applies — SQLite returns JS numbers, so this only
- * bites on Postgres/Neon, where the raw high-scale decimal would otherwise be
- * dumped verbatim. A configured `valueLabels` mapping wins; a non-numeric
- * string falls through unformatted.
- */
 export function formatMetricValue(
   raw: unknown,
   formatter?: "number" | "currency" | "percent",
@@ -368,7 +318,9 @@ export function formatMetricValue(
         : null;
   return numericRaw !== null
     ? formatYValue(numericRaw, formatter)
-    : String(raw ?? "-");
+    : raw == null
+      ? "-"
+      : stringifyValue(raw);
 }
 
 function isNumericLikeValue(value: unknown): boolean {
@@ -443,7 +395,7 @@ export function toSqlChartDateKey(value: unknown): string | null {
     if (compact) return `${compact[1]}-${compact[2]}-${compact[3]}`;
   }
 
-  const parsed = new Date(String(value ?? ""));
+  const parsed = new Date(stringifyValue(value));
   return Number.isNaN(parsed.getTime()) ? null : sqlChartLocalDateKey(parsed);
 }
 
@@ -521,6 +473,10 @@ export function shouldSplitCurrentDayTimeSeries(
 ): boolean {
   if (panel.source === "prometheus") return false;
 
+  return isDailyChartKey(xKey);
+}
+
+function isDailyChartKey(xKey: string): boolean {
   const normalizedKey = xKey.trim().toLowerCase();
   if (normalizedKey === "timestamp" || normalizedKey.endsWith("_timestamp")) {
     return false;
@@ -592,19 +548,41 @@ function usesPrometheusPresentation(panel: SqlPanel): boolean {
   return panel.source === "prometheus" || panel.source === "demo";
 }
 
-function formatSeriesLabelForPanel(panel: SqlPanel, value: string): string {
+export function formatSeriesLabelForPanel(
+  panel: SqlPanel,
+  value: string,
+): string {
+  const alias = panel.config?.seriesLabels?.[value]?.trim();
+  if (alias) return alias;
   return usesPrometheusPresentation(panel) ? formatSeriesLabel(value) : value;
 }
 
-function formatXLabel(value: string, panel: SqlPanel): string {
+function formatXLabel(
+  value: string,
+  panel: SqlPanel,
+  includeWeekday = false,
+): string {
   try {
     const s = String(value);
     const d = parseCalendarDate(s);
     if (d && s.length >= 8) {
-      return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+      const options: Intl.DateTimeFormatOptions = {
+        month: "short",
+        day: "numeric",
+      };
+      if (includeWeekday) options.weekday = "long";
+      return d.toLocaleDateString("en-US", options);
     }
   } catch {}
   return formatSeriesLabelForPanel(panel, String(value));
+}
+
+export function formatSqlChartTooltipLabel(
+  value: string,
+  panel: SqlPanel,
+  xKey: string,
+): string {
+  return formatXLabel(value, panel, isDailyChartKey(xKey));
 }
 
 function shouldShowLegend(panel: SqlPanel, seriesCount: number): boolean {
@@ -614,6 +592,23 @@ function shouldShowLegend(panel: SqlPanel, seriesCount: number): boolean {
 function numericTooltipValue(value: unknown): number {
   const numeric = typeof value === "number" ? value : Number(value);
   return Number.isFinite(numeric) ? numeric : Number.NEGATIVE_INFINITY;
+}
+
+function sumTooltipPayloadValues(
+  items: Array<{ value?: unknown }>,
+): number | null {
+  let total = 0;
+  let hasNumericValue = false;
+
+  for (const item of items) {
+    const numeric =
+      typeof item.value === "number" ? item.value : Number(item.value);
+    if (!Number.isFinite(numeric)) continue;
+    hasNumericValue = true;
+    total += numeric;
+  }
+
+  return hasNumericValue ? total : null;
 }
 
 function tooltipItemName(item: {
@@ -880,10 +875,6 @@ export function SeriesLegend({
   );
 }
 
-// When a chart renders inside the full-screen modal it should grow to fill the
-// available space rather than the fixed 250px card height. ChartFrame reads
-// this via context so we avoid threading a prop through every renderer
-// (line/area/bar/pie all share ChartFrame).
 const ChartFillHeightContext = createContext(false);
 
 export function ChartFillHeight({ children }: { children: ReactNode }) {
@@ -1060,6 +1051,7 @@ export function ChartTooltip({
   labelFormatter,
   seriesNameFormatter,
   valueFormatter,
+  stacked,
 }: {
   active?: boolean;
   payload?: Array<{
@@ -1073,6 +1065,7 @@ export function ChartTooltip({
   labelFormatter?: (value: string) => string;
   seriesNameFormatter?: (value: string) => string;
   valueFormatter?: (value: number, name?: string | number) => string;
+  stacked?: boolean;
 }) {
   const items = useMemo(
     () =>
@@ -1087,13 +1080,20 @@ export function ChartTooltip({
     isVisible,
     coordinate,
   );
+  const stackedTotal = stacked ? sumTooltipPayloadValues(items) : null;
+  const totalValue =
+    stackedTotal != null && valueFormatter
+      ? valueFormatter(stackedTotal, items[0]?.name)
+      : stackedTotal != null
+        ? String(stackedTotal)
+        : null;
 
   const labelText =
     label == null
       ? ""
       : labelFormatter
-        ? labelFormatter(String(label))
-        : String(label);
+        ? labelFormatter(stringifyValue(label))
+        : stringifyValue(label);
 
   if (!isVisible) return null;
 
@@ -1101,8 +1101,12 @@ export function ChartTooltip({
     <div
       ref={boxRef}
       role="tooltip"
-      className="fixed z-[280] min-w-40 max-w-[280px] rounded-md border border-border bg-card px-3 py-2 text-xs text-foreground shadow-lg pointer-events-none"
+      className="fixed min-w-40 max-w-[280px] rounded-md border border-border bg-card px-3 py-2 text-xs text-foreground shadow-lg pointer-events-none"
+      style={{ zIndex: CHART_TOOLTIP_Z_INDEX }}
     >
+      {totalValue && (
+        <div className="mb-1.5 font-semibold text-foreground">{totalValue}</div>
+      )}
       {labelText && (
         <div className="mb-1.5 truncate font-medium text-foreground">
           {labelText}
@@ -1116,7 +1120,7 @@ export function ChartTooltip({
           const value =
             Number.isFinite(numeric) && valueFormatter
               ? valueFormatter(numeric, name)
-              : String(raw ?? "");
+              : stringifyValue(raw);
           return (
             <div key={name} className="flex items-center gap-2">
               <span
@@ -1155,7 +1159,6 @@ function detectKeys(
   const colSet = new Set(cols);
   const sample = rows[0] as Record<string, unknown>;
 
-  // Find the x-axis: prefer a date-like or string column
   let xKey = config?.xKey && colSet.has(config.xKey) ? config.xKey : "";
   if (!xKey) {
     xKey =
@@ -1171,12 +1174,10 @@ function detectKeys(
       cols[0];
   }
 
-  // Pivoted data: caller already knows the series keys
   if (forcedYKeys && forcedYKeys.length) {
     return { xKey, yKeys: forcedYKeys.filter((key) => colSet.has(key)) };
   }
 
-  // Y keys: all numeric columns that aren't the x-axis
   const yKeys = (config?.yKeys ?? (config?.yKey ? [config.yKey] : [])).filter(
     (key) => colSet.has(key),
   );
@@ -1203,9 +1204,6 @@ function configuredKeysMissingFromRows(
   const config = panel.config;
   if (config?.xKey && !rowKeys.has(config.xKey)) missing.add(config.xKey);
 
-  // Pivoted charts turn the configured value column into one column per
-  // discovered series. After that transform, yKey/yKeys are no longer active
-  // output columns, so do not warn that the original value column is absent.
   if (!config?.pivot) {
     if (config?.yKey && !rowKeys.has(config.yKey)) missing.add(config.yKey);
     for (const key of config?.yKeys ?? []) {
@@ -1235,13 +1233,16 @@ function ConfigWarning({ keys }: { keys: string[] }) {
 
 interface SqlChartProps {
   panel: SqlPanel;
-  /** SQL with dashboard variables already interpolated. Falls back to panel.sql. */
   resolvedSql?: string;
   className?: string;
   loadData?: boolean;
+  resultOverride?: SqlQueryResult;
+  showLoadingWhenDisabled?: boolean;
+  timeRange?: number;
   reportScreenshot?: boolean;
   onExportCsvChange?: (handler: (() => void) | null) => void;
-  /** Dashboard/panel state sent to slot-backed extension boxes. */
+  onCopyTableChange?: (handler: (() => Promise<void>) | null) => void;
+  dashboardId?: string;
   extensionContext?: Record<string, unknown> | null;
 }
 
@@ -1249,33 +1250,37 @@ export function SqlChart({
   panel,
   resolvedSql,
   loadData = true,
+  resultOverride,
+  showLoadingWhenDisabled = true,
+  timeRange,
   reportScreenshot = false,
   onExportCsvChange,
+  onCopyTableChange,
+  dashboardId,
   extensionContext,
 }: SqlChartProps) {
   const t = useT();
   const { enabled: demoModeEnabled } = useDemoModeStatus();
-  // Hooks must be called unconditionally before any early return.
   const isSection = panel.chartType === "section";
   const isExtension = panel.chartType === "extension";
-  // Sections are pure layout and extensions render their own iframe — neither
-  // runs the SQL pipeline.
-  const shouldQuery = !isSection && !isExtension && loadData;
+  const shouldQuery = !isSection && !isExtension && loadData && !resultOverride;
   const sql = serializePanelSql(resolvedSql ?? panel.sql);
   const {
-    data: result,
-    isLoading,
-    isFetching,
+    data: queryResult,
+    isLoading: queryIsLoading,
+    isFetching: queryIsFetching,
     error: queryError,
     refetch,
   } = useSqlQuery(
-    ["sql-chart", panel.id, sql, panel.source],
+    ["sql-chart", dashboardId || panel.id, sql, panel.source],
     sql,
     panel.source,
-    // Skip the query for section panels — they are pure layout with no data.
     { enabled: shouldQuery, reportScreenshot },
   );
 
+  const result = resultOverride ?? queryResult;
+  const isLoading = resultOverride ? false : queryIsLoading;
+  const isFetching = resultOverride ? false : queryIsFetching;
   const rawRows = result?.rows ?? [];
   const error =
     rawRows.length === 0
@@ -1287,11 +1292,12 @@ export function SqlChart({
     if (panel.config?.pivot && rawRows.length) {
       const pivoted = pivotRows(rawRows, panel.config.pivot, {
         fillDateGaps: panel.chartType !== "bar",
+        timeRange,
       });
       return { rows: pivoted.rows, forcedYKeys: pivoted.seriesKeys };
     }
     return { rows: rawRows, forcedYKeys: undefined };
-  }, [rawRows, panel.chartType, panel.config?.pivot]);
+  }, [rawRows, panel.chartType, panel.config?.pivot, timeRange]);
 
   const { xKey, yKeys } = useMemo(
     () => detectKeys(queryRows, panel.config, forcedYKeys),
@@ -1309,9 +1315,17 @@ export function SqlChart({
         : queryRows,
     [queryRows, yKeys, panel.id, shouldCreateDemoTrend],
   );
+  const chartType: ChartType =
+    (panel.chartType as string) === "stacked-bar"
+      ? "bar"
+      : (panel.chartType as string) === "stacked-area"
+        ? "area"
+        : panel.chartType;
+  const chartRows = useMemo(
+    () => limitChartRows(rows, chartType),
+    [chartType, rows],
+  );
 
-  // Section panels are pure layout — no query, no chart. Render a header with
-  // optional description and skip the SQL pipeline entirely.
   if (isSection) {
     return (
       <div className="px-1 py-2">
@@ -1324,8 +1338,6 @@ export function SqlChart({
     );
   }
 
-  // Extension panels render either a named extension-point slot or a legacy
-  // direct extension iframe instead of querying a data source.
   if (isExtension) {
     const extensionId = panel.config?.extensionId;
     const slotId = panel.config?.extensionSlotId;
@@ -1359,7 +1371,7 @@ export function SqlChart({
       : "min-h-[250px]";
   const placeholderPadY = isMetric ? "py-2" : "py-8";
 
-  if (!loadData || isLoading || isFetching) {
+  if (isLoading || isFetching || (!loadData && showLoadingWhenDisabled)) {
     return <SqlChartLoadingSkeleton panel={panel} />;
   }
 
@@ -1369,18 +1381,20 @@ export function SqlChart({
         className={`flex flex-1 flex-col items-center justify-center gap-3 px-4 ${placeholderPadY} ${placeholderMinH}`}
         role="alert"
       >
-        <p className="text-center text-sm text-red-400 break-all">
+        <p className="text-center text-sm text-destructive break-words">
           {formatSqlChartError(error)}
         </p>
-        <Button
-          type="button"
-          variant="secondary"
-          size="sm"
-          onClick={() => void refetch()}
-        >
-          <IconRefresh className="mr-2 h-3.5 w-3.5" />
-          {t("sqlDashboard.refresh")}
-        </Button>
+        {loadData ? (
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={() => void refetch()}
+          >
+            <IconRefresh className="mr-2 h-3.5 w-3.5" />
+            {t("sqlDashboard.refresh")}
+          </Button>
+        ) : null}
       </div>
     );
   }
@@ -1397,14 +1411,6 @@ export function SqlChart({
     );
   }
 
-  // Legacy normalization: older saved dashboards may still have stacked-*
-  // chart types. Render them unstacked rather than silently blank.
-  const chartType: ChartType =
-    (panel.chartType as string) === "stacked-bar"
-      ? "bar"
-      : (panel.chartType as string) === "stacked-area"
-        ? "area"
-        : panel.chartType;
   const missingConfigKeys = configuredKeysMissingFromRows(rows, panel);
   const withConfigWarning = (node: ReactNode) =>
     missingConfigKeys.length > 0 ? (
@@ -1426,6 +1432,7 @@ export function SqlChart({
         rows={rows}
         panel={panel}
         onExportCsvChange={onExportCsvChange}
+        onCopyTableChange={onCopyTableChange}
       />,
     );
   }
@@ -1433,7 +1440,7 @@ export function SqlChart({
   if (chartType === "pie") {
     return withConfigWarning(
       <PieRenderer
-        rows={rows}
+        rows={chartRows}
         xKey={xKey}
         yKey={yKeys[0]}
         colors={colors}
@@ -1445,7 +1452,7 @@ export function SqlChart({
   if (chartType === "bar") {
     return withConfigWarning(
       <BarRenderer
-        rows={rows}
+        rows={chartRows}
         xKey={xKey}
         yKeys={yKeys}
         colors={colors}
@@ -1458,16 +1465,18 @@ export function SqlChart({
 
   if (chartType === "funnel") {
     return withConfigWarning(
-      <FunnelRenderer rows={rows} panel={panel} colors={colors} />,
+      <FunnelRenderer rows={chartRows} panel={panel} colors={colors} />,
     );
   }
 
   if (chartType === "heatmap") {
-    return withConfigWarning(<HeatmapRenderer rows={rows} panel={panel} />);
+    return withConfigWarning(
+      <HeatmapRenderer rows={chartRows} panel={panel} />,
+    );
   }
 
   if (chartType === "callout") {
-    return withConfigWarning(<CalloutRenderer rows={rows} />);
+    return withConfigWarning(<CalloutRenderer rows={chartRows} />);
   }
 
   if (chartType !== "line" && chartType !== "area") {
@@ -1476,7 +1485,7 @@ export function SqlChart({
 
   return withConfigWarning(
     <TimeSeriesRenderer
-      rows={rows}
+      rows={chartRows}
       xKey={xKey}
       yKeys={yKeys}
       colors={colors}
@@ -1500,8 +1509,6 @@ function DashboardExtensionPanel({
   context?: Record<string, unknown> | null;
 }) {
   const t = useT();
-  // Hold the report-readiness marker until the extension iframe paints so
-  // dashboard report screenshots don't capture a blank extension panel.
   const [ready, setReady] = useState(false);
   const [unavailable, setUnavailable] = useState(false);
   const loadingSkeleton = !ready ? (
@@ -1534,9 +1541,6 @@ function DashboardExtensionPanel({
     );
   }
 
-  // Embedding never grants access to the extension itself (same model as
-  // ExtensionSlots). A viewer with dashboard-only access who can't see the
-  // referenced extension gets a clear message instead of a blank panel.
   if (unavailable) {
     return (
       <div className="flex flex-1 items-center justify-center px-4 py-8 min-h-[120px]">
@@ -1562,7 +1566,6 @@ function DashboardExtensionPanel({
         initialHeight={180}
         onReady={() => setReady(true)}
         onUnavailable={() => {
-          // Clear the report-loading gate so report capture doesn't hang.
           setReady(true);
           setUnavailable(true);
         }}
@@ -1605,24 +1608,79 @@ function MetricRenderer({
   );
 }
 
-function formatCell(value: unknown, format: ColumnFormat | undefined): string {
+function numericTableValue(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed === "") return null;
+  const cleaned = trimmed.replace(/[$€£¥%,\s]/g, "");
+  if (cleaned === "" || cleaned === "-" || cleaned === "+") return null;
+  const numeric = Number(cleaned);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+export type TableSort = {
+  key: string;
+  direction: "asc" | "desc";
+};
+
+export function sortTableRows(
+  rows: Record<string, unknown>[],
+  sorts: TableSort[],
+): Record<string, unknown>[] {
+  if (sorts.length === 0) return rows;
+
+  return rows
+    .map((row, index) => ({ row, index }))
+    .sort((a, b) => {
+      for (const sort of sorts) {
+        const av = a.row[sort.key];
+        const bv = b.row[sort.key];
+        if (av == null && bv == null) continue;
+        if (av == null) return 1;
+        if (bv == null) return -1;
+
+        const an = numericTableValue(av);
+        const bn = numericTableValue(bv);
+
+        if (an !== null && bn === null) return -1;
+        if (an === null && bn !== null) return 1;
+
+        const comparison =
+          an !== null && bn !== null
+            ? an - bn
+            : stringifyValue(av).localeCompare(stringifyValue(bv));
+        if (comparison !== 0) {
+          return sort.direction === "asc" ? comparison : -comparison;
+        }
+      }
+      return a.index - b.index;
+    })
+    .map(({ row }) => row);
+}
+
+export function formatCell(
+  value: unknown,
+  format: ColumnFormat | undefined,
+): string {
   if (value == null) return "";
-  if (format === "number" && typeof value === "number") {
-    return value.toLocaleString();
+  const numeric = numericTableValue(value);
+  if (format === "number" && numeric !== null) {
+    return numeric.toLocaleString();
   }
-  if (format === "currency" && typeof value === "number") {
-    return `$${value.toLocaleString()}`;
+  if (format === "currency" && numeric !== null) {
+    return `$${numeric.toLocaleString()}`;
   }
-  if (format === "percent" && typeof value === "number") {
-    const pct = value <= 1 && value >= -1 ? value * 100 : value;
+  if (format === "percent" && numeric !== null) {
+    const pct = numeric <= 1 && numeric >= -1 ? numeric * 100 : numeric;
     return `${pct.toFixed(2)}%`;
   }
-  if (format === "delta" && typeof value === "number") {
-    const sign = value > 0 ? "+" : "";
-    return `${sign}${value.toFixed(1)}%`;
+  if (format === "delta" && numeric !== null) {
+    const sign = numeric > 0 ? "+" : "";
+    return `${sign}${numeric.toFixed(1)}%`;
   }
   if (format === "date") {
-    const d = new Date(String(value));
+    const d = new Date(stringifyValue(value));
     if (!isNaN(d.getTime())) {
       return d.toLocaleDateString("en-US", {
         year: "numeric",
@@ -1631,7 +1689,24 @@ function formatCell(value: unknown, format: ColumnFormat | undefined): string {
       });
     }
   }
-  return String(value);
+  return stringifyValue(value);
+}
+
+function clipboardCell(value: string): string {
+  return value.replace(/[\t\r\n]+/g, " ");
+}
+
+export function buildTableClipboardText(
+  columns: TableColumnConfig[],
+  rows: Record<string, unknown>[],
+): string {
+  const tableRows = [
+    columns.map((col) => col.label ?? col.key),
+    ...rows.map((row) =>
+      columns.map((col) => formatCell(row[col.key], col.format)),
+    ),
+  ];
+  return tableRows.map((row) => row.map(clipboardCell).join("\t")).join("\n");
 }
 
 export function safeDashboardLinkHref(value: unknown): string | null {
@@ -1653,13 +1728,14 @@ export function safeDashboardLinkHref(value: unknown): string | null {
 }
 
 function renderDeltaCell(value: unknown): ReactNode {
-  if (value == null || typeof value !== "number" || Number.isNaN(value)) {
+  const numeric = numericTableValue(value);
+  if (numeric === null) {
     return <span className="text-muted-foreground">-</span>;
   }
-  const sign = value > 0 ? "+" : "";
-  const text = `${sign}${value.toFixed(1)}%`;
-  const isPositive = value > 0;
-  const isNegative = value < 0;
+  const sign = numeric > 0 ? "+" : "";
+  const text = `${sign}${numeric.toFixed(1)}%`;
+  const isPositive = numeric > 0;
+  const isNegative = numeric < 0;
   const colorClass = isPositive
     ? "text-emerald-500"
     : isNegative
@@ -1670,7 +1746,7 @@ function renderDeltaCell(value: unknown): ReactNode {
     : isNegative
       ? IconTrendingDown
       : null;
-  const critical = Math.abs(value) > 30;
+  const critical = Math.abs(numeric) > 30;
   return (
     <span
       className={`inline-flex items-center justify-end gap-1 ${colorClass}`}
@@ -1715,16 +1791,17 @@ function TableRenderer({
   rows,
   panel,
   onExportCsvChange,
+  onCopyTableChange,
 }: {
   rows: Record<string, unknown>[];
   panel: SqlPanel;
   onExportCsvChange?: (handler: (() => void) | null) => void;
+  onCopyTableChange?: (handler: (() => Promise<void>) | null) => void;
 }) {
   const t = useT();
   const config = panel.config;
-  const sortable = config?.sortable !== false; // default on
+  const sortable = config?.sortable !== false;
 
-  // Resolve column list: explicit config wins, otherwise infer from first row
   const columns = useMemo<TableColumnConfig[]>(() => {
     const rowKeys = new Set(Object.keys(rows[0] ?? {}));
     if (config?.columns?.length) {
@@ -1736,47 +1813,45 @@ function TableRenderer({
     return Object.keys(rows[0]).map((key) => ({ key }));
   }, [config?.columns, rows]);
 
-  // Cap the dataset at `config.limit` before sorting/paginating. Saved
-  // dashboards rely on this to keep long-tailed queries snappy — sorting
-  // 50k rows client-side to page through the first 50 wastes a lot of work.
   const limitedRows = useMemo(() => {
     const limit = config?.limit;
     return limit != null && rows.length > limit ? rows.slice(0, limit) : rows;
   }, [rows, config?.limit]);
 
-  const [sortKey, setSortKey] = useState<string | null>(null);
-  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  const [sortColumns, setSortColumns] = useState<TableSort[]>([]);
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState(10);
 
   const sortedRows = useMemo(() => {
-    if (!sortable || !sortKey) return limitedRows;
-    const sorted = [...limitedRows].sort((a, b) => {
-      const av = a[sortKey];
-      const bv = b[sortKey];
-      if (av == null && bv == null) return 0;
-      if (av == null) return 1;
-      if (bv == null) return -1;
-      if (typeof av === "number" && typeof bv === "number") {
-        return av - bv;
-      }
-      return String(av).localeCompare(String(bv));
-    });
-    if (sortDir === "desc") sorted.reverse();
-    return sorted;
-  }, [limitedRows, sortKey, sortDir, sortable]);
+    return sortable ? sortTableRows(limitedRows, sortColumns) : limitedRows;
+  }, [limitedRows, sortColumns, sortable]);
 
   const pageCount = Math.ceil(sortedRows.length / pageSize);
   const displayRows = sortedRows.slice(page * pageSize, (page + 1) * pageSize);
 
-  const handleHeaderClick = (key: string) => {
+  const handleHeaderClick = (key: string, shiftKey: boolean) => {
     if (!sortable) return;
-    if (sortKey === key) {
-      setSortDir(sortDir === "asc" ? "desc" : "asc");
-    } else {
-      setSortKey(key);
-      setSortDir("desc");
-    }
+    setSortColumns((current) => {
+      const index = current.findIndex((sort) => sort.key === key);
+      if (!shiftKey) {
+        const existing = index >= 0 ? current[index] : undefined;
+        return [
+          {
+            key,
+            direction: existing?.direction === "desc" ? "asc" : "desc",
+          },
+        ];
+      }
+      if (index < 0) return [...current, { key, direction: "desc" }];
+      return current.map((sort, sortIndex) =>
+        sortIndex === index
+          ? {
+              ...sort,
+              direction: sort.direction === "desc" ? "asc" : "desc",
+            }
+          : sort,
+      );
+    });
     setPage(0);
   };
 
@@ -1801,10 +1876,23 @@ function TableRenderer({
     URL.revokeObjectURL(url);
   }, [columns, panel.id, sortedRows]);
 
+  const handleCopyTable = useCallback(async () => {
+    if (!navigator.clipboard?.writeText) {
+      throw new Error("Clipboard unavailable");
+    }
+    await navigator.clipboard.writeText(
+      buildTableClipboardText(columns, sortedRows),
+    );
+  }, [columns, sortedRows]);
+
   useEffect(() => {
     onExportCsvChange?.(handleExportCsv);
-    return () => onExportCsvChange?.(null);
-  }, [handleExportCsv, onExportCsvChange]);
+    onCopyTableChange?.(handleCopyTable);
+    return () => {
+      onExportCsvChange?.(null);
+      onCopyTableChange?.(null);
+    };
+  }, [handleCopyTable, handleExportCsv, onCopyTableChange, onExportCsvChange]);
 
   return (
     <div className={`space-y-1 ${TABLE_PANEL_MIN_HEIGHT_CLASS}`}>
@@ -1814,22 +1902,37 @@ function TableRenderer({
             <tr className="border-b border-border">
               {columns.map((col) => {
                 const label = col.label ?? col.key;
-                const isSorted = sortKey === col.key;
+                const sort = sortColumns.find((item) => item.key === col.key);
+                const isSorted = sort !== undefined;
                 return (
                   <th
                     key={col.key}
+                    aria-sort={
+                      sort
+                        ? sort.direction === "asc"
+                          ? "ascending"
+                          : "descending"
+                        : "none"
+                    }
                     className={`text-left py-1.5 px-2 font-medium text-muted-foreground whitespace-nowrap ${
                       sortable
                         ? "cursor-pointer select-none hover:text-foreground"
                         : ""
                     }`}
-                    onClick={() => handleHeaderClick(col.key)}
+                    onClick={(event) =>
+                      handleHeaderClick(col.key, event.shiftKey)
+                    }
+                    title={
+                      sortable
+                        ? t("sqlDashboard.multiColumnSortHelp")
+                        : undefined
+                    }
                   >
                     <span className="inline-flex items-center gap-1">
                       {label}
                       {sortable &&
                         (isSorted ? (
-                          sortDir === "asc" ? (
+                          sort?.direction === "asc" ? (
                             <IconSortAscending className="h-3 w-3" />
                           ) : (
                             <IconSortDescending className="h-3 w-3" />
@@ -1851,8 +1954,8 @@ function TableRenderer({
                   if (col.format === "link") {
                     const formatted = formatCell(raw, col.format);
                     const href = col.linkKey
-                      ? String(row[col.linkKey] ?? "")
-                      : String(raw ?? "");
+                      ? stringifyValue(row[col.linkKey])
+                      : stringifyValue(raw);
                     const safeHref = safeDashboardLinkHref(href);
                     return (
                       <td
@@ -1983,47 +2086,45 @@ function PieRenderer({
 }) {
   const seriesNameFormatter = (name: string) =>
     formatSeriesLabelForPanel(panel, name);
-  const legendKeys = rows.map((row) => String(row[xKey] ?? ""));
+  const legendKeys = rows.map((row) => stringifyValue(row[xKey]));
 
   return (
     <ChartFrame panel={panel} legendKeys={legendKeys} colors={colors}>
       <ChartResponsiveContainer>
-        {(isAnimationActive) => (
-          <PieChart>
-            <Pie
-              data={rows}
-              dataKey={yKey}
-              nameKey={xKey}
-              cx="50%"
-              cy="50%"
-              outerRadius={80}
-              label={(props: any) =>
-                `${seriesNameFormatter(String(props.name))} ${((props.percent ?? 0) * 100).toFixed(0)}%`
-              }
-              labelLine={false}
-              isAnimationActive={isAnimationActive}
-            >
-              {rows.map((_, i) => (
-                <Cell key={i} fill={colors[i % colors.length]} />
-              ))}
-            </Pie>
-            <Tooltip
-              {...CHART_TOOLTIP_PROPS}
-              content={
-                <ChartTooltip
-                  seriesNameFormatter={seriesNameFormatter}
-                  valueFormatter={(v) =>
-                    formatYValue(v, panel.config?.yFormatter)
-                  }
-                />
-              }
-            />
-            {!usesPrometheusPresentation(panel) &&
-              shouldShowLegend(panel, rows.length) && (
-                <Legend {...CHART_LEGEND_PROPS} />
-              )}
-          </PieChart>
-        )}
+        <PieChart>
+          <Pie
+            data={rows}
+            dataKey={yKey}
+            nameKey={xKey}
+            cx="50%"
+            cy="50%"
+            outerRadius={80}
+            label={(props: any) =>
+              `${seriesNameFormatter(String(props.name))} ${((props.percent ?? 0) * 100).toFixed(0)}%`
+            }
+            labelLine={false}
+            isAnimationActive={false}
+          >
+            {rows.map((_, i) => (
+              <Cell key={i} fill={colors[i % colors.length]} />
+            ))}
+          </Pie>
+          <Tooltip
+            {...CHART_TOOLTIP_PROPS}
+            content={
+              <ChartTooltip
+                seriesNameFormatter={seriesNameFormatter}
+                valueFormatter={(v) =>
+                  formatYValue(v, panel.config?.yFormatter)
+                }
+              />
+            }
+          />
+          {!usesPrometheusPresentation(panel) &&
+            shouldShowLegend(panel, rows.length) && (
+              <Legend {...CHART_LEGEND_PROPS} />
+            )}
+        </PieChart>
       </ChartResponsiveContainer>
     </ChartFrame>
   );
@@ -2048,6 +2149,8 @@ function BarRenderer({
 }) {
   const xLabelFormatter = (value: any) =>
     formatXLabel(String(value ?? ""), panel);
+  const xTooltipLabelFormatter = (value: any) =>
+    formatSqlChartTooltipLabel(String(value ?? ""), panel, xKey);
   const seriesNameFormatter = (name: string) =>
     formatSeriesLabelForPanel(panel, name);
   const { hiddenKeys, toggleSeries, filterSeries } = useSeriesVisibility(yKeys);
@@ -2070,52 +2173,51 @@ function BarRenderer({
       showCustomLegend
     >
       <ChartResponsiveContainer>
-        {(isAnimationActive) => (
-          <BarChart data={rows}>
-            <XAxis
-              dataKey={xKey}
-              stroke="hsl(var(--muted-foreground))"
-              fontSize={12}
-              tickLine={false}
-              axisLine={false}
-              tickFormatter={xLabelFormatter}
-            />
-            {renderChartYAxes(dualAxis, yFormatter)}
-            <CartesianGrid
-              strokeDasharray="3 3"
-              stroke="hsl(var(--border))"
-              vertical={false}
-            />
-            <Tooltip
-              {...CHART_TOOLTIP_PROPS}
-              cursor={BAR_TOOLTIP_CURSOR_PROPS}
-              labelFormatter={xLabelFormatter}
-              content={
-                <ChartTooltip
-                  labelFormatter={xLabelFormatter}
-                  seriesNameFormatter={seriesNameFormatter}
-                  valueFormatter={valueFormatter}
-                />
-              }
-              itemSorter={(item) => -(Number(item.value) || 0)}
-            />
-            {yKeys.map((key, i) => (
-              <Bar
-                key={key}
-                dataKey={key}
-                name={seriesNameFormatter(key)}
-                yAxisId={seriesAxisId(dualAxis, key)}
-                fill={colors[i % colors.length]}
-                radius={
-                  stacked && i < yKeys.length - 1 ? [0, 0, 0, 0] : [4, 4, 0, 0]
-                }
-                stackId={stacked ? "stack" : undefined}
-                hide={hiddenKeys.has(key)}
-                isAnimationActive={isAnimationActive}
+        <BarChart data={rows}>
+          <XAxis
+            dataKey={xKey}
+            stroke="hsl(var(--muted-foreground))"
+            fontSize={12}
+            tickLine={false}
+            axisLine={false}
+            tickFormatter={xLabelFormatter}
+          />
+          {renderChartYAxes(dualAxis, yFormatter)}
+          <CartesianGrid
+            strokeDasharray="3 3"
+            stroke="hsl(var(--border))"
+            vertical={false}
+          />
+          <Tooltip
+            {...CHART_TOOLTIP_PROPS}
+            cursor={BAR_TOOLTIP_CURSOR_PROPS}
+            labelFormatter={xTooltipLabelFormatter}
+            content={
+              <ChartTooltip
+                labelFormatter={xTooltipLabelFormatter}
+                seriesNameFormatter={seriesNameFormatter}
+                valueFormatter={valueFormatter}
+                stacked={stacked}
               />
-            ))}
-          </BarChart>
-        )}
+            }
+            itemSorter={(item) => -(Number(item.value) || 0)}
+          />
+          {yKeys.map((key, i) => (
+            <Bar
+              key={key}
+              dataKey={key}
+              name={seriesNameFormatter(key)}
+              yAxisId={seriesAxisId(dualAxis, key)}
+              fill={colors[i % colors.length]}
+              radius={
+                stacked && i < yKeys.length - 1 ? [0, 0, 0, 0] : [4, 4, 0, 0]
+              }
+              stackId={stacked ? "stack" : undefined}
+              hide={hiddenKeys.has(key)}
+              isAnimationActive={false}
+            />
+          ))}
+        </BarChart>
       </ChartResponsiveContainer>
     </ChartFrame>
   );
@@ -2142,6 +2244,8 @@ function TimeSeriesRenderer({
 }) {
   const xLabelFormatter = (value: any) =>
     formatXLabel(String(value ?? ""), panel);
+  const xTooltipLabelFormatter = (value: any) =>
+    formatSqlChartTooltipLabel(String(value ?? ""), panel, xKey);
   const seriesNameFormatter = (name: string) =>
     formatSeriesLabelForPanel(panel, name);
   const { hiddenKeys, visibleKeys, toggleSeries, filterSeries } =
@@ -2181,115 +2285,7 @@ function TimeSeriesRenderer({
         showCustomLegend
       >
         <ChartResponsiveContainer>
-          {(isAnimationActive) => (
-            <LineChart data={chartRows}>
-              <XAxis
-                dataKey={xKey}
-                stroke="hsl(var(--muted-foreground))"
-                fontSize={12}
-                tickLine={false}
-                axisLine={false}
-                tickFormatter={xLabelFormatter}
-              />
-              {renderChartYAxes(dualAxis, yFormatter)}
-              <CartesianGrid
-                strokeDasharray="3 3"
-                stroke="hsl(var(--border))"
-                vertical={false}
-              />
-              <Tooltip
-                {...CHART_TOOLTIP_PROPS}
-                labelFormatter={xLabelFormatter}
-                content={
-                  <ChartTooltip
-                    labelFormatter={xLabelFormatter}
-                    seriesNameFormatter={seriesNameFormatter}
-                    valueFormatter={valueFormatter}
-                  />
-                }
-                itemSorter={(item) => -(Number(item.value) || 0)}
-              />
-              {series.map((item, i) => (
-                <Line
-                  key={item.solidKey}
-                  type="monotone"
-                  dataKey={item.solidKey}
-                  name={seriesNameFormatter(item.key)}
-                  yAxisId={seriesAxisId(dualAxis, item.key)}
-                  stroke={colors[i % colors.length]}
-                  strokeWidth={2}
-                  dot={false}
-                  hide={hiddenKeys.has(item.key)}
-                  isAnimationActive={isAnimationActive}
-                />
-              ))}
-              {series.map((item, i) =>
-                item.partialKey ? (
-                  <Line
-                    key={item.partialKey}
-                    type="monotone"
-                    dataKey={item.partialKey}
-                    name={seriesNameFormatter(item.key)}
-                    yAxisId={seriesAxisId(dualAxis, item.key)}
-                    stroke={colors[i % colors.length]}
-                    strokeWidth={2}
-                    strokeDasharray={PARTIAL_DAY_DASH}
-                    dot={false}
-                    hide={hiddenKeys.has(item.key)}
-                    isAnimationActive={isAnimationActive}
-                  />
-                ) : null,
-              )}
-            </LineChart>
-          )}
-        </ChartResponsiveContainer>
-      </ChartFrame>
-    );
-  }
-
-  // With multiple series, filled areas stack and obscure lines behind them,
-  // so only draw the gradient fill when there's a single series — unless
-  // the caller asked for an explicit stacked area.
-  const showFill = visibleKeys.length === 1 || stacked;
-
-  return (
-    <ChartFrame
-      panel={panel}
-      legendKeys={yKeys}
-      colors={colors}
-      hiddenKeys={hiddenKeys}
-      onToggleLegendKey={toggleSeries}
-      onFilterLegendKey={filterSeries}
-      showCustomLegend
-    >
-      <ChartResponsiveContainer>
-        {(isAnimationActive) => (
-          <AreaChart data={chartRows}>
-            {showFill && (
-              <defs>
-                {yKeys.map((key, i) => (
-                  <linearGradient
-                    key={key}
-                    id={`sql-gradient-${key}`}
-                    x1="0"
-                    y1="0"
-                    x2="0"
-                    y2="1"
-                  >
-                    <stop
-                      offset="5%"
-                      stopColor={colors[i % colors.length]}
-                      stopOpacity={0.3}
-                    />
-                    <stop
-                      offset="95%"
-                      stopColor={colors[i % colors.length]}
-                      stopOpacity={0}
-                    />
-                  </linearGradient>
-                ))}
-              </defs>
-            )}
+          <LineChart data={chartRows}>
             <XAxis
               dataKey={xKey}
               stroke="hsl(var(--muted-foreground))"
@@ -2306,18 +2302,19 @@ function TimeSeriesRenderer({
             />
             <Tooltip
               {...CHART_TOOLTIP_PROPS}
-              labelFormatter={xLabelFormatter}
+              labelFormatter={xTooltipLabelFormatter}
               content={
                 <ChartTooltip
-                  labelFormatter={xLabelFormatter}
+                  labelFormatter={xTooltipLabelFormatter}
                   seriesNameFormatter={seriesNameFormatter}
                   valueFormatter={valueFormatter}
+                  stacked={stacked}
                 />
               }
               itemSorter={(item) => -(Number(item.value) || 0)}
             />
             {series.map((item, i) => (
-              <Area
+              <Line
                 key={item.solidKey}
                 type="monotone"
                 dataKey={item.solidKey}
@@ -2325,16 +2322,14 @@ function TimeSeriesRenderer({
                 yAxisId={seriesAxisId(dualAxis, item.key)}
                 stroke={colors[i % colors.length]}
                 strokeWidth={2}
-                fillOpacity={showFill ? 1 : 0}
-                fill={showFill ? `url(#sql-gradient-${item.key})` : "none"}
-                stackId={stacked ? "stack" : undefined}
+                dot={false}
                 hide={hiddenKeys.has(item.key)}
-                isAnimationActive={isAnimationActive}
+                isAnimationActive={false}
               />
             ))}
             {series.map((item, i) =>
               item.partialKey ? (
-                <Area
+                <Line
                   key={item.partialKey}
                   type="monotone"
                   dataKey={item.partialKey}
@@ -2343,16 +2338,120 @@ function TimeSeriesRenderer({
                   stroke={colors[i % colors.length]}
                   strokeWidth={2}
                   strokeDasharray={PARTIAL_DAY_DASH}
-                  fill="none"
-                  fillOpacity={0}
-                  stackId={stacked ? "partial-stack" : undefined}
+                  dot={false}
                   hide={hiddenKeys.has(item.key)}
-                  isAnimationActive={isAnimationActive}
+                  isAnimationActive={false}
                 />
               ) : null,
             )}
-          </AreaChart>
-        )}
+          </LineChart>
+        </ChartResponsiveContainer>
+      </ChartFrame>
+    );
+  }
+
+  const showFill = visibleKeys.length === 1 || stacked;
+
+  return (
+    <ChartFrame
+      panel={panel}
+      legendKeys={yKeys}
+      colors={colors}
+      hiddenKeys={hiddenKeys}
+      onToggleLegendKey={toggleSeries}
+      onFilterLegendKey={filterSeries}
+      showCustomLegend
+    >
+      <ChartResponsiveContainer>
+        <AreaChart data={chartRows}>
+          {showFill && (
+            <defs>
+              {yKeys.map((key, i) => (
+                <linearGradient
+                  key={key}
+                  id={`sql-gradient-${key}`}
+                  x1="0"
+                  y1="0"
+                  x2="0"
+                  y2="1"
+                >
+                  <stop
+                    offset="5%"
+                    stopColor={colors[i % colors.length]}
+                    stopOpacity={0.3}
+                  />
+                  <stop
+                    offset="95%"
+                    stopColor={colors[i % colors.length]}
+                    stopOpacity={0}
+                  />
+                </linearGradient>
+              ))}
+            </defs>
+          )}
+          <XAxis
+            dataKey={xKey}
+            stroke="hsl(var(--muted-foreground))"
+            fontSize={12}
+            tickLine={false}
+            axisLine={false}
+            tickFormatter={xLabelFormatter}
+          />
+          {renderChartYAxes(dualAxis, yFormatter)}
+          <CartesianGrid
+            strokeDasharray="3 3"
+            stroke="hsl(var(--border))"
+            vertical={false}
+          />
+          <Tooltip
+            {...CHART_TOOLTIP_PROPS}
+            labelFormatter={xTooltipLabelFormatter}
+            content={
+              <ChartTooltip
+                labelFormatter={xTooltipLabelFormatter}
+                seriesNameFormatter={seriesNameFormatter}
+                valueFormatter={valueFormatter}
+                stacked={stacked}
+              />
+            }
+            itemSorter={(item) => -(Number(item.value) || 0)}
+          />
+          {series.map((item, i) => (
+            <Area
+              key={item.solidKey}
+              type="monotone"
+              dataKey={item.solidKey}
+              name={seriesNameFormatter(item.key)}
+              yAxisId={seriesAxisId(dualAxis, item.key)}
+              stroke={colors[i % colors.length]}
+              strokeWidth={2}
+              fillOpacity={showFill ? 1 : 0}
+              fill={showFill ? `url(#sql-gradient-${item.key})` : "none"}
+              stackId={stacked ? "stack" : undefined}
+              hide={hiddenKeys.has(item.key)}
+              isAnimationActive={false}
+            />
+          ))}
+          {series.map((item, i) =>
+            item.partialKey ? (
+              <Area
+                key={item.partialKey}
+                type="monotone"
+                dataKey={item.partialKey}
+                name={seriesNameFormatter(item.key)}
+                yAxisId={seriesAxisId(dualAxis, item.key)}
+                stroke={colors[i % colors.length]}
+                strokeWidth={2}
+                strokeDasharray={PARTIAL_DAY_DASH}
+                fill="none"
+                fillOpacity={0}
+                stackId={stacked ? "partial-stack" : undefined}
+                hide={hiddenKeys.has(item.key)}
+                isAnimationActive={false}
+              />
+            ) : null,
+          )}
+        </AreaChart>
       </ChartResponsiveContainer>
     </ChartFrame>
   );
@@ -2432,9 +2531,6 @@ function FunnelRenderer({
   );
 }
 
-// Heatmap config: `xKey` = x-axis column, `yKey` = numeric value column,
-// `color` = optional row-label column. If `color` is omitted, the renderer
-// auto-detects the row-label as the first non-x non-value string column.
 function HeatmapRenderer({
   rows,
   panel,
@@ -2480,8 +2576,8 @@ function HeatmapRenderer({
     const seenY = new Set<string>();
     const g = new Map<string, number>();
     for (const r of rows) {
-      const xv = String(r[xK] ?? "");
-      const yv = rowK ? String(r[rowK] ?? "") : "";
+      const xv = stringifyValue(r[xK]);
+      const yv = rowK ? stringifyValue(r[rowK]) : "";
       const v = Number(r[valK]);
       if (!seenX.has(xv)) {
         seenX.add(xv);
@@ -2619,12 +2715,12 @@ function CalloutRenderer({ rows }: { rows: Record<string, unknown>[] }) {
   return (
     <div className="space-y-2">
       {rows.map((row, i) => {
-        const sevRaw = String(row.severity ?? "info").toLowerCase();
+        const sevRaw = (stringifyValue(row.severity) || "info").toLowerCase();
         const severity: CalloutSeverity =
           sevRaw === "critical" || sevRaw === "warning" || sevRaw === "info"
             ? (sevRaw as CalloutSeverity)
             : "info";
-        const message = String(row.message ?? "");
+        const message = stringifyValue(row.message);
         const { wrapper, Icon } = styleFor(severity);
         return (
           <div

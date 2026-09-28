@@ -1,4 +1,10 @@
+import {
+  safeParseIconValue,
+  serializeIconValue,
+  type IconValue,
+} from "@agent-native/core/icons";
 import { findTrailingPlainInlineMath } from "@shared/inline-math";
+import { NFM_COLORS } from "@shared/nfm";
 import {
   escapeHtml,
   indentMarkdown,
@@ -11,8 +17,10 @@ import {
   IconExternalLink,
   IconFileText,
 } from "@tabler/icons-react";
-import { InputRule } from "@tiptap/core";
+import { InputRule, type Editor } from "@tiptap/core";
+import { Code } from "@tiptap/extension-code";
 import type { Fragment, Node as ProseMirrorNode } from "@tiptap/pm/model";
+import { Selection } from "@tiptap/pm/state";
 import {
   Mark,
   Node,
@@ -23,6 +31,8 @@ import {
   type NodeViewProps,
 } from "@tiptap/react";
 
+import { ContentIcon } from "../../icons/ContentIcon";
+import { EmojiPicker } from "../EmojiPicker";
 import { MathRenderer } from "../MathRenderer";
 
 const BLOCK_ATOM_TAGS = [
@@ -53,7 +63,7 @@ export interface NotionPageLink {
   notionPageId: string;
   documentId: string;
   title: string;
-  icon: string | null;
+  icon: IconValue | string | null;
 }
 
 interface NotionBlockAtomOptions {
@@ -173,6 +183,119 @@ export const TOGGLE_SUMMARY_PLACEHOLDER = "Toggle";
 export const EMPTY_TOGGLE_BODY_PLACEHOLDER =
   "Empty toggle. Click or drop blocks inside.";
 
+export type ToggleSummaryEnterDestination =
+  | "paragraph"
+  | "toggle-body"
+  | "sibling-toggle";
+
+function scheduleEditorViewFocus(editor: Editor) {
+  setTimeout(() => {
+    if (!editor.isDestroyed) editor.view.focus();
+  }, 0);
+}
+
+export function applyToggleSummaryEnter(
+  editor: Editor,
+  pos: number,
+  summary: string,
+): ToggleSummaryEnterDestination | null {
+  const { state, view } = editor;
+  const toggle = state.doc.nodeAt(pos);
+  const paragraphType = state.schema.nodes.paragraph;
+  const toggleType = state.schema.nodes.notionToggle;
+  if (toggle?.type !== toggleType || !paragraphType || !toggleType) return null;
+
+  if (!summary && toggle.childCount === 0) {
+    const tr = state.tr.replaceWith(
+      pos,
+      pos + toggle.nodeSize,
+      paragraphType.create(),
+    );
+    tr.setMeta("preventClearDocument", true);
+    tr.setMeta("uiEvent", "keydown");
+    tr.setSelection(Selection.near(tr.doc.resolve(pos + 1)));
+    view.dispatch(tr.scrollIntoView());
+    scheduleEditorViewFocus(editor);
+    return "paragraph";
+  }
+
+  if (toggle.attrs.open) {
+    if (toggle.childCount === 0) {
+      const tr = state.tr.replaceWith(
+        pos,
+        pos + toggle.nodeSize,
+        toggleType.create({ ...toggle.attrs, summary }, paragraphType.create()),
+      );
+      tr.setMeta("preventClearDocument", true);
+      tr.setMeta("uiEvent", "keydown");
+      tr.setSelection(Selection.near(tr.doc.resolve(pos + 2)));
+      view.dispatch(tr.scrollIntoView());
+      scheduleEditorViewFocus(editor);
+      return "toggle-body";
+    }
+    const tr = state.tr.setNodeMarkup(pos, undefined, {
+      ...toggle.attrs,
+      summary,
+    });
+    tr.setMeta("preventClearDocument", true);
+    tr.setMeta("uiEvent", "keydown");
+    tr.setSelection(Selection.near(tr.doc.resolve(pos + 2)));
+    view.dispatch(tr.scrollIntoView());
+    scheduleEditorViewFocus(editor);
+    return "toggle-body";
+  }
+
+  const tr = state.tr
+    .setNodeMarkup(pos, undefined, { ...toggle.attrs, summary })
+    .insert(
+      pos + toggle.nodeSize,
+      toggleType.create({ summary: "", open: false }),
+    );
+  tr.setMeta("preventClearDocument", true);
+  tr.setMeta("uiEvent", "keydown");
+  view.dispatch(tr.scrollIntoView());
+  return "sibling-toggle";
+}
+
+export function outdentDirectToggleChild(editor: Editor): boolean {
+  const { state, view } = editor;
+  const { $from, $to } = state.selection;
+  if ($from.depth < 2 || $to.depth !== $from.depth) return false;
+
+  const toggleDepth = $from.depth - 1;
+  if (
+    $from.node(toggleDepth).type.name !== "notionToggle" ||
+    $to.node(toggleDepth) !== $from.node(toggleDepth)
+  ) {
+    return false;
+  }
+
+  const range = $from.blockRange($to);
+  if (!range || range.depth !== toggleDepth) return false;
+  const childDepth = $from.depth;
+  const child = $from.node(childDepth);
+  const childPos = $from.before(childDepth);
+  const togglePos = $from.before(toggleDepth);
+  const cursorOffset = $from.parentOffset;
+  const tr = state.tr.delete(childPos, childPos + child.nodeSize);
+  const remainingToggle = tr.doc.nodeAt(togglePos);
+  if (remainingToggle?.type.name !== "notionToggle") return false;
+  const insertPos = togglePos + remainingToggle.nodeSize;
+  tr.insert(insertPos, child);
+  tr.setMeta("preventClearDocument", true);
+  tr.setMeta("uiEvent", "keydown");
+  tr.setSelection(
+    Selection.near(
+      tr.doc.resolve(
+        insertPos + 1 + Math.min(cursorOffset, child.content.size),
+      ),
+    ),
+  );
+  view.dispatch(tr.scrollIntoView());
+  scheduleEditorViewFocus(editor);
+  return true;
+}
+
 function normalizeIndentAttr(value: unknown): number {
   const parsed =
     typeof value === "number"
@@ -191,7 +314,7 @@ export function focusMostRecentEmptyToggleSummary(editor: {
       ? requestAnimationFrame
       : (callback: FrameRequestCallback) => setTimeout(callback, 0);
 
-  schedule(() => {
+  const focusSummary = (attempt: number) => {
     let editorDom: HTMLElement;
     try {
       editorDom = editor.view.dom;
@@ -206,24 +329,56 @@ export function focusMostRecentEmptyToggleSummary(editor: {
       [...inputs].reverse().find((input) => input.value === "") ??
       inputs[inputs.length - 1];
 
-    target?.focus();
+    if (!target && attempt < 3) {
+      schedule(() => focusSummary(attempt + 1));
+      return;
+    }
+
+    target?.focus({ preventScroll: true });
     target?.select();
-  });
+  };
+
+  schedule(() => focusSummary(0));
 }
 
-function ToggleView({ node, updateAttributes, editor, getPos }: NodeViewProps) {
+export function focusToggleSummaryAtPosition(
+  editor: Pick<Editor, "view">,
+  pos: number,
+) {
+  const nodeDom = editor.view.nodeDOM(pos);
+  if (!(nodeDom instanceof HTMLElement)) return;
+  const target = nodeDom.querySelector<HTMLInputElement>(
+    ".notion-toggle__summary",
+  );
+  target?.focus();
+  target?.select();
+}
+
+function ToggleView({ node, editor, getPos }: NodeViewProps) {
   const open = !!node.attrs.open;
-  const setOpen = (value: boolean) => updateAttributes({ open: value });
   const summary = (node.attrs.summary || "") as string;
   const isEditable = editor.isEditable;
-  const firstChild = node.firstChild;
   const bodyHasNoBlocks = node.childCount === 0;
-  const bodyIsEmpty =
-    bodyHasNoBlocks ||
-    (node.childCount === 1 &&
-      firstChild?.type.name === "paragraph" &&
-      firstChild.content.size === 0 &&
-      !firstChild.textContent.trim());
+
+  const updateToggleAttributes = (
+    attrs: Record<string, unknown>,
+    uiEvent: "input" | "pointer",
+  ) => {
+    const pos = getPos();
+    if (typeof pos !== "number") return;
+    const currentNode = editor.state.doc.nodeAt(pos);
+    if (currentNode?.type.name !== "notionToggle") return;
+    const tr = editor.state.tr.setNodeMarkup(pos, undefined, {
+      ...currentNode.attrs,
+      ...attrs,
+    });
+    tr.setMeta("preventClearDocument", true);
+    tr.setMeta("uiEvent", uiEvent);
+    editor.view.dispatch(tr);
+  };
+
+  const setOpen = (value: boolean) =>
+    updateToggleAttributes({ open: value }, "pointer");
 
   const focusEmptyBody = (event: React.MouseEvent<HTMLElement>) => {
     if (!isEditable) return;
@@ -235,12 +390,14 @@ function ToggleView({ node, updateAttributes, editor, getPos }: NodeViewProps) {
 
     if (!open) setOpen(true);
 
-    editor
-      .chain()
-      .focus()
-      .insertContentAt(pos + 1, { type: "paragraph" })
-      .focus(pos + 2)
-      .run();
+    const paragraph = editor.state.schema.nodes.paragraph;
+    if (!paragraph) return;
+    const tr = editor.state.tr.insert(pos + 1, paragraph.create());
+    tr.setMeta("preventClearDocument", true);
+    tr.setMeta("uiEvent", "pointer");
+    tr.setSelection(Selection.near(tr.doc.resolve(pos + 2)));
+    editor.view.dispatch(tr.scrollIntoView());
+    scheduleEditorViewFocus(editor);
   };
 
   const getEmptyBodyInsertPos = () => {
@@ -322,6 +479,9 @@ function ToggleView({ node, updateAttributes, editor, getPos }: NodeViewProps) {
       );
     }
 
+    tr.setMeta("preventClearDocument", true);
+    tr.setMeta("uiEvent", "drop");
+
     editor.view.dispatch(tr.scrollIntoView());
     editor.view.focus();
     (
@@ -338,48 +498,40 @@ function ToggleView({ node, updateAttributes, editor, getPos }: NodeViewProps) {
       e.preventDefault();
       const pos = getPos();
       if (typeof pos !== "number") return;
-      // Insert a new toggle after this one
-      const endPos = pos + node.nodeSize;
-      editor
-        .chain()
-        .focus()
-        .insertContentAt(endPos, {
-          type: "notionToggle",
-          attrs: { summary: "", open: true },
-          content: [{ type: "paragraph" }],
-        })
-        .run();
-      // Focus the new toggle's summary input after render
-      setTimeout(() => {
-        const wrapper = editor.view.dom.closest(".visual-editor-wrapper");
-        if (!wrapper) return;
-        const toggles = wrapper.querySelectorAll(".notion-toggle__summary");
-        const allToggles = Array.from(toggles) as HTMLInputElement[];
-        const currentInput = e.currentTarget;
-        const idx = allToggles.indexOf(currentInput);
-        if (idx >= 0 && allToggles[idx + 1]) {
-          allToggles[idx + 1].focus();
-        }
-      }, 0);
+      const currentInput = e.currentTarget;
+      const destination = applyToggleSummaryEnter(
+        editor,
+        pos,
+        currentInput.value,
+      );
+      if (destination === "sibling-toggle") {
+        setTimeout(() => {
+          focusToggleSummaryAtPosition(editor, pos + node.nodeSize);
+        }, 0);
+      }
     } else if (e.key === "Backspace" && summary === "") {
       e.preventDefault();
       const pos = getPos();
       if (typeof pos !== "number") return;
-      // Delete this empty toggle and replace with paragraph
-      editor
-        .chain()
-        .focus()
-        .deleteRange({ from: pos, to: pos + node.nodeSize })
-        .insertContentAt(pos, { type: "paragraph" })
-        .focus(pos + 1)
-        .run();
+      const paragraph = editor.state.schema.nodes.paragraph;
+      if (!paragraph) return;
+      const tr = editor.state.tr.replaceWith(
+        pos,
+        pos + node.nodeSize,
+        paragraph.create(),
+      );
+      tr.setMeta("preventClearDocument", true);
+      tr.setMeta("uiEvent", "keydown");
+      tr.setSelection(Selection.near(tr.doc.resolve(pos + 1)));
+      editor.view.dispatch(tr.scrollIntoView());
+      scheduleEditorViewFocus(editor);
     }
   };
 
   return (
     <NodeViewWrapper
       className={`notion-toggle ${open ? "notion-toggle--open" : ""} ${
-        bodyIsEmpty ? "notion-toggle--body-empty" : ""
+        bodyHasNoBlocks ? "notion-toggle--body-empty" : ""
       }`}
       data-color={node.attrs.color || undefined}
       data-heading-level={node.attrs.headingLevel || undefined}
@@ -402,7 +554,10 @@ function ToggleView({ node, updateAttributes, editor, getPos }: NodeViewProps) {
           <input
             value={summary}
             onChange={(event) =>
-              updateAttributes({ summary: event.currentTarget.value })
+              updateToggleAttributes(
+                { summary: event.currentTarget.value },
+                "input",
+              )
             }
             onKeyDown={handleKeyDown}
             onClick={(e) => e.stopPropagation()}
@@ -498,7 +653,11 @@ function BlockAtomView({ node, extension }: NodeViewProps) {
           }}
         >
           <span className="notion-page-reference__icon" aria-hidden="true">
-            {pageLink?.icon || <IconFileText size={20} stroke={1.8} />}
+            <ContentIcon
+              value={pageLink?.icon}
+              size={20}
+              fallback={<IconFileText size={20} stroke={1.8} />}
+            />
           </span>
           <span className="notion-page-reference__label">{primary}</span>
           {!pageLink && externalUrl ? (
@@ -598,12 +757,19 @@ export const NotionSpanMark = Mark.create({
   renderHTML({ HTMLAttributes }) {
     const attrs = parseAttrsJson(HTMLAttributes.attrsJson as string);
     const style: string[] = [];
+    const classes: string[] = [];
 
-    if (HTMLAttributes.color) {
-      style.push(`color: ${HTMLAttributes.color}`);
+    if (
+      NFM_COLORS.has(HTMLAttributes.color) &&
+      !HTMLAttributes.color.endsWith("_bg")
+    ) {
+      classes.push(`notion-block-color--${HTMLAttributes.color}`);
     }
-    if (HTMLAttributes.bgColor) {
-      style.push(`background-color: ${HTMLAttributes.bgColor}`);
+    if (
+      NFM_COLORS.has(HTMLAttributes.bgColor) &&
+      HTMLAttributes.bgColor.endsWith("_bg")
+    ) {
+      classes.push(`notion-block-bg--${HTMLAttributes.bgColor.slice(0, -3)}`);
     }
     if (HTMLAttributes.underline === "true") {
       style.push("text-decoration: underline");
@@ -617,6 +783,7 @@ export const NotionSpanMark = Mark.create({
         bg_color: HTMLAttributes.bgColor || undefined,
         underline: HTMLAttributes.underline || undefined,
         href: HTMLAttributes.href || undefined,
+        class: classes.length ? classes.join(" ") : undefined,
         style: style.length ? style.join("; ") : undefined,
       }),
       0,
@@ -640,8 +807,13 @@ export const NotionSpanMark = Mark.create({
   },
 });
 
+export const CompatibleCode = Code.extend({
+  excludes: "",
+});
+
 export const NotionToggle = Node.create({
   name: "notionToggle",
+  priority: 1000,
   group: "block",
   content: "block*",
   defining: true,
@@ -730,16 +902,14 @@ export const NotionToggle = Node.create({
   addNodeView() {
     return ReactNodeViewRenderer(ToggleView);
   },
+  addKeyboardShortcuts() {
+    return {
+      "Shift-Tab": ({ editor }) => outdentDirectToggleChild(editor),
+    };
+  },
   addStorage() {
     return {
       markdown: {
-        // NOTE: must be a regular function (not arrow) so that
-        // tiptap-markdown's `serialize.bind({editor, options})` actually
-        // sets `this`. Arrow functions ignore .bind() — that left
-        // `this.editor` undefined inside `serializeInnerMarkdown`,
-        // which silently fell back to `node.textContent` and stripped
-        // every paragraph break, blockquote marker, and inline mark
-        // from the toggle's contents on save.
         serialize: function (_state: any, node: any) {
           const attrs: Record<string, string> = {};
           if (node.attrs.color) attrs.color = String(node.attrs.color);
@@ -769,6 +939,37 @@ export const NotionToggle = Node.create({
     };
   },
 });
+
+function CalloutView({ editor, getPos, node }: NodeViewProps) {
+  const icon = typeof node.attrs.icon === "string" ? node.attrs.icon : "💡";
+  const updateIcon = (value: IconValue | null) => {
+    if (!editor.isEditable) throw new Error("Callout is not editable");
+    const pos = getPos();
+    if (typeof pos !== "number") throw new Error("Callout is unavailable");
+    const currentNode = editor.state.doc.nodeAt(pos);
+    if (currentNode?.type.name !== "notionCallout")
+      throw new Error("Callout is unavailable");
+    const tr = editor.state.tr.setNodeMarkup(pos, undefined, {
+      ...currentNode.attrs,
+      icon: value ? serializeIconValue(value) : "💡",
+    });
+    tr.setMeta("preventClearDocument", true);
+    tr.setMeta("uiEvent", "pointer");
+    editor.view.dispatch(tr);
+  };
+  return (
+    <NodeViewWrapper
+      data-notion-callout="true"
+      data-icon={icon}
+      data-color={node.attrs.color || undefined}
+    >
+      <div data-notion-callout-icon="true" contentEditable={false}>
+        <EmojiPicker icon={icon} variant="compact" onSelect={updateIcon} />
+      </div>
+      <NodeViewContent data-notion-callout-content="true" />
+    </NodeViewWrapper>
+  );
+}
 
 export const NotionCallout = Node.create({
   name: "notionCallout",
@@ -814,6 +1015,11 @@ export const NotionCallout = Node.create({
   },
 
   renderHTML({ HTMLAttributes }) {
+    const parsedIcon = safeParseIconValue(HTMLAttributes.icon || "💡");
+    const fallbackIcon =
+      parsedIcon.success && parsedIcon.data?.kind === "emoji"
+        ? parsedIcon.data.emoji
+        : "";
     return [
       "div",
       mergeAttributes(HTMLAttributes, {
@@ -821,19 +1027,18 @@ export const NotionCallout = Node.create({
         "data-icon": HTMLAttributes.icon || "💡",
         "data-color": HTMLAttributes.color || undefined,
       }),
-      [
-        "div",
-        { "data-notion-callout-icon": "true" },
-        HTMLAttributes.icon || "💡",
-      ],
+      ["div", { "data-notion-callout-icon": "true" }, fallbackIcon],
       ["div", { "data-notion-callout-content": "true" }, 0],
     ];
+  },
+
+  addNodeView() {
+    return ReactNodeViewRenderer(CalloutView);
   },
 
   addStorage() {
     return {
       markdown: {
-        // Regular function — see NotionToggle.serialize for why.
         serialize: function (_state: any, node: any) {
           const inner = serializeInnerMarkdown((this as any).editor, node);
           _state.write(
@@ -875,7 +1080,6 @@ export const NotionColumns = Node.create({
   addStorage() {
     return {
       markdown: {
-        // Regular function — see NotionToggle.serialize for why.
         serialize: function (_state: any, node: any) {
           const inner = serializeInnerMarkdown((this as any).editor, node);
           _state.write(serializeContainerTag("columns", {}, inner));
@@ -907,7 +1111,6 @@ export const NotionColumn = Node.create({
   addStorage() {
     return {
       markdown: {
-        // Regular function — see NotionToggle.serialize for why.
         serialize: function (_state: any, node: any) {
           const inner = serializeInnerMarkdown((this as any).editor, node);
           _state.write(serializeContainerTag("column", {}, inner));
@@ -938,12 +1141,6 @@ export const NotionBlockAtom = Node.create({
       tagName: { default: "unknown" },
       attrsJson: { default: "{}" },
       label: { default: "" },
-      // Verbatim source for unrecognized raw containers (e.g. <meeting-notes>)
-      // preserved by parseRawContainer. Must survive editor load/save so the
-      // real content isn't replaced by the tagName summary on the next save.
-      // Kept out of the rendered DOM (see renderHTML) since the NodeView
-      // renders from label/tagName; parseHTML restores it from data-raw for
-      // the rare case content is round-tripped through HTML (e.g. paste).
       __raw: { default: "" },
     };
   },

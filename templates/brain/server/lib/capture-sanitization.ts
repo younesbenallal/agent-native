@@ -8,6 +8,11 @@ import type {
   BrainSourceProvider,
 } from "../../shared/types.js";
 import {
+  classifyWithJev,
+  resolveClassifierPreference,
+  type JevClassificationOutcome,
+} from "./jev-classifier.js";
+import {
   BRAIN_SENSITIVITY_POLICY_VERSION,
   type BrainSensitivityDecision,
 } from "./search-index-contracts.js";
@@ -16,6 +21,7 @@ import {
   deterministicQuarantineDecision,
   fallbackSensitivityDecision,
   MAX_CLASSIFIER_OUTPUT_CHARS,
+  sanitizeSensitiveText,
   screenSensitivityDeterministically,
 } from "./sensitivity-policy.js";
 
@@ -71,6 +77,7 @@ export interface CaptureSanitizationInput {
     title: string;
     provider: BrainSourceProvider;
     ownerEmail: string;
+    orgId?: string | null;
   };
   sourceConfig?: Record<string, unknown>;
   settings: BrainSettings;
@@ -80,6 +87,7 @@ export interface CaptureSanitizationResult {
   title: string;
   content: string;
   metadata: Record<string, unknown>;
+  classifierFailureReason?: string;
   decision?: BrainSensitivityDecision;
 }
 
@@ -125,27 +133,6 @@ export function shouldSanitizeCaptureBeforeStorage(
   if (configOverride !== undefined) return configOverride;
 
   return input.kind === "transcript";
-}
-
-function sanitizeSensitiveText(value: string): string {
-  return value
-    .replace(/<mailto:[^>|]+(?:\|[^>]+)?>/gi, "[redacted]")
-    .replace(/<@[UW][A-Z0-9]+(?:\|[^>]+)?>/g, "[redacted]")
-    .replace(/\bU[A-Z0-9]{8,}\b/g, "[redacted]")
-    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted]")
-    .replace(/(?:\+?\d|\(\d{2,4}\))[\d\s().-]{6,}\d/g, (candidate) =>
-      /^\d{4}-\d{2}-\d{2}$/.test(candidate) ? candidate : "[redacted]",
-    )
-    .replace(
-      /\b(?:sk|pk|rk|ghp|gho|ghu|github_pat)_[A-Za-z0-9_=-]{16,}\b/g,
-      "[redacted]",
-    )
-    .replace(/\b(?:sk|pk|rk)-[A-Za-z0-9_=-]{16,}\b/g, "[redacted]")
-    .replace(
-      /\b(password|passcode|secret|token|api key)\s*[:=]\s*\S+/gi,
-      "$1: [redacted]",
-    )
-    .replace(/https?:\/\/\S+/gi, "[link]");
 }
 
 function neutralizeSpeakerLabel(line: string): string {
@@ -399,17 +386,6 @@ function buildClassifierSystemPrompt(settings: BrainSettings) {
     .join("\n");
 }
 
-function buildSanitizerUserPrompt(input: CaptureSanitizationInput) {
-  return [
-    `Source provider: ${input.source.provider}`,
-    `Capture title: ${sanitizeSensitiveText(input.title)}`,
-    "Raw capture text to filter:",
-    "```text",
-    input.content,
-    "```",
-  ].join("\n");
-}
-
 function modelInputLimit(input: CaptureSanitizationInput) {
   return (
     numberSetting(input.sourceConfig?.captureSanitizationMaxChars) ??
@@ -432,21 +408,36 @@ function parseClassifierOutput(value: string) {
   }
 }
 
+function approvedModelSettings(settings: BrainSettings) {
+  if (resolveClassifierPreference(settings) === "deterministic") return null;
+  const model = stringSetting(settings.privacyClassifierModel);
+  const engineName = stringSetting(settings.privacyClassifierEngine);
+  return model && engineName ? { model, engineName } : null;
+}
+
 async function classifyWithApprovedModel(
   input: CaptureSanitizationInput,
 ): Promise<BrainSensitivityDecision | null> {
   if (process.env.NODE_ENV === "test" || process.env.VITEST) return null;
 
-  const model = stringSetting(input.settings.privacyClassifierModel);
-  const engineName = stringSetting(input.settings.privacyClassifierEngine);
-  if (!model || !engineName) return null;
+  const approved = approvedModelSettings(input.settings);
+  if (!approved) return null;
+  const { model, engineName } = approved;
 
   const core = await import("@agent-native/core/server");
-  const userApiKey = await core.getOwnerActiveApiKey(input.source.ownerEmail);
+  const userApiKey = await core.resolveOwnerEngineApiKey({
+    engineOption: engineName,
+    ownerEmail: input.source.ownerEmail,
+  });
   const engine = await core.resolveEngine({
-    apiKey: userApiKey ?? undefined,
+    apiKey: userApiKey.apiKey,
+    apiKeyEnvVar: userApiKey.apiKeyEnvVar,
     appId: "brain",
     engineOption: engineName,
+    credentialIdentity: {
+      userEmail: input.source.ownerEmail,
+      orgId: input.source.orgId ?? undefined,
+    },
   });
 
   const maxChars = Math.min(
@@ -542,22 +533,36 @@ export async function sanitizeCaptureForStorage(
   const sanitizationRequested = shouldSanitizeCaptureBeforeStorage(input);
   let fallbackReason: string | undefined;
   let classifierOutageFallback = false;
-  const classifierConfigured = Boolean(
-    stringSetting(input.settings.privacyClassifierModel) &&
-    stringSetting(input.settings.privacyClassifierEngine),
-  );
+  const jev: JevClassificationOutcome = decision
+    ? { configured: false }
+    : await classifyWithJev({
+        title: input.title,
+        content: input.content,
+        capturedAt: input.capturedAt,
+        settings: input.settings,
+        ownerEmail: input.source.ownerEmail,
+        orgId: input.source.orgId,
+      });
+  decision ??= jev.decision ?? null;
+  fallbackReason = jev.failureReason;
+  const classifierConfigured =
+    jev.configured ||
+    Boolean(jev.failureReason) ||
+    Boolean(approvedModelSettings(input.settings));
   let classifierFailed = false;
   try {
     decision ??= await classifyWithApprovedModel(input);
     if (!decision) {
       classifierFailed = classifierConfigured;
-      fallbackReason = classifierConfigured
-        ? "classifier-malformed"
-        : "classifier-not-approved-or-malformed";
+      fallbackReason =
+        jev.failureReason ??
+        (classifierConfigured
+          ? "classifier-malformed"
+          : "classifier-not-approved-or-malformed");
     }
   } catch {
     classifierFailed = classifierConfigured;
-    fallbackReason = "model-unavailable";
+    fallbackReason = jev.failureReason ?? "model-unavailable";
   }
   decision ??= fallbackSensitivityDecision(input.content, capturedAt);
   if (classifierFailed) {
@@ -631,6 +636,7 @@ export async function sanitizeCaptureForStorage(
           decision.classifier === "approved-model"
             ? input.settings.privacyClassifierModel
             : undefined,
+        jevAuthSource: jev.authSource,
         fallbackReason,
         classifierOutageFallback: classifierOutageFallback || undefined,
         disposition: decision.disposition,
@@ -643,6 +649,7 @@ export async function sanitizeCaptureForStorage(
         sanitizedAt: new Date().toISOString(),
       },
     },
+    classifierFailureReason: jev.failureReason,
     decision,
   };
 }

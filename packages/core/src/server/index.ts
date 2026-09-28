@@ -1,8 +1,31 @@
 export {
+  readComposerWebsiteSource,
+  type ComposerWebsiteExtraction,
+} from "./composer-website-source.js";
+export {
+  defineAppConfig,
+  getAppConfig,
+  resolveAppHomePath,
+  resetAppConfigForTests,
+  appConfigSchema,
+  type AppConfig,
+  type AppConfigInput,
+} from "../app-config/index.js";
+export { resolveDeployEnvironment } from "./deploy-environment.js";
+export {
+  inferWorkspaceAppRootHomePath,
+  readConfiguredWorkspaceAppHomePath,
+} from "../workspace-app-config.js";
+export {
   createServer,
   type CreateServerOptions,
   type EnvKeyConfig,
 } from "./create-server.js";
+export {
+  startIntervalJob,
+  type IntervalJobOptions,
+  type IntervalJobHandle,
+} from "./interval-job.js";
 export {
   AGENT_BACKGROUND_PROCESSOR_FIELD,
   AGENT_BACKGROUND_PROCESSOR_ROUTE,
@@ -58,15 +81,23 @@ export { createSSEHandler, type SSEHandlerOptions } from "./sse.js";
 export {
   mountAuthMiddleware,
   autoMountAuth,
+  registerAuthPublicPaths,
   getSession,
+  getMcpOAuthBearerSession,
+  logout,
   COOKIE_NAME,
   addSession,
   removeSession,
   getSessionEmail,
   getFrameworkSessionCookieValues,
   setFrameworkSessionCookie,
+  setFirstRunOnboardingCookie,
   clearFrameworkSessionCookies,
   runAuthGuard,
+  registerDesktopExchange,
+  prepareDesktopOAuthBrowserBinding,
+  matchesDesktopOAuthBrowserBinding,
+  DESKTOP_OAUTH_BROWSER_BINDING_COOKIE,
   setDesktopExchange,
   setDesktopExchangeError,
   safeReturnPath,
@@ -76,13 +107,27 @@ export {
 } from "./auth.js";
 export {
   handleIdentitySso,
+  ensureIdentityUser,
   getIdentityHubUrl,
   isIdentitySsoEnabled,
   isIdentitySsoBypassPath,
   identitySsoLoginButtonHtml,
+  IDENTITY_SSO_BOOTSTRAP_ACTIVATE_PATH,
+  IDENTITY_SSO_BOOTSTRAP_BINDING_COOKIE,
+  clearIdentitySsoBootstrapBindingCookie,
+  getIdentitySsoBootstrapBindingCookie,
+  setIdentitySsoBootstrapBindingCookie,
   IDENTITY_SSO_PROVIDER_ID,
   IDENTITY_SSO_SCOPE,
+  IDENTITY_SSO_DESKTOP_COMPLETE_PATH,
 } from "./identity-sso.js";
+export {
+  createBetterAuthSessionForEmail,
+  ensureGoogleAuthIdentity,
+  hasGoogleAuthIdentity,
+  setBetterAuthSessionCookie,
+} from "./better-auth-instance.js";
+export { setIdentityGoogleAuthCookie } from "./identity-auth-provider.js";
 export { requireEnvKey, type MissingKeyResponse } from "./missing-key.js";
 export {
   assertCurrentRequestUserIsOrgAdmin,
@@ -102,6 +147,10 @@ export {
   type ActionEntry,
   type ScriptEntry,
   type ProductionAgentOptions,
+  type AgentActionSurface,
+  type DefaultAgentActionSurface,
+  type AgentActionSurfaceResolution,
+  type AgentActionSurfaceDetails,
   type ActionTool,
   type ScriptTool,
   type AgentMessage,
@@ -110,6 +159,7 @@ export {
   type AgentChatAttachment,
   type AgentChatReference,
   type MentionProvider,
+  type MentionItemMedia,
   type MentionProviderItem,
   type AgentLoopFinalResponseGuard,
   type AgentLoopFinalResponseGuardContext,
@@ -117,14 +167,28 @@ export {
   type AgentLoopToolCallSummary,
   type AgentLoopToolResultSummary,
 } from "../agent/index.js";
+export type { AgentActionScope } from "../agent/types.js";
 export {
   actionsToEngineTools,
   executeAgentToolCall,
+  getJevContextCredentials,
   getOwnerActiveApiKey,
+  getOwnerApiKeyForEngine,
+  getOwnerJevApiKey,
+  resolveOwnerEngineApiKey,
   runAgentLoop,
   type AgentToolCallExecutionResult,
   type ExecuteAgentToolCallOptions,
+  type JevContextCredentials,
+  type ResolvedOwnerApiKey,
 } from "../agent/production-agent.js";
+export {
+  isJevEnabled,
+  requestJevThroughBuilder,
+  type JevResponse,
+} from "../agent/jev-tool-prefetch.js";
+export { getRunStatus, getRunTurnRef } from "../agent/run-store.js";
+export { getActiveRunForThreadAsync } from "../agent/run-manager.js";
 export {
   mountRealtimeVoiceRoutes,
   realtimeVoiceSafetyIdentifier,
@@ -154,14 +218,21 @@ export { createDevScriptRegistry } from "../scripts/dev/index.js";
 export {
   createPollHandler,
   recordChange,
+  prepareTransactionalChange,
   getVersion,
   getChangesSince,
   getPollEmitter,
   canSeeChangeForUser,
   POLL_CHANGE_EVENT,
+  type TransactionalChange,
 } from "./poll.js";
 export { createPollEventsHandler } from "./poll-events.js";
 export { createAuthPlugin, defaultAuthPlugin } from "./auth-plugin.js";
+export {
+  BETTER_AUTH_MIGRATIONS,
+  runBetterAuthMigrations,
+} from "./better-auth-migrations.js";
+export { runFrameworkReleaseMigrations } from "./release-migrations.js";
 export {
   initServerSentry,
   isServerSentryEnabled,
@@ -177,11 +248,13 @@ export {
   type CaptureErrorProvider,
 } from "./capture-error.js";
 export { createSentryPlugin, defaultSentryPlugin } from "./sentry-plugin.js";
-// Re-export the org plugin so the auto-discovery's DEFAULT_PLUGIN_REGISTRY
-// (which references "defaultOrgPlugin" from @agent-native/core/server) can
-// resolve it during the deploy build worker-entry generation.
 export { createOrgPlugin, defaultOrgPlugin } from "../org/plugin.js";
-export { createFeatureFlagsPlugin } from "../feature-flags/plugin.js";
+export {
+  createFeatureFlagA2AActionRouteAuth,
+  createFeatureFlagsPlugin,
+} from "../feature-flags/server.js";
+export { createLabsPlugin } from "../labs/server.js";
+export { createExperimentsPlugin } from "../experiments/server.js";
 export {
   createContextXrayPlugin,
   defaultContextXrayPlugin,
@@ -201,6 +274,20 @@ export {
   refreshGlobalMcpManager,
   type AgentChatPluginOptions,
 } from "./agent-chat-plugin.js";
+export {
+  AGENT_CHAT_STREAM_PATH,
+  AGENT_CHAT_STREAM_TOKEN_SUFFIX,
+  AGENT_CHAT_STREAM_TOKEN_TTL_SECONDS,
+  createAgentChatStreamToken,
+  isAgentChatStreamingRuntime,
+  readAgentChatStreamBearerToken,
+  verifyAgentChatStreamToken,
+  type AgentChatStreamPrincipal,
+} from "./agent-chat-stream.js";
+export type {
+  AgentChatMcpIcon,
+  AgentChatMcpOptions,
+} from "./agent-chat/mcp-options.js";
 export {
   configureAgentNativeEmbeddedEnvironment,
   createAgentNativeEmbeddedAuthOptions,
@@ -236,6 +323,21 @@ export {
   FRAMEWORK_ROUTE_PREFIX,
   type CoreRoutesPluginOptions,
 } from "./core-routes-plugin.js";
+export type { CoreRoutesMcpOptions } from "./core-routes/mcp-connect-options.js";
+export {
+  buildRuntimeConfigPrompt,
+  formatRuntimeConfigReport,
+  getRuntimeConfigReport,
+  parseRuntimeConfigReport,
+  runtimeConfigRequirementsFromSearchParams,
+  type RuntimeConfigEnvironment,
+  type RuntimeConfigIssue,
+  type RuntimeConfigIssueCode,
+  type RuntimeConfigIssueSeverity,
+  type RuntimeConfigPhase,
+  type RuntimeConfigReport,
+  type RuntimeConfigRequirements,
+} from "../shared/runtime-config.js";
 export {
   AGENT_NATIVE_OG_IMAGE_CACHE_CONTROL,
   AGENT_NATIVE_OG_IMAGE_HEIGHT,
@@ -245,8 +347,11 @@ export {
   createAgentNativeOgImageHandler,
   renderAgentNativeOgImagePng,
   renderAgentNativeOgImageSvg,
+  stageOgImageResponseHeaders,
   type AgentNativeOgImageInput,
+  type AgentNativeOgImagePresentation,
 } from "./social-og-image.js";
+export { AGENT_NATIVE_OG_BACKGROUND_DATA_URL } from "./og-background-data.js";
 export { OG_FONT_FAMILY, resolveOgFontFiles } from "./og-fonts.js";
 export {
   createBrowserSessionActionEntries,
@@ -341,6 +446,22 @@ export {
   mergeCoreSharingActions,
   registerPackageActions,
 } from "./action-discovery.js";
+export {
+  attachToolSearch,
+  createToolSearchEntry,
+  searchToolRegistry,
+  TOOL_SEARCH_ACTION_NAME,
+} from "../agent/tool-search.js";
+export {
+  filterFrameworkToolGroups,
+  frameworkGroupEnabled,
+  resolveFrameworkTools,
+  FRAMEWORK_TOOL_GROUPS,
+  type FrameworkToolGroup,
+  type FrameworkToolsConfig,
+  type FrameworkToolsOption,
+  type ResolvedFrameworkTools,
+} from "../framework-tools.js";
 export {
   registerPromptContextProvider,
   type PromptContextProvider,
@@ -439,12 +560,23 @@ export {
   isAllowedOAuthRedirectUri,
   encodeOAuthState,
   decodeOAuthState,
+  encodeNetlifyPreviewGoogleOAuthRelayState,
+  decodeNetlifyPreviewGoogleOAuthRelayState,
+  wrapNetlifyPreviewGoogleOAuthState,
+  getNetlifyPreviewGoogleOAuthCallbackUrl,
+  isNetlifyPreviewGoogleOAuthCallbackUrl,
+  isNetlifyPreviewGoogleOAuthRelayState,
+  AGENT_NATIVE_GOOGLE_OAUTH_RELAY_SECRET_ENV,
+  NETLIFY_PREVIEW_GOOGLE_OAUTH_CALLBACK_URL,
+  logOAuthStateDecodeFailure,
   resolveOAuthOwner,
   createOAuthSession,
   oauthCallbackResponse,
   oauthErrorPage,
   oauthDesktopExchangePage,
   type OAuthStatePayload,
+  type OAuthStateDecodeFailureReason,
+  type DecodeOAuthStateResult,
   type OAuthOwnerResult,
   type OAuthSessionResult,
 } from "./google-oauth.js";
@@ -455,6 +587,8 @@ export {
   exchangeWorkspaceProviderOAuthCode,
   handleWorkspaceProviderOAuthCallback,
   handleWorkspaceProviderOAuthStart,
+  hasWorkspaceProviderOAuthCredentials,
+  isGoogleWorkspaceOAuthProvider,
   isWorkspaceProviderOAuthFlowValid,
   mergeWorkspaceOAuthValues,
   resolveWorkspaceProviderIdentity,
@@ -464,11 +598,14 @@ export {
 } from "./workspace-provider-oauth.js";
 
 export {
+  CredentialStoreUnavailableError,
   FeatureNotConfiguredError,
   hasBuilderPrivateKey,
   isBuilderEnvManaged,
   getBuilderProxyOrigin,
   getBuilderImageGenerationBaseUrl,
+  getBuilderEmbeddingsBaseUrl,
+  getBuilderVideoGenerationBaseUrl,
   getBuilderWebSearchBaseUrl,
   getBuilderAuthHeader,
   resolveBuilderPrivateKey,
@@ -477,24 +614,96 @@ export {
   resolveHasCompleteBuilderConnection,
   resolveBuilderCredentials,
   resolveBuilderCredentialsDetailed,
+  resolveBuilderGatewayCredentialsDetailed,
+  resolveBuilderGatewayAuth,
+  resolveBuilderGatewayCredentials,
+  resolveHasBuilderGatewayCredential,
   resolveBuilderCredentialSource,
   resolveBuilderCredential,
   readDeployCredentialEnv,
+  resolveVercelDeploymentProtectionHeaders,
   writeBuilderCredentials,
   deleteBuilderCredentials,
   resolveSecret,
+  resolveSecretDetailed,
+  BuilderCredentialLookupError,
   type BuilderCredentialsDetailed,
+  type ResolvedSecretDetail,
 } from "./credential-provider.js";
 export {
+  GEMINI_API_KEY,
+  LEGACY_GEMINI_API_KEY,
+  canonicalSecretKey,
+  readGeminiDeployCredentialEnv,
+  resolveGeminiApiKey,
+  resolveGeminiApiKeyDetailed,
+  resolveSecretWithAliases,
+  resolveSecretWithAliasesDetailed,
+  secretKeyNames,
+  type ResolvedAliasedSecret,
+} from "./secret-key-aliases.js";
+export {
+  SERVICE_IDS,
+  SERVICE_PROVIDERS_SETTING_KEY,
+  SERVICE_PROVIDER_KEYS,
+  SERVICE_PROVIDER_OPTIONS,
+  isServiceProviderOption,
+  readServiceProviderChoice,
+  readServiceProviderSettings,
+  serviceProviderOrder,
+  writeServiceProviderChoice,
+  type ServiceId,
+  type ServiceProviderChoices,
+  type ServiceProviderId,
+  type ServiceProviderSettings,
+} from "./service-providers.js";
+export {
+  getInfrastructureStatus,
+  type InfrastructureApp,
+  type InfrastructureDatabase,
+  type InfrastructureDatabaseProvider,
+  type InfrastructureHosting,
+  type InfrastructureSetupTag,
+  type InfrastructureSetupTags,
+  type InfrastructureStatus,
+  type InfrastructureVariable,
+  type InfrastructureVariableKey,
+} from "./infrastructure-status.js";
+export {
+  resolveDeployPlatform,
+  type DeployPlatform,
+} from "./deploy-environment.js";
+export {
+  BUILDER_PUBLISH_MCP_RESOURCE,
+  canAuthorizeBuilderApiRequest,
+  hasBuilderApiCredentialCustody,
+  resolveBuilderApiAuthorization,
+  resolveBuilderRequestAuthorization,
+  type BuilderLegacyCredentialKey,
+  type BuilderRequestAuthorization,
+} from "./builder-api-auth.js";
+export {
+  BUILDER_ASSETS_WRITE_SCOPE,
+  BUILDER_OAUTH_SCOPE,
+  type BuilderOAuthPermissionScope,
+} from "./builder-oauth.js";
+export {
+  assertBuilderDesignSystemCodeIndexingAllowed,
   builderDesignSystemUrl,
   builderProjectBranchUrl,
   buildBuilderDesignSystemIndexFiles,
+  collectBuilderDesignSystemGitHubFiles,
   createBuilderDesignSystemProxyFields,
+  designSystemTierUpgradeUrl,
   fetchBuilderDesignSystemDecodeJobStatus,
   fetchBuilderDesignSystemDocs,
+  fetchBuilderDesignSystemDocumentCount,
+  fetchBuilderDesignSystemRecord,
+  fetchBuilderDesignSystemTierLimit,
   getBuilderDesignSystemsBaseUrl,
   hydrateBuilderDesignSystemReference,
   indexBuilderDesignSystem,
+  isBuilderDesignSystemReadyByCount,
   localBuilderDesignSystemId,
   mimeTypeForBuilderDesignSystemFilename,
   parseBuilderDesignSystemProxyReference,
@@ -505,11 +714,18 @@ export {
   type BuilderDesignSystemDecodeJobStatus,
   type BuilderDesignSystemDocsOptions,
   type BuilderDesignSystemDocument,
+  type BuilderDesignSystemDocumentCountResult,
   type BuilderDesignSystemHydratedReference,
   type BuilderDesignSystemIndexFile,
   type BuilderDesignSystemIndexFromSourcesOptions,
   type BuilderDesignSystemIndexOptions,
   type BuilderDesignSystemIndexResult,
+  type BuilderDesignSystemRecord,
+  type BuilderDesignSystemStatus,
+  type BuilderDesignSystemTierLimit,
+  type BuilderDesignSystemGitHubFile,
+  type BuilderDesignSystemGitHubFileCollection,
+  type BuilderDesignSystemGitHubSource,
   type BuilderDesignSystemUploadAttachment,
   type BuilderDesignSystemUploadSlot,
   type BuilderDesignSystemProxyFields,
@@ -518,12 +734,20 @@ export {
   type BuilderDesignSystemSourceKind,
 } from "./builder-design-systems.js";
 export {
+  cdnSafeOriginStatus,
+  createBuilderProject,
+  ensureBuilderProject,
+  findBuilderProjectForRepo,
   getBuilderBranchProjectId,
   isBuilderBranchingEnabled,
   requestBuilderBrowserConnection,
   resolveBuilderBranchProjectId,
   resolveIsBuilderBranchingEnabled,
   runBuilderAgent,
+  type BuilderAgentAttachment,
+  type BuilderAgentUploadAttachment,
+  type BuilderAgentUrlAttachment,
+  type BuilderProjectResult,
   type RunBuilderAgentResult,
 } from "./builder-browser.js";
 export {
@@ -552,6 +776,8 @@ export {
 } from "./email.js";
 export {
   defineTransactionalEmail,
+  defineTransactionalEmails,
+  replaceTransactionalEmails,
   listTransactionalEmails,
   getTransactionalEmail,
   renderTransactionalEmailPreview,
@@ -571,12 +797,27 @@ export {
 export {
   renderEmail,
   emailStrong,
+  emailQuote,
   emailLink,
   type RenderEmailArgs,
   type RenderedEmail,
   type EmailCta,
 } from "./email-template.js";
-export { getAppProductionUrl, getFirstPartyProdUrl } from "./app-url.js";
+export {
+  hasRecurringSweepHandler,
+  registerRecurringSweepHandler,
+  runRecurringSweepHandlers,
+  type RecurringSweepHandler,
+} from "../jobs/sweep-hooks.js";
+export {
+  scheduledTriggerAvailability,
+  type ScheduledTriggerAvailability,
+} from "./agent-chat/recurring-jobs-runtime.js";
+export {
+  getAppProductionUrl,
+  getFirstPartyProdUrl,
+  resolveAppRuntimeUrl,
+} from "./app-url.js";
 export {
   getConfiguredAppBasePath,
   normalizeAppBasePath,
@@ -617,14 +858,6 @@ export {
   type BuildAgentReadableResourceDiscoveryOptions,
 } from "../shared/agent-readable-resource.js";
 
-// SSR handler is NOT re-exported here — it uses a virtual module
-// (virtual:react-router/server-build) that only exists at Vite dev/build time.
-// Including it in this barrel would break the esbuild CF Pages bundler.
-// Templates import directly: import { ssrHandler } from "@agent-native/core/server/ssr-handler"
-
-// Nitro plugin helper — re-exported so templates don't need nitro as a direct dependency.
-// defineNitroPlugin is an identity function; this typed wrapper lets templates use it
-// without resolving `nitro/runtime` (which requires Nitro's virtual modules at runtime).
 export type NitroPluginDef = (nitroApp: any) => void | Promise<void>;
 export function defineNitroPlugin(def: NitroPluginDef): NitroPluginDef {
   return def;

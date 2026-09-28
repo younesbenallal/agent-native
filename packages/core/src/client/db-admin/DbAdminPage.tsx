@@ -1,11 +1,4 @@
 import { IconDatabase, IconLoader2 } from "@tabler/icons-react";
-/**
- * Database admin page — the shell that hosts the table browser, the table
- * editor, and the SQL editor.
- *
- * By default this is gated to Code mode for the core dev route. Trusted hosts
- * can opt out and point it at their own admin-gated API path.
- */
 import { useEffect, useMemo, useState } from "react";
 
 import type { DbAdminFilter } from "../../db-admin/types.js";
@@ -16,12 +9,6 @@ import { TableBrowser } from "./TableBrowser.js";
 import { TableEditor } from "./TableEditor.js";
 import { useDbAdminAgentSync, useNavigateConsumer } from "./useAgentSync.js";
 import { useOverview, type DbAdminRequestConfig } from "./useDbAdmin.js";
-
-const DIALECT_LABEL: Record<string, string> = {
-  postgres: "Postgres",
-  sqlite: "SQLite",
-  d1: "Cloudflare D1",
-};
 
 export interface DbAdminPageProps {
   apiBasePath?: string;
@@ -55,16 +42,12 @@ export function DbAdminPage({
   );
 
   const tables = overview?.tables ?? [];
-  const dialect = overview?.dialect ?? "sqlite";
-
-  // Default selection to the first table once the overview loads.
   useEffect(() => {
     if (selectedTable === null && tables.length > 0) {
       setSelectedTable(tables[0].name);
     }
   }, [selectedTable, tables]);
 
-  // Keep the agent's <current-screen> in sync, and let it drive navigation.
   useDbAdminAgentSync({ table: selectedTable, mode, enabled: syncNavigation });
   useNavigateConsumer((table) => {
     setSelectedTable(table);
@@ -73,11 +56,8 @@ export function DbAdminPage({
   }, syncNavigation);
 
   const tableNames = useMemo(() => tables.map((t) => t.name), [tables]);
-  // SqlEditor degrades gracefully without per-table columns; pass an empty map.
-  // (Table-name autocomplete still works; column autocomplete fills in lazily.)
   const columnsByTable = useMemo<Record<string, string[]>>(() => ({}), []);
 
-  // ─── Code mode gate ──────────────────────────────────────────────────────
   if (codeModeGate && !devLoading && !canToggle) {
     return (
       <div className="flex h-full w-full items-center justify-center bg-background p-6">
@@ -108,9 +88,6 @@ export function DbAdminPage({
       <header className="flex h-12 shrink-0 items-center gap-3 border-b px-4">
         <IconDatabase className="h-5 w-5 text-muted-foreground" stroke={1.75} />
         <span className="text-sm font-semibold">{title}</span>
-        <span className="inline-flex items-center rounded-full border bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">
-          {DIALECT_LABEL[dialect] ?? dialect}
-        </span>
         <span className="text-xs text-muted-foreground">
           {tables.length} {tables.length === 1 ? "table" : "tables"}
         </span>
@@ -145,7 +122,6 @@ export function DbAdminPage({
             <MainLoading />
           ) : mode === "sql" ? (
             <SqlEditor
-              dialect={dialect}
               tableNames={tableNames}
               columnsByTable={columnsByTable}
               requestConfig={requestConfig}
@@ -154,7 +130,6 @@ export function DbAdminPage({
             <TableEditor
               key={selectedTable}
               table={selectedTable}
-              dialect={dialect}
               requestConfig={requestConfig}
               initialFilters={fkFilters}
               onNavigateToRow={(t, filters) => {

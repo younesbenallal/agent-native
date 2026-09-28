@@ -2,8 +2,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 import type { AuthSession } from "./auth.js";
 
-// Mock @sentry/node BEFORE we import the module under test so the spied
-// versions of init / setUser / captureException are observed.
 const sentryMock = vi.hoisted(() => {
   const mockScope = {
     setUser: vi.fn(),
@@ -73,6 +71,23 @@ describe("server/sentry", () => {
       expect(cfg.tracesSampleRate).toBe(0);
       expect(typeof cfg.beforeSend).toBe("function");
       expect(isServerSentryEnabled()).toBe(true);
+    });
+
+    it("uses the explicit deployment lane for Sentry", async () => {
+      process.env.SENTRY_SERVER_DSN = "https://test@example/123";
+      process.env.SENTRY_ENVIRONMENT = "production";
+      process.env.AGENT_NATIVE_DEPLOYMENT_ENVIRONMENT = "beta";
+      const { initServerSentry } = await import("./sentry.js");
+
+      initServerSentry();
+
+      const cfg = sentryMock.init.mock.calls[0][0];
+      expect(cfg.environment).toBe("beta");
+      const event = cfg.beforeSend({ tags: { existing: "tag" } });
+      expect(event.tags).toEqual({
+        existing: "tag",
+        deployment_environment: "beta",
+      });
     });
 
     it("falls back to the common SENTRY_DSN when SENTRY_SERVER_DSN is unset", async () => {
@@ -284,10 +299,6 @@ describe("server/sentry", () => {
     });
 
     it("drops ErrorEvent rejections whose only in_app frames are bundled SDK chunks", async () => {
-      // Production shape from AGENT-NATIVE-BROWSER-6: serverless bundles place
-      // the Sentry SDK under the app root (/var/task/_libs/@sentry/...), so
-      // those instrumentation frames carry in_app: true and defeated the
-      // original !hasApplicationFrame check — 574 events leaked through.
       process.env.SENTRY_SERVER_DSN = "https://test@example/123";
       const { initServerSentry } = await import("./sentry.js");
       initServerSentry();

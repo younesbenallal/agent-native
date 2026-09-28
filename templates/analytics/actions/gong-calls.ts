@@ -1,4 +1,4 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
 
 import {
@@ -63,7 +63,7 @@ interface TranscriptSearchError {
 
 function callLimitGuidance(limit: number, truncated: boolean): string {
   return truncated
-    ? `Returned the ${limit} most recent matching calls. If this coverage is insufficient for the analysis, increase the limit and page through more calls; for very large datasets prefer chunked background processing.`
+    ? `Coverage is incomplete: returned the ${limit} most recent matching calls and more Gong pages remain. Do not increase the limit or page this action for broad or exhaustive analysis. Switch to tracker staging with provider-api-request plus query-staged-dataset or a Data Program, or use provider-corpus-job when raw transcript bodies are required.`
     : `Returned ${limit} or fewer matching calls. Answer from these calls; expand limit if broader coverage is needed.`;
 }
 
@@ -471,11 +471,6 @@ async function loadTranscriptEvidence(
   return evidence;
 }
 
-/**
- * Normalize a user-supplied date (ISO `yyyy-mm-dd` or full timestamp) to an
- * ISO string for the Gong window filters. Returns undefined for empty/invalid
- * input so the caller falls back to the `days` window.
- */
 function normalizeGongDate(
   value: string | undefined,
   boundary: "start" | "end" = "start",
@@ -491,13 +486,8 @@ function normalizeGongDate(
 }
 
 export default defineAction({
-  // Read-only provider query: safe to call from run-code `appAction` and
-  // reusable across continuation retries (no re-fetch on resume).
   readOnly: true,
   publicAgent: { expose: true, readOnly: true, requiresAuth: true },
-  // A bounded multi-call transcript review is intentionally larger than the
-  // shared 50K tool default. One batched result avoids 10+ one-call-at-a-time
-  // model round trips while still staying well below the model context limit.
   maxResultChars: 100_000,
   description:
     "Query bounded Gong sales-call evidence. Pass --users for the user list, --transcript for one transcript, or --company for a bounded search by company/domain/person/email. Without --company, the action lists calls in the date window; set exhaustive=true only for a small bounded cohort of fewer than 500 records, not a broad org-wide export. For account-level transcript mention questions, transcriptQuery performs a case-insensitive local scan after batched transcript retrieval and returns coverage counts plus snippets; it is not Gong's server-side keyword search. Use includeTranscripts=true for bounded qualitative context. For broad keyword, tracker, cross-account, or absence-sensitive work, use provider-api-catalog/provider-api-docs, stage the raw Gong API response, then use query-staged-dataset or a Data Program; use provider-corpus-job only when raw transcript bodies are required.",
@@ -583,6 +573,7 @@ export default defineAction({
       ),
   }),
   http: { method: "GET" },
+  grounding: true,
   run: async (args, ctx) => {
     const requestOptions = ctx?.signal ? { signal: ctx.signal } : undefined;
     if (args.users) {
@@ -719,7 +710,7 @@ export default defineAction({
           : {}),
         guidance: [
           transcriptSearch
-            ? `Transcript search inspected ${transcriptSearch.inspectedCalls} of ${result.calls.length} matching call(s) for "${transcriptQuery}" and found ${transcriptSearch.matches.length} matching call(s). Use coverageComplete/errors before making absence claims; increase transcriptScanLimit or narrow the window if coverage is incomplete.`
+            ? `Transcript search inspected ${transcriptSearch.inspectedCalls} of ${result.calls.length} matching call(s) for "${transcriptQuery}" and found ${transcriptSearch.matches.length} matching call(s). Use coverageComplete/errors before making absence claims; if coverage is incomplete, keep any retry bounded by narrowing the window, or switch broad/exhaustive work to tracker staging or provider-corpus-job.`
             : "",
           exhaustive
             ? shouldLoadTranscripts
@@ -854,7 +845,7 @@ export default defineAction({
         ...(transcripts ? { transcripts } : {}),
         guidance: [
           transcriptSearch
-            ? `Transcript search inspected ${transcriptSearch.inspectedCalls} of ${returnedCalls.length} returned call(s) for "${transcriptQuery}" and found ${transcriptSearch.matches.length} matching call(s). Use coverageComplete/errors before making absence claims; increase limit/transcriptScanLimit or narrow the window if coverage is incomplete.`
+            ? `Transcript search inspected ${transcriptSearch.inspectedCalls} of ${returnedCalls.length} returned call(s) for "${transcriptQuery}" and found ${transcriptSearch.matches.length} matching call(s). Use coverageComplete/errors before making absence claims; if coverage is incomplete, keep any retry bounded by narrowing the window, or switch broad/exhaustive work to tracker staging or provider-corpus-job.`
             : "",
           exhaustive
             ? `Exhaustive discovery returned ${returnedCalls.length} call(s) from the date window${truncated ? ", but Gong has more pages than this request covered" : ""}.`

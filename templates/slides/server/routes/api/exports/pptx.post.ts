@@ -1,20 +1,23 @@
 import path from "path";
 
-import {
-  getSession,
-  readBody,
-  runWithRequestContext,
-} from "@agent-native/core/server";
+import { isActionContractError } from "@agent-native/core";
+import { readBody, runWithRequestContext } from "@agent-native/core/server";
 import { defineEventHandler, setResponseStatus } from "h3";
 
 import exportPptxAction from "../../../../actions/export-pptx.js";
+import { resolveSlidesRequestAuth } from "../../../handlers/request-auth-context.js";
 
 const PPTX_CONTENT_TYPE =
   "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 
 export default defineEventHandler(async (event) => {
-  const session = await getSession(event).catch(() => null);
-  if (!session?.email) {
+  const auth = await resolveSlidesRequestAuth(event);
+  if (!auth.ok) {
+    setResponseStatus(event, auth.statusCode);
+    return { error: auth.error };
+  }
+  const session = auth.context;
+  if (!session.email) {
     setResponseStatus(event, 401);
     return { error: "Unauthorized" };
   }
@@ -54,9 +57,18 @@ export default defineEventHandler(async (event) => {
         "Content-Disposition": `attachment; filename="${path.basename(
           result.filename,
         )}"`,
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
       },
     });
   } catch (error) {
+    if (isActionContractError(error)) {
+      setResponseStatus(event, error.statusCode);
+      return {
+        error: error.message,
+        errorCode: error.errorCode,
+      };
+    }
     const message =
       error instanceof Error
         ? error.message

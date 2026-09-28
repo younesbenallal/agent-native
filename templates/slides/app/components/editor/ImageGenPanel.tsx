@@ -4,11 +4,11 @@ import {
   normalizeReferenceUrls,
 } from "@shared/api";
 import { IconX } from "@tabler/icons-react";
-import { IconLoader2 } from "@tabler/icons-react";
 import { useState, useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 
 import { useAgentGenerating } from "@/hooks/use-agent-generating";
+import { WEBSITE_STYLE_REFERENCE_DIRECTIVE } from "@/lib/create-deck-generation";
 
 interface ImageGenPanelProps {
   open: boolean;
@@ -31,6 +31,15 @@ export interface BuildImageGenerationContextArgs {
   referenceImageUrls?: string[];
 }
 
+export function getImageGenerationLabel(
+  prompt: string,
+  slideIndex?: number,
+): string {
+  return prompt.trim()
+    ? prompt
+    : `Generate image for slide ${slideIndex === undefined ? "" : slideIndex + 1}`;
+}
+
 export function buildImageGenerationContext({
   prompt,
   slideContext,
@@ -50,6 +59,7 @@ export function buildImageGenerationContext({
   contextParts.push(
     'Do not browse, search, or inspect brand assets for style phrases like "Builder.io" unless the user explicitly asks to set up, import, save, or apply a brand/design system.',
   );
+  contextParts.push(WEBSITE_STYLE_REFERENCE_DIRECTIVE);
 
   const styleReferenceUrls = normalizeReferenceUrls(referenceImageUrls);
   if (styleReferenceUrls.length > 0) {
@@ -80,7 +90,7 @@ export function buildImageGenerationContext({
   }
 
   contextParts.push(
-    '\nGenerate 3 variations. Show each as an inline rendered image preview using markdown image syntax (![Variation 1](url)), not a plain text link — the chat renders "![]()" as an actual image but "[]()" as a bare link. Let the user pick their favorite, then insert the chosen generated image into the slide content in the right place.',
+    '\nGenerate 3 preview-only variations. Show each as an inline rendered image preview using markdown image syntax (![Variation 1](url)), not a plain text link — the chat renders "![]()" as an actual image but "[]()" as a bare link. After the user chooses one, place that preview URL with update-slide and then get-deck to verify the persisted slide HTML contains it before claiming success. For a direct one-image request instead, call `generate-image-api` with insertIntoSlide: true plus deckId and slideId; claim it was added only if the action returns inserted: true.',
   );
 
   return contextParts.join("\n");
@@ -98,7 +108,7 @@ export default function ImageGenPanel({
   const [disabledDefaults, setDisabledDefaults] = useState<Set<number>>(
     new Set(),
   );
-  const { generating, submit: agentSubmit } = useAgentGenerating();
+  const { submit: agentSubmit } = useAgentGenerating();
   const panelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -142,17 +152,15 @@ export default function ImageGenPanel({
       referenceImageUrls: activeRefs,
     });
 
-    const label = prompt.trim()
-      ? `Generate 3 image variations: ${prompt}`
-      : `Generate image for slide ${slideContext ? slideContext.slideIndex + 1 : ""}`;
+    const label = getImageGenerationLabel(prompt, slideContext?.slideIndex);
 
     agentSubmit(label, context);
     setPrompt("");
+    onOpenChange(false);
   };
 
   if (!open) return null;
 
-  // Position below anchor button
   let style: React.CSSProperties = {
     position: "fixed",
     top: "50%",
@@ -246,17 +254,9 @@ export default function ImageGenPanel({
         {/* Generate button */}
         <button
           onClick={handleGenerate}
-          disabled={generating}
-          className="w-full px-4 py-2 rounded-lg bg-[#609FF8] hover:bg-[#7AB2FA] disabled:opacity-70 disabled:cursor-not-allowed text-black text-sm font-medium transition-colors flex items-center justify-center gap-2"
+          className="w-full px-4 py-2 rounded-lg bg-[#609FF8] hover:bg-[#7AB2FA] text-black text-sm font-medium transition-colors flex items-center justify-center gap-2"
         >
-          {generating ? (
-            <>
-              <IconLoader2 className="w-4 h-4 animate-spin" />
-              {t("raw.generatingImage")}
-            </>
-          ) : (
-            "Generate"
-          )}
+          Generate
         </button>
       </div>
     </div>,

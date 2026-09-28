@@ -1,9 +1,4 @@
-import {
-  getDbExec,
-  intType,
-  isPostgres,
-  retryOnDdlRace,
-} from "../db/client.js";
+import { getDbExec } from "../db/client.js";
 import {
   ensureColumnExists,
   ensureTableExists,
@@ -48,10 +43,9 @@ const REMOTE_COMMAND_KINDS: RemoteCommandKind[] = [
 
 const TERMINAL_STATUSES = new Set<RemoteCommandStatus>(["completed", "failed"]);
 
-async function ensureTable(): Promise<void> {
+export async function ensureTable(): Promise<void> {
   if (!_initPromise) {
     _initPromise = (async () => {
-      const client = getDbExec();
       const createSql = `CREATE TABLE IF NOT EXISTS integration_remote_commands (
   id TEXT PRIMARY KEY,
   device_id TEXT NOT NULL,
@@ -65,23 +59,22 @@ async function ensureTable(): Promise<void> {
   external_thread_id TEXT,
   computer_task_id TEXT,
   computer_run_id TEXT,
-  computer_sequence ${intType()},
+  computer_sequence BIGINT,
   idempotency_key TEXT,
   operation_class TEXT,
   approval_scope TEXT,
   action_hash TEXT,
-  lease_expires_at ${intType()},
-  attempts ${intType()} NOT NULL DEFAULT 0,
-  next_check_at ${intType()} NOT NULL,
-  claimed_at ${intType()},
-  completed_at ${intType()},
+  lease_expires_at BIGINT,
+  attempts BIGINT NOT NULL DEFAULT 0,
+  next_check_at BIGINT NOT NULL,
+  claimed_at BIGINT,
+  completed_at BIGINT,
   error_message TEXT,
-  created_at ${intType()} NOT NULL,
-  updated_at ${intType()} NOT NULL
+  created_at BIGINT NOT NULL,
+  updated_at BIGINT NOT NULL
 )`;
 
-      if (isPostgres()) {
-        // PG guard: probe via information_schema, only issue DDL if missing, bounded lock_timeout
+      {
         await ensureTableExists("integration_remote_commands", createSql);
         await ensureComputerCommandColumns();
         await ensureIndexExists(
@@ -95,23 +88,7 @@ async function ensureTable(): Promise<void> {
         await ensureComputerCommandIndexes();
         return;
       }
-
-      // SQLite: keep existing behavior
-      await retryOnDdlRace(() => client.execute(createSql));
-      await ensureComputerCommandColumns();
-      await retryOnDdlRace(() =>
-        client.execute(
-          `CREATE INDEX IF NOT EXISTS idx_remote_commands_device_status_next ON integration_remote_commands(device_id, status, next_check_at)`,
-        ),
-      );
-      await ensureComputerCommandIndexes();
-      await retryOnDdlRace(() =>
-        client.execute(
-          `CREATE INDEX IF NOT EXISTS idx_remote_commands_owner ON integration_remote_commands(owner_email, org_id)`,
-        ),
-      );
     })().catch((err) => {
-      // Retry init on the next call after a failed startup.
       _initPromise = undefined;
       throw err;
     });
@@ -132,6 +109,7 @@ function rowToCommand(row: Record<string, unknown>): RemoteCommand {
     result: parseJson(row.result_json, null),
     platform: (row.platform as string | null) ?? null,
     externalThreadId: (row.external_thread_id as string | null) ?? null,
+    idempotencyKey: (row.idempotency_key as string | null) ?? null,
     computerOperation:
       row.kind === "computer-operation"
         ? ((params as { envelope?: ComputerCommandEnvelope })?.envelope ?? null)
@@ -151,24 +129,16 @@ async function ensureComputerCommandColumns(): Promise<void> {
   const columns: Array<[string, string]> = [
     ["computer_task_id", "TEXT"],
     ["computer_run_id", "TEXT"],
-    ["computer_sequence", intType()],
+    ["computer_sequence", "BIGINT"],
     ["idempotency_key", "TEXT"],
     ["operation_class", "TEXT"],
     ["approval_scope", "TEXT"],
     ["action_hash", "TEXT"],
-    ["lease_expires_at", intType()],
+    ["lease_expires_at", "BIGINT"],
   ];
   for (const [name, definition] of columns) {
-    const sql = `ALTER TABLE integration_remote_commands ADD COLUMN${isPostgres() ? " IF NOT EXISTS" : ""} ${name} ${definition}`;
-    if (isPostgres()) {
-      await ensureColumnExists("integration_remote_commands", name, sql);
-      continue;
-    }
-    try {
-      await retryOnDdlRace(() => getDbExec().execute(sql));
-    } catch (error) {
-      if (!isDuplicateColumnError(error)) throw error;
-    }
+    const sql = `ALTER TABLE integration_remote_commands ADD COLUMN${" IF NOT EXISTS"} ${name} ${definition}`;
+    await ensureColumnExists("integration_remote_commands", name, sql);
   }
 }
 
@@ -184,8 +154,7 @@ async function ensureComputerCommandIndexes(): Promise<void> {
     ],
   ] as const;
   for (const [name, sql] of indexes) {
-    if (isPostgres()) await ensureIndexExists(name, sql);
-    else await retryOnDdlRace(() => getDbExec().execute(sql));
+    await ensureIndexExists(name, sql);
   }
 }
 
@@ -206,6 +175,7 @@ export async function enqueueRemoteCommand(input: {
   params?: unknown;
   platform?: string | null;
   externalThreadId?: string | null;
+  idempotencyKey?: string | null;
   nextCheckAt?: number;
 }): Promise<RemoteCommand> {
   if (input.kind === "computer-operation") {
@@ -218,29 +188,51 @@ export async function enqueueRemoteCommand(input: {
   const client = getDbExec();
   const now = Date.now();
   const id = `remote-command-${now}-${randomHex(8)}`;
+  const idempotencyKey = normalizeIdempotencyKey(input.idempotencyKey);
 
-  await client.execute({
-    sql: `INSERT INTO integration_remote_commands
-      (id, device_id, owner_email, org_id, kind, params_json, status, result_json,
-       platform, external_thread_id, attempts, next_check_at, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    args: [
-      id,
-      input.deviceId,
-      input.ownerEmail,
-      input.orgId ?? null,
-      input.kind,
-      JSON.stringify(input.params ?? {}),
-      "pending",
-      null,
-      input.platform ?? null,
-      input.externalThreadId ?? null,
-      0,
-      input.nextCheckAt ?? now,
-      now,
-      now,
-    ],
-  });
+  if (idempotencyKey) {
+    const existing = await getRemoteCommandByIdempotencyKey({
+      deviceId: input.deviceId,
+      idempotencyKey,
+    });
+    if (existing) return existing;
+  }
+
+  try {
+    await client.execute({
+      sql: `INSERT INTO integration_remote_commands
+        (id, device_id, owner_email, org_id, kind, params_json, status, result_json,
+         platform, external_thread_id, idempotency_key, attempts, next_check_at,
+         created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      args: [
+        id,
+        input.deviceId,
+        input.ownerEmail,
+        input.orgId ?? null,
+        input.kind,
+        JSON.stringify(input.params ?? {}),
+        "pending",
+        null,
+        input.platform ?? null,
+        input.externalThreadId ?? null,
+        idempotencyKey,
+        0,
+        input.nextCheckAt ?? now,
+        now,
+        now,
+      ],
+    });
+  } catch (error) {
+    if (idempotencyKey && isUniqueConstraintError(error)) {
+      const existing = await getRemoteCommandByIdempotencyKey({
+        deviceId: input.deviceId,
+        idempotencyKey,
+      });
+      if (existing) return existing;
+    }
+    throw error;
+  }
 
   const command = await getRemoteCommand(id);
   if (!command) throw new Error("remote command insert failed");
@@ -348,6 +340,20 @@ export async function getRemoteCommand(
   return rows[0] ? rowToCommand(rows[0] as Record<string, unknown>) : null;
 }
 
+export async function getRemoteCommandByIdempotencyKey(input: {
+  deviceId: string;
+  idempotencyKey: string;
+}): Promise<RemoteCommand | null> {
+  await ensureTable();
+  const { rows } = await getDbExec().execute({
+    sql: `SELECT * FROM integration_remote_commands
+          WHERE device_id = ? AND idempotency_key = ?
+          LIMIT 1`,
+    args: [input.deviceId, input.idempotencyKey],
+  });
+  return rows[0] ? rowToCommand(rows[0] as Record<string, unknown>) : null;
+}
+
 export async function listRemoteCommandsForOwner(input: {
   ownerEmail: string;
   orgId?: string | null;
@@ -396,26 +402,14 @@ export async function claimNextRemoteCommand(
   if (!id) return null;
 
   const result = await client.execute({
-    sql: isPostgres()
-      ? `UPDATE integration_remote_commands
+    sql: `UPDATE integration_remote_commands
           SET status = ?, attempts = attempts + 1, claimed_at = ?, updated_at = ?
           WHERE id = ? AND device_id = ? AND status = 'pending'
-          RETURNING *`
-      : `UPDATE integration_remote_commands
-          SET status = ?, attempts = attempts + 1, claimed_at = ?, updated_at = ?
-          WHERE id = ? AND device_id = ? AND status = 'pending'`,
+          RETURNING *`,
     args: ["claimed", now, now, id, deviceId],
   });
-  if (isPostgres()) {
-    const row = result.rows?.[0];
-    return row ? rowToCommand(row as Record<string, unknown>) : null;
-  }
-  const affected = result.rowsAffected ?? (result as any).rowCount;
-  if (affected === 0) return null;
-
-  const command = await getRemoteCommand(id);
-  if (!command || command.status !== "claimed") return null;
-  return command;
+  const row = result.rows?.[0];
+  return row ? rowToCommand(row as Record<string, unknown>) : null;
 }
 
 export async function claimNextComputerCommand(input: {
@@ -496,18 +490,12 @@ export async function claimNextComputerCommand(input: {
   }
 
   const result = await client.execute({
-    sql: isPostgres()
-      ? `UPDATE integration_remote_commands
+    sql: `UPDATE integration_remote_commands
           SET status = 'claimed', attempts = attempts + 1, claimed_at = ?, updated_at = ?
           WHERE id = ? AND device_id = ? AND owner_email = ?
             AND ((org_id IS NULL AND CAST(? AS TEXT) IS NULL) OR org_id = ?)
             AND status = 'pending' AND lease_expires_at > ?
-          RETURNING *`
-      : `UPDATE integration_remote_commands
-          SET status = 'claimed', attempts = attempts + 1, claimed_at = ?, updated_at = ?
-          WHERE id = ? AND device_id = ? AND owner_email = ?
-            AND ((org_id IS NULL AND CAST(? AS TEXT) IS NULL) OR org_id = ?)
-            AND status = 'pending' AND lease_expires_at > ?`,
+          RETURNING *`,
     args: [
       now,
       now,
@@ -519,7 +507,7 @@ export async function claimNextComputerCommand(input: {
       now,
     ],
   });
-  if (isPostgres()) {
+  {
     const row = result.rows?.[0];
     return row ? rowToCommand(row as Record<string, unknown>) : null;
   }
@@ -640,7 +628,9 @@ export async function retryStaleRemoteCommands(options?: {
 function parseJson(value: unknown, fallback: unknown): unknown {
   if (value == null) return fallback;
   try {
-    return JSON.parse(String(value));
+    return JSON.parse(
+      typeof value === "string" ? value : (JSON.stringify(value) ?? ""),
+    );
   } catch {
     return fallback;
   }
@@ -654,6 +644,14 @@ function randomHex(byteLength: number): string {
     .join("");
 }
 
+function normalizeIdempotencyKey(
+  value: string | null | undefined,
+): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized ? normalized.slice(0, 512) : null;
+}
+
 function affectedRows(result: {
   rowsAffected?: number;
   rows?: unknown[];
@@ -664,26 +662,14 @@ function affectedRows(result: {
   );
 }
 
-function isDuplicateColumnError(error: unknown): boolean {
-  const code = String((error as { code?: unknown })?.code ?? "");
-  const message = String((error as { message?: unknown })?.message ?? error)
-    .toLowerCase()
-    .trim();
-  return (
-    code === "42701" ||
-    message.includes("duplicate column") ||
-    message.includes("already exists")
-  );
-}
-
 function isUniqueConstraintError(error: unknown): boolean {
-  const code = String((error as { code?: unknown })?.code ?? "");
+  const codeValue = (error as { code?: unknown })?.code;
+  const code = typeof codeValue === "string" ? codeValue : "";
   const message = String((error as { message?: unknown })?.message ?? error)
     .toLowerCase()
     .trim();
   return (
     code === "23505" ||
-    code === "2067" ||
     message.includes("unique constraint") ||
     message.includes("duplicate key")
   );

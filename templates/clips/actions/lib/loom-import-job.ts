@@ -4,17 +4,24 @@ import { and, asc, eq, gte, inArray } from "drizzle-orm";
 
 import { getDb, schema } from "../../server/db/index.js";
 import { queueBuilderMediaCompression } from "../../server/lib/builder-media-compression.js";
+import {
+  ensureRecordingThumbnail,
+  isRetryableRecordingThumbnailStatus,
+} from "../../server/lib/ensure-recording-thumbnail.js";
+import { dispatchPostFinalizeJob } from "../../server/lib/post-finalize-dispatch.js";
+import { trackRecordingFailure } from "../../server/lib/recording-failures.js";
 import { ownerEmailMatches } from "../../server/lib/recordings.js";
 import { transactionalEmailStore } from "../../server/lib/transactional-email-store.js";
 import {
   extractLoomVideoId,
+  loomEmbedUrlForId,
   normalizeLoomShareUrl,
 } from "../../shared/loom.js";
 import {
   fetchLoomTranscript,
   loomTranscriptUnavailableMessage,
 } from "./loom-transcript.js";
-import { downloadLoomVideo } from "./loom-video.js";
+import { downloadLoomVideo, LoomVideoUnavailableError } from "./loom-video.js";
 
 export type LoomImportJobResult = {
   status: "ready" | "failed";
@@ -65,6 +72,7 @@ export async function failLoomImport(
     .update(schema.recordings)
     .set({
       status: "failed",
+      failureCode: "loom_import_failed",
       failureReason,
       loomImportClaimId: null,
       loomImportClaimedAt: null,
@@ -78,8 +86,20 @@ export async function failLoomImport(
           )
         : eq(schema.recordings.id, recordingId),
     )
-    .returning({ id: schema.recordings.id });
+    .returning({
+      id: schema.recordings.id,
+      ownerEmail: schema.recordings.ownerEmail,
+      uploadAttemptId: schema.recordings.uploadAttemptId,
+      recordingPlatform: schema.recordings.recordingPlatform,
+    });
   if (!updated) return { status: "failed", failureReason };
+  trackRecordingFailure({
+    recordingId,
+    userId: updated.ownerEmail,
+    uploadAttemptId: updated.uploadAttemptId,
+    platform: updated.recordingPlatform ?? "import",
+    failureCode: "loom_import_failed",
+  });
 
   try {
     await writeAppState(`recording-upload-${recordingId}`, {
@@ -98,12 +118,6 @@ export async function failLoomImport(
   return { status: "failed", failureReason };
 }
 
-/**
- * Downloads a Loom video and re-uploads it to Clips storage, off the request
- * that created the "processing" row. Loom's CDN plus a reupload can outlast a
- * synchronous serverless function's execution ceiling; running it here keeps
- * import-loom-recording's own request fast regardless of Loom video length.
- */
 export async function runLoomImportJob({
   recordingId,
   ownerEmail,
@@ -147,49 +161,69 @@ export async function runLoomImportJob({
 
   console.log("[loom-import] job started", { recordingId, claimId });
 
-  let media: Awaited<ReturnType<typeof downloadLoomVideo>>;
+  let media: Awaited<ReturnType<typeof downloadLoomVideo>> | null = null;
   try {
-    media = await downloadLoomVideo({ loomId, shareUrl });
+    media = await downloadLoomVideo({
+      loomId,
+      shareUrl,
+      expectedDurationMs: recording.durationMs,
+    });
     console.log("[loom-import] download complete", {
       recordingId,
       bytes: media.sizeBytes,
       mimeType: media.mimeType,
     });
   } catch (err) {
-    return failLoomImport(
-      recordingId,
-      err instanceof Error ? err.message : String(err),
-      claimId,
-    );
+    if (err instanceof LoomVideoUnavailableError) {
+      console.warn(
+        "[loom-import] MP4 unavailable or could not be verified; keeping Loom embed",
+        {
+          recordingId,
+          loomId,
+        },
+      );
+    } else {
+      return failLoomImport(
+        recordingId,
+        err instanceof Error ? err.message : String(err),
+        claimId,
+      );
+    }
   }
 
   try {
-    const upload = await uploadFile({
-      data: media.bytes,
-      filename: `${recordingId}.mp4`,
-      mimeType: media.mimeType,
-      ownerEmail,
-      stableUrl: true,
-      recordAsset: false,
-    });
-    if (!upload?.url) {
+    const upload = media
+      ? await uploadFile({
+          data: media.bytes,
+          filename: `${recordingId}.mp4`,
+          mimeType: media.mimeType,
+          ownerEmail,
+          stableUrl: true,
+          recordAsset: false,
+        })
+      : null;
+    if (media && !upload?.url) {
       return failLoomImport(
         recordingId,
         "File upload returned no URL. Check your storage provider configuration.",
         claimId,
       );
     }
-    console.log("[loom-import] reupload complete", {
-      recordingId,
-      videoUrl: upload.url,
-    });
+
+    const videoUrl = upload?.url ?? loomEmbedUrlForId(loomId);
+    if (upload) {
+      console.log("[loom-import] reupload complete", {
+        recordingId,
+        videoUrl: upload.url,
+      });
+    }
 
     const now = new Date().toISOString();
     const [mediaReady] = await db
       .update(schema.recordings)
       .set({
-        videoUrl: upload.url,
-        videoSizeBytes: media.sizeBytes,
+        videoUrl,
+        videoSizeBytes: media?.sizeBytes ?? 0,
         status: "ready",
         failureReason: null,
         updatedAt: now,
@@ -213,20 +247,56 @@ export async function runLoomImportJob({
     }
     console.log("[loom-import] recording ready", { recordingId });
 
-    void queueBuilderMediaCompression({
-      recordingId,
-      ownerEmail,
-      videoUrl: upload.url,
-      mimeType: media.mimeType,
-      providerId: upload.provider,
-      assetDbId: upload.id,
-      sourceSizeBytes: media.sizeBytes,
-    }).catch((err) => {
-      console.warn("[clips] Loom media compression queue failed", {
+    if (media && upload) {
+      const thumbnail = await ensureRecordingThumbnail({
         recordingId,
-        error: err instanceof Error ? err.message : String(err),
+        ownerEmail,
+        mediaBytes: media.bytes,
+        mimeType: media.mimeType,
+        replaceNonEditorThumbnail: true,
+      }).catch((err) => {
+        console.warn("[clips] Loom thumbnail generation skipped", {
+          recordingId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return null;
       });
-    });
+      if (thumbnail?.status === "skipped-frame-extraction") {
+        console.warn("[clips] Loom thumbnail frame extraction skipped", {
+          recordingId,
+          detail: thumbnail.detail,
+        });
+      }
+      if (!thumbnail || isRetryableRecordingThumbnailStatus(thumbnail.status)) {
+        await dispatchPostFinalizeJob({
+          recordingId,
+          kind: "thumbnail",
+          requireAccepted: true,
+        }).catch((err) => {
+          console.warn("[clips] Loom thumbnail retry queue failed", {
+            recordingId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
+    }
+
+    if (media && upload) {
+      void queueBuilderMediaCompression({
+        recordingId,
+        ownerEmail,
+        videoUrl: upload.url,
+        mimeType: media.mimeType,
+        providerId: upload.provider,
+        assetDbId: upload.id,
+        sourceSizeBytes: media.sizeBytes,
+      }).catch((err) => {
+        console.warn("[clips] Loom media compression queue failed", {
+          recordingId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
 
     try {
       let transcript: Awaited<ReturnType<typeof fetchLoomTranscript>> = null;
@@ -291,7 +361,7 @@ export async function runLoomImportJob({
         recordingId,
         status: "ready",
         progress: 100,
-        videoUrl: upload.url,
+        videoUrl,
         updatedAt: now,
       });
       await writeAppState("refresh-signal", { ts: Date.now() });

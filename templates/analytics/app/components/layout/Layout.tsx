@@ -8,17 +8,32 @@ import {
   useAgentChatHomeHandoff,
   useAgentChatHomeHandoffLinks,
   useGuidedQuestionFlow,
+  isAssistantChatHistoryVersion,
+  type AssistantChatHistoryConfig,
+  type AssistantChatHistoryVersion,
 } from "@agent-native/core/client/agent-chat";
+import { useFeatureFlagState } from "@agent-native/core/client/feature-flags";
 import { useT } from "@agent-native/core/client/i18n";
 import { InvitationBanner } from "@agent-native/core/client/org";
-import { CreativeContextComposerChip } from "@agent-native/creative-context/client";
-import { useEffect, useMemo } from "react";
+import { isSettingsPathname } from "@agent-native/core/client/settings";
+import { SETTINGS_REDESIGN_FLAG } from "@agent-native/core/feature-flags/registry";
+import {
+  CreativeContextComposerChip,
+  useCreativeContextLab,
+} from "@agent-native/creative-context/client";
+import { useEffect, useMemo, useRef } from "react";
 import { useLocation, useNavigate } from "react-router";
 
 import { useNavigationState } from "@/hooks/use-navigation-state";
 import {
   ANALYTICS_CHAT_STORAGE_KEY,
+  ANALYTICS_RECENT_CHAT_HANDOFF_TTL_MS,
+  discardAnalyticsChatHandoffOnSettings,
+  hasTrackedAnalyticsChatRun,
+  isAnalyticsSettingsPath,
   markAnalyticsChatActivity,
+  updateAnalyticsChatHandoffForRun,
+  type AnalyticsChatRunningRuns,
 } from "@/lib/chat-handoff";
 import { TAB_ID } from "@/lib/tab-id";
 
@@ -43,11 +58,8 @@ function InteractiveLayout({ children }: LayoutProps) {
   const location = useLocation();
   const navigate = useNavigate();
   const t = useT();
+  const creativeContextEnabled = useCreativeContextLab();
 
-  // Analytics stages the active primary resource as composer context —
-  // dashboards (`/dashboards/:id`, legacy `/adhoc/:id`) and ad-hoc analyses
-  // (`/analyses/:id`). List pages and Ask leave context null so general data
-  // questions still work.
   const analyticsScope = useMemo(() => {
     const dashMatch = location.pathname.match(
       /^\/(?:adhoc|dashboards)\/([^/]+)/,
@@ -65,6 +77,60 @@ function InteractiveLayout({ children }: LayoutProps) {
     }
     return null;
   }, [location.pathname]);
+  const analyticsChatHistory = useMemo<
+    AssistantChatHistoryConfig | undefined
+  >(() => {
+    if (!analyticsScope) return undefined;
+    if (analyticsScope.type === "dashboard") {
+      const dashboardId = analyticsScope.id;
+      return {
+        list: {
+          action: "list-dashboard-revisions",
+          args: { dashboardId },
+          getVersions: (result: unknown) => {
+            const revisions =
+              result && typeof result === "object"
+                ? (result as { revisions?: unknown }).revisions
+                : undefined;
+            return Array.isArray(revisions)
+              ? revisions.filter(isAssistantChatHistoryVersion)
+              : [];
+          },
+        },
+        restore: {
+          action: "restore-dashboard-revision",
+          args: (version: AssistantChatHistoryVersion) => ({
+            dashboardId,
+            revisionId: version.id,
+          }),
+        },
+      };
+    }
+
+    const analysisId = analyticsScope.id;
+    return {
+      list: {
+        action: "list-analysis-revisions",
+        args: { analysisId },
+        getVersions: (result: unknown) => {
+          const revisions =
+            result && typeof result === "object"
+              ? (result as { revisions?: unknown }).revisions
+              : undefined;
+          return Array.isArray(revisions)
+            ? revisions.filter(isAssistantChatHistoryVersion)
+            : [];
+        },
+      },
+      restore: {
+        action: "restore-analysis-revision",
+        args: (version: AssistantChatHistoryVersion) => ({
+          analysisId,
+          revisionId: version.id,
+        }),
+      },
+    };
+  }, [analyticsScope]);
 
   const {
     questions: guidedQuestions,
@@ -72,6 +138,9 @@ function InteractiveLayout({ children }: LayoutProps) {
     description: guidedDescription,
     skipLabel: guidedSkipLabel,
     submitLabel: guidedSubmitLabel,
+    isSubmissionBlocked: guidedSubmissionBlocked,
+    providerStatus: guidedProviderStatus,
+    retryProviderStatus: retryGuidedProviderStatus,
     handleSubmit: handleGuidedSubmit,
     handleSkip: handleGuidedSkip,
   } = useGuidedQuestionFlow({
@@ -84,54 +153,78 @@ function InteractiveLayout({ children }: LayoutProps) {
         "Answers:",
         formattedAnswers,
         "",
-        "Use these answers to choose the dashboard scope, data source, metrics, breakdowns, and layout. For dashboards, consult the data dictionary before writing SQL and only ask another question if a required source/table/metric is still genuinely ambiguous.",
+        "Use these answers to choose the dashboard scope, data source, metrics, breakdowns, and layout. For dashboards, consult the data dictionary before writing SQL.",
       ].join("\n"),
     buildSkipContext: () =>
       "The user skipped the guided analytics questions. Proceed with reasonable defaults, consult the data dictionary before writing SQL, and ask again only if a required source/table/metric is still genuinely ambiguous.",
   });
-  // Extensions list (`/extensions`) and viewer (`/extensions/:id`) render their own h-12
-  // toolbar. Skip the framework
-  // Header so there's no double-header.
   const isExtensionsRoute =
     location.pathname === "/extensions" ||
     location.pathname.startsWith("/extensions/");
   const isSessionDetailRoute = /^\/sessions\/[^/]+/.test(location.pathname);
-  // Monitoring renders its own header row (section tabs / "Back to monitors"
-  // + the relocated agent toggle), so skip the framework Header to avoid a
-  // redundant second title bar.
   const isMonitoringRoute =
     location.pathname === "/monitoring" ||
     location.pathname.startsWith("/monitoring/");
   const isAskRoute = location.pathname === "/ask";
+  // The redesigned Settings brings its own navigation, header, and agent
+  // toggle, so it renders full width. While the flag loads it shows the
+  // shell's skeleton, which needs the same frame.
+  const settingsRedesign = useFeatureFlagState(SETTINGS_REDESIGN_FLAG.key);
+  const isRedesignedSettingsRoute =
+    isSettingsPathname(location.pathname) &&
+    (settingsRedesign.enabled || settingsRedesign.status === "loading");
+  const isSettingsRoute = isAnalyticsSettingsPath(location.pathname);
+  const runningRuns = useRef<AnalyticsChatRunningRuns>(new Map());
   const chatHomeHandoffActive = useAgentChatHomeHandoff({
     storageKey: ANALYTICS_CHAT_STORAGE_KEY,
     activePath: location.pathname,
-    enabled: !isAskRoute,
+    ttlMs: ANALYTICS_RECENT_CHAT_HANDOFF_TTL_MS,
+    enabled: !isAskRoute && !isSettingsRoute,
   });
-  const chatHomeHandoffPending = isAgentChatHomeHandoffActive(
-    ANALYTICS_CHAT_STORAGE_KEY,
-  );
+  const chatHomeHandoffPending =
+    !isSettingsRoute &&
+    isAgentChatHomeHandoffActive(ANALYTICS_CHAT_STORAGE_KEY, {
+      ttlMs: ANALYTICS_RECENT_CHAT_HANDOFF_TTL_MS,
+    });
   useAgentChatHomeHandoffLinks({
     storageKey: ANALYTICS_CHAT_STORAGE_KEY,
     chatPath: "/ask",
+    ttlMs: ANALYTICS_RECENT_CHAT_HANDOFF_TTL_MS,
     enabled: true,
     requireActiveHandoff: true,
   });
   useEffect(() => {
+    discardAnalyticsChatHandoffOnSettings(location.pathname);
+  }, [location.pathname]);
+  useEffect(() => {
+    if (!isAskRoute) return;
+    const refreshHandoff = () => {
+      if (!hasTrackedAnalyticsChatRun(runningRuns.current)) return;
+      markAgentChatHomeHandoff(ANALYTICS_CHAT_STORAGE_KEY);
+    };
+    refreshHandoff();
+    const interval = window.setInterval(
+      refreshHandoff,
+      ANALYTICS_RECENT_CHAT_HANDOFF_TTL_MS / 2,
+    );
+    return () => window.clearInterval(interval);
+  }, [isAskRoute]);
+  useEffect(() => {
     function handleChatRunning(event: Event) {
       const detail = (event as CustomEvent).detail;
-      if (isAskRoute && typeof detail?.isRunning === "boolean") {
-        markAnalyticsChatActivity();
-        if (detail.isRunning === true) {
-          markAgentChatHomeHandoff(ANALYTICS_CHAT_STORAGE_KEY);
-        }
-      }
+      if (typeof detail?.isRunning !== "boolean") return;
+      if (location.pathname === "/ask") markAnalyticsChatActivity();
+      updateAnalyticsChatHandoffForRun(
+        runningRuns.current,
+        detail,
+        location.pathname,
+      );
     }
 
     window.addEventListener("agentNative.chatRunning", handleChatRunning);
     return () =>
       window.removeEventListener("agentNative.chatRunning", handleChatRunning);
-  }, [isAskRoute]);
+  }, [location.pathname]);
 
   function openAskAgentFullscreen() {
     focusAgentChat();
@@ -149,17 +242,18 @@ function InteractiveLayout({ children }: LayoutProps) {
 
   const contentFrame = (
     <div className="flex h-full flex-1 flex-col overflow-hidden">
-      <MobileNav showNewChat={isAskRoute} />
+      {!isRedesignedSettingsRoute && <MobileNav showNewChat={isAskRoute} />}
       {!isExtensionsRoute &&
         !isAskRoute &&
         !isSessionDetailRoute &&
-        !isMonitoringRoute && <Header />}
+        !isMonitoringRoute &&
+        !isRedesignedSettingsRoute && <Header />}
       <InvitationBanner />
       <main
         className={
           isExtensionsRoute
             ? "agent-native-app-main flex-1 overflow-y-auto"
-            : isAskRoute
+            : isAskRoute || isRedesignedSettingsRoute
               ? "agent-native-app-main flex-1 overflow-hidden p-0"
               : "agent-native-app-main flex-1 overflow-y-auto p-6 pt-2"
         }
@@ -176,6 +270,9 @@ function InteractiveLayout({ children }: LayoutProps) {
             description={guidedDescription ?? t("guidedQuestions.description")}
             skipLabel={guidedSkipLabel}
             submitLabel={guidedSubmitLabel}
+            isSubmissionBlocked={guidedSubmissionBlocked}
+            providerStatus={guidedProviderStatus}
+            onRetryProviderStatus={retryGuidedProviderStatus}
           />
         </div>
       )}
@@ -187,9 +284,11 @@ function InteractiveLayout({ children }: LayoutProps) {
       <AgentCompletionSound />
       <HeaderActionsProvider>
         <div className="agent-layout-shell flex h-screen w-full overflow-hidden bg-background text-foreground">
-          <div className="agent-layout-left-drawer hidden shrink-0 md:block">
-            <Sidebar />
-          </div>
+          {!isRedesignedSettingsRoute && (
+            <div className="agent-layout-left-drawer hidden shrink-0 md:block">
+              <Sidebar />
+            </div>
+          )}
           {isAskRoute ? (
             <div className="agent-layout-main-surface flex min-w-0 flex-1 overflow-hidden">
               {contentFrame}
@@ -205,7 +304,7 @@ function InteractiveLayout({ children }: LayoutProps) {
               openOnChatRunning={chatHomeHandoffActive}
               onFullscreenRequest={openAskAgentFullscreen}
               emptyStateText={t("chat.emptyState")}
-              agentPageHref="/agent"
+              agentPageHref="/settings/agent"
               suggestions={[
                 t("chat.suggestionArrGrowth"),
                 t("chat.suggestionChurn"),
@@ -213,7 +312,12 @@ function InteractiveLayout({ children }: LayoutProps) {
                 t("chat.suggestionMrr"),
               ]}
               scope={analyticsScope}
-              composerSlot={<CreativeContextComposerChip />}
+              chatHistory={analyticsChatHistory}
+              composerSlot={
+                creativeContextEnabled ? (
+                  <CreativeContextComposerChip />
+                ) : undefined
+              }
             >
               {contentFrame}
             </AgentSidebar>

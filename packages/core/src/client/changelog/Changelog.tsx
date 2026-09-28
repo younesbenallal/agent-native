@@ -1,21 +1,6 @@
-/**
- * Changelog UI — renders an app's CHANGELOG.md as an in-app "What's new"
- * surface. Core owns all of this; a template just passes its own
- * `CHANGELOG.md?raw` content in (Vite inlines it at build time, so this works
- * on every host with no runtime file access or server route).
- *
- * Surfaces:
- *   - <ChangelogDialog>      a self-contained modal listing every release.
- *   - <ChangelogSettingsCard> a settings-page card with the latest updates.
- *   - useChangelogSeen()     tracks the last release a user has seen (so the
- *                            command menu can show an "unseen" dot).
- *
- * The command menu's built-in `changelog` prop (see CommandMenu.tsx) wires the
- * dialog automatically — most templates never touch these directly.
- */
-
-import { IconX, IconHistory } from "@tabler/icons-react";
-import React, { useEffect, useMemo, useState } from "react";
+import { Button } from "@agent-native/toolkit/ui/button";
+import { IconChevronDown, IconHistory, IconX } from "@tabler/icons-react";
+import React, { useEffect, useId, useMemo, useState } from "react";
 
 import { parseChangelog, type ChangelogEntry } from "../../changelog/parse.js";
 import {
@@ -27,11 +12,13 @@ import {
 import { DEFAULT_LOCALE, useOptionalLocale, type LocaleCode } from "../i18n.js";
 import { cn } from "../utils.js";
 
-// ─── Date formatting ──────────────────────────────────────────────────────────
+export {
+  getChangelogLatestId,
+  useChangelogSeen,
+} from "./use-changelog-seen.js";
 
 function formatEntryHeading(entry: ChangelogEntry, locale: LocaleCode): string {
   if (entry.date) {
-    // Parse as a plain calendar date (avoid TZ shifting YYYY-MM-DD back a day).
     const [y, m, d] = entry.date.split("-").map(Number);
     if (y && m && d) {
       const formatted = new Date(y, m - 1, d).toLocaleDateString(locale, {
@@ -44,11 +31,6 @@ function formatEntryHeading(entry: ChangelogEntry, locale: LocaleCode): string {
   }
   return entry.title;
 }
-
-// ─── Markdown body ────────────────────────────────────────────────────────────
-// A small, self-contained renderer for a release body. Avoids depending on the
-// typography plugin (`prose`) being generated in the host template by applying
-// explicit utility classes that Tailwind scans from core's compiled output.
 
 const changelogMarkdownComponents = {
   h3: (props: React.HTMLAttributes<HTMLHeadingElement>) => (
@@ -97,8 +79,6 @@ function ChangelogBody({ markdown }: { markdown: string }) {
   const gfm = remarkGfmFn;
 
   if (!ready || !ReactMarkdown || !gfm) {
-    // The react-markdown chunk loads on module eval; this is typically only one
-    // frame. Show readable plain text rather than nothing in the meantime.
     return (
       <div className="whitespace-pre-wrap text-sm text-foreground">
         {markdown}
@@ -115,54 +95,6 @@ function ChangelogBody({ markdown }: { markdown: string }) {
     </ReactMarkdown>
   );
 }
-
-// ─── Unseen tracking ──────────────────────────────────────────────────────────
-
-function seenStorageKey(appKey: string): string {
-  return `an:changelog-seen:${appKey}`;
-}
-
-/**
- * Tracks the latest release a user has already seen (per browser, via
- * localStorage). Returns whether there's an unseen release and a `markSeen`
- * callback to clear the indicator once the changelog is opened.
- */
-export function useChangelogSeen(
-  appKey: string,
-  latestId: string | undefined,
-): { unseen: boolean; markSeen: () => void } {
-  const [seenId, setSeenId] = useState<string | null>(null);
-  const [hydrated, setHydrated] = useState(false);
-
-  useEffect(() => {
-    try {
-      setSeenId(window.localStorage.getItem(seenStorageKey(appKey)));
-    } catch {
-      // Private mode / disabled storage — treat as "nothing seen yet".
-    }
-    setHydrated(true);
-  }, [appKey]);
-
-  const markSeen = React.useCallback(() => {
-    if (!latestId) return;
-    setSeenId(latestId);
-    try {
-      window.localStorage.setItem(seenStorageKey(appKey), latestId);
-    } catch {
-      // Ignore storage failures; the dot just won't persist.
-    }
-  }, [appKey, latestId]);
-
-  // Don't flag "unseen" until hydrated, and never on a first-ever visit (no
-  // stored value) — only once the user has seen *something* and a newer
-  // release appears. This avoids nagging brand-new users.
-  const unseen =
-    hydrated && !!latestId && seenId !== null && seenId !== latestId;
-
-  return { unseen, markSeen };
-}
-
-// ─── Shared markup ────────────────────────────────────────────────────────────
 
 function ChangelogEntries({
   entries,
@@ -190,14 +122,10 @@ function ChangelogEntries({
   );
 }
 
-// ─── Dialog ───────────────────────────────────────────────────────────────────
-
 export interface ChangelogDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** Raw CHANGELOG.md contents (e.g. `import md from "../CHANGELOG.md?raw"`). */
   markdown: string;
-  /** Dialog heading. Default: "What's new". */
   title?: string;
   closeLabel?: string;
   emptyText?: string;
@@ -262,18 +190,16 @@ export function ChangelogDialog({
   );
 }
 
-// ─── Settings card ────────────────────────────────────────────────────────────
-
 export interface ChangelogSettingsCardProps {
-  /** Raw CHANGELOG.md contents (e.g. `import md from "../CHANGELOG.md?raw"`). */
   markdown: string;
-  /** How many recent releases to show inline before "View all". Default: 2. */
   limit?: number;
-  /** Card heading. Default: "What's new". */
   title?: string;
+  /** Drop the heading, for a page whose header already names it. */
+  hideTitle?: boolean;
   closeLabel?: string;
   emptyText?: string;
   viewAllLabel?: string;
+  collapseLabel?: string;
   className?: string;
 }
 
@@ -281,18 +207,21 @@ export function ChangelogSettingsCard({
   markdown,
   limit = 2,
   title = "What's new",
-  closeLabel = "Close",
+  hideTitle = false,
   emptyText = "No updates yet.",
   viewAllLabel = "View all updates",
+  collapseLabel = "Show fewer updates",
   className,
 }: ChangelogSettingsCardProps) {
   const entries = useMemo(() => parseChangelog(markdown), [markdown]);
-  const [dialogOpen, setDialogOpen] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const bodyId = useId();
 
   if (entries.length === 0) return null;
 
   const shown = entries.slice(0, limit);
   const hasMore = entries.length > shown.length;
+  const visibleEntries = expanded ? entries : shown;
 
   return (
     <div
@@ -301,30 +230,43 @@ export function ChangelogSettingsCard({
         className,
       )}
     >
-      <div className="flex items-center gap-2 border-b border-border px-5 py-4">
-        <IconHistory className="h-4 w-4 text-muted-foreground" />
-        <h3 className="text-sm font-semibold">{title}</h3>
-      </div>
+      {hideTitle ? null : (
+        <div className="flex items-center gap-2 border-b border-border px-5 py-4">
+          <IconHistory className="h-4 w-4 text-muted-foreground" />
+          <h3 className="text-sm font-semibold">{title}</h3>
+        </div>
+      )}
       <div className="px-5 py-4">
-        <ChangelogEntries entries={shown} emptyText={emptyText} />
+        <div
+          id={bodyId}
+          className={cn(
+            "overflow-hidden transition-[max-height] duration-200 ease-[var(--ease-collapse)]",
+            expanded ? "max-h-96 overflow-y-auto pr-1" : "max-h-[9.5rem]",
+          )}
+        >
+          <ChangelogEntries entries={visibleEntries} emptyText={emptyText} />
+        </div>
         {hasMore && (
-          <button
+          <Button
             type="button"
-            onClick={() => setDialogOpen(true)}
-            className="mt-4 text-sm font-medium text-foreground underline underline-offset-2"
+            variant="secondary"
+            size="sm"
+            onClick={() => setExpanded((value) => !value)}
+            aria-expanded={expanded}
+            aria-controls={bodyId}
+            className="mt-4"
           >
-            {viewAllLabel}
-          </button>
+            {expanded ? collapseLabel : viewAllLabel}
+            <IconChevronDown
+              className={cn(
+                "transition-transform duration-200 ease-[var(--ease-collapse)]",
+                expanded && "rotate-180",
+              )}
+              aria-hidden="true"
+            />
+          </Button>
         )}
       </div>
-      <ChangelogDialog
-        open={dialogOpen}
-        onOpenChange={setDialogOpen}
-        markdown={markdown}
-        title={title}
-        closeLabel={closeLabel}
-        emptyText={emptyText}
-      />
     </div>
   );
 }

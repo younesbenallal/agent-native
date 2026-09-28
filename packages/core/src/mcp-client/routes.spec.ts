@@ -4,6 +4,7 @@ import { hashEmail } from "./remote-store.js";
 import {
   buildMergedConfig,
   formatMcpConnectError,
+  McpConfigUnreadableError,
   mountMcpServersRoutes,
   startMcpConfigRefresh,
 } from "./routes.js";
@@ -87,6 +88,62 @@ describe("formatMcpConnectError", () => {
     );
   });
 
+  it("preserves typed HTTP status when formatting HTML responses", () => {
+    const error = Object.assign(
+      new Error("Error POSTing to endpoint: <!doctype html><html>502</html>"),
+      { data: { status: 502, statusText: "Bad Gateway" } },
+    );
+
+    expect(formatMcpConnectError(error)).toBe(
+      "HTTP 502: That URL returned a web page instead of an MCP response. Check that you pasted the Streamable HTTP endpoint, often ending in /mcp.",
+    );
+  });
+
+  it("preserves HTTP status from MCP SDK error codes", () => {
+    const error = Object.assign(
+      new Error(
+        "Streamable HTTP error: Error POSTing to endpoint: <!doctype html><html>502</html>",
+      ),
+      { code: 502 },
+    );
+
+    expect(formatMcpConnectError(error)).toBe(
+      "HTTP 502: That URL returned a web page instead of an MCP response. Check that you pasted the Streamable HTTP endpoint, often ending in /mcp.",
+    );
+  });
+
+  it("keeps a useful fallback for typed errors without a message", () => {
+    const error = Object.assign(new Error(), { code: 502 });
+
+    expect(formatMcpConnectError(error)).toBe(
+      "HTTP 502: Could not connect to that MCP server.",
+    );
+  });
+
+  it.each(["error", "[object ErrorEvent]"])(
+    "preserves typed status for legacy event errors (%s)",
+    (message) => {
+      const error = Object.assign(new Error(message), { code: 502 });
+
+      expect(formatMcpConnectError(error)).toBe(
+        "HTTP 502: The MCP server connection failed while opening its event stream. Check the URL and any required authorization headers.",
+      );
+    },
+  );
+
+  it("retains typed status when an HTML body contains the same status", () => {
+    const error = Object.assign(
+      new Error(
+        "Error POSTing to endpoint: HTTP 502 Bad Gateway <!doctype html><html></html>",
+      ),
+      { code: 502 },
+    );
+
+    expect(formatMcpConnectError(error)).toBe(
+      "HTTP 502: That URL returned a web page instead of an MCP response. Check that you pasted the Streamable HTTP endpoint, often ending in /mcp.",
+    );
+  });
+
   it("explains Streamable HTTP handshake failures", () => {
     expect(
       formatMcpConnectError("Streamable HTTP error: non-200 status code"),
@@ -116,9 +173,6 @@ describe("formatMcpConnectError", () => {
 
 describe("startMcpConfigRefresh", () => {
   it("re-reads the settings table only on a write or the backstop", async () => {
-    // `buildMergedConfig` scans the whole settings table. On an idle app that
-    // used to be a full-table round trip every 60s per app, forever, just to
-    // diff a signature that had not changed since boot.
     vi.useFakeTimers();
     const manager = {
       getConfig: () => ({ servers: {} }),
@@ -129,7 +183,6 @@ describe("startMcpConfigRefresh", () => {
       await vi.advanceTimersByTimeAsync(60_000);
       expect(mockedSettings.reads).toBe(1);
 
-      // Idle: no settings write, no scan.
       await vi.advanceTimersByTimeAsync(120_000);
       expect(mockedSettings.reads).toBe(1);
 
@@ -137,11 +190,27 @@ describe("startMcpConfigRefresh", () => {
       await vi.advanceTimersByTimeAsync(60_000);
       expect(mockedSettings.reads).toBe(2);
 
-      // Backstop still catches a write made by another process.
       await vi.advanceTimersByTimeAsync(6 * 60_000);
       expect(mockedSettings.reads).toBe(3);
     } finally {
       stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("starts no timer where in-process sweeps are disabled", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("NETLIFY", "true");
+    vi.useFakeTimers();
+    const manager = {
+      getConfig: () => ({ servers: {} }),
+      reconfigure: vi.fn(async () => {}),
+    };
+    try {
+      expect(startMcpConfigRefresh(manager as never)).toBeNull();
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(mockedSettings.reads).toBe(0);
+    } finally {
       vi.useRealTimers();
     }
   });
@@ -228,6 +297,12 @@ describe("buildMergedConfig built-in MCP capabilities", () => {
     };
 
     await expect(buildMergedConfig()).resolves.toBeNull();
+  });
+
+  it("reports an unreadable settings table instead of an empty config", async () => {
+    mockedSettings.readError = new Error("connect ECONNREFUSED");
+
+    await expect(buildMergedConfig()).rejects.toThrow(McpConfigUnreadableError);
   });
 });
 

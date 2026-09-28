@@ -6,6 +6,9 @@
  * hot-reload the configured server set.
  *
  *   GET    /_agent-native/mcp/servers           list user + org servers
+ *   GET    /_agent-native/mcp/servers/runtime-config
+ *                                                reserved; returns 410 until a
+ *                                                desktop capability broker exists
  *   POST   /_agent-native/mcp/servers           add a server
  *   DELETE /_agent-native/mcp/servers/:id       remove a server (scope via ?scope=)
  *   POST   /_agent-native/mcp/servers/:id/test  dry-run connect (no persist)
@@ -28,11 +31,10 @@ import {
   type H3Event,
 } from "h3";
 
-import { getOrgContext } from "../org/context.js";
-import { getSession } from "../server/auth.js";
 import { getH3App } from "../server/framework-request-handler.js";
 import { readBody } from "../server/h3-helpers.js";
 import { runWithRequestContext } from "../server/request-context.js";
+import { shouldDisableInProcessSweeps } from "../server/sweep-runtime.js";
 import { getAllSettings, getSettingsEmitter } from "../settings/store.js";
 import {
   areBuiltinMcpCapabilitiesSupported,
@@ -75,9 +77,25 @@ import {
 import { isMcpToolAllowedForRequest } from "./visibility.js";
 import { loadWorkspaceMcpServers } from "./workspace-servers.js";
 
+const getOrgContext: (typeof import("../org/context.js"))["getOrgContext"] = (
+  ...args
+) =>
+  import("../org/context.js").then(({ getOrgContext }) =>
+    getOrgContext(...args),
+  );
+
 export { formatMcpConnectError } from "./errors.js";
 
-/** Redact obvious auth header values before sending to the client. */
+export class McpConfigUnreadableError extends Error {
+  constructor(cause: unknown) {
+    super(
+      `Could not read MCP configuration from settings: ${(cause as any)?.message ?? cause}`,
+    );
+    this.name = "McpConfigUnreadableError";
+    this.cause = cause;
+  }
+}
+
 function redactHeaders(
   headers?: Record<string, string>,
 ): Record<string, { set: true }> | undefined {
@@ -134,7 +152,6 @@ export interface ClientServer {
   description?: string;
   firstParty?: boolean;
   createdAt: number;
-  /** The key under which this server is registered in the running MCP manager. */
   mergedId: string;
   status: ServerStatus;
 }
@@ -211,7 +228,12 @@ export async function buildMergedConfig(): Promise<McpConfig | null> {
   const base = loadMcpConfig() ?? autoDetectMcpConfig();
   const servers: Record<string, McpServerConfig> = { ...(base?.servers ?? {}) };
 
-  const all = await getAllSettings().catch(() => ({}));
+  const all = await getAllSettings().catch((err: unknown) => {
+    console.warn(
+      `[mcp-client] settings read failed: ${(err as any)?.message ?? err}`,
+    );
+    throw new McpConfigUnreadableError(err);
+  });
   for (const [fullKey, value] of Object.entries(all)) {
     const userMatch = /^u:([^:]+):mcp-servers-remote$/.exec(fullKey);
     const orgMatch = /^o:([^:]+):mcp-servers-remote$/.exec(fullKey);
@@ -304,11 +326,6 @@ function sortedConfigSignature(config: McpConfig | null): string {
   return JSON.stringify(entries);
 }
 
-/**
- * How long the refresh may skip the settings read on the strength of "no
- * in-process settings write since the last one". Bounds how stale a remote MCP
- * server list added by ANOTHER process can be.
- */
 const MCP_CONFIG_REFRESH_BACKSTOP_MS = 5 * 60 * 1000;
 
 function mcpConfigRefreshIntervalMs(): number {
@@ -324,13 +341,10 @@ export function startMcpConfigRefresh(
 ): (() => void) | null {
   const intervalMs = mcpConfigRefreshIntervalMs();
   if (intervalMs <= 0 || typeof setInterval !== "function") return null;
+  if (shouldDisableInProcessSweeps()) return null;
 
   let currentSignature = sortedConfigSignature(manager.getConfig());
   let refreshing = false;
-  // `buildMergedConfig` reads the entire settings table just to diff a
-  // signature, which on an idle app is a full-table round trip every minute
-  // forever. Only pay it when an in-process settings write says something might
-  // have changed, plus a periodic backstop for writes from another process.
   let settingsDirty = true;
   let lastFullRefresh = 0;
   const markDirty = () => {
@@ -356,8 +370,6 @@ export function startMcpConfigRefresh(
       settingsDirty = false;
       lastFullRefresh = Date.now();
     } catch (err: any) {
-      // Keep this dirty so a transient database or manager failure is retried
-      // on the next interval instead of being hidden by the backstop window.
       settingsDirty = true;
       console.warn(
         `[mcp-client] config refresh failed: ${err?.message ?? err}`,
@@ -382,6 +394,7 @@ async function resolveContextForRequest(event: H3Event): Promise<{
 }> {
   let email: string | null = null;
   try {
+    const { getSession } = await import("../server/auth.js");
     const session = await getSession(event);
     email = session?.email ?? null;
   } catch {
@@ -422,9 +435,10 @@ export function mountMcpServersRoutes(
   mountedApps.add(nitroApp);
 
   mountMcpOAuthRoutes(nitroApp, {
-    reconfigure: async () => {
+    reconfigure: async ({ scope, scopeId, server }) => {
       await options.waitUntilReady?.();
       await reconfigureManager(manager);
+      return manager.hasServer(mergedConfigKey(scope, server, scopeId));
     },
   });
 
@@ -441,12 +455,18 @@ export function mountMcpServersRoutes(
 
         setResponseHeader(event, "Content-Type", "application/json");
 
-        // POST /servers/test — dry-run a URL+headers before persisting
+        if (
+          method === "GET" &&
+          parts.length === 1 &&
+          parts[0] === "runtime-config"
+        ) {
+          return handleRuntimeConfig(event);
+        }
+
         if (method === "POST" && parts.length === 1 && parts[0] === "test") {
           return handleTestUrl(event);
         }
 
-        // Collection root
         if (parts.length === 0) {
           if (method === "GET") return handleList(event, manager);
           if (method === "POST") return handleAdd(event, manager);
@@ -454,7 +474,6 @@ export function mountMcpServersRoutes(
           return { error: "Method not allowed" };
         }
 
-        // /:id  /  /:id/test
         if (parts.length === 1 || parts.length === 2) {
           const id = parts[0];
           if (parts.length === 2 && parts[1] === "test" && method === "POST") {
@@ -920,6 +939,14 @@ async function handleList(
   };
 }
 
+function handleRuntimeConfig(event: H3Event): { error: string } {
+  setResponseStatus(event, 410);
+  return {
+    error:
+      "Cleartext MCP runtime config requires a desktop capability broker and is not available over session-authenticated HTTP.",
+  };
+}
+
 async function handleAdd(event: H3Event, manager: McpClientManager) {
   const body = (await readBody(event).catch(() => ({}))) as {
     scope?: unknown;
@@ -1085,10 +1112,6 @@ async function handleTestExisting(
     setResponseStatus(event, 404);
     return { error: "Server not found" };
   }
-  // `server.headers` holds only the cleartext (non-secret) subset; auth headers
-  // (Authorization, API keys) live encrypted in app_secrets and are resolved by
-  // toHttpServerConfigAsync. Testing with cleartext-only headers would fail for
-  // any server that uses encrypted credentials.
   const config = await toHttpServerConfigAsync(parsedScope, scopeId, server);
   const result = await tryConnect(server.url, config.headers);
   if (result.ok !== true) {

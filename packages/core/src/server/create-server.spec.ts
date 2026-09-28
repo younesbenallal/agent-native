@@ -1,10 +1,15 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 
+import {
+  defineAppConfig,
+  resetAppConfigForTests,
+} from "../app-config/index.js";
 import { createServer } from "./create-server.js";
 
 describe("createServer", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
+    resetAppConfigForTests();
   });
 
   it("returns an H3 app and router", () => {
@@ -16,7 +21,6 @@ describe("createServer", () => {
   });
 
   it("disables CORS when cors is false", () => {
-    // Should not throw
     const { app } = createServer({ cors: false });
     expect(app).toBeDefined();
   });
@@ -24,6 +28,16 @@ describe("createServer", () => {
   it("accepts custom jsonLimit", () => {
     const { app } = createServer({ jsonLimit: "1mb" });
     expect(app).toBeDefined();
+  });
+
+  it("uses the shared app config for the liveness message", async () => {
+    defineAppConfig({ app: { name: "Test app", pingMessage: "ready" } });
+    const { app } = createServer();
+
+    const res = await app.request("http://localhost/_agent-native/ping");
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ message: "ready" });
   });
 
   it.each([
@@ -74,6 +88,101 @@ describe("createServer", () => {
     ]);
   });
 
+  it("marks non-credential env keys as non-secret without flagging credentials", async () => {
+    vi.stubEnv("ENABLE_BUILDER", "true");
+    vi.stubEnv("DATABASE_URL", "postgres://deploy.example/db");
+    const { app } = createServer({
+      envKeys: [
+        { key: "ENABLE_BUILDER", label: "Enable Builder.io", secret: false },
+        { key: "DATABASE_URL", label: "Database URL" },
+      ],
+    });
+
+    const res = await app.request("http://localhost/_agent-native/env-status");
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([
+      {
+        key: "ENABLE_BUILDER",
+        label: "Enable Builder.io",
+        required: false,
+        configured: true,
+        secret: false,
+      },
+      {
+        key: "DATABASE_URL",
+        label: "Database URL",
+        required: false,
+        configured: true,
+      },
+    ]);
+  });
+
+  it("reports a Netlify database through the effective URL status", async () => {
+    vi.stubEnv("APP_NAME", "forms");
+    vi.stubEnv("FORMS_DATABASE_URL", "");
+    vi.stubEnv("DATABASE_URL", "");
+    vi.stubEnv("NETLIFY_DATABASE_URL", "postgres://netlify.example/db");
+    const { app } = createServer({
+      envKeys: [
+        { key: "DATABASE_URL", label: "Database URL" },
+        { key: "NETLIFY_DATABASE_URL", label: "Netlify Database URL" },
+      ],
+    });
+
+    const res = await app.request("http://localhost/_agent-native/env-status");
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([
+      {
+        key: "DATABASE_URL",
+        label: "Database URL",
+        required: false,
+        configured: false,
+      },
+      {
+        key: "NETLIFY_DATABASE_URL",
+        label: "Netlify Database URL",
+        required: false,
+        configured: true,
+      },
+    ]);
+  });
+
+  it("returns redacted built-in runtime diagnostics without an env-name oracle", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("DATABASE_URL", "postgres://deploy.example/db");
+    vi.stubEnv("BETTER_AUTH_SECRET", "a".repeat(64));
+    const { app } = createServer();
+
+    const res = await app.request(
+      "http://localhost/_agent-native/ping?configuration=1&requiredEnv=NOTION_API_KEY",
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.configuration.status).toBe("ok");
+    expect(body.configuration.issues).toEqual([]);
+    expect(JSON.stringify(body)).not.toContain("NOTION_API_KEY");
+    expect(JSON.stringify(body)).not.toContain("a".repeat(64));
+  });
+
+  it("honors app opt-outs in the public configuration probe", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    const { app } = createServer();
+
+    const res = await app.request(
+      "http://localhost/_agent-native/ping?configuration=1&auth=0&database=0",
+    );
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).configuration).toMatchObject({
+      ok: true,
+      status: "ok",
+      issues: [],
+    });
+  });
+
   it("rejects env-var writes outside the configured key list", async () => {
     const { app } = createServer({
       envKeys: [{ key: "GOOGLE_CLIENT_ID", label: "Google client ID" }],
@@ -94,8 +203,6 @@ describe("createServer", () => {
   });
 });
 
-// Test parseEnvFile behavior by reimplementing and testing the same logic
-// since the function is private to the module
 describe("parseEnvFile (logic)", () => {
   function parseEnvFile(content: string): Map<string, string> {
     const vars = new Map<string, string>();

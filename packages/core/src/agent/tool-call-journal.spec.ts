@@ -26,8 +26,6 @@ function done(
 
 describe("classifyToolCallJournal", () => {
   it("classifies one completed and one interrupted tool call", () => {
-    // sendEmail completed (has a tool_done); createTicket started but the run
-    // was cut off before its result was recorded.
     const events: AgentChatEvent[] = [
       start("sendEmail", { to: "a@example.com" }),
       done("sendEmail", "Email sent to a@example.com (id msg_123)"),
@@ -81,6 +79,28 @@ describe("classifyToolCallJournal", () => {
     expect(journal.interrupted[0].input).toEqual({ path: "a.ts" });
   });
 
+  it("preserves valid artifact receipts and filters malformed persisted elements", () => {
+    const events: AgentChatEvent[] = [
+      start("generate-asset", { prompt: "cover" }),
+      {
+        type: "tool_done",
+        tool: "generate-asset",
+        result: "...[truncated]",
+        artifacts: [
+          { kind: "image", id: "asset-1", url: "/asset/asset-1" },
+          null,
+          {},
+        ],
+      } as unknown as AgentChatEvent,
+    ];
+
+    const journal = classifyToolCallJournal(events);
+
+    expect(journal.completed[0].artifacts).toEqual([
+      { kind: "image", id: "asset-1", url: "/asset/asset-1" },
+    ]);
+  });
+
   it("treats all tool calls as completed when every start has a done", () => {
     const events: AgentChatEvent[] = [
       { type: "text", text: "working on it" },
@@ -114,8 +134,6 @@ describe("classifyToolCallJournal", () => {
   it("drops not-yet-completed starts on a clear event (discarded partial output)", () => {
     const events: AgentChatEvent[] = [
       start("sendEmail", { to: "a@example.com" }),
-      // partial output discarded on resume — sendEmail start is dropped, not
-      // reported as interrupted.
       { type: "clear" },
       start("sendEmail", { to: "a@example.com" }),
       done("sendEmail", "sent"),
@@ -194,12 +212,10 @@ describe("buildResumeJournalNote", () => {
 
     expect(note).not.toBeNull();
     const text = note as string;
-    // Completed section instructs not to re-run and surfaces the result.
     expect(text).toContain("Already completed");
     expect(text).toContain("do NOT re-run");
     expect(text).toContain("sendEmail");
     expect(text).toContain("Email sent (id msg_123)");
-    // Interrupted section flags the unknown outcome.
     expect(text).toContain("Interrupted / unknown outcome");
     expect(text).toContain("createTicket");
   });
@@ -210,9 +226,6 @@ describe("buildResumeJournalNote", () => {
   });
 
   it("returns null for a clean turn where all tool calls completed", () => {
-    // All tool calls completed → nothing dangerous to flag. The structured note
-    // is suppressed so the existing continuation nudge is the only change to the
-    // prefix, exactly as before this feature.
     const events: AgentChatEvent[] = [
       start("listFiles"),
       done("listFiles", "a.ts"),
@@ -221,8 +234,6 @@ describe("buildResumeJournalNote", () => {
     ];
     const journal = classifyToolCallJournal(events);
     expect(journal.interrupted).toHaveLength(0);
-    // Completed-only still reports (so the model reuses results), but with no
-    // interrupted section.
     const note = buildResumeJournalNote(journal);
     expect(note).toContain("Already completed");
     expect(note).not.toContain("Interrupted / unknown outcome");
@@ -236,7 +247,6 @@ describe("buildResumeJournalNote", () => {
     ];
     const note = buildResumeJournalNote(classifyToolCallJournal(events)) ?? "";
     expect(note).toContain("…");
-    // Result summary is capped well under the raw length.
     expect(note.length).toBeLessThan(longResult.length);
   });
 

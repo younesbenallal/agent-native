@@ -1,9 +1,3 @@
-/**
- * Tests for apply-fusion-edits batching: pending queued edits become one
- * numbered prompt for the app agent, and rows transition to sent/error based
- * on the dispatch result.
- */
-
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@agent-native/core/sharing", () => ({
@@ -151,13 +145,13 @@ describe("apply-fusion-edits", () => {
       error: "container unreachable",
     });
 
-    const result = (await action.run({ designId: "design_1" } as never)) as {
-      sentCount: number;
-      error?: string;
-    };
-
-    expect(result.sentCount).toBe(0);
-    expect(result.error).toBe("container unreachable");
+    await expect(
+      action.run({ designId: "design_1" } as never),
+    ).rejects.toMatchObject({
+      message: "container unreachable",
+      errorCode: "fusion_edit_dispatch_failed",
+      statusCode: 502,
+    });
     expect(updateCalls[0]).toMatchObject({
       status: "error",
       error: "container unreachable",

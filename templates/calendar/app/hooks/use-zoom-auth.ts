@@ -9,8 +9,20 @@ export interface ZoomAuthStatus {
   accounts: Array<{ id: string; email?: string; displayName?: string }>;
 }
 
+const FETCH_ABORT_MS = 10_000;
+
 async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(input, init);
+  const controller = new AbortController();
+  const abortTimer = setTimeout(() => controller.abort(), FETCH_ABORT_MS);
+  let res: Response;
+  try {
+    res = await fetch(input, {
+      ...init,
+      signal: init?.signal ?? controller.signal,
+    });
+  } finally {
+    clearTimeout(abortTimer);
+  }
   if (!res.ok) {
     let message = `${input} -> ${res.status}`;
     try {
@@ -23,17 +35,6 @@ async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
   }
   return (await res.json()) as T;
 }
-
-// ---------------------------------------------------------------------------
-// Shared Zoom OAuth-completion listener
-//
-// Every mounted useZoomStatus() call (one per rendered EventDetailPopover,
-// plus Settings/CreateEventDialog/BookingLinksPage) needs to react to the
-// OAuth popup finishing. Rather than each instance opening its own
-// window "message" listener and BroadcastChannel, a single module-level pair
-// attaches when the first subscriber joins and detaches when the last
-// leaves, fanning the "connected" signal out to every subscriber.
-// ---------------------------------------------------------------------------
 
 const zoomAuthSubscribers = new Set<() => void>();
 let zoomAuthChannel: BroadcastChannel | null = null;
@@ -96,11 +97,6 @@ export function useZoomStatus() {
   });
 }
 
-/**
- * Kick off the Zoom OAuth flow by navigating to the auth URL. Uses a
- * mutation (not a query) so the flow only starts when the user clicks
- * Connect, not on mount.
- */
 export function useConnectZoom() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -121,11 +117,18 @@ export function useConnectZoom() {
       return { opened: "popup" as const };
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["zoom-status"] });
+      void queryClient.invalidateQueries({ queryKey: ["zoom-status"] });
 
       const startedAt = Date.now();
-      const pollId = window.setInterval(() => {
-        queryClient.invalidateQueries({ queryKey: ["zoom-status"] });
+      let inFlight = false;
+      const pollId = window.setInterval(async () => {
+        if (document.hidden || inFlight) return;
+        inFlight = true;
+        try {
+          await queryClient.invalidateQueries({ queryKey: ["zoom-status"] });
+        } finally {
+          inFlight = false;
+        }
         if (Date.now() - startedAt > 120_000) {
           window.clearInterval(pollId);
         }

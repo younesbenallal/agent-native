@@ -40,24 +40,8 @@ function toNumber(value: unknown): number {
   return 0;
 }
 
-function parseConfig(value: unknown): Record<string, unknown> {
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    return value as Record<string, unknown>;
-  }
-  if (typeof value !== "string") return {};
-  try {
-    const parsed = JSON.parse(value);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? parsed
-      : {};
-  } catch {
-    return {};
-  }
-}
-
-function dashboardName(row: { title: string; config: unknown }): string {
-  const config = parseConfig(row.config);
-  const configName = config.name;
+function dashboardName(row: { title: string; configName: unknown }): string {
+  const configName = row.configName;
   if (typeof configName === "string" && configName.trim()) {
     return configName.trim();
   }
@@ -66,11 +50,10 @@ function dashboardName(row: { title: string; config: unknown }): string {
 
 function dashboardPanelCount(row: {
   kind: string;
-  config: unknown;
+  panelCount: unknown;
 }): number | null {
   if (row.kind !== "sql") return null;
-  const panels = parseConfig(row.config).panels;
-  return Array.isArray(panels) ? panels.length : 0;
+  return toNumber(row.panelCount);
 }
 
 export function dashboardIdFromPath(path: string | null): string | null {
@@ -143,6 +126,12 @@ export default defineAction({
   run: async (_args, ctx) => {
     const admin = await requireDbAdminContextFromRequest(ctx);
     const db = getDb() as any;
+    const configName = sql<
+      string | null
+    >`(${schema.dashboards.config}::jsonb ->> 'name')`;
+    const panelCount = sql<
+      number | null
+    >`CASE WHEN ${schema.dashboards.kind} = 'sql' AND jsonb_typeof(${schema.dashboards.config}::jsonb -> 'panels') = 'array' THEN jsonb_array_length(${schema.dashboards.config}::jsonb -> 'panels') ELSE 0 END`;
 
     // guard:allow-unscoped — org owner/admin audit intentionally spans all
     // dashboard rows in the active org after requireDbAdminContextFromRequest.
@@ -151,7 +140,8 @@ export default defineAction({
         id: schema.dashboards.id,
         kind: schema.dashboards.kind,
         title: schema.dashboards.title,
-        config: schema.dashboards.config,
+        configName,
+        panelCount,
         ownerEmail: schema.dashboards.ownerEmail,
         visibility: schema.dashboards.visibility,
         createdAt: schema.dashboards.createdAt,

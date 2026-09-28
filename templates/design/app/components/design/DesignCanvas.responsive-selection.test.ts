@@ -36,9 +36,13 @@ describe("responsive mirrored selection chrome", () => {
     expect(bridgeSource).toContain(
       "color-mix(in srgb,var(--design-editor-accent-color) 64%,transparent)",
     );
-    expect(bridgeSource).toContain(
+    expect(bridgeSource).not.toContain(
       'if (style !== "soft") appendPassiveSelectionHandles(overlay);',
     );
+    expect(
+      bridgeSource.split("appendPassiveSelectionHandles(overlay)").length - 1,
+      "handles must be appended only to the combined bounds overlay",
+    ).toBe(1);
     expect(bridgeSource).toContain(
       'e.data.passiveSelectionStyle === "soft" ? "soft" : "default"',
     );

@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -35,6 +37,168 @@ describe("extractThreadMeta", () => {
 });
 
 describe("buildAssistantMessage", () => {
+  it("persists the resource scope used by the chat turn", () => {
+    const message = buildAssistantMessage(
+      [{ seq: 0, event: { type: "text", text: "Saved." } }],
+      "run-scoped",
+      { scope: { type: "deck", id: "deck-1" } },
+    );
+
+    expect(message?.metadata).toMatchObject({
+      custom: { chatScope: { type: "deck", id: "deck-1" } },
+    });
+  });
+
+  it("persists typed artifact receipts with the completed tool part", () => {
+    const artifacts = [
+      {
+        kind: "image" as const,
+        id: "asset-1",
+        url: "/asset/asset-1",
+        title: "Launch illustration",
+        runId: "generation-1",
+      },
+    ];
+    const message = buildAssistantMessage(
+      [
+        {
+          seq: 0,
+          event: {
+            type: "tool_start",
+            id: "call_generate",
+            tool: "generate-image",
+          },
+        },
+        {
+          seq: 1,
+          event: {
+            type: "tool_done",
+            id: "call_generate",
+            tool: "generate-image",
+            result: "...[truncated]",
+            completedSideEffect: true,
+            artifacts,
+          },
+        },
+      ],
+      "run-artifact-receipt",
+    );
+
+    expect(message?.content).toContainEqual(
+      expect.objectContaining({
+        type: "tool-call",
+        toolName: "generate-image",
+        result: "...[truncated]",
+        completedSideEffect: true,
+        artifacts,
+      }),
+    );
+  });
+
+  it("persists raw action widget data beside the transcript result", () => {
+    const result = { deepLink: "/_agent-native/open?composeDraftId=draft-1" };
+    const message = buildAssistantMessage(
+      [
+        {
+          seq: 0,
+          event: {
+            type: "tool_start",
+            id: "call_draft",
+            tool: "manage-draft",
+            input: { action: "create" },
+          },
+        },
+        {
+          seq: 1,
+          event: {
+            type: "tool_done",
+            id: "call_draft",
+            tool: "manage-draft",
+            result: JSON.stringify(result, null, 2),
+            chatUI: { renderer: "mail.draft-created" },
+            chatUIResult: result,
+          },
+        },
+      ],
+      "run-action-widget-result",
+    );
+
+    expect(message?.content).toContainEqual(
+      expect.objectContaining({
+        type: "tool-call",
+        result: JSON.stringify(result, null, 2),
+        chatUIResult: result,
+      }),
+    );
+  });
+
+  it("folds a replayed tool_start onto the original card instead of persisting a second one", () => {
+    const events: RunEvent[] = [
+      {
+        seq: 0,
+        event: {
+          type: "tool_start",
+          id: "call_a",
+          tool: "query",
+          input: { sql: "select 1" },
+        },
+      },
+      {
+        seq: 1,
+        event: { type: "tool_done", id: "call_a", tool: "query", result: "1" },
+      },
+      {
+        seq: 2,
+        event: {
+          type: "tool_start",
+          id: "call_a",
+          tool: "query",
+          input: { sql: "select 1" },
+        },
+      },
+      {
+        seq: 3,
+        event: {
+          type: "tool_done",
+          id: "call_a",
+          tool: "query",
+          result:
+            "(Already completed in an earlier interrupted attempt - not re-run to avoid a duplicate side effect.)\n\n1",
+        },
+      },
+    ];
+
+    const message = buildAssistantMessage(events, "run-replay");
+    const toolCalls = (message?.content ?? []).filter(
+      (part: { type: string }) => part.type === "tool-call",
+    );
+
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0]).toMatchObject({ toolName: "query" });
+  });
+
+  it("keeps two cards when one id is reused across different tools", () => {
+    const events: RunEvent[] = [
+      { seq: 0, event: { type: "tool_start", id: "dup", tool: "query" } },
+      {
+        seq: 1,
+        event: { type: "tool_done", id: "dup", tool: "query", result: "1" },
+      },
+      { seq: 2, event: { type: "tool_start", id: "dup", tool: "write" } },
+      {
+        seq: 3,
+        event: { type: "tool_done", id: "dup", tool: "write", result: "ok" },
+      },
+    ];
+
+    const message = buildAssistantMessage(events, "run-id-reuse");
+    const toolCalls = (message?.content ?? []).filter(
+      (part: { type: string }) => part.type === "tool-call",
+    );
+
+    expect(toolCalls).toHaveLength(2);
+  });
+
   it("clears rejected draft text while preserving completed tool results", () => {
     const events: RunEvent[] = [
       {
@@ -63,6 +227,36 @@ describe("buildAssistantMessage", () => {
     ]);
   });
 
+  it("keeps narration from before the last completed tool call", () => {
+    const events: RunEvent[] = [
+      { seq: 0, event: { type: "text", text: "Checked the schema." } },
+      {
+        seq: 1,
+        event: {
+          type: "tool_start",
+          tool: "query",
+          input: { sql: "select 1" },
+        },
+      },
+      { seq: 2, event: { type: "tool_done", tool: "query", result: "1" } },
+      { seq: 3, event: { type: "text", text: "Rejected draft" } },
+      { seq: 4, event: { type: "clear" } },
+      { seq: 5, event: { type: "text", text: "Corrected answer" } },
+    ];
+
+    const message = buildAssistantMessage(events, "run-clear-scoped");
+
+    expect(message?.content).toEqual([
+      { type: "text", text: "Checked the schema." },
+      expect.objectContaining({
+        type: "tool-call",
+        toolName: "query",
+        result: "1",
+      }),
+      { type: "text", text: "Corrected answer" },
+    ]);
+  });
+
   it("ignores a trailing clear so a rebuild cannot wipe the transcript", () => {
     const events: RunEvent[] = [
       { seq: 0, event: { type: "text", text: "Here is the answer" } },
@@ -76,9 +270,6 @@ describe("buildAssistantMessage", () => {
     ]);
   });
 
-  // Each failed engine attempt emits its own `clear`, so three failures in a
-  // row is the ordinary shape. Skipping only the last one still applied the
-  // other two and destroyed the answer the user had already been shown.
   it("ignores a whole trailing run of clears, not just the last one", () => {
     const events: RunEvent[] = [
       { seq: 0, event: { type: "text", text: "Here is the answer" } },
@@ -94,9 +285,6 @@ describe("buildAssistantMessage", () => {
     ]);
   });
 
-  // The second-order effect: with the text spliced out and no tool call to keep
-  // `content` non-empty, the builder returned null and the user's message was
-  // persisted with no assistant reply at all.
   it("still persists an assistant message after a trailing clear streak", () => {
     const events: RunEvent[] = [
       { seq: 0, event: { type: "text", text: "Partial answer" } },
@@ -107,8 +295,6 @@ describe("buildAssistantMessage", () => {
     expect(buildAssistantMessage(events, "run-no-reply")).not.toBeNull();
   });
 
-  // A clear with real events after it still applies — the successor chunk
-  // re-emits what it wiped, which is the whole point of the event.
   it("applies a clear that is followed by more content", () => {
     const events: RunEvent[] = [
       { seq: 0, event: { type: "text", text: "Discarded draft" } },
@@ -285,6 +471,101 @@ describe("buildAssistantMessage", () => {
     ]);
   });
 
+  it("persists the approval affordance after a gated tool pauses", () => {
+    const message = buildAssistantMessage(
+      [
+        {
+          seq: 0,
+          event: {
+            type: "tool_start",
+            id: "create-builder-branch-call",
+            tool: "create-builder-branch",
+            input: {
+              projectId: "project-1",
+              branchName: "remove-trash-icon",
+              prompt: "Remove the trash can icon from the request queue",
+            },
+          },
+        },
+        {
+          seq: 1,
+          event: {
+            type: "approval_required",
+            tool: "create-builder-branch",
+            toolCallId: "create-builder-branch-call",
+            approvalKey: "create-builder-branch:approval",
+            input: {
+              projectId: "project-1",
+              branchName: "remove-trash-icon",
+              prompt: "Remove the trash can icon from the request queue",
+            },
+          },
+        },
+        {
+          seq: 2,
+          event: {
+            type: "tool_done",
+            id: "create-builder-branch-call",
+            tool: "create-builder-branch",
+            result:
+              'Awaiting human approval to run "create-builder-branch". ' +
+              "This action did NOT execute.",
+          },
+        },
+      ],
+      "run-create-builder-branch-approval",
+    );
+
+    expect(message?.content).toEqual([
+      expect.objectContaining({
+        type: "tool-call",
+        toolName: "create-builder-branch",
+        result:
+          'Awaiting human approval to run "create-builder-branch". ' +
+          "This action did NOT execute.",
+        approval: { approvalKey: "create-builder-branch:approval" },
+      }),
+    ]);
+  });
+
+  it("persists per-call-only approval policy when rebuilding thread history", () => {
+    const message = buildAssistantMessage(
+      [
+        {
+          seq: 0,
+          event: {
+            type: "tool_start",
+            id: "send-email-call",
+            tool: "send-email",
+            input: { to: "person@example.com" },
+          },
+        },
+        {
+          seq: 1,
+          event: {
+            type: "approval_required",
+            tool: "send-email",
+            toolCallId: "send-email-call",
+            approvalKey: "send-email:approval",
+            allowPersistentApproval: false,
+          },
+        },
+      ],
+      "run-send-email-approval",
+    );
+
+    expect(message?.content).toEqual([
+      expect.objectContaining({
+        type: "tool-call",
+        toolName: "send-email",
+        approval: {
+          approvalKey: "send-email:approval",
+          allowPersistentApproval: false,
+        },
+      }),
+    ]);
+  });
+
   it("falls back to legacy name matching when a done id has no matching start", () => {
     const message = buildAssistantMessage(
       [
@@ -344,6 +625,37 @@ describe("buildAssistantMessage", () => {
     ]);
   });
 
+  it("keeps a user-stopped rebuilt message neutral", () => {
+    const message = buildAssistantMessage(
+      [
+        {
+          seq: 0,
+          event: {
+            type: "tool_start",
+            tool: "save-analysis",
+            input: { id: "stopped-analysis" },
+          },
+        },
+        { seq: 1, event: { type: "done", reason: "user" } },
+      ],
+      "run-user-stop",
+      { turnId: "turn-user-stop" },
+    );
+
+    expect(message).toMatchObject({
+      status: { type: "complete", reason: "stop" },
+      metadata: { custom: { userStopped: true } },
+    });
+    expect(message?.content).toEqual([
+      expect.objectContaining({
+        type: "tool-call",
+        toolName: "save-analysis",
+        result: "",
+      }),
+    ]);
+    expect(message?.content[0]).not.toHaveProperty("outcome");
+  });
+
   it("keeps unresolved tool calls pending at internal continuation boundaries", () => {
     const message = buildAssistantMessage(
       [
@@ -367,6 +679,141 @@ describe("buildAssistantMessage", () => {
     expect(message?.metadata).toMatchObject({
       custom: { continued: true },
     });
+  });
+
+  it("folds a truncated gateway stream by its code, not its sentence", () => {
+    for (const error of [
+      "Builder gateway stream ended without a stop event",
+      "AI features aren't available on this site right now.",
+    ]) {
+      const message = buildAssistantMessage(
+        [
+          { seq: 0, event: { type: "text", text: "partial answer" } },
+          {
+            seq: 1,
+            event: {
+              type: "error",
+              error,
+              errorCode: "builder_gateway_stream_ended",
+            },
+          },
+        ],
+        "run-stream-ended",
+        { suppressInternalContinuation: true, turnId: "turn-stream-ended" },
+      );
+
+      expect(message?.content).toEqual([
+        { type: "text", text: "partial answer" },
+      ]);
+      expect(message?.metadata).toMatchObject({
+        custom: { continued: true },
+      });
+    }
+  });
+
+  it("folds the gateway internal-error envelope by its code, not its sentence", () => {
+    for (const error of [
+      "Sorry, we ran into an issue processing your request. ERROR ID: bebaeb5da13441539790834b63ff955a",
+      "AI features aren't available on this site right now.",
+    ]) {
+      const message = buildAssistantMessage(
+        [
+          { seq: 0, event: { type: "text", text: "partial answer" } },
+          {
+            seq: 1,
+            event: {
+              type: "error",
+              error,
+              errorCode: "builder_gateway_internal_error",
+            },
+          },
+        ],
+        "run-gateway-internal",
+        { suppressInternalContinuation: true, turnId: "turn-gateway-internal" },
+      );
+
+      expect(message?.content).toEqual([
+        { type: "text", text: "partial answer" },
+      ]);
+      expect(message?.metadata).toMatchObject({
+        custom: { continued: true },
+      });
+    }
+  });
+
+  it("keeps a breaker stop that preserved its underlying transient code", () => {
+    const message = buildAssistantMessage(
+      [
+        {
+          seq: 0,
+          event: {
+            type: "error",
+            error:
+              "Sorry, we ran into an issue processing your request. ERROR ID: bebaeb5da13441539790834b63ff955a\n\nThis failed 2 times in a row without making any progress, so I stopped instead of retrying again.",
+            errorCode: "builder_gateway_internal_error",
+            recoverable: false,
+          },
+        },
+      ],
+      "run-no-progress-breaker",
+      {
+        suppressInternalContinuation: true,
+        turnId: "turn-no-progress-breaker",
+      },
+    );
+
+    expect(message?.status).toEqual({ type: "incomplete", reason: "error" });
+    expect(message?.metadata?.custom?.continued).toBeUndefined();
+    expect(message?.metadata?.custom?.runError).toMatchObject({
+      errorCode: "builder_gateway_internal_error",
+      details: expect.stringContaining(
+        "ERROR ID: bebaeb5da13441539790834b63ff955a",
+      ),
+    });
+  });
+
+  it("ignores the engine's retry verdict when deciding continuation boundaries", () => {
+    const message = buildAssistantMessage(
+      [
+        { seq: 0, event: { type: "text", text: "partial answer" } },
+        {
+          seq: 1,
+          event: {
+            type: "error",
+            error: "AI features aren't available on this site right now.",
+            errorCode: "too_many_concurrent_requests",
+            providerRetryable: true,
+          },
+        },
+      ],
+      "run-throttled",
+      { suppressInternalContinuation: true, turnId: "turn-throttled" },
+    );
+
+    expect(message?.metadata).toMatchObject({ custom: { continued: true } });
+
+    const unlisted = buildAssistantMessage(
+      [
+        { seq: 0, event: { type: "text", text: "partial answer" } },
+        {
+          seq: 1,
+          event: {
+            type: "error",
+            error: "AI features aren't available on this site right now.",
+            errorCode: "upstream_unavailable",
+            providerRetryable: true,
+          },
+        },
+      ],
+      "run-unlisted-throttle",
+      {
+        suppressInternalContinuation: true,
+        turnId: "turn-unlisted-throttle",
+      },
+    );
+
+    expect(unlisted?.status).toEqual({ type: "incomplete", reason: "error" });
+    expect(unlisted?.metadata.custom).not.toHaveProperty("continued");
   });
 
   it("persists partial output from recoverable gateway errors when suppressed", () => {
@@ -416,8 +863,6 @@ describe("buildAssistantMessage", () => {
       suppressInternalContinuation: true,
     });
 
-    // Friendly copy, same as the live client (client/sse-event-processor.ts) —
-    // not the raw gateway dump this used to append verbatim.
     expect(message?.content).toEqual([
       {
         type: "text",
@@ -437,11 +882,6 @@ describe("buildAssistantMessage", () => {
   });
 
   it("never persists a raw provider connection dump as user-visible text", () => {
-    // Reproduces the Slack-reported repro: switching to a non-Anthropic model
-    // surfaces a raw SSL handshake failure. classifyProviderError tags this
-    // shape as errorCode "provider_network_error" upstream; the persisted
-    // text must go through the same friendly-copy layer as the live client
-    // instead of appending the raw diagnostic string.
     const rawSslError =
       "write EPROTO 140:error:1417C0C7:SSL routines:tls_process_client_certificate:" +
       "sslv3 alert bad certificate:../ssl/record/rec_layer_s3.c:1584:SSL alert number 42";
@@ -634,6 +1074,85 @@ describe("buildAssistantMessage", () => {
     });
   });
 
+  it("preserves an explicit root parent when appending an assistant message", () => {
+    const finalMessage = buildAssistantMessage(
+      [{ seq: 0, event: { type: "text", text: "Root answer." } }],
+      "run-root",
+    );
+    expect(finalMessage).not.toBeNull();
+
+    const updated = upsertAssistantMessage(
+      {
+        messages: [
+          {
+            id: "assistant-old",
+            role: "assistant",
+            content: [{ type: "text", text: "Old answer." }],
+            status: { type: "complete", reason: "stop" },
+          },
+        ],
+      },
+      finalMessage!,
+      null,
+    );
+
+    expect(updated.messages).toHaveLength(2);
+    expect(updated.messages[1].parentId).toBeNull();
+  });
+
+  it("keeps the prior answer when a regeneration targets the same user branch", () => {
+    const regenerated = buildAssistantMessage(
+      [
+        { seq: 0, event: { type: "text", text: "Regenerated answer." } },
+        { seq: 1, event: { type: "done" } },
+      ],
+      "run-regenerated",
+      { turnId: "turn-regenerated" },
+    );
+    expect(regenerated).not.toBeNull();
+
+    const updated = foldAssistantTurn(
+      {
+        messages: [
+          {
+            message: {
+              id: "user-1",
+              role: "user",
+              content: [{ type: "text", text: "try again" }],
+            },
+            parentId: null,
+          },
+          {
+            message: {
+              id: "assistant-original",
+              role: "assistant",
+              content: [{ type: "text", text: "Original answer." }],
+              status: { type: "complete", reason: "stop" },
+            },
+            parentId: "user-1",
+          },
+        ],
+      },
+      regenerated!,
+      {
+        turnId: "turn-regenerated",
+        runId: "run-regenerated",
+        parentId: "user-1",
+      },
+    );
+
+    expect(updated.messages).toHaveLength(3);
+    expect(updated.messages[1].message.content).toEqual([
+      { type: "text", text: "Original answer." },
+    ]);
+    expect(updated.messages[2]).toMatchObject({
+      parentId: "user-1",
+      message: {
+        content: [{ type: "text", text: "Regenerated answer." }],
+      },
+    });
+  });
+
   it("does not replace a completed different-run answer with a prefix-matching recovery answer", () => {
     const finalMessage = buildAssistantMessage(
       [
@@ -811,6 +1330,49 @@ describe("buildAssistantMessage", () => {
   });
 });
 
+describe("buildUserMessage", () => {
+  it("persists display-only file and pasted-text chips without binary data", () => {
+    const message = buildUserMessage({
+      text: "make a deck from the reference",
+      runId: "run-attachments",
+      attachments: [
+        {
+          type: "file",
+          name: "reference.pdf",
+          contentType: "application/pdf",
+          displayOnly: true,
+        },
+        {
+          type: "file",
+          name: "pasted-text-1.txt",
+          contentType: "text/plain",
+          displayOnly: true,
+          text: "outline",
+        },
+      ],
+    });
+
+    expect(message.attachments).toEqual([
+      expect.objectContaining({
+        name: "reference.pdf",
+        content: [],
+        metadata: { displayOnly: true },
+      }),
+      expect.objectContaining({
+        name: "pasted-text-1.txt",
+        content: [
+          {
+            type: "text",
+            text: expect.stringContaining("outline"),
+          },
+        ],
+        metadata: { displayOnly: true },
+      }),
+    ]);
+    expect(JSON.stringify(message.attachments)).not.toContain("data:");
+  });
+});
+
 describe("mergeThreadDataForClientSave", () => {
   it("preserves a saved run duration when a later client copy omits it", () => {
     const existing = {
@@ -889,6 +1451,56 @@ describe("mergeThreadDataForClientSave", () => {
     ]);
     expect(merged.messages[0].parentId).toBeNull();
     expect(merged.messages[1].parentId).toBe("user-1");
+    expect(merged.headId).toBe("server-run-1");
+  });
+
+  it("keeps the newest server branch active when a stale branch is merged", () => {
+    const existing = {
+      messages: [
+        {
+          message: {
+            id: "user-1",
+            role: "user",
+            createdAt: "2026-05-17T12:00:00.000Z",
+            content: [{ type: "text", text: "start" }],
+          },
+          parentId: null,
+        },
+        {
+          message: {
+            id: "assistant-server",
+            role: "assistant",
+            createdAt: "2026-05-17T12:00:01.000Z",
+            content: [{ type: "text", text: "server answer" }],
+            status: { type: "complete", reason: "stop" },
+          },
+          parentId: "user-1",
+        },
+      ],
+      headId: "assistant-server",
+    };
+    const staleIncoming = {
+      messages: [
+        {
+          message: {
+            id: "user-1",
+            role: "user",
+            createdAt: "2026-05-17T12:00:00.000Z",
+            content: [{ type: "text", text: "start" }],
+          },
+          parentId: null,
+        },
+      ],
+      headId: "user-1",
+    };
+
+    const merged = mergeThreadDataForClientSave(existing, staleIncoming);
+
+    expect(merged.headId).toBe("assistant-server");
+    expect(merged.messages.map((entry: any) => entry.message.id)).toEqual([
+      "user-1",
+      "assistant-server",
+    ]);
   });
 
   it("drops empty assistant placeholders when the real server answer arrives", () => {
@@ -1035,14 +1647,6 @@ describe("mergeThreadDataForClientSave", () => {
   });
 
   it("dedupes a client-save user message against the server's submittedRunId copy of the same prompt", () => {
-    // The runtime's saveThreadData PUT sends the runtime export, which
-    // assigns every user message `attachments: []`. The server's
-    // `persistSubmittedUserMessage` → `buildUserMessage` writes the same
-    // logical message but omits `attachments` entirely. Without
-    // attachment normalization in `messageIdentityKeys`, the merge sees
-    // them as different fingerprints and keeps both, producing a duplicate
-    // user-message row per turn (observed on slides prod: every turn
-    // ended up as `client_user → assistant → server_user`).
     const existing = {
       messages: [
         {
@@ -1111,13 +1715,6 @@ describe("mergeThreadDataForClientSave", () => {
   });
 
   it("dedupes a clean client tool-call turn against the server fold of the same turn", () => {
-    // Regression: the server now scopes rebuilt tool-call ids by run
-    // (`${runId}:tc_1`) while the client's live stream uses a bare counter
-    // (`tc_1`). A cleanly-completed client export carries neither runId nor
-    // turnId (only requestMode), so without stripping the render-only id from
-    // the dedup fingerprint these two copies of ONE turn no longer match and the
-    // turn renders twice. The fingerprint must ignore toolCallId.
-    // Server fold of a tool-call turn: runId-scoped tool ids, has runId+turnId.
     const existing = {
       messages: [
         {
@@ -1141,8 +1738,6 @@ describe("mergeThreadDataForClientSave", () => {
         },
       ],
     };
-    // Client export of the SAME turn after a clean completion: tc_N ids, and the
-    // adapter stamps only requestMode (no runId, no turnId).
     const incoming = {
       messages: [
         {
@@ -1265,6 +1860,98 @@ describe("mergeThreadDataForClientSave", () => {
       "server-run-1",
     ]);
     expect(merged.messages[1].parentId).toBe("client-user-1");
+  });
+
+  it("does not rewrite a child's parentId onto the wrong twin when two structurally identical messages are merged", () => {
+    const existing = {
+      messages: [
+        {
+          message: {
+            id: "u1",
+            role: "user",
+            content: [{ type: "text", text: "the prompt" }],
+            metadata: { custom: {} },
+          },
+          parentId: null,
+        },
+        {
+          message: {
+            id: "a1",
+            role: "assistant",
+            content: [{ type: "text", text: "identical reply" }],
+            status: { type: "complete", reason: "stop" },
+            metadata: { runId: "run-1", custom: { label: "first" } },
+          },
+          parentId: "u1",
+        },
+        {
+          message: {
+            id: "a2",
+            role: "assistant",
+            content: [{ type: "text", text: "identical reply" }],
+            status: { type: "complete", reason: "stop" },
+            metadata: { runId: "run-2", custom: { label: "second" } },
+          },
+          parentId: "u1",
+        },
+        {
+          message: {
+            id: "followup",
+            role: "user",
+            content: [{ type: "text", text: "thanks!" }],
+            metadata: { custom: {} },
+          },
+          parentId: "a1",
+        },
+      ],
+    };
+    const incoming = {
+      messages: [
+        {
+          message: {
+            id: "u1",
+            role: "user",
+            content: [{ type: "text", text: "the prompt" }],
+            metadata: { custom: {} },
+          },
+          parentId: null,
+        },
+        {
+          message: {
+            id: "ca2",
+            role: "assistant",
+            content: [{ type: "text", text: "identical reply" }],
+            status: { type: "complete", reason: "stop" },
+            metadata: { runId: "run-2", custom: { label: "second" } },
+          },
+          parentId: "u1",
+        },
+        {
+          message: {
+            id: "ca1",
+            role: "assistant",
+            content: [{ type: "text", text: "identical reply" }],
+            status: { type: "complete", reason: "stop" },
+            metadata: { runId: "run-1", custom: { label: "first" } },
+          },
+          parentId: "u1",
+        },
+      ],
+    };
+
+    const merged = mergeThreadDataForClientSave(existing, incoming);
+
+    expect(merged.messages).toHaveLength(4);
+    const byRunId = (runId: string) =>
+      merged.messages.find(
+        (entry: any) => entry.message.metadata?.runId === runId,
+      );
+    const followup = merged.messages.find(
+      (entry: any) => entry.message.id === "followup",
+    );
+    expect(byRunId("run-1").message.metadata.custom.label).toBe("first");
+    expect(byRunId("run-2").message.metadata.custom.label).toBe("second");
+    expect(followup.parentId).toBe(byRunId("run-1").message.id);
   });
 });
 
@@ -1685,9 +2372,38 @@ describe("upsertUserMessage", () => {
     });
   });
 
+  it("parents a submitted message to the repository head, not an array sibling", () => {
+    const message = buildUserMessage({
+      text: "latest request",
+      runId: "run-latest",
+    });
+    const repo = {
+      messages: [
+        {
+          message: buildUserMessage({
+            text: "active request",
+            runId: "run-active",
+          }),
+          parentId: null,
+        },
+        {
+          message: buildUserMessage({
+            text: "stale sibling",
+            runId: "run-stale",
+          }),
+          parentId: "server-user-run-active",
+        },
+      ],
+      headId: "server-user-run-active",
+    };
+
+    const updated = upsertUserMessage(repo, message);
+
+    expect(updated.messages.at(-1)?.parentId).toBe("server-user-run-active");
+    expect(updated.headId).toBe("server-user-run-latest");
+  });
+
   it("stores image attachments as URL references when a hosted URL exists", () => {
-    // Simulate a pre-uploaded image: the `url` property has been injected by
-    // preUploadAttachments; base64 `data` is still present for the current turn.
     const attWithUrl = {
       type: "image",
       name: "screenshot.png",
@@ -1706,12 +2422,10 @@ describe("upsertUserMessage", () => {
     const updated = upsertUserMessage({}, message);
     const storedAtt = updated.messages[0].message.attachments?.[0];
     expect(storedAtt).toBeDefined();
-    // Content should use the hosted URL, not the base64 string.
     expect(storedAtt.content[0]).toEqual({
       type: "image",
       image: "https://cdn.example.com/screenshot.png",
     });
-    // Reference metadata must be present for tooling.
     expect(storedAtt.metadata).toMatchObject({
       uploadUrl: "https://cdn.example.com/screenshot.png",
       uploadProvider: "builder",
@@ -1782,15 +2496,14 @@ describe("upsertUserMessage", () => {
     });
   });
 
-  it("caps base64 image data larger than 2 MB when no URL exists", () => {
-    // Generate a fake base64 string that's clearly over 2 MB of decoded bytes.
-    // 2 MB = 2097152 bytes; base64 is 4/3 of that ≈ 2796203 chars.
+  it("does not persist base64 image data when storage is required", () => {
     const bigB64 = "A".repeat(3_000_000);
     const att = {
       type: "image",
       name: "big.png",
       contentType: "image/png",
       data: `data:image/png;base64,${bigB64}`,
+      storageRequired: true,
     };
 
     const message = buildUserMessage({
@@ -1801,9 +2514,127 @@ describe("upsertUserMessage", () => {
 
     const storedAtt = message.attachments?.[0];
     expect(storedAtt).toBeDefined();
-    const img = storedAtt.content[0].image as string;
-    // The stored value must NOT contain the raw big base64.
-    expect(img).not.toContain("A".repeat(100));
-    expect(img).toContain("[base64 truncated");
+    expect(storedAtt.content[0]).toEqual({
+      type: "text",
+      text: expect.stringContaining("connect object storage"),
+    });
+    expect(JSON.stringify(storedAtt)).not.toContain("A".repeat(100));
+    expect(storedAtt.metadata).toEqual({ storageRequired: true });
+  });
+
+  it("preserves a distinct marker when a configured provider upload fails", () => {
+    const message = buildUserMessage({
+      text: "Keep this failed upload visible",
+      runId: "run-upload-failed",
+      attachments: [
+        {
+          type: "image",
+          name: "failed.png",
+          contentType: "image/png",
+          data: "data:image/png;base64,AAAA",
+          storageRequired: true,
+          storageUploadFailed: true,
+        } as any,
+      ],
+    });
+
+    const storedAtt = message.attachments?.[0];
+    expect(storedAtt?.content[0]).toEqual({
+      type: "text",
+      text: expect.stringContaining("configured object-storage upload failed"),
+    });
+    expect(storedAtt?.metadata).toEqual({
+      storageRequired: true,
+      storageUploadFailed: true,
+    });
+  });
+
+  it("preserves bounded text attachments when storage is required", () => {
+    const message = buildUserMessage({
+      text: "Keep these notes in the thread",
+      runId: "run-text-attachment",
+      attachments: [
+        {
+          type: "file",
+          name: "notes.txt",
+          contentType: "text/plain",
+          text: "Important notes",
+          storageRequired: true,
+        } as any,
+      ],
+    });
+
+    const storedAtt = message.attachments?.[0];
+    expect(storedAtt).toBeDefined();
+    expect(storedAtt.content[0]).toEqual({
+      type: "text",
+      text: expect.stringContaining("Important notes"),
+    });
+    expect(storedAtt.metadata).toBeUndefined();
+  });
+});
+
+describe("live-client twins", () => {
+  const sourceOf = (relativePath: string): string =>
+    readFileSync(new URL(relativePath, import.meta.url), "utf8");
+
+  const functionBody = (source: string, name: string): string => {
+    const start = source.indexOf(`function ${name}(`);
+    expect(start, `${name} not found`).toBeGreaterThan(-1);
+    const open = source.indexOf("{", start);
+    let depth = 0;
+    for (let i = open; i < source.length; i++) {
+      if (source[i] === "{") depth++;
+      else if (source[i] === "}" && --depth === 0) {
+        return source
+          .slice(open + 1, i)
+          .replace(/\/\/[^\n]*/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+      }
+    }
+    throw new Error(`unterminated body for ${name}`);
+  };
+
+  const stringConst = (source: string, name: string): string => {
+    const match = new RegExp(`\\b${name}\\s*=\\s*\n?\\s*"([^"]*)"`).exec(
+      source,
+    );
+    expect(match, `${name} not found`).not.toBeNull();
+    return match![1]!;
+  };
+
+  it("keeps clearAssistantDraftContent identical to the live client copy", () => {
+    expect(
+      functionBody(
+        sourceOf("./thread-data-builder.ts"),
+        "clearAssistantDraftContent",
+      ),
+    ).toBe(
+      functionBody(
+        sourceOf("../client/sse-event-processor.ts"),
+        "clearAssistantDraftContent",
+      ),
+    );
+  });
+
+  it("keeps the interrupted-tool-result marker identical across all three copies", () => {
+    const client = stringConst(
+      sourceOf("../client/sse-event-processor.ts"),
+      "INTERRUPTED_TOOL_RESULT",
+    );
+
+    expect(
+      stringConst(
+        sourceOf("./thread-data-builder.ts"),
+        "INTERRUPTED_TOOL_RESULT",
+      ),
+    ).toBe(client);
+    expect(
+      stringConst(
+        sourceOf("./production-agent.ts"),
+        "INTERRUPTED_TOOL_RESULT_MARKER",
+      ),
+    ).toBe(client);
   });
 });

@@ -5,20 +5,49 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const clientMocks = vi.hoisted(() => ({
+  creativeContextEnabled: false,
   contextItems: [] as Array<{ key: string; title: string; context: string }>,
+  callAction: vi.fn(async () => ({ cleared: true })),
   remove: vi.fn(),
+  readClientAppState: vi.fn(async () => null as Record<string, unknown> | null),
 }));
 
 vi.mock("@agent-native/core/client/agent-chat", () => ({
-  AgentChatSurface: () => <div data-testid="chat" />,
+  AgentChatHome: ({
+    composerSlot,
+    homeIntroSlot,
+  }: {
+    composerSlot?: React.ReactNode;
+    homeIntroSlot?: React.ReactNode;
+  }) => (
+    <div data-testid="chat">
+      {composerSlot}
+      {homeIntroSlot}
+    </div>
+  ),
   useAgentChatContext: () => ({
     items: clientMocks.contextItems,
     remove: clientMocks.remove,
   }),
 }));
 
+vi.mock("@agent-native/creative-context/client", () => ({
+  CreativeContextComposerChip: () => (
+    <div data-testid="creative-context-chip" />
+  ),
+  useCreativeContextLab: () => clientMocks.creativeContextEnabled,
+}));
+
 vi.mock("@agent-native/core/client/i18n", () => ({
   useT: () => (key: string) => key,
+}));
+
+vi.mock("@agent-native/core/client/hooks", () => ({
+  callAction: clientMocks.callAction,
+}));
+
+vi.mock("@agent-native/core/client/application-state", () => ({
+  readClientAppState: clientMocks.readClientAppState,
 }));
 
 vi.mock("@/lib/chat-handoff", () => ({
@@ -35,7 +64,13 @@ describe("AskPage", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    clientMocks.creativeContextEnabled = false;
     clientMocks.contextItems = [];
+    clientMocks.readClientAppState.mockResolvedValue({
+      type: "dashboard",
+      id: "dash-1",
+      __agentNativeSelectedObjectSource: "test-tab",
+    });
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -74,5 +109,71 @@ describe("AskPage", () => {
     });
 
     expect(clientMocks.remove).not.toHaveBeenCalled();
+  });
+
+  it("hides the Creative Context composer chip until its Lab is enabled", async () => {
+    await act(async () => {
+      root.render(<AskPage />);
+    });
+
+    expect(
+      container.querySelector('[data-testid="creative-context-chip"]'),
+    ).toBeNull();
+  });
+
+  it("shows the Creative Context composer chip when its Lab is enabled", async () => {
+    clientMocks.creativeContextEnabled = true;
+
+    await act(async () => {
+      root.render(<AskPage />);
+    });
+
+    expect(
+      container.querySelector('[data-testid="creative-context-chip"]'),
+    ).not.toBeNull();
+  });
+
+  it("requests atomic dashboard selection cleanup on Ask entry", async () => {
+    await act(async () => {
+      root.render(<AskPage />);
+    });
+
+    expect(clientMocks.callAction).toHaveBeenCalledWith(
+      "clear-selected-dashboard-object",
+      {
+        browserTabId: "test-tab",
+        expectedSelection: expect.objectContaining({
+          type: "dashboard",
+          id: "dash-1",
+        }),
+        source: "test-tab",
+      },
+    );
+  });
+
+  it("does not clear after Ask has navigated away while reading selection", async () => {
+    let resolveSelection: (value: Record<string, unknown>) => void = () => {};
+    clientMocks.readClientAppState.mockReturnValue(
+      new Promise((resolve) => {
+        resolveSelection = resolve;
+      }),
+    );
+
+    await act(async () => {
+      root.render(<AskPage />);
+    });
+    window.history.pushState({}, "", "/dashboards/dash-2");
+
+    await act(async () => {
+      resolveSelection({
+        type: "dashboard",
+        id: "dash-1",
+        __agentNativeSelectedObjectSource: "test-tab",
+      });
+      await Promise.resolve();
+    });
+
+    expect(clientMocks.callAction).not.toHaveBeenCalled();
+    window.history.replaceState({}, "", "/");
   });
 });

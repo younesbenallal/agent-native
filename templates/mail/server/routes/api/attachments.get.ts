@@ -37,11 +37,7 @@ async function getAccessToken(accountEmail: string): Promise<string | null> {
     try {
       const { clientId, clientSecret } =
         await getOAuth2Credentials(accountEmail);
-      const oauth = createOAuth2Client(
-        clientId,
-        clientSecret,
-        "http://localhost:8080/_agent-native/google/callback",
-      );
+      const oauth = createOAuth2Client(clientId, clientSecret, "");
       const refreshed = await oauth.refreshToken(tokens.refresh_token);
       const updated = {
         ...tokens,
@@ -86,7 +82,6 @@ export default defineEventHandler(async (event) => {
     return { error: "messageId and id are required" };
   }
 
-  // Allowlist of safe content types for inline display
   const SAFE_TYPES = new Set([
     "image/jpeg",
     "image/png",
@@ -115,13 +110,11 @@ export default defineEventHandler(async (event) => {
 
       setResponseHeader(event, "Cache-Control", "private, max-age=31536000");
       setResponseHeader(event, "Content-Length", String(buffer.length));
-      // X-Content-Type-Options prevents MIME sniffing of HTML for XSS
       setResponseHeader(event, "X-Content-Type-Options", "nosniff");
       setResponseHeader(event, "Content-Type", contentType);
 
       return buffer;
     } catch {
-      // Try next account
       continue;
     }
   }

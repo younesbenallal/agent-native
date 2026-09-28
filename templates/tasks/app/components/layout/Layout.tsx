@@ -2,12 +2,14 @@ import {
   AgentSidebar,
   focusAgentChat,
 } from "@agent-native/core/client/agent-chat";
+import { useFeatureFlagState } from "@agent-native/core/client/feature-flags";
 import { useT } from "@agent-native/core/client/i18n";
+import { isSettingsPathname } from "@agent-native/core/client/settings";
+import { SETTINGS_REDESIGN_FLAG } from "@agent-native/core/feature-flags/registry";
 import { IconMenu2 } from "@tabler/icons-react";
 import { useState, useEffect } from "react";
 import { useLocation } from "react-router";
 
-import { Button } from "@/components/ui/button";
 import {
   Sheet,
   SheetContent,
@@ -26,11 +28,6 @@ interface LayoutProps {
 
 const SIDEBAR_COLLAPSE_KEY = "tasks.sidebar.collapsed";
 
-/**
- * Routes whose page renders its own toolbar. Layout still wraps these with the
- * left Sidebar and agent surfaces but skips the global Header so they don't
- * double-stack chrome.
- */
 function routeOwnsToolbar(pathname: string): boolean {
   return pathname === "/tasks" || pathname.startsWith("/extensions");
 }
@@ -40,6 +37,13 @@ export function Layout({ children }: LayoutProps) {
   const location = useLocation();
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
+  // The redesigned Settings brings its own navigation, header, and agent
+  // toggle, so it renders full width. While the flag loads it shows the
+  // shell's skeleton, which needs the same frame.
+  const settingsRedesign = useFeatureFlagState(SETTINGS_REDESIGN_FLAG.key);
+  const isRedesignedSettingsRoute =
+    isSettingsPathname(location.pathname) &&
+    (settingsRedesign.enabled || settingsRedesign.status === "loading");
   useEffect(() => {
     setMobileSidebarOpen(false);
   }, [location.pathname]);
@@ -79,7 +83,7 @@ export function Layout({ children }: LayoutProps) {
             <IconMenu2 className="h-4 w-4" />
           </button>
         </div>
-      ) : (
+      ) : isRedesignedSettingsRoute ? null : (
         <Header onOpenMobileSidebar={() => setMobileSidebarOpen(true)} />
       )}
       <main className="min-w-0 flex-1 overflow-y-auto overscroll-contain">
@@ -91,12 +95,14 @@ export function Layout({ children }: LayoutProps) {
   return (
     <HeaderActionsProvider>
       <div className="flex h-screen w-full overflow-hidden bg-background text-foreground">
-        <div className="hidden md:block">
-          <Sidebar
-            collapsed={sidebarCollapsed}
-            onCollapsedChange={setSidebarCollapsed}
-          />
-        </div>
+        {isRedesignedSettingsRoute ? null : (
+          <div className="hidden md:block">
+            <Sidebar
+              collapsed={sidebarCollapsed}
+              onCollapsedChange={setSidebarCollapsed}
+            />
+          </div>
+        )}
         <Sheet open={mobileSidebarOpen} onOpenChange={setMobileSidebarOpen}>
           <SheetContent side="left" className="p-0 w-[260px]">
             <SheetTitle className="sr-only">
@@ -113,7 +119,7 @@ export function Layout({ children }: LayoutProps) {
           chatViewTransition
           storageKey="tasks"
           browserTabId={TAB_ID}
-          agentPageHref="/agent"
+          agentPageHref="/settings/agent"
           onFullscreenRequest={() => focusAgentChat()}
           emptyStateText={t("agent.emptyState")}
           dynamicSuggestions={false}

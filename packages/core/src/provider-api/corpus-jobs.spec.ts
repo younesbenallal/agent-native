@@ -4,9 +4,7 @@ const jobs = new Map<string, Record<string, unknown>>();
 const hits = new Map<string, Record<string, unknown>[]>();
 
 vi.mock("../db/client.js", () => ({
-  getDialect: () => "sqlite",
-  isPostgres: () => false,
-  intType: () => "INTEGER",
+  isProductionServerlessFunctionRuntime: () => false,
   getDbExec: () => ({
     execute: async (sql: string | { sql: string; args: unknown[] }) => {
       const rawSql = typeof sql === "string" ? sql : sql.sql;
@@ -38,9 +36,6 @@ vi.mock("../db/client.js", () => ({
           createdAt,
           updatedAt,
         ] = args;
-        // Emulate `ON CONFLICT (id) DO UPDATE ... WHERE app_id/owner_email
-        // match`: a conflicting insert from a different owner is skipped rather
-        // than clobbering the existing tenant's row.
         const existing = jobs.get(String(id));
         if (
           existing &&
@@ -149,9 +144,6 @@ vi.mock("../db/client.js", () => ({
       }
 
       if (/INSERT INTO provider_corpus_job_hits/i.test(rawSql)) {
-        // Multi-row insert: args arrive in (job_id, hit_index, hit_data)
-        // triples. Emulate `ON CONFLICT (job_id, hit_index) DO NOTHING` so a
-        // resume that re-appends already-stored indices is idempotent.
         const ignoreConflicts = /DO NOTHING/i.test(rawSql);
         const jobId = String(args[0]);
         const rows = hits.get(jobId) ?? [];
@@ -280,6 +272,11 @@ describe("provider corpus jobs", () => {
     expect(second.job.status).toBe("completed");
     expect(second.coverage.pagesProcessed).toBe(2);
     expect(second.coverage.totalHits).toBe(2);
+    expect(second.coverage).toMatchObject({
+      paginationComplete: false,
+      paginationStopReason: "max-pages",
+    });
+    expect(second.nextAction).toContain("exhaustive");
     expect((calls[0] as any).query.page).toBe(1);
     expect((calls[1] as any).query.page).toBe(2);
 
@@ -408,6 +405,40 @@ describe("provider corpus jobs", () => {
     expect(second.coverage.totalHits).toBe(1);
   });
 
+  it("distinguishes a max-pages cap from complete pagination", async () => {
+    const action = createProviderCorpusJobAction({
+      appId: "analytics",
+      getRuntime: () => ({
+        executeRequest: async () =>
+          providerEnvelope({
+            items: [{ id: "m1", text: "Figma MCP" }],
+            next: "page-2",
+          }),
+      }),
+    });
+
+    const capped = (await action.run({
+      operation: "start",
+      mode: "paginated-search",
+      request: { provider: "fake", path: "/messages" },
+      pagination: {
+        itemsPath: "items",
+        nextCursorPath: "next",
+        cursorParam: "cursor",
+        maxPages: 1,
+      },
+      search: { query: "Figma MCP", textPaths: ["text"] },
+    })) as any;
+
+    expect(capped.job.status).toBe("completed");
+    expect(capped.coverage).toMatchObject({
+      paginationComplete: false,
+      paginationStopReason: "max-pages",
+    });
+    expect(capped.nextAction).toContain("Start a new job");
+    expect(capped.nextAction).not.toContain("Read all stored hits");
+  });
+
   it("exposes read-only job status and results for UI surfaces", async () => {
     const action = createProviderCorpusJobAction({
       appId: "analytics",
@@ -440,6 +471,8 @@ describe("provider corpus jobs", () => {
       itemsProcessed: 1,
       matchedItems: 1,
       totalHits: 1,
+      paginationComplete: true,
+      paginationStopReason: "single-page",
     });
 
     const results = (await readAction.run({

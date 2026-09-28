@@ -1,3 +1,4 @@
+import { isActionHiddenFromEveryAgentSurface } from "../action.js";
 import { parseMcpToolName } from "../mcp-client/manager.js";
 import { isMcpToolAllowedForRequest } from "../mcp-client/visibility.js";
 import { getRequestRunContext } from "../server/request-context.js";
@@ -9,6 +10,7 @@ type ToolSearchArgs = {
   query?: unknown;
   limit?: unknown;
   includeSchemas?: unknown;
+  readOnlyOnly?: unknown;
 };
 
 type ToolParameterSummary = {
@@ -25,9 +27,7 @@ type ToolSearchResult = {
   source?: string;
   description: string;
   score: number;
-  /** Whether this result can be loaded and called in the current registry. */
   callable: boolean;
-  /** How the action behaves while the agent is in Plan mode. */
   planAvailability: "read" | "conditional" | "act-only";
   parameters: ToolParameterSummary[];
   inputSchema?: unknown;
@@ -66,6 +66,11 @@ export function createToolSearchEntry(
             description:
               "When true, include each matching tool's full input schema. Default false.",
           },
+          readOnlyOnly: {
+            type: "boolean",
+            description:
+              "When true, return tools whose current policy is read-only or can classify the supplied arguments as read-only. The bounded orchestration host rechecks conditional policies before every call.",
+          },
         },
       },
     },
@@ -100,13 +105,9 @@ export function searchToolRegistry(
   results: ToolSearchResult[];
 } {
   const query = String(args.query ?? "").trim();
-  // No query → "menu" mode: list every available tool by name + a terse
-  // description, with no parameter summaries or input schemas. This is the
-  // cheap, non-opaque counterpart to the compact catalog: the agent can see
-  // the full set of tools for a small token cost, then search/load the few it
-  // actually needs. A query switches to ranked search with parameter details.
   const listAll = query.length === 0;
   const includeSchemas = !listAll && parseBoolean(args.includeSchemas);
+  const readOnlyOnly = parseBoolean(args.readOnlyOnly);
   const limit = parseLimit(
     args.limit,
     options.defaultLimit ?? DEFAULT_LIMIT,
@@ -116,6 +117,7 @@ export function searchToolRegistry(
     query,
     limit,
     includeSchemas,
+    readOnlyOnly,
   });
   const runCtx = getRequestRunContext();
   const priorSearch = includeSchemas
@@ -148,18 +150,26 @@ export function searchToolRegistry(
 
   for (const [name, entry] of Object.entries(registry)) {
     if (!entry?.tool || name === TOOL_SEARCH_ACTION_NAME) continue;
-    if (entry.agentTool === false) continue;
+    if (isActionHiddenFromEveryAgentSurface(entry)) continue;
     if (name.startsWith("mcp__") && !isMcpToolAllowedForRequest(name)) {
       continue;
     }
 
-    totalTools++;
     const description = normalizeWhitespace(entry.tool.description ?? "");
     const parsedMcp = parseMcpToolName(name);
     const kind = parsedMcp ? "mcp" : "action";
     const source = parsedMcp?.serverId;
     const callable = entry.allowInPlanMode !== false;
     const planAvailability = getPlanAvailability(name, entry);
+    if (
+      readOnlyOnly &&
+      planAvailability !== "read" &&
+      (planAvailability !== "conditional" || name === "bash")
+    ) {
+      continue;
+    }
+
+    totalTools++;
 
     if (listAll) {
       candidates.push({
@@ -234,6 +244,7 @@ const PLAN_MODE_BLOCKED_DISCOVERY_TOOLS = new Set([
   "refresh-screen",
   "set-search-params",
   "set-url-path",
+  "open-settings-page",
 ]);
 
 function getPlanAvailability(
@@ -258,11 +269,13 @@ function normalizeToolSearchCacheKey(options: {
   query: string;
   limit: number;
   includeSchemas: boolean;
+  readOnlyOnly: boolean;
 }): string {
   return JSON.stringify({
     query: options.query.trim().toLowerCase(),
     limit: options.limit,
     includeSchemas: options.includeSchemas,
+    readOnlyOnly: options.readOnlyOnly,
   });
 }
 

@@ -1,16 +1,16 @@
 import { defineAction, embedApp } from "@agent-native/core";
 import {
-  applyText,
-  hasCollabState,
-  seedFromText,
-} from "@agent-native/core/collab";
-import {
   buildDeepLink,
   getRequestOrgId,
   getRequestUserEmail,
 } from "@agent-native/core/server";
+import { track } from "@agent-native/core/tracking";
 import { z } from "zod";
 
+import {
+  DASHBOARD_COLLAB_SYNC_TIMEOUT_MS,
+  queueDashboardCollabSync,
+} from "../server/lib/dashboard-collab-sync";
 import {
   getDashboard,
   upsertDashboardWithRetry,
@@ -20,6 +20,8 @@ import {
   applyDashboardMutationOperations,
   DASHBOARD_MUTATION_API_TYPES,
   DASHBOARD_MUTATION_EXAMPLES,
+  MAX_DASHBOARD_MUTATION_CODE_LENGTH,
+  MAX_DASHBOARD_MUTATION_OPERATIONS,
   parseDashboardMutationScript,
   type DashboardMutationOperation,
   type DashboardMutationResult,
@@ -48,6 +50,13 @@ const mutationTargetSchema = {
     .describe("Where in rowNumber to place the panel. Defaults to end."),
 };
 
+const insertPanelSchema = z
+  .record(z.string(), z.unknown())
+  .refine(
+    (panel) => typeof panel.id === "string" && panel.id.trim().length > 0,
+    { message: "panel.id must be a non-empty string" },
+  );
+
 const mutationOperationSchema = z.discriminatedUnion("op", [
   z.object({
     op: z.literal("movePanels"),
@@ -71,7 +80,7 @@ const mutationOperationSchema = z.discriminatedUnion("op", [
   }),
   z.object({
     op: z.literal("insertPanel"),
-    panel: z.record(z.string(), z.unknown()),
+    panel: insertPanelSchema,
     ...mutationTargetSchema,
   }),
   z.object({
@@ -105,6 +114,11 @@ function parseJsonArrayString(
   if (!Array.isArray(parsed)) {
     throw new Error(`${fieldName} must be a JSON array`);
   }
+  if (parsed.length > MAX_DASHBOARD_MUTATION_OPERATIONS) {
+    throw new Error(
+      `${fieldName} has ${parsed.length} operations; keep it at or below ${MAX_DASHBOARD_MUTATION_OPERATIONS}`,
+    );
+  }
   return parsed.map((op, index) => {
     try {
       return mutationOperationSchema.parse(op) as DashboardMutationOperation;
@@ -116,7 +130,7 @@ function parseJsonArrayString(
 
 const operationsInputSchema = z
   .union([
-    z.array(mutationOperationSchema),
+    z.array(mutationOperationSchema).max(MAX_DASHBOARD_MUTATION_OPERATIONS),
     z.string().transform((value) => {
       const trimmed = value.trim();
       return trimmed ? parseJsonArrayString(trimmed, "operations") : undefined;
@@ -135,10 +149,11 @@ function nonEmptyOperations(
 }
 
 const apiHelp =
-  "Constrained TypeScript-like dashboard mutation script. The server parses only calls on `dashboard`; it does not execute arbitrary JavaScript. " +
+  "Short, constrained TypeScript-like dashboard mutation script for compatibility. Prefer structured `operations` for agent calls; use this only for small layout/config edits. The server parses only calls on `dashboard`; it does not execute arbitrary JavaScript. " +
   "No variables, imports, loops, functions, templates, network, filesystem, or DB access. Arguments must be JSON-compatible literals, so quote object keys. " +
   "Subjects: dashboard.set, dashboard.setFilterDefault, dashboard.panel, dashboard.panels, dashboard.panelsMatching, dashboard.section, dashboard.insertPanel. " +
   'For a simple default-filter change, use `dashboard.setFilterDefault("emailFilter","exclude_builder");`; it verifies the filter and option value without resending every filter or revalidating unchanged panel SQL. ' +
+  "Panel config is for renderer options such as xKey, yKey, columns, and formatters; use setSql or set for panel fields such as sql, chartType, source, title, or width. " +
   'Selection methods: moveToTop, moveToBottom, moveBefore, moveAfter, moveToIndex, moveNextTo, moveToRow, remove, set, setTitle, setSql, setWidth, setConfig, setConfigPath, duplicate. Duplicate supports one chained placement method, for example `dashboard.panel("source").duplicate("copy", {"chartType":"bar"}).nextTo("source");`. ' +
   "Inserted panels support atTop, atBottom, before, after, atIndex, nextTo, atRow, atRowStart, and atRowEnd. Use nextTo(panelId) or atRow(rowNumber) for visible row placement. " +
   "AI-generated first-party panels are dashboard-time-bound by default: set config.timeScope to dashboard and include a matching dashboard time filter in SQL. Allowed values are dashboard, fixed-window, cohort-history, and all-time; use all-time only when the user requests full available history and put all-time, lifetime, or historical in the title or description. A {{timeRange}} token requires the timeRange select filter; {{<id>Start}}/{{<id>End}} require a matching date-range filter. Server validation rejects unbound first-party SQL. " +
@@ -149,7 +164,26 @@ const agentInputSchema = z.object({
     .string()
     .min(1)
     .describe("Dashboard id, e.g. 'agent-native-templates-first-party'."),
-  code: z.string().min(1).describe(apiHelp),
+  operations: z
+    .array(mutationOperationSchema)
+    .max(MAX_DASHBOARD_MUTATION_OPERATIONS)
+    .optional()
+    .describe(
+      "Preferred agent input: structured dashboard edits applied atomically in one save. Use panel ids, not array indexes. For first-party metric refreshes, use compose-dashboard with metric keys instead of embedding SQL here.",
+    ),
+  code: z
+    .string()
+    .max(MAX_DASHBOARD_MUTATION_CODE_LENGTH)
+    .optional()
+    .describe(apiHelp),
+  dryRun: z
+    .boolean()
+    .optional()
+    .describe("Validate the mutation without saving it."),
+  returnConfig: z
+    .boolean()
+    .optional()
+    .describe("Include the full resulting config only when it is needed."),
 });
 
 function resolveScope() {
@@ -169,24 +203,6 @@ function resolveDashboardId(args: { dashboardId?: string; id?: string }) {
 
 function cloneConfig(config: Record<string, unknown>): Record<string, unknown> {
   return JSON.parse(JSON.stringify(config)) as Record<string, unknown>;
-}
-
-async function syncToCollab(
-  dashboardId: string,
-  config: Record<string, unknown>,
-): Promise<void> {
-  const docId = `dash-${dashboardId}`;
-  const configStr = JSON.stringify(config);
-  try {
-    const exists = await hasCollabState(docId);
-    if (exists) {
-      await applyText(docId, configStr, "content", "agent");
-    } else {
-      await seedFromText(docId, configStr);
-    }
-  } catch {
-    // SQL remains the source of truth; live collab sync is best-effort.
-  }
 }
 
 function sqlValidationScope(
@@ -231,10 +247,13 @@ function sqlValidationScope(
 async function validateMutationSql(
   config: Record<string, unknown>,
   operations: DashboardMutationOperation[],
+  signal?: AbortSignal,
 ): Promise<string | null> {
   const scope = sqlValidationScope(operations);
   if (scope === null) return null;
-  return validatePanelSql(config, scope === "all" ? undefined : scope);
+  return validatePanelSql(config, scope === "all" ? undefined : scope, {
+    signal,
+  });
 }
 
 function movedPanelIdsFrom(operations: DashboardMutationOperation[]): string[] {
@@ -258,11 +277,12 @@ function helpResult() {
 
 export default defineAction({
   description:
-    "Apply general SQL dashboard edits through a small typed mutation API in ONE atomic save. " +
+    "Apply general SQL dashboard edits through a small typed mutation API in ONE atomic save. Prefer structured `operations` for agent calls; use the short `code` form only for compact layout/config edits. " +
     "Prefer this for dashboard layout and panel edits: move panels by id, edit titles/SQL/width/config, remove panels, duplicate panels, insert panels, or patch dashboard fields. " +
     "For user placement requests like 'second row' or 'next to return rates', use row-aware placement such as `dashboard.insertPanel(...).nextTo(\"retention-over-time\")` or `.atRow(2)`, then verify rendered rows from `get-sql-dashboard.layout.groups`. " +
     "This is code-shaped but not arbitrary code execution: the server parses the allowed dashboard methods, validates the resulting config with the same invariants as update-dashboard, saves once, syncs collab, and returns compact proof. First-party SQL must be explicitly time-bound as described in the API help; server validation rejects unbound first-party SQL. " +
-    "The main code argument is a string, so it avoids brittle JSON-pointer indexes and native-array serialization issues. " +
+    "Structured operations avoid brittle JSON-pointer indexes and native-array serialization issues. Do not put a large multi-panel SQL payload in `code`; use `compose-dashboard` for catalog metrics or structured operations for a bounded custom edit. " +
+    "When adding or restyling a panel, read the existing panels from `view-screen` or `get-sql-dashboard` first and match their chart types, widths, and config conventions instead of introducing a one-off style. " +
     `Common example: ${DASHBOARD_MUTATION_EXAMPLES[0]}`,
   schema: z.object({
     dashboardId: z
@@ -273,7 +293,11 @@ export default defineAction({
       .string()
       .optional()
       .describe("Legacy alias for dashboardId. Prefer dashboardId."),
-    code: z.string().optional().describe(apiHelp),
+    code: z
+      .string()
+      .max(MAX_DASHBOARD_MUTATION_CODE_LENGTH)
+      .optional()
+      .describe(apiHelp),
     operations: operationsInputSchema.describe(
       "Structured equivalent of the typed script. Native callers should pass an array of mutation ops; shell/legacy callers may pass a JSON string. " +
         "Supported ops: movePanels, removePanels, updatePanel, updatePanelPath, insertPanel, duplicatePanel, setDashboard, setFilterDefault.",
@@ -307,7 +331,8 @@ export default defineAction({
       height: 680,
     }),
   },
-  run: async (args) => {
+  timeoutMs: 35_000,
+  run: async (args, actionContext) => {
     const code = nonEmptyCode(args.code);
     const requestedOperations = nonEmptyOperations(args.operations);
     const wantsHelpOnly =
@@ -330,12 +355,6 @@ export default defineAction({
     const scope = resolveScope();
     const ctx = { email: scope.email, orgId: scope.orgId };
 
-    // Recomputes the mutation from whatever dashboard state is passed in.
-    // `operations` sourced from `args.operations` are already concrete panel
-    // ids, safe to replay verbatim; `args.code` is re-parsed against `existing`
-    // every time because selectors like `panelsMatching(...)` resolve against
-    // the config at parse time, so a retry must re-resolve them against the
-    // fresh state, not reuse ids resolved from a now-stale config.
     function computeMutation(
       existing: Pick<DashboardRecord, "kind" | "config">,
     ) {
@@ -357,10 +376,6 @@ export default defineAction({
       return { nextRoot, nextOperations, nextMutation };
     }
 
-    // Assigned inside `computeMutation`'s caller (directly for dry-run, inside
-    // the retry callback for a real save); always assigned at least once
-    // before use below, since `upsertDashboardWithRetry` only resolves after
-    // its callback has run.
     let root: Record<string, unknown>;
     let operations!: DashboardMutationOperation[];
     let mutation!: DashboardMutationResult;
@@ -376,7 +391,11 @@ export default defineAction({
       root = computed.nextRoot;
       operations = computed.nextOperations;
       mutation = computed.nextMutation;
-      const sqlError = await validateMutationSql(root, operations);
+      const sqlError = await validateMutationSql(
+        root,
+        operations,
+        actionContext?.signal,
+      );
       if (sqlError) throw new Error(sqlError);
     } else {
       const saved = await upsertDashboardWithRetry(
@@ -387,6 +406,7 @@ export default defineAction({
           const sqlError = await validateMutationSql(
             computed.nextRoot,
             computed.nextOperations,
+            actionContext?.signal,
           );
           if (sqlError) throw new Error(sqlError);
           root = computed.nextRoot;
@@ -395,11 +415,20 @@ export default defineAction({
           return { kind: "sql" as const, body: computed.nextRoot };
         },
       );
-      // Use the persisted config as the source of truth for the response —
-      // structurally identical to the winning attempt's `root`, but reflects
-      // exactly what was saved.
       root = saved.config as Record<string, unknown>;
-      await syncToCollab(dashboardId, root);
+      queueDashboardCollabSync(dashboardId, root, "agent");
+      track(
+        "dashboard_saved",
+        {
+          app_name: "analytics",
+          template_name: "analytics",
+          output_id: dashboardId,
+          output_type: "dashboard",
+          dashboard_id: dashboardId,
+          panel_count: Array.isArray(root.panels) ? root.panels.length : 0,
+        },
+        actionContext,
+      );
     }
 
     const compact = compactDashboardResult(root, movedPanelIdsFrom(operations));
@@ -421,6 +450,14 @@ export default defineAction({
       insertedPanelIds: mutation.insertedPanelIds,
       removedPanelIds: mutation.removedPanelIds,
       dashboardFieldsChanged: mutation.dashboardFieldsChanged,
+      ...(args.dryRun === true
+        ? { collabSync: { status: "skipped" as const } }
+        : {
+            collabSync: {
+              status: "queued" as const,
+              timeoutMs: DASHBOARD_COLLAB_SYNC_TIMEOUT_MS,
+            },
+          }),
       ...(args.returnConfig === true ? { config: root } : {}),
       ...(args.returnTypes === true
         ? {

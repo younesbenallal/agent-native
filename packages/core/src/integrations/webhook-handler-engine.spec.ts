@@ -14,12 +14,8 @@ const setThreadSourceIfMissingMock = vi.hoisted(() => vi.fn());
 const isInBackgroundFunctionRuntimeMock = vi.hoisted(() => vi.fn(() => false));
 const resolveOrgIdForEmailMock = vi.hoisted(() => vi.fn());
 const getOrgA2ASecretMock = vi.hoisted(() => vi.fn());
-const getOwnerActiveApiKeyMock = vi.hoisted(() => vi.fn());
-const getOwnerApiKeyMock = vi.hoisted(() => vi.fn());
+const resolveOwnerEngineApiKeyMock = vi.hoisted(() => vi.fn());
 const runAgentLoopMock = vi.hoisted(() => vi.fn());
-// The integration run goes through the resume wrapper. Delegate to the loop
-// mock so every assertion below still reads the options the loop was called
-// with.
 const actionsToEngineToolsMock = vi.hoisted(() => vi.fn());
 const resolveEngineMock = vi.hoisted(() => vi.fn());
 const getConfiguredEngineNameForRequestMock = vi.hoisted(() => vi.fn());
@@ -114,13 +110,6 @@ vi.mock("../org/context.js", () => ({
   resolveOrgIdForEmail: resolveOrgIdForEmailMock,
 }));
 
-// `filterInitialEngineTools`'s own filtering semantics are covered directly
-// (unmocked) by production-agent.spec.ts. Re-implemented minimally here
-// rather than via `vi.importActual` on the real module, which would pull in
-// production-agent.ts's full module graph (e.g. its module-scope
-// `registerBuiltinEngines()` call) and conflict with the narrower engine
-// mock below. This only needs to prove webhook-handler.ts WIRES the filter
-// with the right inputs, not re-prove the filter's own correctness.
 function fakeFilterInitialEngineTools(
   tools: Array<{ name: string }>,
   initialToolNames?: string[],
@@ -141,12 +130,7 @@ function fakeFilterInitialEngineTools(
 }
 
 vi.mock("../agent/production-agent.js", () => ({
-  getOwnerActiveApiKey: getOwnerActiveApiKeyMock,
-  getOwnerApiKey: getOwnerApiKeyMock,
-  engineToProvider: (engineName: string) =>
-    engineName.startsWith("ai-sdk:")
-      ? engineName.slice("ai-sdk:".length)
-      : engineName,
+  resolveOwnerEngineApiKey: resolveOwnerEngineApiKeyMock,
   actionsToEngineTools: actionsToEngineToolsMock,
   runAgentLoop: runAgentLoopMock,
   filterInitialEngineTools: fakeFilterInitialEngineTools,
@@ -211,17 +195,36 @@ vi.mock("../agent/run-manager.js", () => ({
           createdAt: Date.now(),
         });
       };
-      Promise.resolve(runFn(send, new AbortController().signal)).then(() =>
-        onComplete?.({
-          runId,
-          threadId,
-          events,
-          status: "completed",
-          subscribers: new Set(),
-          abort: new AbortController(),
-          startedAt: Date.now(),
-        }),
-      );
+      Promise.resolve(runFn(send, new AbortController().signal))
+        .then(() =>
+          onComplete?.({
+            runId,
+            threadId,
+            events,
+            status: "completed",
+            subscribers: new Set(),
+            abort: new AbortController(),
+            startedAt: Date.now(),
+          }),
+        )
+        .catch((error) => {
+          send({
+            type: "error",
+            error: error instanceof Error ? error.message : String(error),
+            ...(typeof error?.errorCode === "string"
+              ? { errorCode: error.errorCode }
+              : {}),
+          });
+          return onComplete?.({
+            runId,
+            threadId,
+            events,
+            status: "errored",
+            subscribers: new Set(),
+            abort: new AbortController(),
+            startedAt: Date.now(),
+          });
+        });
       return {
         runId,
         threadId,
@@ -336,8 +339,10 @@ describe("integration webhook handler engine resolution", () => {
     isInBackgroundFunctionRuntimeMock.mockReturnValue(false);
     resolveOrgIdForEmailMock.mockResolvedValue("org-qa");
     getOrgA2ASecretMock.mockResolvedValue(null);
-    getOwnerActiveApiKeyMock.mockResolvedValue(undefined);
-    getOwnerApiKeyMock.mockResolvedValue(undefined);
+    resolveOwnerEngineApiKeyMock.mockResolvedValue({
+      apiKey: undefined,
+      apiKeyEnvVar: undefined,
+    });
     isLocalDatabaseMock.mockReturnValue(true);
     readDeployCredentialEnvMock.mockReturnValue(undefined);
     canUseDeployCredentialFallbackForRequestMock.mockReturnValue(true);
@@ -379,11 +384,6 @@ describe("integration webhook handler engine resolution", () => {
     }
   });
 
-  // CI runs this suite with a much longer transform/import phase than local
-  // (~28s vs ~7s observed on 2026-05-11), which left the per-test 5s budget
-  // too tight for the full processIntegrationTask pipeline. Bumping these two
-  // mock-heavy run-loop tests to 15s avoids flake without masking real perf
-  // regressions: the test bodies still finish in well under a second locally.
   it(
     "releases reserved budgets when thread setup fails",
     { timeout: 15_000 },
@@ -453,12 +453,6 @@ describe("integration webhook handler engine resolution", () => {
         principalType: "service",
       });
 
-      // objectContaining, not an exact match: `runOptions` is handed to
-      // startRun by reference and deliberately mutated afterwards (model and
-      // engineName are filled in inside the run callback so run-manager's
-      // terminal event can read them in its `.finally()`), and it also carries
-      // attemptCount. This assertion is about which soft-timeout ceiling was
-      // chosen, so it pins those two fields and stays agnostic to the rest.
       expect(startRunMock).toHaveBeenLastCalledWith(
         expect.any(String),
         expect.any(String),
@@ -690,18 +684,23 @@ describe("integration webhook handler engine resolution", () => {
         ownerEmail: task.ownerEmail,
       });
 
-      expect(getOwnerActiveApiKeyMock).toHaveBeenCalledWith(task.ownerEmail);
+      expect(resolveOwnerEngineApiKeyMock).toHaveBeenCalledWith({
+        engineOption: undefined,
+        ownerEmail: task.ownerEmail,
+        anthropicFallback: "",
+      });
       expect(resolveEngineMock).toHaveBeenCalledWith({
         engineOption: undefined,
         apiKey: undefined,
+        apiKeyEnvVar: undefined,
         model: "claude-sonnet-4-6",
       });
       expect(runAgentLoopMock).toHaveBeenCalledWith(
         expect.objectContaining({
           engine: expect.objectContaining({ name: "builder" }),
           model: "claude-sonnet-4-6",
-          maxOutputTokens: 32_000,
-          reasoningEffort: "medium",
+          maxOutputTokens: 64_000,
+          reasoningEffort: "high",
           systemPrompt: expect.stringContaining("<runtime-context>"),
         }),
       );
@@ -721,6 +720,235 @@ describe("integration webhook handler engine resolution", () => {
         expect.objectContaining({ externalThreadId: "thread-1" }),
         expect.objectContaining({ placeholderRef: undefined }),
       );
+    },
+  );
+
+  it(
+    "re-resolves a rejected service-principal credential before any agent output",
+    { timeout: 15_000 },
+    async () => {
+      const { processIntegrationTask } = await import("./webhook-handler.js");
+      const sendResponse = vi.fn(async () => ({
+        status: "delivered" as const,
+      }));
+      const rejected = Object.assign(new Error("Unauthorized"), {
+        errorCode: "http_401",
+      });
+      getConfiguredEngineNameForRequestMock.mockResolvedValue("ai-sdk:openai");
+      resolveOwnerEngineApiKeyMock
+        .mockResolvedValueOnce({
+          apiKey: "rejected-test-key",
+          apiKeyEnvVar: "OPENAI_API_KEY",
+        })
+        .mockResolvedValueOnce({
+          apiKey: "fallback-test-key",
+          apiKeyEnvVar: "BUILDER_PRIVATE_KEY",
+        });
+      resolveEngineMock
+        .mockResolvedValueOnce({
+          name: "ai-sdk:openai",
+          defaultModel: "gpt-5.6-sol",
+          stream: vi.fn(),
+        })
+        .mockResolvedValueOnce({
+          name: "builder",
+          defaultModel: "gpt-5.6-sol",
+          stream: vi.fn(),
+        });
+      runAgentLoopMock
+        .mockImplementationOnce(async ({ send }) => {
+          send({ type: "model_stream", status: "start" });
+          throw rejected;
+        })
+        .mockImplementationOnce(async ({ send }) => {
+          send({ type: "text", text: "fallback completed" });
+        });
+
+      await processIntegrationTask(pendingTask(), {
+        adapter: createAdapter(sendResponse),
+        systemPrompt: "system",
+        actions: {},
+        apiKey: "",
+        ownerEmail: "integration@fake",
+        orgId: "org-qa",
+        principalType: "service",
+        appId: "dispatch",
+      });
+
+      expect(runAgentLoopMock).toHaveBeenCalledTimes(2);
+      expect(resolveEngineMock.mock.calls[0]?.[0]).toMatchObject({
+        engineOption: "ai-sdk:openai",
+        apiKey: "rejected-test-key",
+      });
+      expect(resolveEngineMock.mock.calls[1]?.[0]).toMatchObject({
+        engineOption: "builder",
+        apiKey: "fallback-test-key",
+      });
+      expect(getConfiguredEngineNameForRequestMock).toHaveBeenCalledOnce();
+      expect(sendResponse).toHaveBeenCalledOnce();
+      expect(sendResponse.mock.calls[0]?.[0].text).toBe("fallback completed");
+      expect(sendResponse.mock.calls[0]?.[2]).toMatchObject({
+        idempotencyKey: "integration-response:task-qa",
+      });
+      expect(stageTaskDeliveryPayloadMock).toHaveBeenCalled();
+    },
+  );
+
+  it(
+    "does not replace a user-principal provider after credential rejection",
+    { timeout: 15_000 },
+    async () => {
+      const { processIntegrationTask } = await import("./webhook-handler.js");
+      const sendResponse = vi.fn(async () => ({
+        status: "delivered" as const,
+      }));
+      const rejected = Object.assign(new Error("Unauthorized"), {
+        errorCode: "http_401",
+      });
+      getConfiguredEngineNameForRequestMock.mockResolvedValue("ai-sdk:openai");
+      resolveOwnerEngineApiKeyMock.mockResolvedValue({
+        apiKey: "user-selected-test-key",
+        apiKeyEnvVar: "OPENAI_API_KEY",
+      });
+      resolveEngineMock.mockResolvedValue({
+        name: "ai-sdk:openai",
+        defaultModel: "gpt-5.6-sol",
+        stream: vi.fn(),
+      });
+      runAgentLoopMock.mockRejectedValueOnce(rejected);
+
+      await processIntegrationTask(pendingTask(), {
+        adapter: createAdapter(sendResponse),
+        systemPrompt: "system",
+        actions: {},
+        apiKey: "",
+        ownerEmail: "person@fake",
+        orgId: "org-qa",
+        principalType: "user",
+        appId: "dispatch",
+      });
+
+      expect(runAgentLoopMock).toHaveBeenCalledOnce();
+      expect(resolveOwnerEngineApiKeyMock).toHaveBeenCalledOnce();
+      expect(resolveEngineMock).toHaveBeenCalledOnce();
+      expect(sendResponse).toHaveBeenCalledOnce();
+      expect(sendResponse.mock.calls[0]?.[0].text).toContain(
+        "Settings > Agent > AI providers",
+      );
+    },
+  );
+
+  it(
+    "updates the native progress target after an ambiguous terminal failure",
+    { timeout: 15_000 },
+    async () => {
+      const { processIntegrationTask } = await import("./webhook-handler.js");
+      const sendResponse = vi.fn(async () => ({
+        status: "delivered" as const,
+        messageRefs: ["stream-qa"],
+      }));
+      const complete = vi.fn(async () => {
+        throw new Error("chat.stopStream transport failed");
+      });
+      const fail = vi.fn(async () => undefined);
+      const adapter = {
+        ...createAdapter(sendResponse),
+        startRunProgress: async () => ({
+          ref: { kind: "slack-stream", streamTs: "stream-qa" },
+          responseTargetRef: "stream-qa",
+          onEvent: vi.fn(async () => undefined),
+          complete,
+          fail,
+        }),
+      };
+      runAgentLoopMock.mockImplementationOnce(async ({ send }) => {
+        send({ type: "text", text: "completed once" });
+      });
+
+      await processIntegrationTask(pendingTask(), {
+        adapter,
+        systemPrompt: "system",
+        actions: {},
+        engine: "builder",
+        apiKey: "",
+        ownerEmail: "integration@fake",
+        orgId: "org-qa",
+        principalType: "service",
+        appId: "dispatch",
+      });
+
+      expect(complete).toHaveBeenCalledOnce();
+      expect(complete).toHaveBeenCalledWith(
+        expect.objectContaining({ text: "completed once" }),
+        { idempotencyKey: "integration-response:task-qa" },
+      );
+      expect(fail).toHaveBeenCalledWith(
+        "I couldn't update the live response, but I posted the final result in this thread.",
+      );
+      expect(sendResponse).toHaveBeenCalledOnce();
+      expect(sendResponse).toHaveBeenCalledWith(
+        expect.objectContaining({ text: "completed once" }),
+        expect.any(Object),
+        expect.objectContaining({
+          placeholderRef: "stream-qa",
+          strictTargetRef: true,
+          idempotencyKey: "integration-response:task-qa",
+        }),
+      );
+      expect(stageTaskDeliveryPayloadMock).toHaveBeenCalledWith(
+        "task-qa",
+        expect.stringContaining('"strictTargetRef":true'),
+      );
+    },
+  );
+
+  it(
+    "delivers one terminal response when no distinct credential fallback exists",
+    { timeout: 15_000 },
+    async () => {
+      const { processIntegrationTask } = await import("./webhook-handler.js");
+      const sendResponse = vi.fn(async () => ({
+        status: "delivered" as const,
+      }));
+      const rejected = Object.assign(new Error("Unauthorized"), {
+        errorCode: "http_401",
+      });
+      getConfiguredEngineNameForRequestMock.mockResolvedValue("ai-sdk:openai");
+      resolveOwnerEngineApiKeyMock.mockResolvedValue({
+        apiKey: "same-rejected-test-key",
+        apiKeyEnvVar: "OPENAI_API_KEY",
+      });
+      resolveEngineMock.mockResolvedValue({
+        name: "ai-sdk:openai",
+        defaultModel: "gpt-5.6-sol",
+        stream: vi.fn(),
+      });
+      runAgentLoopMock.mockRejectedValueOnce(rejected);
+
+      await processIntegrationTask(pendingTask(), {
+        adapter: createAdapter(sendResponse),
+        systemPrompt: "system",
+        actions: {},
+        engine: "builder",
+        apiKey: "",
+        ownerEmail: "integration@fake",
+        orgId: "org-qa",
+        principalType: "service",
+        appId: "dispatch",
+      });
+
+      expect(runAgentLoopMock).toHaveBeenCalledOnce();
+      expect(sendResponse).toHaveBeenCalledOnce();
+      expect(sendResponse.mock.calls[0]?.[2]).toMatchObject({
+        idempotencyKey: "integration-response:task-qa",
+      });
+      expect(sendResponse.mock.calls[0]?.[0].text).toContain(
+        "Settings > Agent > AI providers",
+      );
+      expect(sendResponse.mock.calls[0]?.[0].text).not.toContain(
+        "same-rejected-test-key",
+      );
+      expect(stageTaskDeliveryPayloadMock).toHaveBeenCalled();
     },
   );
 
@@ -1301,7 +1529,10 @@ describe("integration webhook handler engine resolution", () => {
       const sendResponse = vi.fn(async () => ({
         status: "delivered" as const,
       }));
-      getOwnerApiKeyMock.mockResolvedValue("openai-user-key");
+      resolveOwnerEngineApiKeyMock.mockResolvedValue({
+        apiKey: "openai-user-key",
+        apiKeyEnvVar: "OPENAI_API_KEY",
+      });
       const task: PendingTask = {
         id: "task-openai",
         platform: "fake",
@@ -1337,14 +1568,15 @@ describe("integration webhook handler engine resolution", () => {
         ownerEmail: task.ownerEmail,
       });
 
-      expect(getOwnerApiKeyMock).toHaveBeenCalledWith(
-        "openai",
-        task.ownerEmail,
-      );
-      expect(getOwnerActiveApiKeyMock).not.toHaveBeenCalled();
+      expect(resolveOwnerEngineApiKeyMock).toHaveBeenCalledWith({
+        engineOption: "ai-sdk:openai",
+        ownerEmail: task.ownerEmail,
+        anthropicFallback: "deploy-anthropic-key",
+      });
       expect(resolveEngineMock).toHaveBeenCalledWith({
         engineOption: "ai-sdk:openai",
         apiKey: "openai-user-key",
+        apiKeyEnvVar: "OPENAI_API_KEY",
         model: "gpt-5.2",
       });
     },
@@ -1365,7 +1597,10 @@ describe("integration webhook handler engine resolution", () => {
         expect(getRequestOrgId()).toBe("org-qa");
         return "anthropic";
       });
-      getOwnerApiKeyMock.mockResolvedValue("anthropic-org-key");
+      resolveOwnerEngineApiKeyMock.mockResolvedValue({
+        apiKey: "anthropic-org-key",
+        apiKeyEnvVar: "ANTHROPIC_API_KEY",
+      });
       getStoredModelForEngineMock.mockResolvedValueOnce("claude-sonnet-4-6");
       resolveEngineMock.mockResolvedValueOnce({
         name: "anthropic",
@@ -1393,13 +1628,15 @@ describe("integration webhook handler engine resolution", () => {
       expect(getConfiguredEngineNameForRequestMock).toHaveBeenCalledWith({
         appId: "dispatch",
       });
-      expect(getOwnerApiKeyMock).toHaveBeenCalledWith(
-        "anthropic",
-        task.ownerEmail,
-      );
+      expect(resolveOwnerEngineApiKeyMock).toHaveBeenCalledWith({
+        engineOption: "anthropic",
+        ownerEmail: task.ownerEmail,
+        anthropicFallback: "",
+      });
       expect(resolveEngineMock).toHaveBeenCalledWith({
         engineOption: "anthropic",
         apiKey: "anthropic-org-key",
+        apiKeyEnvVar: "ANTHROPIC_API_KEY",
         model: "builder-default-model",
         appId: "dispatch",
       });
@@ -1453,113 +1690,8 @@ describe("integration webhook handler engine resolution", () => {
     });
 
     const sentText = vi.mocked(sendResponse).mock.calls[0]?.[0].text ?? "";
-    expect(sentText).toContain("Manage agent > LLM");
+    expect(sentText).toContain("Settings > Agent > AI providers");
     expect(sentText).not.toContain("ANTHROPIC_API_KEY");
-  });
-
-  it("uses the explicit provider env key when no owner key exists in single-tenant mode", async () => {
-    const { processIntegrationTask } = await import("./webhook-handler.js");
-    const sendResponse = vi.fn(async () => ({ status: "delivered" as const }));
-    readDeployCredentialEnvMock.mockImplementation((key: string) =>
-      key === "OPENAI_API_KEY" ? "openai-env-key" : undefined,
-    );
-    const task: PendingTask = {
-      id: "task-openai-env",
-      platform: "fake",
-      externalEventKey: "fake:thread-env:1005",
-      externalThreadId: "thread-env",
-      payload: JSON.stringify({
-        incoming: {
-          platform: "fake",
-          externalThreadId: "thread-env",
-          text: "hello from slack",
-          senderName: "QA User",
-          platformContext: { channel: "C123" },
-          timestamp: 1005,
-        },
-      }),
-      ownerEmail: "dispatch+qa@integration.local",
-      orgId: "org-qa",
-      status: "processing",
-      attempts: 1,
-      errorMessage: null,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      completedAt: null,
-    };
-
-    await processIntegrationTask(task, {
-      adapter: createAdapter(sendResponse),
-      systemPrompt: "system",
-      actions: {},
-      model: "gpt-5.2",
-      apiKey: "",
-      engine: "ai-sdk:openai",
-      ownerEmail: task.ownerEmail,
-    });
-
-    expect(readDeployCredentialEnvMock).toHaveBeenCalledWith("OPENAI_API_KEY");
-    expect(resolveEngineMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        engineOption: "ai-sdk:openai",
-        apiKey: "openai-env-key",
-      }),
-    );
-  });
-
-  it("does not fall back to deployment LLM keys in production shared mode", async () => {
-    const { processIntegrationTask } = await import("./webhook-handler.js");
-    const sendResponse = vi.fn(async () => ({ status: "delivered" as const }));
-    process.env.NODE_ENV = "production";
-    isLocalDatabaseMock.mockReturnValue(false);
-    canUseDeployCredentialFallbackForRequestMock.mockReturnValue(false);
-    readDeployCredentialEnvMock.mockImplementation((key: string) =>
-      key === "OPENAI_API_KEY" ? "openai-hosted-key" : undefined,
-    );
-    const task: PendingTask = {
-      id: "task-multitenant",
-      platform: "fake",
-      externalEventKey: "fake:thread-mt:1006",
-      externalThreadId: "thread-mt",
-      payload: JSON.stringify({
-        incoming: {
-          platform: "fake",
-          externalThreadId: "thread-mt",
-          text: "hello from slack",
-          senderName: "QA User",
-          platformContext: { channel: "C123" },
-          timestamp: 1006,
-        },
-      }),
-      ownerEmail: "dispatch+qa@integration.local",
-      orgId: "org-qa",
-      status: "processing",
-      attempts: 1,
-      errorMessage: null,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      completedAt: null,
-    };
-
-    await processIntegrationTask(task, {
-      adapter: createAdapter(sendResponse),
-      systemPrompt: "system",
-      actions: {},
-      model: "gpt-5.2",
-      apiKey: "deploy-key",
-      engine: "ai-sdk:openai",
-      ownerEmail: task.ownerEmail,
-    });
-
-    expect(readDeployCredentialEnvMock).not.toHaveBeenCalledWith(
-      "OPENAI_API_KEY",
-    );
-    expect(resolveEngineMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        engineOption: "ai-sdk:openai",
-        apiKey: undefined,
-      }),
-    );
   });
 
   it("prefers stored model settings over the integration plugin default", async () => {
@@ -3013,6 +3145,76 @@ describe("integration webhook handler engine resolution", () => {
     );
   });
 
+  it("uses the canonical URL when APP_URL is absent for Slack thread links", async () => {
+    const { processIntegrationTask } = await import("./webhook-handler.js");
+    vi.stubEnv("APP_URL", "");
+    vi.stubEnv("BETTER_AUTH_URL", "https://agent-workspace.builder.io");
+    vi.stubEnv("URL", "https://builder-agent-native-workspace.netlify.app");
+    vi.stubEnv("APP_BASE_PATH", "/dispatch");
+    const sendResponse = vi.fn(async () => ({ status: "delivered" as const }));
+    const formatAgentResponse = vi.fn(
+      (text: string, opts?: { threadDeepLinkUrl?: string }) => ({
+        text,
+        platformContext: opts ?? {},
+      }),
+    );
+    runAgentLoopMock.mockImplementationOnce(async ({ send }) => {
+      send({ type: "text", text: "I found the issue." });
+    });
+
+    await processIntegrationTask(pendingTask({ id: "task-canonical-thread" }), {
+      adapter: createAdapter(sendResponse, formatAgentResponse),
+      systemPrompt: "system",
+      actions: {},
+      model: "claude-sonnet-4-6",
+      apiKey: "",
+      ownerEmail: "dispatch+qa@integration.local",
+    });
+
+    expect(formatAgentResponse).toHaveBeenCalledWith("I found the issue.", {
+      threadDeepLinkUrl:
+        "https://agent-workspace.builder.io/dispatch/chat/thread-qa",
+    });
+  });
+
+  it("omits Slack thread links when only the local URL fallback is available", async () => {
+    const { processIntegrationTask } = await import("./webhook-handler.js");
+    for (const key of [
+      "APP_URL",
+      "WORKSPACE_OAUTH_ORIGIN",
+      "VITE_WORKSPACE_OAUTH_ORIGIN",
+      "BETTER_AUTH_URL",
+      "VITE_BETTER_AUTH_URL",
+      "WORKSPACE_GATEWAY_URL",
+      "VITE_WORKSPACE_GATEWAY_URL",
+    ]) {
+      vi.stubEnv(key, "");
+    }
+    const sendResponse = vi.fn(async () => ({ status: "delivered" as const }));
+    const formatAgentResponse = vi.fn(
+      (text: string, opts?: { threadDeepLinkUrl?: string }) => ({
+        text,
+        platformContext: opts ?? {},
+      }),
+    );
+    runAgentLoopMock.mockImplementationOnce(async ({ send }) => {
+      send({ type: "text", text: "I found the issue." });
+    });
+
+    await processIntegrationTask(pendingTask({ id: "task-local-thread" }), {
+      adapter: createAdapter(sendResponse, formatAgentResponse),
+      systemPrompt: "system",
+      actions: {},
+      model: "claude-sonnet-4-6",
+      apiKey: "",
+      ownerEmail: "dispatch+qa@integration.local",
+    });
+
+    expect(formatAgentResponse).toHaveBeenCalledWith("I found the issue.", {
+      threadDeepLinkUrl: undefined,
+    });
+  });
+
   it("does not send hallucinated local design URLs to Slack-style integrations", async () => {
     const { processIntegrationTask } = await import("./webhook-handler.js");
     const previousAppUrl = process.env.APP_URL;
@@ -3155,9 +3357,6 @@ describe("integration webhook handler engine resolution", () => {
 
   it("defers framework-added tools behind tool-search on the first engine request while keeping template actions and initial defaults", async () => {
     const { processIntegrationTask } = await import("./webhook-handler.js");
-    // Only this test needs a real-shaped action->tool conversion — every
-    // other test in this file relies on the `[]` stub set in `beforeEach`
-    // and doesn't inspect `tools`/`availableTools`.
     actionsToEngineToolsMock.mockImplementation(
       (actionsMap: Record<string, { tool: { description: string } }>) =>
         Object.keys(actionsMap).map((name) => ({
@@ -3187,8 +3386,6 @@ describe("integration webhook handler engine resolution", () => {
         "call-agent": noopTool("Delegate to another A2A agent"),
         "list-integration-memory": noopTool("List integration memory"),
       },
-      // Mirrors what `createIntegrationsPlugin` passes: the app's own
-      // action names, not the framework additions merged into `actions`.
       initialToolNames: ["template-action"],
       apiKey: "test-key",
       ownerEmail: "dispatch+qa@integration.local",
@@ -3205,22 +3402,15 @@ describe("integration webhook handler engine resolution", () => {
       .map((tool: { name: string }) => tool.name)
       .sort();
 
-    // Deferred framework additions never reach the first request...
     expect(firstRequestToolNames).not.toContain("call-agent");
     expect(firstRequestToolNames).not.toContain("list-integration-memory");
-    // ...but the template action, and tool-search itself, do.
     expect(firstRequestToolNames).toEqual(["template-action", "tool-search"]);
-    // ...while the full registry (used for mid-run tool-search expansion)
-    // still contains everything, so the model can discover and call the
-    // deferred tools after a tool-search hit.
     expect(availableToolNames).toEqual([
       "call-agent",
       "list-integration-memory",
       "template-action",
       "tool-search",
     ]);
-    // The executable registry passed through for real tool dispatch must
-    // also include tool-search so a model-issued call to it can run.
     expect(Object.keys(call.actions).sort()).toEqual([
       "call-agent",
       "list-integration-memory",

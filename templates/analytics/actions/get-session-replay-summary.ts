@@ -1,4 +1,4 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import {
   getRequestOrgId,
   getRequestUserEmail,
@@ -22,6 +22,7 @@ export default defineAction({
   http: { method: "GET" },
   readOnly: true,
   publicAgent: { expose: true, readOnly: true, requiresAuth: true },
+  grounding: true,
   run: async (args) => {
     return getSessionReplaySummary(args.recordingId, resolveScope());
   },

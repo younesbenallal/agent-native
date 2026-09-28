@@ -1,19 +1,4 @@
-/**
- * Regenerate the recording's title using its transcript.
- *
- * Title generation uses the same low-cost text-model media-pipeline path as
- * transcript cleanup so a freshly recorded clip can get a useful title without
- * waiting for the agent chat bridge. If the fast path is unavailable, we still
- * queue the older agent-chat request as a fallback.
- *
- * When the user enables Include full video, we skip the transcript-only fast
- * path and always delegate so the agent can watch the recording.
- *
- * Usage:
- *   pnpm action regenerate-title --recordingId=<id>
- */
-
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
 import { getRequestUserEmail } from "@agent-native/core/server/request-context";
 import { assertAccess } from "@agent-native/core/sharing";
@@ -25,6 +10,10 @@ import { isBuilderCreditsExhaustedMessage } from "../shared/builder-credits.js";
 import { withFullVideoAiInstructions } from "../shared/clips-ai-prefs.js";
 import cleanupTranscript from "./cleanup-transcript.js";
 import { loadAgentsMdContext } from "./lib/agents-md-context.js";
+import {
+  queueAiRequest,
+  withAiRequestStatusInstructions,
+} from "./lib/ai-request-status.js";
 import { clearBuilderCreditsExhausted } from "./lib/builder-credits-state.js";
 import { readIncludeFullVideoInAi } from "./lib/clips-ai-prefs.js";
 import {
@@ -103,12 +92,14 @@ export async function queueTitleRegenerationRequest({
     `\`update-recording --id=${recordingId} --title="..."\`${summaryInstruction} ` +
     `Current title: "${currentTitle ?? ""}". Current description: "${currentDescription ?? ""}". ` +
     "Do not prompt the user.";
+  const kind = includeSummary
+    ? ("generate-metadata" as const)
+    : ("regenerate-title" as const);
+  const requestedAt = new Date().toISOString();
   const request = {
-    kind: includeSummary
-      ? ("generate-metadata" as const)
-      : ("regenerate-title" as const),
+    kind,
     recordingId,
-    requestedAt: new Date().toISOString(),
+    requestedAt,
     currentTitle: currentTitle ?? "",
     currentDescription: currentDescription ?? "",
     transcriptStatus,
@@ -117,11 +108,20 @@ export async function queueTitleRegenerationRequest({
     agentsContext,
     includeFullVideoInAi: useVideo,
     includeSummary,
-    message: withFullVideoAiInstructions(baseMessage, recordingId, useVideo),
+    message: withAiRequestStatusInstructions({
+      message: withFullVideoAiInstructions(baseMessage, recordingId, useVideo),
+      recordingId,
+      kind,
+      requestedAt,
+    }),
   };
 
-  await writeAppState(`clips-ai-request-${recordingId}`, request as any);
-  await writeAppState("refresh-signal", { ts: Date.now() });
+  await queueAiRequest({
+    recordingId,
+    kind,
+    requestedAt,
+    request,
+  });
   return request;
 }
 
@@ -173,10 +173,8 @@ export default defineAction({
 
     const includeFullVideoInAi = await readIncludeFullVideoInAi();
 
-    // Full-video mode needs the agent to watch the clip; skip the transcript-
-    // only text-model fast path so we don't generate titles from audio alone.
     if (includeFullVideoInAi) {
-      await queueTitleRegenerationRequest({
+      const queuedRequest = await queueTitleRegenerationRequest({
         recordingId: args.recordingId,
         currentTitle: rec.title,
         currentDescription: rec.description,
@@ -192,6 +190,8 @@ export default defineAction({
       );
       return {
         queued: true,
+        kind: queuedRequest.kind,
+        requestedAt: queuedRequest.requestedAt,
         recordingId: args.recordingId,
         includeFullVideoInAi: true,
       };
@@ -328,14 +328,12 @@ export default defineAction({
           .update(schema.recordings)
           .set({
             title: fallbackTitle,
-            // This is an immediate heuristic while the agent prepares the
-            // real transcript-backed title. Keep it replaceable.
             titleSource: "context",
             updatedAt: new Date().toISOString(),
           })
           .where(eq(schema.recordings.id, args.recordingId));
         await writeAppState("refresh-signal", { ts: Date.now() });
-        await queueTitleRegenerationRequest({
+        const queuedRequest = await queueTitleRegenerationRequest({
           recordingId: args.recordingId,
           currentTitle: fallbackTitle,
           currentDescription: rec.description,
@@ -353,6 +351,8 @@ export default defineAction({
         return {
           updated: true,
           queued: true,
+          kind: queuedRequest.kind,
+          requestedAt: queuedRequest.requestedAt,
           recordingId: args.recordingId,
           title: fallbackTitle,
           provider: "local",
@@ -370,7 +370,7 @@ export default defineAction({
       };
     }
 
-    await queueTitleRegenerationRequest({
+    const queuedRequest = await queueTitleRegenerationRequest({
       recordingId: args.recordingId,
       currentTitle: rec.title,
       currentDescription: rec.description,
@@ -385,6 +385,8 @@ export default defineAction({
     console.log(`Delegation queued: regenerate-title for ${args.recordingId}`);
     return {
       queued: true,
+      kind: queuedRequest.kind,
+      requestedAt: queuedRequest.requestedAt,
       recordingId: args.recordingId,
     };
   },

@@ -10,12 +10,14 @@ import {
   setResponseStatus,
 } from "h3";
 
+import { normalizeDashboardConfig } from "../../../shared/dashboard-config-normalization";
 import { ANALYTICS_DASHBOARD_AGENT_RESOURCE_KIND } from "../../../shared/resource-agent-access.js";
 import { getDb, schema } from "../../db/index.js";
 import {
   buildDashboardAgentContext,
   buildDashboardSeedAgentContext,
 } from "../../lib/agent-readable-resource-context.js";
+import { repairKnownFirstPartyDashboardQueries } from "../../lib/canonical-first-party-dashboard-repair.js";
 import { loadDashboardSeed } from "../../lib/dashboard-seeds.js";
 import type { DashboardRecord } from "../../lib/dashboards-store.js";
 
@@ -41,15 +43,17 @@ function parseJsonObject(value: unknown): Record<string, unknown> {
 }
 
 function rowToDashboard(row: any): DashboardRecord {
+  const config = parseJsonObject(row.config);
   return {
     id: row.id,
     kind: row.kind,
     title: row.title,
-    config: parseJsonObject(row.config),
+    config: row.kind === "sql" ? normalizeDashboardConfig(config) : config,
     ownerEmail: row.ownerEmail,
     orgId: row.orgId ?? null,
     visibility: row.visibility,
     createdAt: row.createdAt,
+    createdBy: row.createdBy ?? null,
     updatedAt: row.updatedAt,
     updatedBy: row.updatedBy ?? null,
     archivedAt: row.archivedAt ?? null,
@@ -91,7 +95,8 @@ export default defineEventHandler(async (event) => {
       setResponseStatus(event, 403);
       return { error: "Invalid or expired agent access token" };
     }
-    return buildDashboardSeedAgentContext(id, seed, { includeConfig: true });
+    const config = repairKnownFirstPartyDashboardQueries(id, seed).config;
+    return buildDashboardSeedAgentContext(id, config, { includeConfig: true });
   }
 
   if (!row) {
@@ -104,7 +109,13 @@ export default defineEventHandler(async (event) => {
     return { error: "Invalid or expired agent access token" };
   }
 
-  return buildDashboardAgentContext(rowToDashboard(row), {
-    includeConfig: true,
-  });
+  const dashboard = rowToDashboard(row);
+  return buildDashboardAgentContext(
+    {
+      ...dashboard,
+      config: repairKnownFirstPartyDashboardQueries(id, dashboard.config)
+        .config,
+    },
+    { includeConfig: true },
+  );
 });

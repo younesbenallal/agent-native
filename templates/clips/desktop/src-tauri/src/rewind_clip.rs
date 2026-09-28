@@ -95,9 +95,6 @@ pub(crate) fn rewind_clip_status(
     })
 }
 
-/// Perform every potentially slow operation before the numeric countdown.
-/// The resulting secondary writer shares Rewind's physical producer but is
-/// still closed to samples until `rewind_clip_start` activates it at zero.
 #[tauri::command]
 pub(crate) fn rewind_clip_prepare(
     app: AppHandle,
@@ -119,6 +116,7 @@ pub(crate) fn rewind_clip_prepare(
     if state.0.lock().map_err(|error| error.to_string())?.is_some() {
         return Err("a Rewind-derived clip is already prepared or active".into());
     }
+    native_screen::reset_native_upload_completion_state();
     let temporary_audio = if include_mic || include_system_audio {
         screen_memory::acquire_temporary_audio_consumer(
             &app,
@@ -135,6 +133,8 @@ pub(crate) fn rewind_clip_prepare(
     }
     let sources = screen_memory::rewind_clip_sources(&app);
     let output = artifact_path(&app, &artifact_label)?;
+    #[cfg(target_os = "macos")]
+    let recovery_intent = (server_url.clone(), recording_id.clone());
     #[cfg(target_os = "macos")]
     let shared_sink = match screen_memory::prepare_shared_clip_sink(
         &app,
@@ -168,6 +168,30 @@ pub(crate) fn rewind_clip_prepare(
         release_temporary_audio(&app, temporary_audio);
         return Err(not_compatible("shared Rewind Clip sinks require macOS"));
     }
+    #[cfg(target_os = "macos")]
+    if let (Some(server_url), Some(recording_id)) = recovery_intent {
+        if !server_url.trim().is_empty() && !recording_id.trim().is_empty() {
+            let (width, height) = shared_sink.dimensions();
+            if let Err(error) = native_screen::persist_recording_intent(
+                shared_sink.path(),
+                &recording_id,
+                &server_url,
+                native_screen::MP4_RECORDING_MIME_TYPE,
+                Some(width),
+                Some(height),
+                include_mic || include_system_audio,
+                include_mic,
+                include_system_audio,
+                has_camera,
+                true,
+                crate::config::feature_config(&app).voice_cleanup_enabled && include_mic,
+            ) {
+                shared_sink.cancel();
+                release_temporary_audio(&app, temporary_audio);
+                return Err(error);
+            }
+        }
+    }
     let response_sources = sources.clone();
     let mut active = state.0.lock().map_err(|error| error.to_string())?;
     if active.is_some() {
@@ -200,8 +224,6 @@ pub(crate) fn rewind_clip_prepare(
     })
 }
 
-/// Countdown zero/Enter boundary. Preparation has already installed the Clip
-/// writer, so this path performs only in-memory graph and callback admission.
 #[tauri::command]
 pub(crate) fn rewind_clip_start(
     app: AppHandle,
@@ -643,9 +665,6 @@ fn select_audio(
     })
 }
 
-/// Materialize an explicit recent range as one exact local MP4. This powers
-/// “Save what just happened” without copying whole five-minute container
-/// segments (which could otherwise retain media from before the chosen range).
 pub(crate) fn materialize_recent_exact(
     app: &AppHandle,
     duration: std::time::Duration,
@@ -708,9 +727,6 @@ fn materialize_wall_clock_exact(
     match materialize() {
         Ok(artifact) => Ok(artifact),
         Err(initial_error) => {
-            // A request ending near “now” may overlap the still-open segment.
-            // Fence once and retry. Older retained ranges never depend on the
-            // current capture graph, so they survive app restarts and pauses.
             if Utc::now().signed_duration_since(ended).num_minutes() <= 6
                 && screen_memory::fence_active_for_clip(app).is_ok()
             {
@@ -1013,6 +1029,7 @@ fn materialize(
     label: &str,
     include_mic: bool,
     include_system_audio: bool,
+    recovery: Option<(&str, &str, bool)>,
 ) -> Result<FinalizedNativeArtifact, String> {
     let active = take_active(state)?;
     let mut intervals = active.intervals.clone();
@@ -1087,10 +1104,26 @@ fn materialize(
         }
         let output = artifact_path(app, label)?;
         let audio = select_audio(&active.sources, include_mic, include_system_audio)?;
-        native_screen::materialize_mp4_slices_exact(&slices, &output, audio)?;
         let first = first_segment
             .as_ref()
             .ok_or_else(|| "no Rewind media selected".to_string())?;
+        if let Some((server_url, recording_id, has_camera)) = recovery {
+            native_screen::persist_recording_intent(
+                &output,
+                recording_id,
+                server_url,
+                native_screen::MP4_RECORDING_MIME_TYPE,
+                first.width,
+                first.height,
+                include_mic || include_system_audio,
+                include_mic,
+                include_system_audio,
+                has_camera,
+                true,
+                false,
+            )?;
+        }
+        native_screen::materialize_mp4_slices_exact(&slices, &output, audio)?;
         Ok(FinalizedNativeArtifact::rewind_mp4(
             output,
             duration_ms,
@@ -1174,11 +1207,12 @@ pub(crate) async fn rewind_clip_stop_and_upload(
                         &server_url,
                         &recording_id,
                         logical_duration_ms as u128,
-                        sink_width,
-                        sink_height,
+                        Some(sink_width),
+                        Some(sink_height),
                         include_mic,
                         include_system_audio,
                         has_camera,
+                        crate::config::feature_config(&app).voice_cleanup_enabled && include_mic,
                         Some(&error),
                     )
                     .err();
@@ -1205,11 +1239,12 @@ pub(crate) async fn rewind_clip_stop_and_upload(
                 &server_url,
                 &recording_id,
                 result.duration_ms as u128,
-                result.width,
-                result.height,
+                Some(result.width),
+                Some(result.height),
                 include_mic,
                 include_system_audio,
                 has_camera,
+                crate::config::feature_config(&app).voice_cleanup_enabled && include_mic,
                 None,
             ) {
                 sink.cancel_upload();
@@ -1232,11 +1267,12 @@ pub(crate) async fn rewind_clip_stop_and_upload(
                         &server_url,
                         &recording_id,
                         result.duration_ms as u128,
-                        result.width,
-                        result.height,
+                        Some(result.width),
+                        Some(result.height),
                         include_mic,
                         include_system_audio,
                         has_camera,
+                        crate::config::feature_config(&app).voice_cleanup_enabled && include_mic,
                         Some(&error),
                     );
                     native_screen::emit_native_upload_finished(
@@ -1289,19 +1325,64 @@ pub(crate) async fn rewind_clip_stop_and_upload(
         &recording_id,
         include_mic,
         include_system_audio,
+        Some((&server_url, &recording_id, has_camera)),
     )?;
-    native_screen::upload_finalized_native_artifact(
+    native_screen::persist_shared_clip_recording(
+        &app,
+        &artifact.path,
+        &server_url,
+        &recording_id,
+        artifact.duration_ms,
+        artifact.width,
+        artifact.height,
+        include_mic,
+        include_system_audio,
+        has_camera,
+        artifact.audio_cleanup_applied,
+        None,
+    )?;
+    let recovery_server_url = server_url.clone();
+    let recovery_recording_id = recording_id.clone();
+    let artifact_path = artifact.path.clone();
+    let result = native_screen::upload_finalized_native_artifact(
         &app,
         &artifact,
         server_url,
-        recording_id,
+        recording_id.clone(),
         auth_token.unwrap_or_default(),
         cookie.unwrap_or_default(),
         NativeUploadMode::from_option(upload_mode),
         include_mic || include_system_audio,
         has_camera,
     )
-    .await
+    .await;
+    match &result {
+        Ok(upload) if !upload.verification_pending => {
+            native_screen::clear_shared_clip_recording(
+                &app,
+                &recovery_recording_id,
+                &artifact_path,
+            );
+        }
+        Err(error) => {
+            let _ = native_screen::persist_shared_clip_recording(
+                &app,
+                &artifact_path,
+                &recovery_server_url,
+                &recovery_recording_id,
+                artifact.duration_ms,
+                artifact.width,
+                artifact.height,
+                include_mic,
+                include_system_audio,
+                has_camera,
+                artifact.audio_cleanup_applied,
+                Some(error),
+            );
+        }
+        _ => {}
+    }
+    result
 }
 
 #[tauri::command]
@@ -1365,6 +1446,7 @@ pub(crate) async fn rewind_clip_stop_and_save(
         &folder_name,
         include_mic,
         include_system_audio,
+        None,
     )?;
     native_screen::save_finalized_native_artifact_to_local_export(
         &app,
@@ -1398,9 +1480,6 @@ pub(crate) fn rewind_clip_cancel(
     Ok(())
 }
 
-/// Called by Screen Memory whenever a segment becomes finalized. Keeping this
-/// hook in the consumer module prevents rotation/pruning from racing a clip
-/// whose materialization has not happened yet.
 pub(crate) fn pin_finalized_segment_if_active(
     app: &AppHandle,
     segment: &ScreenMemorySegmentMetadata,

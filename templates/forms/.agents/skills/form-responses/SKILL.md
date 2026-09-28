@@ -80,13 +80,14 @@ Each response is stored in the `responses` SQL table:
 `submitterEmail` may come from the logged-in Forms session or from trusted
 feedback clients that pass the logged-in user email as submission metadata.
 
-`pageUrl` and `clientSurface` are hidden pass-through fields: trusted embeds
-(e.g. the framework FeedbackButton) forward the URL of the page the respondent
-was on and the runtime shell they were in (`web`, `electron`, or `tauri`) as
-submission metadata, so owners can see which screen and which app feedback came
-from. Both are null for direct fills that send no context, and `clientSurface`
-is allowlisted server-side (unknown values are dropped). The responses table
-surfaces them as "Page" and "Source" columns when any response carries them.
+`pageUrl` and `clientSurface` are hidden pass-through fields. Direct public
+fills record the current form URL, while trusted embeds (e.g. the framework
+FeedbackButton) forward the respondent's source page and runtime shell (`web`,
+`electron`, or `tauri`) so owners can see which screen and app feedback came
+from. Sensitive URL query keys are scrubbed before persistence, `clientSurface`
+is allowlisted server-side (unknown values are dropped), and anonymous forms
+suppress both fields. The responses table surfaces them as "Page" and "Source"
+columns when any response carries them.
 
 The `data` JSON maps field IDs to values:
 
@@ -108,6 +109,11 @@ To analyze responses, the workflow is:
 3. `response-insights --formId <id>` for counts, daily submissions, and table data
 4. Use `list-responses --formId <id>` only when exact row-level inspection is needed
 5. Report whether the answer is exact or sampled, including row counts and truncation
+
+For an actionable theme, ground one concise title and evidence line in the
+`response-insights` result, then call `show-response-insight` with a specific
+follow-up prompt. Its button only prefills the Forms chat; it does not submit or
+change the form.
 
 ## Common Tasks
 

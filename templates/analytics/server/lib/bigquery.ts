@@ -1,13 +1,17 @@
 import { createHash } from "crypto";
 
 import { getDbExec } from "@agent-native/core/db";
+import { getRequestRunContext } from "@agent-native/core/server";
 
+import { DASHBOARD_SQL_VALIDATION_TIMEOUT_MS } from "../../shared/dashboard-report-timeouts.js";
 import { resolveCredential } from "./credentials";
 import {
+  credentialCacheScope,
   requireRequestCredentialContext,
   type CredentialContext,
 } from "./credentials-context";
 import { getAccessToken } from "./gcloud";
+import { assertReadOnlySql } from "./read-only-sql";
 
 async function getProjectContext(): Promise<{
   projectId: string;
@@ -19,7 +23,7 @@ async function getProjectContext(): Promise<{
   if (!projectId) throw new Error("BIGQUERY_PROJECT_ID not configured");
   return {
     projectId,
-    cacheScope: cacheScopeForContext(ctx),
+    cacheScope: credentialCacheScope("BIGQUERY_PROJECT_ID", ctx),
     ctx,
   };
 }
@@ -40,10 +44,6 @@ async function getProjectInfo(): Promise<{
     cacheScope,
     appEventsTable: await getAppEventsTable(projectId, ctx),
   };
-}
-
-function cacheScopeForContext(ctx: CredentialContext): string {
-  return ctx.orgId ? `o:${ctx.orgId}` : `u:${ctx.userEmail}`;
 }
 
 export interface BigQueryTableRef {
@@ -94,9 +94,6 @@ export async function getAppEventsTable(
   return parseBigQueryTableRef(configured, fallbackProjectId);
 }
 
-/**
- * Resolve @app_events placeholder to the fully-qualified table name.
- */
 async function resolveTablePlaceholder(
   sql: string,
   projectId?: string,
@@ -126,13 +123,6 @@ async function resolveTablePlaceholder(
     .replace(/\b@project\./g, `${projectId}.`);
 }
 
-// --- Query cache ---
-//
-// Two tiers:
-//   L1: per-process Map (fast hits within a single invocation)
-//   L2: SQL-backed `bigquery_cache` table (shared across serverless invocations
-//       and deployments). Global scope — BigQuery results are not user-specific.
-
 interface L1Entry {
   result: QueryResult;
   createdAt: number;
@@ -154,6 +144,11 @@ function getCacheKey(
   return createHash("sha256")
     .update(`${cacheScope}\n${projectId}\n${sql}`)
     .digest("hex");
+}
+
+function addUtcDateCacheKey(sql: string): string {
+  if (!/\bCURRENT_DATE\s*(?:\(\s*\))?/i.test(sql)) return sql;
+  return `${sql}\n/* agent-native-utc-date:${new Date().toISOString().slice(0, 10)} */`;
 }
 
 function getL1(key: string): QueryResult | null {
@@ -179,7 +174,7 @@ async function getL2(key: string): Promise<QueryResult | null> {
     const db = getDbExec();
     const nowIso = new Date().toISOString();
     const { rows } = await db.execute({
-      sql: "SELECT result FROM bigquery_cache WHERE key = ? AND expires_at > ?",
+      sql: "SELECT result FROM bigquery_cache WHERE key = $1 AND expires_at > $2",
       args: [key, nowIso],
     });
     if (!rows.length) return null;
@@ -201,13 +196,8 @@ async function setL2(
     const now = new Date();
     const expiresAt = new Date(now.getTime() + CACHE_TTL_MS);
     const serialized = JSON.stringify(result);
-    // Upsert — use delete+insert to stay dialect-agnostic (SQLite/Postgres).
     await db.execute({
-      sql: "DELETE FROM bigquery_cache WHERE key = ?",
-      args: [key],
-    });
-    await db.execute({
-      sql: "INSERT INTO bigquery_cache (key, sql, result, bytes_processed, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+      sql: "INSERT INTO bigquery_cache (key, sql, result, bytes_processed, created_at, expires_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (key) DO UPDATE SET sql = EXCLUDED.sql, result = EXCLUDED.result, bytes_processed = EXCLUDED.bytes_processed, created_at = EXCLUDED.created_at, expires_at = EXCLUDED.expires_at",
       args: [
         key,
         sql,
@@ -217,12 +207,9 @@ async function setL2(
         expiresAt.toISOString(),
       ],
     });
-    // Opportunistically prune expired rows so the cache table doesn't grow
-    // unbounded — the explorer accepts arbitrary SQL so the keyspace is huge.
-    // Run ~1% of the time to avoid thrashing on every write.
     if (Math.random() < 0.01) {
       await db.execute({
-        sql: "DELETE FROM bigquery_cache WHERE expires_at <= ?",
+        sql: "DELETE FROM bigquery_cache WHERE expires_at <= $1",
         args: [now.toISOString()],
       });
     }
@@ -231,24 +218,16 @@ async function setL2(
   }
 }
 
-// --- Query execution ---
-
 export interface QueryResult {
   rows: Record<string, unknown>[];
   totalRows: number;
   schema: { name: string; type: string }[];
   bytesProcessed: number;
   cached?: boolean;
-  /** True when BigQuery matched more rows than this first page returned. */
   truncated?: boolean;
 }
 
 export interface RunQueryOptions {
-  /**
-   * The current agent run's abort signal. This cancels in-flight BigQuery
-   * requests and, importantly, stops the one-second job polling wait without
-   * starting another request after the parent run has ended.
-   */
   signal?: AbortSignal;
 }
 
@@ -327,16 +306,6 @@ async function cancelQueryJob(
   }
 }
 
-/**
- * Convert BigQuery REST API row format to plain objects.
- * BigQuery returns rows as { f: [{ v: value }, ...] } arrays
- * mapped to the schema fields.
- *
- * The REST API serializes every value as a string (even numeric types
- * — FLOAT64 comes back as Java-style "6.925207756232687E-4"). Coerce
- * numeric and boolean columns to real JS types using the schema so
- * downstream formatters and charts can work with them.
- */
 const NUMERIC_BQ_TYPES = new Set([
   "INTEGER",
   "INT64",
@@ -373,17 +342,17 @@ function rowsToObjects(
   });
 }
 
-/**
- * Validate a BigQuery SQL statement without executing it. Uses BigQuery's
- * `dryRun` flag, which is free (no bytes billed) and returns query-compilation
- * errors — unknown columns, type mismatches, missing tables — in the same
- * format as a real run. Use this before persisting agent-generated SQL so
- * the agent gets immediate feedback instead of saving a broken dashboard.
- *
- * Returns `null` when the query is valid; otherwise returns a short error
- * string suitable for bubbling back to the agent.
- */
-export async function dryRunQuery(sql: string): Promise<string | null> {
+export interface DryRunQueryOptions {
+  signal?: AbortSignal;
+}
+
+export async function dryRunQuery(
+  sql: string,
+  options: DryRunQueryOptions = {},
+): Promise<string | null> {
+  if (options.signal?.aborted) {
+    throw new Error("BigQuery validation was cancelled before it started");
+  }
   const { projectId, appEventsTable } = await getProjectInfo();
   const resolvedSql = await resolveTablePlaceholder(
     sql,
@@ -394,39 +363,64 @@ export async function dryRunQuery(sql: string): Promise<string | null> {
   const token = await getAccessToken();
   const url = `https://bigquery.googleapis.com/bigquery/v2/projects/${projectId}/jobs`;
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      configuration: {
-        dryRun: true,
-        query: { query: resolvedSql, useLegacySql: false },
-      },
-    }),
-  });
-
-  if (res.ok) return null;
-
-  const text = await res.text();
+  const controller = new AbortController();
+  const abortFromCaller = () => controller.abort();
+  options.signal?.addEventListener("abort", abortFromCaller, { once: true });
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutMessage = `BigQuery validation timed out after ${Math.round(DASHBOARD_SQL_VALIDATION_TIMEOUT_MS / 1000)} seconds`;
   try {
-    const parsed = JSON.parse(text) as {
-      error?: { message?: string };
-    };
-    const msg = parsed.error?.message?.trim();
-    if (msg) return msg;
-  } catch {
-    // Fall through
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+        reject(new Error(timeoutMessage));
+      }, DASHBOARD_SQL_VALIDATION_TIMEOUT_MS);
+    });
+    const request = fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        configuration: {
+          dryRun: true,
+          query: { query: resolvedSql, useLegacySql: false },
+        },
+      }),
+      signal: controller.signal,
+    });
+    const res = await Promise.race([request, timeout]);
+
+    if (res.ok) return null;
+
+    const text = await res.text();
+    try {
+      const parsed = JSON.parse(text) as {
+        error?: { message?: string };
+      };
+      const msg = parsed.error?.message?.trim();
+      if (msg) return msg;
+      // coercion-ok: malformed BigQuery error bodies use the status fallback below.
+    } catch {
+      // Fall through
+    }
+    return `BigQuery validation failed (${res.status})`;
+  } catch (error) {
+    if (timedOut) return timeoutMessage;
+    throw error;
+  } finally {
+    options.signal?.removeEventListener("abort", abortFromCaller);
+    if (timer !== undefined) clearTimeout(timer);
   }
-  return `BigQuery validation failed (${res.status})`;
 }
 
 export async function runQuery(
   sql: string,
   options: RunQueryOptions = {},
 ): Promise<QueryResult> {
+  assertReadOnlySql(sql, "bigquery");
   const { signal } = options;
   throwIfAborted(signal);
   const { projectId, cacheScope, appEventsTable } = await getProjectInfo();
@@ -435,8 +429,9 @@ export async function runQuery(
     projectId,
     appEventsTable,
   );
+  const cacheableSql = addUtcDateCacheKey(resolvedSql);
 
-  const cacheKey = getCacheKey(resolvedSql, projectId, cacheScope);
+  const cacheKey = getCacheKey(cacheableSql, projectId, cacheScope);
   const l1Hit = getL1(cacheKey);
   if (l1Hit) {
     return { ...l1Hit, cached: true };
@@ -459,7 +454,7 @@ export async function runQuery(
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      query: resolvedSql,
+      query: cacheableSql,
       useLegacySql: false,
       maximumBytesBilled: "750000000000", // 750GB cap
     }),
@@ -472,7 +467,6 @@ export async function runQuery(
 
   let data = (await res.json()) as BigQueryQueryResponse;
 
-  // If the job isn't complete, poll until it is
   if (!data.jobComplete && data.jobReference?.jobId) {
     const jobId = data.jobReference.jobId;
     const resultsUrl = `https://bigquery.googleapis.com/bigquery/v2/projects/${projectId}/queries/${jobId}`;
@@ -518,8 +512,6 @@ export async function runQuery(
   const rows = data.rows ? rowsToObjects(data.rows, fields) : [];
   const bytesProcessed = parseInt(data.totalBytesProcessed || "0", 10);
 
-  // BigQuery reports the full match count; `rows` only holds the first page. Reporting
-  // rows.length as the total made every partial result look complete to the agent.
   const reportedTotal = Number.parseInt(data.totalRows || "", 10);
   const totalRows = Number.isFinite(reportedTotal)
     ? reportedTotal
@@ -534,7 +526,10 @@ export async function runQuery(
   };
 
   setL1(cacheKey, result);
-  await setL2(cacheKey, resolvedSql, result);
+  const l2Persistence = setL2(cacheKey, cacheableSql, result);
+  const waitUntil = getRequestRunContext()?.waitUntil;
+  if (waitUntil) waitUntil(l2Persistence);
+  else await l2Persistence;
 
   return result;
 }

@@ -24,6 +24,8 @@ import {
 import {
   IconArrowLeft,
   IconCode,
+  IconEye,
+  IconMinus,
   IconPlus,
   IconSearch,
   IconTrash,
@@ -36,9 +38,10 @@ import { toast } from "sonner";
 import { Input } from "@/components/ui/input";
 import {
   Popover,
-  PopoverContent,
+  PopoverAnchor,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { Slider } from "@/components/ui/slider";
 import {
   Tooltip,
   TooltipContent,
@@ -47,6 +50,15 @@ import {
 import { sendToDesignAgentChat } from "@/lib/agent-chat";
 import { cn } from "@/lib/utils";
 
+import { SectionIconButton } from "../edit-panel/inspector-controls";
+import {
+  InspectorGridCell,
+  InspectorPaintRow,
+} from "../edit-panel/inspector-grid";
+import {
+  InspectorControlField,
+  InspectorControlPopoverContent,
+} from "./InspectorControlPopover";
 import { ScrubInput, type ScrubInputChangeMeta } from "./ScrubInput";
 
 // ─── Cross-pipeline write-race guard ──────────────────────────────────────────
@@ -85,18 +97,10 @@ import { ScrubInput, type ScrubInputChangeMeta } from "./ScrubInput";
  */
 const shaderWriteLocks = new Map<string, Promise<void>>();
 
-/** True while a shader persist for this file id has not yet settled. */
 export function isShaderWriteInFlight(fileId: string | undefined): boolean {
   return !!fileId && shaderWriteLocks.has(fileId);
 }
 
-/**
- * Resolves once every shader persist registered for this file id (at the time
- * of the call) has settled. Callers that are about to perform their own
- * competing full-document content write for the same file should await this
- * first so their write is always computed from — and lands after — the
- * shader's already-settled result, instead of racing it.
- */
 export async function waitForShaderWriteToSettle(
   fileId: string | undefined,
 ): Promise<void> {
@@ -105,14 +109,6 @@ export async function waitForShaderWriteToSettle(
   if (pending) await pending.catch(() => {});
 }
 
-/**
- * Registers `fn` as the in-flight shader write for `fileId` until it settles,
- * chaining behind any already-registered write for the same file so two
- * shader operations on one file stay ordered too. Mirrors the identity-guard
- * pattern DesignEditor.tsx's fileSaveChainsRef already uses for update-file
- * saves: only clear the registry entry if nothing newer replaced it while
- * this one was running.
- */
 function withShaderWriteLock<T>(
   fileId: string,
   fn: () => Promise<T>,
@@ -132,29 +128,14 @@ function withShaderWriteLock<T>(
   return run;
 }
 
-// ─── Context contract ─────────────────────────────────────────────────────────
-
 export interface GlslShaderPanelContext {
   designId?: string;
   fileId?: string;
-  /** Stable data-agent-native-node-id of the target element. */
   nodeId?: string;
   selector?: string;
-  /**
-   * Called after a persisted apply with the patched file content so the host
-   * editor can sync local/collab state (same contract as component prop
-   * edits' onComponentPropApplied).
-   */
   onApplied?: (fileId: string, content: string, updatedAt?: string) => void;
-  /**
-   * Optional: focus the Code panel on this screen's source so the user can
-   * edit the GLSL directly. When absent the Edit-code affordance still
-   * explains where the source lives.
-   */
   onEditCode?: (shaderId: string) => void;
 }
-
-// ─── Screen-source plumbing ───────────────────────────────────────────────────
 
 interface SourceFileResult {
   fileId?: string;
@@ -163,7 +144,6 @@ interface SourceFileResult {
   versionHash?: string;
 }
 
-/** Broadcast a bridge message to every screen iframe (runtime filters by target). */
 export function broadcastShaderMessage(message: Record<string, unknown>): void {
   if (typeof document === "undefined") return;
   const frames = document.querySelectorAll<HTMLIFrameElement>("iframe");
@@ -176,10 +156,6 @@ export function broadcastShaderMessage(message: Record<string, unknown>): void {
   });
 }
 
-/**
- * Read the target screen's saved shaders + element mounts. Co-located data
- * hook for the shader picker and the effects rows.
- */
 export function useScreenGlslShaders(context: GlslShaderPanelContext) {
   const enabled = Boolean(context.designId && context.fileId);
   const query = useActionQuery<SourceFileResult>(
@@ -193,10 +169,6 @@ export function useScreenGlslShaders(context: GlslShaderPanelContext) {
   return { ...query, enabled, content, shaders, mounts };
 }
 
-/**
- * One persisted shader write: fresh read → pure HTML transform → guarded
- * full-replace write → host sync + iframe rescan.
- */
 export function usePersistShaderEdit(context: GlslShaderPanelContext) {
   const t = useT();
   const applyEdit = useActionMutation("apply-source-edit");
@@ -213,18 +185,7 @@ export function usePersistShaderEdit(context: GlslShaderPanelContext) {
     const designId = context.designId;
     setBusy(true);
     try {
-      // Serialize against any other in-flight shader write for this file, AND
-      // register this operation in the shared registry so DesignEditor.tsx's
-      // commitVisualStyles (Add layer / Remove layer / any other base style
-      // commit) can await waitForShaderWriteToSettle(fileId) before doing its
-      // own competing full-document ydoc rewrite — see the module doc comment
-      // above for why an un-serialized race here corrupts the document.
       return await withShaderWriteLock(fileId, async () => {
-        // read-source-file is a read-only GET action (see useScreenGlslShaders'
-        // useActionQuery above and the code-workbench inline provider's
-        // readFile) — it must be called imperatively via callAction with
-        // method: "GET", never useActionMutation (which always POSTs and the
-        // server rejects with "Method not allowed. Use GET.").
         const source = await callAction<SourceFileResult>(
           "read-source-file",
           { designId, fileId },
@@ -269,8 +230,6 @@ export function usePersistShaderEdit(context: GlslShaderPanelContext) {
   return { persist, busy };
 }
 
-// ─── Small building blocks ────────────────────────────────────────────────────
-
 function normalizeHex(value: string): string {
   const hex = value.trim();
   if (/^#[0-9a-fA-F]{3}$/.test(hex)) {
@@ -291,19 +250,24 @@ function ColorKnob({
   label,
   value,
   disabled,
+  presentation = "compact",
   onChange,
 }: {
   label: string;
   value: string;
   disabled?: boolean;
+  presentation?: "compact" | "popover";
   onChange: (next: string, phase: "preview" | "commit") => void;
 }) {
   const hex = normalizeHex(value);
-  return (
-    <div className="flex h-6 items-center gap-1.5">
-      <span className="w-20 shrink-0 truncate !text-[11px] text-muted-foreground">
-        {label}
-      </span>
+  const roomy = presentation === "popover";
+  const control = (
+    <div
+      className={cn(
+        "flex min-w-0 items-center gap-2",
+        roomy && "h-6 rounded-md bg-[var(--design-editor-control-bg)] px-1.5",
+      )}
+    >
       <label
         className={cn(
           "relative size-4 shrink-0 cursor-pointer overflow-hidden rounded-[3px] border border-[var(--design-editor-control-border)]",
@@ -325,7 +289,10 @@ function ColorKnob({
         value={hex.toUpperCase()}
         disabled={disabled}
         aria-label={`${label} hex`}
-        className="h-6 min-w-0 flex-1 border-[var(--design-editor-control-border)] bg-[var(--design-editor-control-bg)] px-1.5 !text-[11px] uppercase shadow-none md:!text-[11px]"
+        className={cn(
+          "min-w-0 flex-1 border-[var(--design-editor-control-border)] bg-[var(--design-editor-control-bg)] px-1.5 uppercase shadow-none",
+          "h-6 !text-[11px] md:!text-[11px]",
+        )}
         onChange={(event) => {
           const next = event.target.value;
           if (
@@ -338,13 +305,21 @@ function ColorKnob({
       />
     </div>
   );
+  if (roomy) {
+    return (
+      <InspectorControlField label={label}>{control}</InspectorControlField>
+    );
+  }
+  return (
+    <div className="flex h-6 items-center gap-1.5">
+      <span className="w-20 shrink-0 truncate !text-[11px] text-muted-foreground">
+        {label}
+      </span>
+      {control}
+    </div>
+  );
 }
 
-/**
- * Localized preset-category labels. `shared/shader-presets.ts` only carries
- * the stable English `GLSL_SHADER_PRESET_CATEGORY_LABELS` (shared code, not
- * i18n-aware), so the picker maps category -> catalog key here instead.
- */
 function useShaderPresetCategoryLabel() {
   const t = useT();
   return (category: GlslShaderPresetCategory): string => {
@@ -406,25 +381,21 @@ function PresetThumb({
   );
 }
 
-// ─── Uniform knobs (shared by fill picker + effect rows) ─────────────────────
-
 export function GlslShaderKnobs({
   def,
   values,
   disabled,
+  presentation = "compact",
   onValuesChange,
 }: {
   def: GlslShaderDef;
   values: Record<string, GlslUniformValue>;
   disabled?: boolean;
-  /**
-   * phase "preview" = live scrub tick (cheap, broadcast-only);
-   * phase "commit" = gesture end (persist).
-   */
+  presentation?: "compact" | "popover";
   onValuesChange: (
     next: Record<string, GlslUniformValue>,
     changedName: string,
-    phase: "preview" | "commit",
+    phase: ScrubInputChangeMeta["phase"],
   ) => void;
 }) {
   const t = useT();
@@ -439,12 +410,15 @@ export function GlslShaderKnobs({
   const emit = (
     name: string,
     value: GlslUniformValue,
-    phase: "preview" | "commit",
+    phase: ScrubInputChangeMeta["phase"],
   ) => {
     onValuesChange({ ...values, [name]: value }, name, phase);
   };
+  const roomy = presentation === "popover";
   return (
-    <div className="space-y-1">
+    <div
+      className={cn(roomy ? "design-inspector-popover-stack" : "grid gap-1")}
+    >
       {entries.map(([name, u]) => {
         const label = u.label ?? name.replace(/^u_/, "").replace(/_/g, " ");
         const current = values[name] ?? u.value;
@@ -455,12 +429,54 @@ export function GlslShaderKnobs({
               label={label}
               value={typeof current === "string" ? current : "#808080"}
               disabled={disabled}
+              presentation={presentation}
               onChange={(next, phase) => emit(name, next, phase)}
             />
           );
         }
         if (u.type === "vec2") {
           const pair = Array.isArray(current) ? current : [0, 0];
+          if (roomy) {
+            const emitAxis = (
+              axis: 0 | 1,
+              value: number,
+              phase: ScrubInputChangeMeta["phase"],
+            ) => {
+              const next: [number, number] = [pair[0] ?? 0, pair[1] ?? 0];
+              next[axis] = value;
+              emit(name, next, phase);
+            };
+            return (
+              <InspectorControlField key={name} label={label}>
+                <div className="grid h-6 min-w-0 grid-cols-2 overflow-hidden rounded-md bg-[var(--design-editor-control-bg)]">
+                  {([0, 1] as const).map((axis) => (
+                    <label
+                      key={axis}
+                      className="flex min-w-0 items-center border-r border-border/60 last:border-r-0"
+                    >
+                      <span className="px-2 text-xs text-muted-foreground">
+                        {axis === 0 ? "X" : "Y"}
+                      </span>
+                      <Input
+                        type="number"
+                        value={Number(pair[axis]) || 0}
+                        disabled={disabled}
+                        aria-label={`${label} ${axis === 0 ? "X" : "Y"}`}
+                        step={0.01}
+                        className="h-6 min-w-0 border-0 bg-transparent px-1 !text-[11px] shadow-none focus-visible:ring-0"
+                        onChange={(event) =>
+                          emitAxis(axis, Number(event.target.value), "preview")
+                        }
+                        onBlur={(event) =>
+                          emitAxis(axis, Number(event.target.value), "commit")
+                        }
+                      />
+                    </label>
+                  ))}
+                </div>
+              </InspectorControlField>
+            );
+          }
           const emitAxis = (
             axis: 0 | 1,
             value: number,
@@ -500,11 +516,56 @@ export function GlslShaderKnobs({
             </div>
           );
         }
+        const numericValue =
+          typeof current === "number" ? current : Number(current) || 0;
+        if (roomy) {
+          const min = u.min ?? 0;
+          const max = u.max ?? Math.max(1, numericValue * 2);
+          const step = u.step ?? 0.01;
+          return (
+            <InspectorControlField key={name} label={label}>
+              <div className="design-inspector-popover-slider grid h-6 min-w-0 overflow-hidden rounded-md bg-[var(--design-editor-control-bg)]">
+                <div className="flex min-w-0 items-center px-2">
+                  <Slider
+                    value={[numericValue]}
+                    min={min}
+                    max={max}
+                    step={step}
+                    disabled={disabled}
+                    aria-label={label}
+                    onValueChange={([value]) =>
+                      emit(name, value ?? numericValue, "preview")
+                    }
+                    onValueCommit={([value]) =>
+                      emit(name, value ?? numericValue, "commit")
+                    }
+                  />
+                </div>
+                <Input
+                  type="number"
+                  value={numericValue}
+                  min={min}
+                  max={max}
+                  step={step}
+                  disabled={disabled}
+                  aria-label={`${label} value`}
+                  className="h-6 rounded-none border-0 border-l border-border/60 bg-transparent px-2 !text-[11px] shadow-none focus-visible:ring-0"
+                  onChange={(event) =>
+                    emit(name, Number(event.target.value), "preview")
+                  }
+                  onBlur={(event) =>
+                    emit(name, Number(event.target.value), "commit")
+                  }
+                />
+              </div>
+            </InspectorControlField>
+          );
+        }
         return (
           <ScrubInput
             key={name}
             label={label}
-            value={typeof current === "number" ? current : Number(current) || 0}
+            value={numericValue}
             min={u.min}
             max={u.max}
             step={u.step ?? 0.01}
@@ -520,17 +581,10 @@ export function GlslShaderKnobs({
   );
 }
 
-// ─── Main panel ───────────────────────────────────────────────────────────────
-
 export interface GlslShaderPanelProps {
   mode: GlslShaderMode;
   context: GlslShaderPanelContext;
-  /**
-   * Return to the previous picker view (fill picker) or close the popover.
-   * `hasShader` reports whether the target element has a persisted shader of
-   * this panel's mode — callers use it to decide whether to revert the paint
-   * type (never revert when a shader is actually applied).
-   */
+  presentation?: "compact" | "popover";
   onBack: (hasShader: boolean) => void;
   disabled?: boolean;
 }
@@ -540,13 +594,11 @@ export function GlslShaderPanel({
   context,
   onBack,
   disabled = false,
+  presentation = "compact",
 }: GlslShaderPanelProps) {
   const t = useT();
   const categoryLabel = useShaderPresetCategoryLabel();
   const [search, setSearch] = useState("");
-  // View state: detail view shows whenever the target node has a shader of
-  // this mode (or one was just applied) UNLESS the user explicitly backed
-  // out to browse for a replacement.
   const [browsing, setBrowsing] = useState(false);
   const [justAppliedId, setJustAppliedId] = useState<string | null>(null);
   const screen = useScreenGlslShaders(context);
@@ -557,8 +609,8 @@ export function GlslShaderPanel({
     mode === "effect"
       ? t("editPanel.shaders.effectsTitle")
       : t("editPanel.shaders.fillsTitle");
+  const roomy = presentation === "popover";
 
-  // The shader currently mounted on the target node (persisted state).
   const nodeMount = useMemo(
     () =>
       screen.mounts.find(
@@ -687,11 +739,10 @@ export function GlslShaderPanel({
   const handleValuesChange = (
     next: Record<string, GlslUniformValue>,
     changedName: string,
-    phase: "preview" | "commit",
+    phase: ScrubInputChangeMeta["phase"],
   ) => {
     if (!activeDef) return;
     setDraftValues(next);
-    // Live-update the mounted shader in whichever iframe hosts the node.
     broadcastShaderMessage({
       type: "glsl-shader-set-uniform",
       filter: { shaderId: activeDef.id, ...(nodeId ? { nodeId } : {}) },
@@ -712,71 +763,97 @@ export function GlslShaderPanel({
     }
   };
 
-  // ── Detail view — knobs for the applied shader ────────────────────────────
   if (activeDef) {
     return (
       <div className="flex flex-col">
-        <div className="flex h-6 items-center gap-1.5 px-3">
-          <button
-            type="button"
-            aria-label={t("editPanel.shaders.backToBrowser")}
-            onClick={() => {
-              setBrowsing(true);
-              setJustAppliedId(null);
-              setDraftValues(null);
-            }}
-            className="flex size-5 items-center justify-center rounded text-muted-foreground hover:bg-[var(--design-editor-control-bg)] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <IconArrowLeft className="size-3.5" />
-          </button>
-          <span className="flex-1 truncate !text-[11px] font-semibold text-foreground">
-            {activeDef.name}
-          </span>
-          {context.onEditCode ? (
+        {!roomy ? (
+          <div className="flex h-6 items-center gap-1.5 px-3">
+            <button
+              type="button"
+              aria-label={t("editPanel.shaders.backToBrowser")}
+              onClick={() => {
+                setBrowsing(true);
+                setJustAppliedId(null);
+                setDraftValues(null);
+              }}
+              className={cn(
+                "flex items-center justify-center rounded text-muted-foreground hover:bg-[var(--design-editor-control-bg)] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                roomy ? "size-7" : "size-5",
+              )}
+            >
+              <IconArrowLeft className="size-3.5" />
+            </button>
+            <span
+              className={cn(
+                "flex-1 truncate font-semibold text-foreground",
+                roomy ? "text-sm" : "!text-[11px]",
+              )}
+            >
+              {activeDef.name}
+            </span>
+            {context.onEditCode ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label={t("editPanel.shaders.editCode")}
+                    onClick={() => context.onEditCode?.(activeDef.id)}
+                    className={cn(
+                      "flex items-center justify-center rounded text-muted-foreground hover:bg-[var(--design-editor-control-bg)] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                      roomy ? "size-7" : "size-5",
+                    )}
+                  >
+                    <IconCode className="size-3.5" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {t("editPanel.shaders.editCode")}
+                </TooltipContent>
+              </Tooltip>
+            ) : null}
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
                   type="button"
-                  aria-label={t("editPanel.shaders.editCode")}
-                  onClick={() => context.onEditCode?.(activeDef.id)}
-                  className="flex size-5 items-center justify-center rounded text-muted-foreground hover:bg-[var(--design-editor-control-bg)] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  aria-label={t("editPanel.shaders.removeShader")}
+                  disabled={disabled || busy || !nodeMount}
+                  onClick={() => void removeFromNode()}
+                  className={cn(
+                    "flex items-center justify-center rounded text-muted-foreground hover:bg-[var(--design-editor-control-bg)] hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40",
+                    roomy ? "size-7" : "size-5",
+                  )}
                 >
-                  <IconCode className="size-3.5" />
+                  <IconTrash className="size-3" />
                 </button>
               </TooltipTrigger>
-              <TooltipContent>{t("editPanel.shaders.editCode")}</TooltipContent>
+              <TooltipContent>
+                {t("editPanel.shaders.removeShader")}
+              </TooltipContent>
             </Tooltip>
-          ) : null}
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                aria-label={t("editPanel.shaders.removeShader")}
-                disabled={disabled || busy || !nodeMount}
-                onClick={() => void removeFromNode()}
-                className="flex size-5 items-center justify-center rounded text-muted-foreground hover:bg-[var(--design-editor-control-bg)] hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40"
-              >
-                <IconTrash className="size-3" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent>
-              {t("editPanel.shaders.removeShader")}
-            </TooltipContent>
-          </Tooltip>
-          <button
-            type="button"
-            aria-label={t("editPanel.shaders.closePanel")}
-            onClick={() => onBack(Boolean(nodeMount))}
-            className="flex size-5 items-center justify-center rounded text-muted-foreground hover:bg-[var(--design-editor-control-bg)] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <IconX className="size-3" />
-          </button>
-        </div>
-        <div className="space-y-2 border-t border-border/70 p-2">
+            <button
+              type="button"
+              aria-label={t("editPanel.shaders.closePanel")}
+              onClick={() => onBack(Boolean(nodeMount))}
+              className={cn(
+                "flex items-center justify-center rounded text-muted-foreground hover:bg-[var(--design-editor-control-bg)] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                roomy ? "size-7" : "size-5",
+              )}
+            >
+              <IconX className="size-3" />
+            </button>
+          </div>
+        ) : null}
+        <div
+          className={cn(
+            "grid",
+            roomy ? "gap-2" : "gap-2 border-t border-border/70 p-2",
+          )}
+        >
           <GlslShaderKnobs
             def={activeDef}
             values={values}
             disabled={disabled || busy}
+            presentation={presentation}
             onValuesChange={handleValuesChange}
           />
           {!context.onEditCode ? (
@@ -789,26 +866,26 @@ export function GlslShaderPanel({
     );
   }
 
-  // ── Browse view ────────────────────────────────────────────────────────────
   return (
     <div className="flex flex-col">
-      {/* Header */}
-      <div className="flex h-6 items-center gap-1 px-3">
-        <span className="flex-1 truncate !text-[11px] font-semibold text-foreground">
-          {modeAttrTitle}
-        </span>
-        <button
-          type="button"
-          aria-label={t("editPanel.shaders.closePanel")}
-          onClick={() => onBack(Boolean(nodeMount))}
-          className="flex size-5 items-center justify-center rounded text-muted-foreground hover:bg-[var(--design-editor-control-bg)] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          <IconX className="size-3" />
-        </button>
-      </div>
+      {!roomy ? (
+        <div className="flex h-6 items-center gap-1 px-3">
+          <span className="design-sidebar-section-title flex-1 truncate text-foreground">
+            {modeAttrTitle}
+          </span>
+          <button
+            type="button"
+            aria-label={t("editPanel.shaders.closePanel")}
+            onClick={() => onBack(Boolean(nodeMount))}
+            className="flex size-5 items-center justify-center rounded text-muted-foreground hover:bg-[var(--design-editor-control-bg)] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <IconX className="size-3" />
+          </button>
+        </div>
+      ) : null}
 
       {/* Search */}
-      <div className="border-t border-border/70 px-3 py-2">
+      <div className={cn("px-3 py-2", !roomy && "border-t border-border/70")}>
         <div className="flex h-6 items-center gap-1.5 rounded-md border border-[var(--design-editor-control-border)] bg-[var(--design-editor-control-bg)] px-2">
           <IconSearch className="size-3 shrink-0 text-muted-foreground" />
           <Input
@@ -944,14 +1021,6 @@ export function GlslShaderPanel({
   );
 }
 
-// ─── Effects-section integration ─────────────────────────────────────────────
-
-/**
- * Shader rows + picker for EditPanel's Effects section. Rendered alongside
- * the shadow/blur rows; the "Add effect ▸ Shader" menu item controls
- * `pickerOpen`. One shader effect per element (it can coexist with a shader
- * fill — different attribute namespaces).
- */
 export function GlslShaderEffectSection({
   context,
   pickerOpen,
@@ -964,6 +1033,7 @@ export function GlslShaderEffectSection({
   disabled?: boolean;
 }) {
   const t = useT();
+  const [effectPopoverOpen, setEffectPopoverOpen] = useState(false);
   const screen = useScreenGlslShaders(context);
   const { persist, busy } = usePersistShaderEdit(context);
   const nodeId = context.nodeId;
@@ -987,6 +1057,7 @@ export function GlslShaderEffectSection({
 
   const removeEffect = () => {
     if (!nodeId) return;
+    setEffectPopoverOpen(false);
     void persist((html) => removeShaderFromNode(html, nodeId, "effect")).then(
       (ok) => {
         if (ok) void screen.refetch();
@@ -999,66 +1070,80 @@ export function GlslShaderEffectSection({
   return (
     <>
       {effectDef && effectMount ? (
-        /* design effect row: [name + knobs popover trigger (flex-1)] [remove] */
-        <Popover>
-          <div className="group flex items-center gap-1.5">
-            <PopoverTrigger asChild>
-              <button
-                type="button"
-                className="flex h-6 min-w-0 flex-1 items-center gap-1.5 rounded-md border border-[var(--design-editor-control-border)] bg-[var(--design-editor-control-bg)] px-1.5 text-left !text-[11px] hover:bg-[var(--design-editor-panel-raised-bg)]"
-              >
-                <IconWaveSine className="size-3.5 shrink-0 text-muted-foreground" />
-                <span className="min-w-0 flex-1 truncate font-medium text-foreground">
-                  {effectDef.name}
-                </span>
-                <span className="shrink-0 text-muted-foreground">
-                  {t("editPanel.labels.shaderEffectType")}
-                </span>
-              </button>
-            </PopoverTrigger>
-            <Tooltip>
-              <TooltipTrigger asChild>
+        <Popover open={effectPopoverOpen} onOpenChange={setEffectPopoverOpen}>
+          <InspectorPaintRow>
+            <InspectorGridCell span={20}>
+              <PopoverTrigger asChild>
                 <button
                   type="button"
-                  aria-label={t("editPanel.shaders.removeShaderEffect")}
-                  disabled={disabled || busy}
-                  onClick={removeEffect}
-                  className="flex size-5 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:text-destructive focus-visible:opacity-100 group-hover:opacity-100 disabled:pointer-events-none"
+                  className="flex h-6 w-full min-w-0 items-center gap-1.5 rounded-md border border-[var(--design-editor-control-border)] bg-[var(--design-editor-control-bg)] px-1.5 text-left !text-[11px] hover:bg-[var(--design-editor-panel-raised-bg)]"
                 >
-                  <IconTrash className="size-3" />
+                  <IconWaveSine className="size-3.5 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 flex-1 truncate font-medium text-foreground">
+                    {effectDef.name}
+                  </span>
                 </button>
-              </TooltipTrigger>
-              <TooltipContent>
-                {t("editPanel.shaders.removeShaderEffect")}
-              </TooltipContent>
-            </Tooltip>
-          </div>
-          <PopoverContent
-            side="left"
-            align="start"
-            sideOffset={8}
-            className="z-[10000] w-[252px] p-0 shadow-xl"
+              </PopoverTrigger>
+            </InspectorGridCell>
+            <InspectorGridCell span={4} className="flex justify-center">
+              <SectionIconButton
+                label={
+                  "Shader effects are always visible" /* i18n-ignore design shader state */
+                }
+                disabled
+                className="disabled:opacity-100"
+              >
+                <IconEye className="size-3.5" />
+              </SectionIconButton>
+            </InspectorGridCell>
+            <InspectorGridCell span={4} className="flex justify-center">
+              <SectionIconButton
+                label={t("editPanel.shaders.removeShaderEffect")}
+                disabled={disabled || busy}
+                onClick={removeEffect}
+              >
+                <IconMinus className="size-3.5" />
+              </SectionIconButton>
+            </InspectorGridCell>
+          </InspectorPaintRow>
+          <InspectorControlPopoverContent
+            title={effectDef.name}
+            icon={<IconWaveSine className="size-3.5" />}
+            onClose={() => setEffectPopoverOpen(false)}
           >
             <GlslShaderPanel
               mode="effect"
               context={context}
               disabled={disabled}
-              onBack={() => onPickerOpenChange(false)}
+              presentation="popover"
+              onBack={() => setEffectPopoverOpen(false)}
             />
-          </PopoverContent>
+          </InspectorControlPopoverContent>
         </Popover>
       ) : null}
 
       {pickerOpen && !effectMount ? (
-        /* Inline browse panel while choosing the first shader effect. */
-        <div className="rounded-md border border-[var(--design-editor-control-border)] bg-popover py-1.5">
-          <GlslShaderPanel
-            mode="effect"
-            context={context}
-            disabled={disabled}
-            onBack={() => onPickerOpenChange(false)}
-          />
-        </div>
+        <Popover open onOpenChange={onPickerOpenChange}>
+          <PopoverAnchor asChild>
+            <span className="block h-0 w-full" />
+          </PopoverAnchor>
+          {/* The menu handoff can move focus while the canvas reprojects. */}
+          <InspectorControlPopoverContent
+            title={t("editPanel.shaders.effectsTitle")}
+            icon={<IconWaveSine className="size-3.5" />}
+            onClose={() => onPickerOpenChange(false)}
+            onFocusOutside={(event) => event.preventDefault()}
+            bodyClassName="p-0"
+          >
+            <GlslShaderPanel
+              mode="effect"
+              context={context}
+              disabled={disabled}
+              presentation="popover"
+              onBack={() => onPickerOpenChange(false)}
+            />
+          </InspectorControlPopoverContent>
+        </Popover>
       ) : null}
     </>
   );

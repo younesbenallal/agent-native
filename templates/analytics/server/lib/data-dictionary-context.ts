@@ -1,14 +1,12 @@
 type DictionaryEntry = Record<string, unknown>;
 
 const MAX_INJECTED_ENTRIES = 40;
-// Per-field caps above bound a single entry to ~3-3.5K chars, so 40 entries
-// could still swell to ~130K chars riding every chat request even though the
-// entry count is capped. Bound the whole rendered block too, and truncate at
-// entry boundaries (never mid-entry) once it's hit.
 const MAX_DICTIONARY_CONTEXT_CHARS = 10_000;
 
 function compact(value: unknown, max = 240): string {
-  const text = String(value ?? "")
+  const text = (
+    typeof value === "string" ? value : (JSON.stringify(value) ?? "")
+  )
     .replace(/\s+/g, " ")
     .trim();
   if (text.length <= max) return text;
@@ -23,7 +21,14 @@ function boolValue(value: unknown): boolean {
 
 function sortByMetric(entries: DictionaryEntry[]): DictionaryEntry[] {
   return [...entries].sort((a, b) =>
-    String(a.metric ?? "").localeCompare(String(b.metric ?? "")),
+    (typeof a.metric === "string"
+      ? a.metric
+      : (JSON.stringify(a.metric) ?? "")
+    ).localeCompare(
+      typeof b.metric === "string"
+        ? b.metric
+        : (JSON.stringify(b.metric) ?? ""),
+    ),
   );
 }
 
@@ -50,6 +55,10 @@ function renderEntry(
 
   const table = compact(entry.table, 240);
   if (table) lines.push(`  - table: ${table}`);
+  const source = compact(entry.source, 240);
+  if (source) lines.push(`  - source: ${source}`);
+  const action = compact(entry.action, 160);
+  if (action) lines.push(`  - query action: ${action}`);
   const columns = compact(entry.columnsUsed, 360);
   if (columns) lines.push(`  - columns: ${columns}`);
   const cuts = compact(entry.cuts, 240);
@@ -103,22 +112,11 @@ function renderOmittedDictionaryEntries(omitted: number): string[] {
 }
 
 function renderedTextLength(lines: string[]): number {
-  // +1 per line approximates the join("\n") separators without materializing
-  // the joined string on every entry (entry counts are small, so this stays
-  // cheap even though it's O(n) per call).
   return lines.reduce((total, line) => total + line.length + 1, 0);
 }
 
 type TrustLabel = "approved/canonical" | "unreviewed/human" | "ai-suggestion";
 
-/**
- * Render one trust-tier group into `lines`, respecting both the per-tier
- * count budget already applied by `takeWithinBudget` and the shared total
- * character budget tracked in `state`. Entries are never split mid-render:
- * once adding the next whole entry would exceed the char budget, rendering
- * stops at that entry boundary and everything remaining (in this group and
- * any group processed after it) is counted as omitted.
- */
 function renderGroupWithinBudget(
   lines: string[],
   title: string,
@@ -148,9 +146,6 @@ function renderGroupWithinBudget(
       renderedTextLength(bodyLines) +
       renderedTextLength(entryLines);
 
-    // Always keep at least one entry across the whole dictionary render so a
-    // single oversized entry can't produce an empty block; every entry after
-    // that respects the char budget at its boundary.
     if (
       prospectiveTotal > MAX_DICTIONARY_CONTEXT_CHARS &&
       state.anyEntryRendered
@@ -172,16 +167,6 @@ function renderGroupWithinBudget(
   return { renderedCount: budgeted.renderedCount, omitted };
 }
 
-/**
- * Render data-dictionary entries as compact prompt context.
- *
- * Trust tiers:
- * - approved entries are canonical and should be used verbatim.
- * - human-authored entries without approval still stay visible so an org with
- *   no review workflow does not lose its dictionary.
- * - AI-generated unapproved entries are suggestions; they are only injected in
- *   full when there is no human-authored dictionary context at all.
- */
 export function renderDataDictionary(entries: DictionaryEntry[]): string {
   const usable = entries.filter((entry) => compact(entry.metric, 120));
   if (!usable.length) return "";

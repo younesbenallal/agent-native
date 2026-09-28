@@ -36,8 +36,16 @@ image" has very different right answers:
 | `pending` | Caller-side timeout; the Assets run is still going and owns a `taskId` | Tell the user to check Assets; generating again would duplicate the run |
 | `unavailable` | Assets could not be resolved or reached at all | Local fallback |
 
+A `delegated` reply can still say the generation is a draft pending approval.
+That means the user may draft in that brand kit but not save into it: the image
+is real and usable in the deck, and only the copy kept in Assets is waiting on a
+kit editor. Use the image, pass that along, and do not retry or fall back
+locally.
+
 Only `unavailable` falls through to the local Gemini/OpenAI providers under
-`server/handlers/image-providers/`, so a slides-only deploy still works. That
+`server/handlers/image-providers/`, so a slides-only deploy still works. They
+try the organization's Image generation provider first (the
+`manage-service-providers` action), then Gemini, then OpenAI. That
 output is **not** brand-grounded and the action says so: it returns
 `source: "slides-fallback"` with a `fallbackReason`. Report that honestly
 rather than presenting a fallback image as a library generation.
@@ -53,13 +61,29 @@ Call the action with the destination so Assets can ground the generation:
 generate-image-api { prompt, deckId, slideId, slideContent }
 ```
 
+For direct insertion, add `insertIntoSlide: true`. This requires both IDs and
+only returns `inserted: true` after Slides writes the transformed HTML through
+`update-slide` and re-reads it through `get-deck` with `compact=false` to find
+the image source.
+Never say the image was added based on `url`, `previewUrl`, or a completed
+Assets reply alone. For preview-only variations, leave `insertIntoSlide` false;
+after choosing one, use `update-slide` and verify the persisted source with
+`get-deck` with `compact=false` before claiming insertion.
+
 Do **not** reach for the generic `call-agent` tool to ask Assets for an image.
 It talks to the same app, so it looks equivalent, but it skips the slide
 grounding, the completed-vs-failed task handling, and the ready-to-render
 preview markdown this action returns — which is how image results end up in
 chat as bare links instead of visible images.
 
-Drop the returned `previewUrl` into the slide HTML's `<img src="...">`.
+Slides owns the semantic job of the image: its slide role, audience, crop, and
+must-preserve content. Assets owns library and preset selection, style anchors,
+generation settings, and provenance. Include the active design system's
+image-style guidance in the prompt context, but do not ask Assets to invent a
+competing brand direction.
+
+Use the returned `previewUrl` for previews. Do not drop it into slide HTML
+without the verified insertion workflow above.
 
 ## Showing the result in chat
 

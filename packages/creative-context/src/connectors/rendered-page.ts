@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 
 import {
@@ -12,6 +13,12 @@ import {
 } from "@agent-native/core/ingestion";
 
 import { normalizeWhitespace } from "./normalize.js";
+import {
+  chromiumPackUrl,
+  loadOptionalServerlessChromium,
+} from "./serverless-chromium.js";
+
+export { chromiumPackUrl } from "./serverless-chromium.js";
 
 export type RenderedPageMethod =
   | "builder-browser"
@@ -31,8 +38,34 @@ const MAX_RADII = 64;
 const MAX_CSS_VARIABLES = 128;
 const MAX_COMPONENT_STYLES = 24;
 const FONT_READY_TIMEOUT_MS = 4_000;
-const BROWSER_NAVIGATION_DISABLED_WARNING =
-  "Browser rendering is disabled until Chromium navigation has a connect-time SSRF guard.";
+const MAX_BROWSER_RESOURCE_BYTES = 12 * 1024 * 1024;
+const MAX_BROWSER_RESOURCE_COUNT = 400;
+const MAX_BROWSER_RESOURCE_BYTES_TOTAL = 64 * 1024 * 1024;
+const BROWSER_RESOURCE_TIMEOUT_MS = 15_000;
+const BROWSER_REQUEST_HEADERS = new Set([
+  "accept",
+  "accept-language",
+  "if-modified-since",
+  "if-none-match",
+  "origin",
+  "range",
+  "referer",
+  "user-agent",
+]);
+const BROWSER_RESPONSE_HEADERS = new Set([
+  "connection",
+  "content-encoding",
+  "content-length",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "set-cookie",
+  "set-cookie2",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
 
 export interface RenderedPageRequest {
   url: string;
@@ -75,12 +108,19 @@ interface PlaywrightRequestLike {
   url(): string;
   isNavigationRequest(): boolean;
   resourceType(): string;
+  method?(): string;
+  headers?(): Record<string, string>;
 }
 
 interface PlaywrightRouteLike {
   request(): PlaywrightRequestLike;
   continue(): Promise<void>;
   abort(errorCode?: string): Promise<void>;
+  fulfill(options: {
+    status: number;
+    headers: Record<string, string>;
+    body: Uint8Array;
+  }): Promise<void>;
 }
 
 interface PlaywrightPageLike {
@@ -101,7 +141,7 @@ interface PlaywrightPageLike {
   locator(selector: string): { innerText(): Promise<string> };
   setViewportSize(size: { width: number; height: number }): Promise<void>;
   screenshot(options: { type: "png"; fullPage: boolean }): Promise<Uint8Array>;
-  evaluate<T>(callback: () => T): Promise<T>;
+  evaluate<T>(callback: string | (() => T)): Promise<T>;
 }
 
 interface PlaywrightContextLike {
@@ -128,16 +168,10 @@ interface PlaywrightLike {
 }
 
 export interface LayeredRenderedPageProviderOptions {
-  /**
-   * Retained for compatibility with the previous browser renderer. Arbitrary
-   * Chromium navigation is disabled until a connect-time SSRF guard exists.
-   */
   requestBuilderBrowserConnection?: (input: {
     sessionId: string;
   }) => Promise<Record<string, unknown>>;
-  /** @deprecated Browser navigation is disabled until it is connect-time guarded. */
   loadPlaywright?: () => Promise<PlaywrightLike | null>;
-  /** @deprecated Browser navigation is disabled until it is connect-time guarded. */
   requestAttachedBrowserConnection?: (input: {
     sessionId: string;
     url: string;
@@ -146,27 +180,94 @@ export interface LayeredRenderedPageProviderOptions {
 }
 
 export class LayeredRenderedPageProvider implements RenderedPageProvider {
+  readonly #requestBuilderBrowserConnection: (input: {
+    sessionId: string;
+  }) => Promise<Record<string, unknown>>;
+  readonly #loadPlaywright: () => Promise<PlaywrightLike | null>;
+  readonly #requestAttachedBrowserConnection?: NonNullable<
+    LayeredRenderedPageProviderOptions["requestAttachedBrowserConnection"]
+  >;
   readonly #staticFetch: typeof ssrfSafeFetch;
 
   constructor(options: LayeredRenderedPageProviderOptions = {}) {
+    this.#requestBuilderBrowserConnection =
+      options.requestBuilderBrowserConnection ?? defaultBuilderBrowserRequest;
+    this.#loadPlaywright = options.loadPlaywright ?? loadOptionalPlaywright;
+    this.#requestAttachedBrowserConnection =
+      options.requestAttachedBrowserConnection;
     this.#staticFetch = options.staticFetch ?? ssrfSafeFetch;
   }
 
   async render(request: RenderedPageRequest): Promise<RenderedPageResult> {
     await assertPublicBrowserUrl(request.url);
-    return renderStatic(
-      request,
-      [BROWSER_NAVIGATION_DISABLED_WARNING],
-      this.#staticFetch,
-    );
+    const warnings: string[] = [];
+    const playwright = await this.#loadPlaywright().catch((error) => {
+      warnings.push(`Playwright unavailable: ${errorMessage(error)}`);
+      return null;
+    });
+
+    if (request.preferHosted !== false && playwright) {
+      try {
+        const connection = await this.#requestBuilderBrowserConnection({
+          sessionId: `creative-context-${randomUUID()}`,
+        });
+        const wsUrl =
+          typeof connection.wsUrl === "string" ? connection.wsUrl.trim() : "";
+        if (!wsUrl) throw new Error("Builder Browser did not return wsUrl.");
+        return await renderWithPlaywright(
+          playwright,
+          request,
+          warnings,
+          "builder-browser",
+          wsUrl,
+        );
+      } catch (error) {
+        warnings.push(`Builder Browser unavailable: ${errorMessage(error)}`);
+      }
+    }
+
+    if (playwright) {
+      try {
+        return await renderWithPlaywright(
+          playwright,
+          request,
+          warnings,
+          "local-playwright",
+        );
+      } catch (error) {
+        warnings.push(`Local Playwright unavailable: ${errorMessage(error)}`);
+      }
+    }
+
+    if (playwright && this.#requestAttachedBrowserConnection) {
+      try {
+        const connection = await this.#requestAttachedBrowserConnection({
+          sessionId: `creative-context-attached-${randomUUID()}`,
+          url: request.url,
+        });
+        if (!connection.wsUrl?.trim()) {
+          throw new Error("Approved attached browser did not return wsUrl.");
+        }
+        return await renderWithPlaywright(
+          playwright,
+          request,
+          warnings,
+          "attached-chrome",
+          connection.wsUrl,
+        );
+      } catch (error) {
+        warnings.push(`Attached Chrome unavailable: ${errorMessage(error)}`);
+      }
+    } else {
+      warnings.push(
+        "Attached Chrome unavailable: no approved browser connection adapter is configured.",
+      );
+    }
+
+    return renderStatic(request, warnings, this.#staticFetch);
   }
 }
 
-/**
- * Internal browser renderer retained for a future connect-time-guarded
- * adapter. `LayeredRenderedPageProvider` must not call this for arbitrary
- * caller URLs until Chromium's socket connection is guarded as well.
- */
 export async function renderWithPlaywright(
   playwright: PlaywrightLike,
   request: RenderedPageRequest,
@@ -179,20 +280,16 @@ export async function renderWithPlaywright(
     : await launchChromium(playwright.chromium);
   let isolatedContext: PlaywrightContextLike | undefined;
   try {
-    // A hosted CDP browser can already contain the user's other tabs. Prefer a
-    // fresh context so extraction never reads ambient browser state, cookies,
-    // or a page left behind by another workflow. Older browser adapters may not
-    // expose newContext, so retain the existing-context fallback.
-    try {
-      isolatedContext = await browser.newContext?.();
-    } catch {
-      isolatedContext = undefined;
+    if (!browser.newContext) {
+      throw new Error("Browser did not provide isolated context support.");
     }
-    const context = isolatedContext ?? browser.contexts()[0];
-    if (!context)
-      throw new Error("Browser did not provide an isolated context.");
-    const page = context.pages()[0] ?? (await context.newPage());
-    await installNavigationGuard(page);
+    isolatedContext = await browser.newContext();
+    const page = await isolatedContext.newPage();
+    const getFinalNavigationUrl = await installNavigationGuard(
+      page,
+      request,
+      warnings,
+    );
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto(request.url, {
       timeout: boundedTimeout(request.timeoutMs),
@@ -207,9 +304,6 @@ export async function renderWithPlaywright(
           `Browser load stabilization unavailable: ${errorMessage(error)}`,
         );
       });
-    // React hydration, CSS-in-JS insertion, and web fonts commonly finish just
-    // after `load`. Give those layers a bounded chance to settle, then capture
-    // the computed cascade rather than the server HTML.
     await page
       .waitForLoadState?.("networkidle", { timeout: 4_000 })
       .catch((error) => {
@@ -227,7 +321,7 @@ export async function renderWithPlaywright(
     });
     await new Promise((resolve) => setTimeout(resolve, 150));
     await page.evaluate(dismissConsentOverlays).catch(() => undefined);
-    const finalUrl = page.url();
+    const finalUrl = getFinalNavigationUrl() ?? page.url();
     await assertPublicBrowserUrl(finalUrl);
     const [title, text, desktopScreenshot, extraction] = await Promise.all([
       page.title().catch((error) => {
@@ -254,12 +348,14 @@ export async function renderWithPlaywright(
           );
           return undefined;
         }),
-      page.evaluate(captureRenderedWebsiteContext).catch((error) => {
-        warnings.push(
-          `Browser style extraction unavailable: ${errorMessage(error)}`,
-        );
-        return emptyExtraction();
-      }),
+      page
+        .evaluate<WebsiteExtraction>(browserCaptureExpression())
+        .catch((error) => {
+          warnings.push(
+            `Browser style extraction unavailable: ${errorMessage(error)}`,
+          );
+          return emptyExtraction();
+        }),
     ]);
     await page.setViewportSize({ width: 390, height: 844 });
     const mobileScreenshot = await page
@@ -362,17 +458,58 @@ async function waitForFontReadiness(
   }
 }
 
-async function installNavigationGuard(page: PlaywrightPageLike): Promise<void> {
+async function installNavigationGuard(
+  page: PlaywrightPageLike,
+  renderRequest: RenderedPageRequest,
+  warnings: string[],
+): Promise<() => string | undefined> {
+  let finalNavigationUrl: string | undefined;
+  let resourceCount = 0;
+  let resourceBytes = 0;
+  let reservedResourceBytes = 0;
+  const bodyBudgetWaiters: Array<() => void> = [];
+  let resourceLimitWarningAdded = false;
+  let blockedResourceWarningAdded = false;
+  let failedResourceWarningAdded = false;
+
+  const reserveBodyBudget = async (): Promise<() => void> => {
+    while (
+      reservedResourceBytes + MAX_BROWSER_RESOURCE_BYTES >
+      MAX_BROWSER_RESOURCE_BYTES_TOTAL
+    ) {
+      await new Promise<void>((resolve) => {
+        bodyBudgetWaiters.push(resolve);
+      });
+    }
+    reservedResourceBytes += MAX_BROWSER_RESOURCE_BYTES;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      reservedResourceBytes -= MAX_BROWSER_RESOURCE_BYTES;
+      bodyBudgetWaiters.shift()?.();
+    };
+  };
+
+  const addWarning = (value: string): void => {
+    if (!warnings.includes(value)) warnings.push(value);
+  };
+
   await page.route("**/*", async (route) => {
-    const request = route.request();
+    const browserRequest = route.request();
     let parsed: URL;
     try {
-      parsed = new URL(request.url());
+      parsed = new URL(browserRequest.url());
     } catch {
+      // coercion-ok: an absent optional package means the next compatible probe should run.
       await route.abort("blockedbyclient");
       return;
     }
-    if (parsed.protocol === "data:" || parsed.protocol === "blob:") {
+    if (
+      parsed.protocol === "about:" ||
+      parsed.protocol === "data:" ||
+      parsed.protocol === "blob:"
+    ) {
       await route.continue();
       return;
     }
@@ -380,14 +517,130 @@ async function installNavigationGuard(page: PlaywrightPageLike): Promise<void> {
       await route.abort("blockedbyclient");
       return;
     }
-    try {
-      await assertPublicBrowserUrl(parsed.href);
-    } catch {
+
+    const method = (browserRequest.method?.() ?? "GET").toUpperCase();
+    if (method !== "GET" && method !== "HEAD") {
       await route.abort("blockedbyclient");
+      if (!resourceLimitWarningAdded) {
+        resourceLimitWarningAdded = true;
+        addWarning(
+          "Browser blocked a non-read-only resource request during extraction.",
+        );
+      }
       return;
     }
-    await route.continue();
+    if (resourceCount >= MAX_BROWSER_RESOURCE_COUNT) {
+      await route.abort("blockedbyclient");
+      if (!resourceLimitWarningAdded) {
+        resourceLimitWarningAdded = true;
+        addWarning(
+          `Browser resource budget reached (${MAX_BROWSER_RESOURCE_COUNT} requests).`,
+        );
+      }
+      return;
+    }
+
+    resourceCount += 1;
+    let bodyBudgetRelease: (() => void) | undefined;
+    let committedBytes = 0;
+    let fulfilled = false;
+
+    try {
+      await assertPublicBrowserUrl(parsed.href);
+      const response = await ssrfSafeFetch(
+        parsed.href,
+        {
+          method,
+          headers: browserRequestHeaders(browserRequest),
+          signal: AbortSignal.timeout(
+            Math.min(
+              BROWSER_RESOURCE_TIMEOUT_MS,
+              boundedTimeout(renderRequest.timeoutMs),
+            ),
+          ),
+        },
+        { maxRedirects: 5 },
+      );
+      bodyBudgetRelease = await reserveBodyBudget();
+      const body = await readBoundedResponseBytes(
+        response,
+        MAX_BROWSER_RESOURCE_BYTES,
+      );
+      bodyBudgetRelease();
+      bodyBudgetRelease = undefined;
+      if (resourceBytes + body.byteLength > MAX_BROWSER_RESOURCE_BYTES_TOTAL) {
+        await route.abort("blockedbyclient");
+        if (!resourceLimitWarningAdded) {
+          resourceLimitWarningAdded = true;
+          addWarning(
+            `Browser resource budget reached (${MAX_BROWSER_RESOURCE_BYTES_TOTAL} bytes).`,
+          );
+        }
+        return;
+      }
+      resourceBytes += body.byteLength;
+      committedBytes = body.byteLength;
+      if (browserRequest.isNavigationRequest()) {
+        finalNavigationUrl = response.url || parsed.href;
+      }
+      await route.fulfill({
+        status: response.status,
+        headers: browserResponseHeaders(response),
+        body: Buffer.from(body),
+      });
+      fulfilled = true;
+    } catch (error) {
+      if (committedBytes > 0) {
+        resourceBytes -= committedBytes;
+        committedBytes = 0;
+      }
+      await route.abort("blockedbyclient");
+      if (isSsrfError(error)) {
+        if (!blockedResourceWarningAdded) {
+          blockedResourceWarningAdded = true;
+          addWarning(
+            "Some browser resources were blocked by the SSRF safety policy.",
+          );
+        }
+      } else if (!failedResourceWarningAdded) {
+        failedResourceWarningAdded = true;
+        addWarning(
+          "Some browser resources could not be fetched through the safe network proxy.",
+        );
+      }
+    } finally {
+      bodyBudgetRelease?.();
+      if (!fulfilled) resourceCount -= 1;
+    }
   });
+  return () => finalNavigationUrl;
+}
+
+function browserRequestHeaders(
+  request: PlaywrightRequestLike,
+): Record<string, string> {
+  const source = request.headers?.() ?? {};
+  return Object.fromEntries(
+    Object.entries(source).filter(([name, value]) => {
+      return BROWSER_REQUEST_HEADERS.has(name.toLowerCase()) && Boolean(value);
+    }),
+  );
+}
+
+function browserResponseHeaders(response: Response): Record<string, string> {
+  const headers: Record<string, string> = {};
+  response.headers.forEach((value, name) => {
+    if (!BROWSER_RESPONSE_HEADERS.has(name.toLowerCase())) {
+      headers[name] = value;
+    }
+  });
+  return headers;
+}
+
+function isSsrfError(error: unknown): boolean {
+  return /ssrf blocked|private\/internal|connect blocked/i.test(
+    errorMessage(error),
+  );
 }
 
 const SYSTEM_CHROME_EXECUTABLES = [
@@ -404,20 +657,88 @@ async function launchChromium(
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
   };
+  let missingBrowserError: unknown;
   try {
     return await chromium.launch(launchOptions);
   } catch (error) {
     if (!isMissingBrowserError(error)) throw error;
-    for (const executablePath of SYSTEM_CHROME_EXECUTABLES) {
-      if (!existsSync(executablePath)) continue;
-      try {
-        return await chromium.launch({ ...launchOptions, executablePath });
-      } catch {
-        continue;
-      }
-    }
-    throw error;
+    missingBrowserError = error;
   }
+
+  const serverlessChromium = await loadOptionalServerlessChromium();
+  if (serverlessChromium) {
+    try {
+      const executablePath =
+        await serverlessChromium.executablePath(chromiumPackUrl());
+      if (executablePath) {
+        return await chromium.launch({
+          ...launchOptions,
+          args: [...launchOptions.args, ...(serverlessChromium.args ?? [])],
+          executablePath,
+        });
+      }
+    } catch (error) {
+      missingBrowserError = error;
+    }
+  }
+
+  for (const executablePath of SYSTEM_CHROME_EXECUTABLES) {
+    if (!existsSync(executablePath)) continue;
+    try {
+      return await chromium.launch({ ...launchOptions, executablePath });
+    } catch {
+      continue;
+    }
+  }
+  if (missingBrowserError) {
+    throw missingBrowserError;
+  }
+  throw new Error(
+    "No Chromium executable is available for browser extraction.",
+  );
+}
+
+async function loadOptionalPlaywright(): Promise<PlaywrightLike | null> {
+  for (const specifier of [
+    "playwright",
+    "@playwright/test",
+    "playwright-core",
+  ]) {
+    try {
+      const module = (await import(
+        /* @vite-ignore */ specifier
+      )) as unknown as {
+        default?: Partial<PlaywrightLike>;
+      } & Partial<PlaywrightLike>;
+      for (const candidate of [module.default, module]) {
+        if (typeof candidate?.chromium?.launch === "function") {
+          return candidate as PlaywrightLike;
+        }
+      }
+      // coercion-ok: an absent optional package means the next compatible probe should run.
+    } catch {
+      // Try the next compatible browser package before falling back to HTML.
+    }
+  }
+
+  // coercion-ok: browser packages are optional in non-Node runtimes.
+  return null;
+}
+
+async function defaultBuilderBrowserRequest(input: {
+  sessionId: string;
+}): Promise<Record<string, unknown>> {
+  const server = (await import("@agent-native/core/server")) as unknown as {
+    requestBuilderBrowserConnection?: (value: {
+      sessionId: string;
+    }) => Promise<Record<string, unknown>>;
+  };
+  if (!server.requestBuilderBrowserConnection) {
+    throw new Error(
+      "@agent-native/core/server does not export requestBuilderBrowserConnection.",
+    );
+  }
+  return server.requestBuilderBrowserConnection(input);
 }
 
 function isMissingBrowserError(error: unknown): boolean {
@@ -427,7 +748,6 @@ function isMissingBrowserError(error: unknown): boolean {
   );
 }
 
-/** Close common consent banners without accepting tracking or changing page data. */
 function dismissConsentOverlays(): void {
   const selectors = [
     '[aria-label*="reject" i]',
@@ -563,7 +883,7 @@ function captureRenderedWebsiteContext(): WebsiteExtraction {
     WebsiteExtraction["designTokens"]["semanticColors"]
   > = {};
 
-  const isOpaque = (value: string): boolean => {
+  function isOpaque(value: string): boolean {
     const normalized = value.trim().toLowerCase();
     if (!normalized || normalized === "transparent") return false;
     const functionBody = normalized.match(/^[a-z-]+\((.*)\)$/)?.[1];
@@ -578,15 +898,15 @@ function captureRenderedWebsiteContext(): WebsiteExtraction {
       ? Number.parseFloat(alphaValue) / 100
       : Number.parseFloat(alphaValue);
     return Number.isNaN(alpha) || alpha > 0.02;
-  };
+  }
 
-  const addColor = (value: string): void => {
+  function addColor(value: string): void {
     if (colors.length >= MAX_COLOR_VALUES || !isOpaque(value)) return;
     const normalized = value.trim();
     if (!colors.includes(normalized)) colors.push(normalized);
-  };
+  }
 
-  const visible = (element: Element): boolean => {
+  function visible(element: Element): boolean {
     const style = getComputedStyle(element);
     const rect = element.getBoundingClientRect();
     return (
@@ -596,20 +916,22 @@ function captureRenderedWebsiteContext(): WebsiteExtraction {
       style.visibility !== "hidden" &&
       Number(style.opacity || 1) > 0.02
     );
-  };
+  }
 
-  const firstVisible = (selector: string): Element | undefined =>
-    Array.from(document.querySelectorAll(selector)).find(visible);
+  function firstVisible(selector: string): Element | undefined {
+    return Array.from(document.querySelectorAll(selector)).find(visible);
+  }
 
-  const opaqueValue = (value: string): string | undefined =>
-    isOpaque(value) ? value.trim() : undefined;
+  function opaqueValue(value: string): string | undefined {
+    return isOpaque(value) ? value.trim() : undefined;
+  }
 
-  const recordComputedStyle = (
+  function recordComputedStyle(
     element: Element,
     role?: NonNullable<
       WebsiteExtraction["designTokens"]["components"]
     >[number]["role"],
-  ) => {
+  ): CSSStyleDeclaration {
     const style = getComputedStyle(element);
     const values = [
       style.color,
@@ -695,24 +1017,24 @@ function captureRenderedWebsiteContext(): WebsiteExtraction {
         style.textTransform !== "none" ? style.textTransform : undefined,
     });
     return style;
-  };
+  }
 
-  const styleFor = (
+  function styleFor(
     selector: string,
     role?: NonNullable<
       WebsiteExtraction["designTokens"]["components"]
     >[number]["role"],
-  ): CSSStyleDeclaration | undefined => {
+  ): CSSStyleDeclaration | undefined {
     const element = firstVisible(selector);
     if (!element) return undefined;
     return recordComputedStyle(element, role);
-  };
+  }
 
-  const addAsset = (
+  function addAsset(
     raw: string | null | undefined,
     kind: WebsiteExtraction["assets"][number]["kind"],
     role?: "logo" | "open-graph",
-  ) => {
+  ): void {
     if (!raw || assets.size >= MAX_ASSETS) return;
     try {
       const url = new URL(raw, document.baseURI);
@@ -727,7 +1049,7 @@ function captureRenderedWebsiteContext(): WebsiteExtraction {
     } catch {
       return;
     }
-  };
+  }
   for (const image of document.querySelectorAll("img")) {
     if (assets.size >= MAX_ASSETS) break;
     const identity = `${image.getAttribute("alt") ?? ""} ${image.getAttribute("class") ?? ""} ${image.id}`;
@@ -797,7 +1119,7 @@ function captureRenderedWebsiteContext(): WebsiteExtraction {
   const bodyBackground = bodyStyle
     ? opaqueValue(bodyStyle.backgroundColor)
     : undefined;
-  const headingStyle = styleFor("h1, h2, h3", "heading");
+
   const textStyle = styleFor("p, li, label, body", "body");
   const buttonStyle = styleFor(
     'button, [role="button"], input[type="submit"], a[class*="button" i], a[class*="cta" i]',
@@ -812,14 +1134,14 @@ function captureRenderedWebsiteContext(): WebsiteExtraction {
   styleFor("nav, header", "nav");
   styleFor('main, [class*="hero" i]', "hero");
 
-  const setSemantic = (
+  function setSemantic(
     role: keyof NonNullable<
       WebsiteExtraction["designTokens"]["semanticColors"]
     >,
     value: string | undefined,
-  ): void => {
+  ): void {
     if (value) semanticColors[role] = value;
-  };
+  }
   setSemantic("background", bodyBackground ?? rootBackground);
   setSemantic(
     "surface",
@@ -901,6 +1223,13 @@ function captureRenderedWebsiteContext(): WebsiteExtraction {
       layout,
     },
   };
+}
+
+function browserCaptureExpression(): string {
+  return `(function () {
+    const __name = (value) => value;
+    return (${captureRenderedWebsiteContext.toString()})();
+  })()`;
 }
 
 export function boundWebsiteExtraction(

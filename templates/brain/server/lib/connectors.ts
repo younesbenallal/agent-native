@@ -2,6 +2,7 @@ import { getCredentialContext } from "@agent-native/core/server";
 import { accessFilter, assertAccess } from "@agent-native/core/sharing";
 import { and, desc, eq, inArray, isNull, lte, or } from "drizzle-orm";
 
+import { normalizeGitHubRepoRef } from "../../shared/source-config-validation.js";
 import type {
   BrainCaptureKind,
   BrainSourceProvider,
@@ -227,10 +228,20 @@ interface SlackMembersResponse {
 }
 
 interface SlackUserInfoResponse {
-  user?: { profile?: { email?: string } };
+  user?: {
+    deleted?: boolean;
+    is_app_user?: boolean;
+    is_bot?: boolean;
+    is_workflow_bot?: boolean;
+    profile?: { email?: string };
+  };
 }
 
-type SlackUserEmailCache = Map<string, string | null>;
+type SlackUserEmailCacheEntry =
+  | { kind: "human"; email: string }
+  | { kind: "non-human" }
+  | { kind: "unresolved" };
+type SlackUserEmailCache = Map<string, SlackUserEmailCacheEntry>;
 
 const SLACK_USER_LOOKUP_CONCURRENCY = 4;
 const SLACK_THREAD_CAPTURE_CONCURRENCY = 4;
@@ -594,8 +605,8 @@ async function summarizeSlackPilotSource(sourceId: string) {
     rows: T[],
   ) =>
     [...rows].sort((a, b) =>
-      String(b.updatedAt ?? b.createdAt ?? "").localeCompare(
-        String(a.updatedAt ?? a.createdAt ?? ""),
+      JSON.stringify(b.updatedAt ?? b.createdAt ?? "").localeCompare(
+        JSON.stringify(a.updatedAt ?? a.createdAt ?? ""),
       ),
     );
 
@@ -737,7 +748,13 @@ function newestSlackTs(messages: SlackMessage[]): string | undefined {
 function readableJson(value: unknown): string {
   if (typeof value === "string") return value.trim();
   if (value == null) return "";
-  if (typeof value !== "object") return String(value);
+  if (
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    typeof value === "bigint"
+  ) {
+    return value.toString();
+  }
   const record = value as Record<string, unknown>;
   for (const key of ["markdown", "text", "content", "summary"]) {
     const candidate = record[key];
@@ -792,10 +809,6 @@ export interface SlackThreadCapture {
   metadata: Record<string, unknown>;
 }
 
-/**
- * Builds the only Slack representation Brain persists. It deliberately omits
- * Slack user ids, display names, and the raw Events/Web API payload.
- */
 export function normalizeSlackThreadCapture(input: {
   channel: SlackChannel;
   messages: SlackMessage[];
@@ -846,8 +859,6 @@ export function normalizeSlackThreadCapture(input: {
       ),
       sourceUrl: input.permalink ?? null,
       permalink: input.permalink ?? null,
-      // These offsets are against `content`, the safe persisted capture, never
-      // against a provider payload.
       safeSegments,
     },
   };
@@ -1010,14 +1021,18 @@ async function resolveSlackChannel(
       token,
       "conversations.info",
       { channel: channelRef },
+      { toleratedErrors: ["channel_not_found", "not_in_channel"] },
     );
     return data.channel ?? null;
   }
   const byName = await resolveSlackChannelByName(token, channelRef);
   if (!byName) return null;
-  const data = await slackApi<SlackInfoResponse>(token, "conversations.info", {
-    channel: byName.id,
-  });
+  const data = await slackApi<SlackInfoResponse>(
+    token,
+    "conversations.info",
+    { channel: byName.id },
+    { toleratedErrors: ["channel_not_found", "not_in_channel"] },
+  );
   return data.channel ?? byName;
 }
 
@@ -1061,9 +1076,7 @@ async function slackPrivateChannelMemberEmails(
   const userIds = Array.from(memberIds);
   if (!userIds.length) return null;
   if (
-    userIds.some(
-      (userId) => userEmailCache.has(userId) && !userEmailCache.get(userId),
-    )
+    userIds.some((userId) => userEmailCache.get(userId)?.kind === "unresolved")
   ) {
     return null;
   }
@@ -1087,19 +1100,35 @@ async function slackPrivateChannelMemberEmails(
           "users.info",
           { user: userId },
         );
-        const email = user.user?.profile?.email?.trim().toLowerCase() ?? null;
-        userEmailCache.set(userId, email || null);
+        const slackUser = user.user;
+        if (
+          slackUser?.deleted === true ||
+          slackUser?.is_app_user === true ||
+          slackUser?.is_bot === true ||
+          slackUser?.is_workflow_bot === true
+        ) {
+          userEmailCache.set(userId, { kind: "non-human" });
+          return;
+        }
+        const email = slackUser?.profile?.email?.trim().toLowerCase();
+        userEmailCache.set(
+          userId,
+          email ? { kind: "human", email } : { kind: "unresolved" },
+        );
       }),
     );
-    if (batch.some((userId) => !userEmailCache.get(userId))) return null;
+    if (
+      batch.some((userId) => userEmailCache.get(userId)?.kind === "unresolved")
+    ) {
+      return null;
+    }
   }
 
-  const emails: string[] = [];
-  for (const userId of userIds) {
-    const email = userEmailCache.get(userId);
-    if (!email) return null;
-    emails.push(email);
-  }
+  const emails = userIds.flatMap((userId) => {
+    const entry = userEmailCache.get(userId);
+    return entry?.kind === "human" ? [entry.email] : [];
+  });
+  if (!emails.length) return null;
   return Array.from(new Set(emails)).sort();
 }
 
@@ -1228,7 +1257,7 @@ export async function testSlackConnection(
   }
 
   return {
-    ok: true,
+    ok: channels.every((channel) => channel.status === "ok"),
     team: auth.team ?? null,
     teamId: auth.team_id ?? null,
     workspaceUrl: auth.url ?? null,
@@ -1280,6 +1309,16 @@ function slackPilotNextSteps(report: {
     return [
       "Add one or two Slack channel IDs to the source allow-list.",
       "Run the pilot again before attempting any history sync.",
+    ];
+  }
+  if (
+    report.channelValidation.excluded > 0 ||
+    report.channelValidation.missing > 0 ||
+    report.channelValidation.skipped > 0
+  ) {
+    return [
+      "Fix every invalid Slack channel reference before syncing this source.",
+      "Use channel IDs or enable name resolution, and confirm private-channel membership.",
     ];
   }
   if (report.channelValidation.ok === 0) {
@@ -1390,8 +1429,8 @@ export async function runSlackPilot(
     channels,
   };
 
-  if (requestedRefs.length === 0 || !options.readHistory) {
-    const blocked = requestedRefs.length === 0;
+  if (requestedRefs.length === 0 || !credential.ok || !options.readHistory) {
+    const blocked = requestedRefs.length === 0 || !credential.ok;
     const partial = {
       status: blocked ? ("blocked" as const) : ("validated" as const),
       historyRead: false,
@@ -1526,7 +1565,7 @@ function granolaSpeakerLabel(item: Record<string, unknown>): string {
     speaker.source ??
     item.speaker ??
     "speaker";
-  return String(label);
+  return typeof label === "string" ? label : JSON.stringify(label);
 }
 
 function granolaTranscriptLines(transcript: unknown): string[] {
@@ -1618,27 +1657,9 @@ async function granolaApi<T>(
   return (await response.json()) as T;
 }
 
-function githubRepoFromValue(value: string): string | null {
-  const trimmed = value.trim().replace(/\.git$/, "");
-  if (!trimmed) return null;
-  const withoutProtocol = trimmed
-    .replace(/^https?:\/\/github\.com\//i, "")
-    .replace(/^git@github\.com:/i, "");
-  const [owner, repo] = withoutProtocol.split("/");
-  if (!owner || !repo) return null;
-  const cleanRepo = repo.split(/[?#]/)[0];
-  if (
-    !/^[A-Za-z0-9_.-]+$/.test(owner) ||
-    !/^[A-Za-z0-9_.-]+$/.test(cleanRepo)
-  ) {
-    return null;
-  }
-  return `${owner}/${cleanRepo}`;
-}
-
 function githubReposFromConfig(config: Record<string, unknown>): string[] {
   return configuredList(config, ["repositories", "repos"], "github")
-    .map(githubRepoFromValue)
+    .map(normalizeGitHubRepoRef)
     .filter((repo): repo is string => Boolean(repo));
 }
 
@@ -1746,7 +1767,7 @@ function githubRefsFromText(
   const pattern =
     /https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/(issues|pull)\/(\d+)/gi;
   for (const match of text.matchAll(pattern)) {
-    const repo = githubRepoFromValue(`${match[1]}/${match[2]}`);
+    const repo = normalizeGitHubRepoRef(`${match[1]}/${match[2]}`);
     const number = Number(match[4]);
     if (!repo || !Number.isInteger(number) || number <= 0) continue;
     refs.push({
@@ -2099,7 +2120,7 @@ async function createRun(
 }
 
 async function renewRunLease(run: ConnectorSyncRunLease) {
-  const renewed = await getDb()
+  const renewed = (await getDb()
     .update(schema.brainSyncRuns)
     .set({
       leaseExpiresAt: new Date(
@@ -2112,7 +2133,7 @@ async function renewRunLease(run: ConnectorSyncRunLease) {
         eq(schema.brainSyncRuns.leaseToken, run.leaseToken),
         eq(schema.brainSyncRuns.status, "running"),
       ),
-    );
+    )) as { rowsAffected: number };
   if (renewed.rowsAffected === 0) {
     throw new Error("Brain source sync lease was lost");
   }
@@ -2153,7 +2174,7 @@ async function finishRun(
   stats: Record<string, unknown>,
   error?: string | null,
 ) {
-  const finished = await getDb()
+  const finished = (await getDb()
     .update(schema.brainSyncRuns)
     .set({
       activeSourceId: null,
@@ -2169,7 +2190,7 @@ async function finishRun(
         eq(schema.brainSyncRuns.id, run.runId),
         eq(schema.brainSyncRuns.leaseToken, run.leaseToken),
       ),
-    );
+    )) as { rowsAffected: number };
   if (finished.rowsAffected === 0) {
     throw new Error("Brain source sync lease was lost");
   }

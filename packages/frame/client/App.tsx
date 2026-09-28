@@ -1,14 +1,9 @@
-/**
- * Local Dev Frame — App layout
- *
- * The sidebar always looks the same as the in-app agent panel: Chat | CLI | Workspace.
- * A toggle in the settings cog switches between Dev and Prod mode:
- * - Dev: frame renders its own sidebar; Chat uses code-agent modes only with local code access
- * - Prod: frame sidebar disappears, app's own agent sidebar shows inside iframe
- *
- * When collapsed in dev mode, the sidebar is 100% gone.
- */
-
+import {
+  clampAgentSidebarWidth,
+  getAgentSidebarWideWidth,
+  focusAgentChat,
+  startAgentChatViewTransition,
+} from "@agent-native/core/client/agent-chat";
 import {
   TEMPLATES,
   getTemplate,
@@ -23,10 +18,10 @@ import {
   lazy,
   Suspense,
 } from "react";
+import { flushSync } from "react-dom";
 
 import { installDesktopDesignPreviewRelay } from "./desktop-design-preview";
 
-// Lazy-load the AgentPanel; it provides the full Chat/CLI/Workspace UI.
 const AgentPanel = lazy(() =>
   import("@agent-native/core/client").then((m) => ({
     default: m.AgentPanel,
@@ -36,9 +31,10 @@ const AgentPanel = lazy(() =>
 type FrameMode = "dev" | "prod";
 
 const SIDEBAR_WIDTH_KEY = "frame-sidebar-width";
+const SIDEBAR_DRAWER_KEY = "frame-sidebar-wide-drawer";
+const SIDEBAR_DRAWER_PLACEHOLDER_KEY = "frame-sidebar-drawer-placeholder-width";
 const FRAME_MODE_KEY = "frame-mode";
 const SIDEBAR_OPEN_KEY = "frame-sidebar-open";
-const SIDEBAR_FULLSCREEN_KEY = "frame-sidebar-fullscreen";
 const SIDEBAR_STATE_CHANGE_EVENT = "agent-panel:state-change";
 const APP_IFRAME_ALLOW = "camera; microphone; display-capture; fullscreen";
 const OPEN_DESKTOP_URL = "agentnative://open";
@@ -49,12 +45,6 @@ function getAppId(): string {
   const params = new URLSearchParams(window.location.search);
   const appId = params.get("app") || "mail";
   const customDevUrl = normalizeCustomDevUrl(params.get("devUrl"));
-  // Set the routing cookie synchronously so the frame proxy routes
-  // `/_agent-native/**` to the correct app backend on the very first
-  // request — including fetches kicked off by child effects (which run
-  // before parent effects in React, so a useEffect here would be too late).
-  // Max-Age ensures a fresh partition or reload doesn't see a stale value
-  // from a different app.
   if (typeof document !== "undefined") {
     document.cookie = `frame_active_app=${appId}; path=/; SameSite=Lax; Max-Age=31536000`;
     if (customDevUrl) {
@@ -158,16 +148,43 @@ export function App() {
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     try {
       const saved = localStorage.getItem(SIDEBAR_WIDTH_KEY);
-      if (saved) return Math.max(280, Math.min(700, parseInt(saved, 10)));
+      if (saved) {
+        const parsed = Number.parseInt(saved, 10);
+        if (Number.isFinite(parsed)) return clampAgentSidebarWidth(parsed);
+      }
     } catch {}
     return 380;
   });
-  const [sidebarFullscreen, setSidebarFullscreen] = useState(() => {
+  const [sidebarWideDrawer, setSidebarWideDrawer] = useState(() => {
     try {
-      return localStorage.getItem(SIDEBAR_FULLSCREEN_KEY) === "true";
-    } catch {}
-    return false;
+      return localStorage.getItem(SIDEBAR_DRAWER_KEY) === "true";
+    } catch {
+      // coercion-ok: the frame defaults to the normal inline presentation when storage is unavailable.
+      return false;
+    }
   });
+  const [sidebarDrawerPlaceholderWidth, setSidebarDrawerPlaceholderWidth] =
+    useState(() => {
+      try {
+        const saved = localStorage.getItem(SIDEBAR_DRAWER_PLACEHOLDER_KEY);
+        const parsed = saved ? Number.parseInt(saved, 10) : Number.NaN;
+        if (Number.isFinite(parsed)) return clampAgentSidebarWidth(parsed);
+      } catch {
+        // coercion-ok: the normal frame sidebar width is a safe placeholder fallback.
+      }
+      return 380;
+    });
+  const sidebarDrawerExitTimerRef = useRef<ReturnType<
+    typeof setTimeout
+  > | null>(null);
+  useEffect(
+    () => () => {
+      if (sidebarDrawerExitTimerRef.current !== null) {
+        clearTimeout(sidebarDrawerExitTimerRef.current);
+      }
+    },
+    [],
+  );
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const appUrl = getAppDevUrl(appId);
   const customAppOrigin = (() => {
@@ -193,10 +210,6 @@ export function App() {
     return installDesktopDesignPreviewRelay({ iframeRef, appUrl });
   }, [appId, appUrl]);
 
-  // (The `frame_active_app` cookie is set synchronously by getAppId() on
-  // first render, before any child effect can fetch /_agent-native/**.)
-
-  // Persist state
   useEffect(() => {
     try {
       localStorage.setItem(FRAME_MODE_KEY, frameMode);
@@ -207,27 +220,14 @@ export function App() {
       localStorage.setItem(SIDEBAR_OPEN_KEY, String(sidebarOpen));
     } catch {}
   }, [sidebarOpen]);
-  useEffect(() => {
-    try {
-      localStorage.setItem(SIDEBAR_FULLSCREEN_KEY, String(sidebarFullscreen));
-    } catch {}
-  }, [sidebarFullscreen]);
-
   const [isPresentationMode, setIsPresentationMode] = useState(false);
 
-  // Show frame sidebar only in dev mode when open, and not during presentation
   const showFrameSidebar =
     frameMode === "dev" && sidebarOpen && !isPresentationMode;
-  const animateFrameSidebar = !sidebarFullscreen;
   const [renderFrameSidebar, setRenderFrameSidebar] =
     useState(showFrameSidebar);
 
   useEffect(() => {
-    if (!animateFrameSidebar) {
-      setRenderFrameSidebar(showFrameSidebar);
-      return;
-    }
-
     let unmountTimer: number | undefined;
 
     if (showFrameSidebar) {
@@ -243,10 +243,15 @@ export function App() {
         window.clearTimeout(unmountTimer);
       }
     };
-  }, [animateFrameSidebar, showFrameSidebar]);
+  }, [showFrameSidebar]);
 
-  // Notify iframe of sidebar state
-  function notifyIframe(mode: FrameMode, width: number, open: boolean) {
+  function notifyIframe(
+    mode: FrameMode,
+    width: number,
+    open: boolean,
+    wideDrawer: boolean,
+    placeholderWidth: number,
+  ) {
     const visibleOpen = getVisibleSidebarOpen(mode, open, isPresentationMode);
     iframeRef.current?.contentWindow?.postMessage(
       {
@@ -255,14 +260,14 @@ export function App() {
           mode: mode === "dev" ? "code" : "app",
           width,
           open: visibleOpen,
+          wide: wideDrawer,
+          placeholderWidth,
         },
       },
       "*",
     );
   }
 
-  // Send frame origin + initial state to iframe on load.
-  // Retry a few times to handle slow mounts and HMR reloads.
   useEffect(() => {
     const iframe = iframeRef.current;
     if (!iframe) return;
@@ -274,7 +279,14 @@ export function App() {
       const delays = [200, 500, 1500];
       const timers = delays.map((ms) =>
         setTimeout(
-          () => notifyIframe(frameMode, sidebarWidth, sidebarOpen),
+          () =>
+            notifyIframe(
+              frameMode,
+              sidebarWidth,
+              sidebarOpen,
+              sidebarWideDrawer,
+              sidebarDrawerPlaceholderWidth,
+            ),
           ms,
         ),
       );
@@ -289,12 +301,31 @@ export function App() {
       iframe.removeEventListener("load", handleLoad);
       timers.forEach(clearTimeout);
     };
-  }, []);
+  }, [
+    frameMode,
+    sidebarDrawerPlaceholderWidth,
+    sidebarOpen,
+    sidebarWideDrawer,
+    sidebarWidth,
+    isPresentationMode,
+  ]);
 
-  // When mode/open/width changes, notify iframe
   useEffect(() => {
-    notifyIframe(frameMode, sidebarWidth, sidebarOpen);
-  }, [frameMode, sidebarWidth, sidebarOpen, isPresentationMode]);
+    notifyIframe(
+      frameMode,
+      sidebarWidth,
+      sidebarOpen,
+      sidebarWideDrawer,
+      sidebarDrawerPlaceholderWidth,
+    );
+  }, [
+    frameMode,
+    sidebarWidth,
+    sidebarOpen,
+    sidebarWideDrawer,
+    sidebarDrawerPlaceholderWidth,
+    isPresentationMode,
+  ]);
 
   useEffect(() => {
     dispatchFrameSidebarStateChange(
@@ -304,7 +335,15 @@ export function App() {
   }, [frameMode, sidebarOpen, isPresentationMode]);
 
   useEffect(() => {
-    const toggleHandler = () => setSidebarOpen((prev) => !prev);
+    const toggleHandler = (event: Event) => {
+      const focusOnOpen =
+        (event as CustomEvent<{ focus?: unknown }>).detail?.focus === true;
+      if (focusOnOpen && !sidebarOpen) {
+        focusAgentChat();
+        return;
+      }
+      setSidebarOpen((prev) => !prev);
+    };
     const openHandler = () => setSidebarOpen(true);
     const closeHandler = () => setSidebarOpen(false);
     window.addEventListener("agent-panel:toggle", toggleHandler);
@@ -315,19 +354,20 @@ export function App() {
       window.removeEventListener("agent-panel:open", openHandler);
       window.removeEventListener("agent-panel:close", closeHandler);
     };
-  }, []);
+  }, [sidebarOpen]);
 
   useEffect(() => {
     const keydownHandler = (event: KeyboardEvent) => {
       if (!isAgentSidebarToggleShortcut(event)) return;
       event.preventDefault();
-      window.dispatchEvent(new Event("agent-panel:toggle"));
+      window.dispatchEvent(
+        new CustomEvent("agent-panel:toggle", { detail: { focus: true } }),
+      );
     };
     window.addEventListener("keydown", keydownHandler);
     return () => window.removeEventListener("keydown", keydownHandler);
   }, []);
 
-  // Listen for dev mode toggle from AgentPanel settings cog
   useEffect(() => {
     function handler(e: Event) {
       const detail = (e as CustomEvent).detail;
@@ -342,14 +382,15 @@ export function App() {
       window.removeEventListener("agent-panel:dev-mode-change", handler);
   }, []);
 
-  // Listen for messages from iframe
   useEffect(() => {
     function handleMessage(event: MessageEvent) {
       if (!event.data?.type) return;
       if (event.data.type === "agentNative.toggleSidebar") {
         const forceOpen = event.data.data?.open;
+        const focusOnOpen = event.data.data?.focus === true;
         if (forceOpen === true) {
-          setSidebarOpen(true);
+          if (focusOnOpen) focusAgentChat();
+          else setSidebarOpen(true);
         } else if (forceOpen === false) {
           setSidebarOpen(false);
         } else {
@@ -378,10 +419,6 @@ export function App() {
         );
         return;
       }
-      // Relay chat bridge events from the iframe; the agent chat rejects
-      // cross-origin messages, so re-dispatch same-origin so it accepts it.
-      // Only relay from known app dev-server origins to prevent arbitrary
-      // cross-origin pages from injecting agent messages.
       if (event.data.type === "agentNative.presentationMode") {
         setIsPresentationMode(event.data.data?.active === true);
         return;
@@ -418,7 +455,6 @@ export function App() {
     return () => window.removeEventListener("message", handleMessage);
   }, []);
 
-  // Resize — use state so we can show an overlay on the iframe during drag
   const [isDragging, setIsDragging] = useState(false);
   const lastX = useRef(0);
 
@@ -428,7 +464,7 @@ export function App() {
       const delta = lastX.current - e.clientX;
       lastX.current = e.clientX;
       setSidebarWidth((prev) => {
-        const next = Math.max(280, Math.min(700, prev + delta));
+        const next = clampAgentSidebarWidth(prev + delta);
         try {
           localStorage.setItem(SIDEBAR_WIDTH_KEY, String(next));
         } catch {}
@@ -456,6 +492,64 @@ export function App() {
     document.body.style.userSelect = "none";
   }
 
+  const [sidebarMorphing, setSidebarMorphing] = useState(false);
+  function runSidebarMorph(apply: () => void) {
+    flushSync(() => setSidebarMorphing(true));
+    const settle = () => setSidebarMorphing(false);
+    const transition = startAgentChatViewTransition(apply);
+    if (!transition) {
+      settle();
+      return;
+    }
+    transition.finished.then(settle, settle);
+  }
+
+  function snapSidebarTo75Percent() {
+    if (sidebarDrawerExitTimerRef.current !== null) {
+      clearTimeout(sidebarDrawerExitTimerRef.current);
+      sidebarDrawerExitTimerRef.current = null;
+    }
+    const next = getAgentSidebarWideWidth();
+    const placeholderWidth = sidebarWideDrawer
+      ? sidebarDrawerPlaceholderWidth
+      : sidebarWidth;
+    runSidebarMorph(() => {
+      setSidebarDrawerPlaceholderWidth(placeholderWidth);
+      setSidebarWideDrawer(true);
+      setSidebarWidth(next);
+      try {
+        localStorage.setItem(SIDEBAR_WIDTH_KEY, String(next));
+        localStorage.setItem(SIDEBAR_DRAWER_KEY, "true");
+        localStorage.setItem(
+          SIDEBAR_DRAWER_PLACEHOLDER_KEY,
+          String(placeholderWidth),
+        );
+        // coercion-ok: the drawer remains applied in memory when storage is unavailable.
+      } catch {}
+    });
+  }
+
+  function exitSidebarDrawer() {
+    if (!sidebarWideDrawer || sidebarDrawerExitTimerRef.current !== null)
+      return;
+    const next = sidebarDrawerPlaceholderWidth;
+    runSidebarMorph(() => {
+      setSidebarWidth(next);
+      try {
+        localStorage.setItem(SIDEBAR_WIDTH_KEY, String(next));
+        localStorage.setItem(SIDEBAR_DRAWER_KEY, "false");
+        // coercion-ok: the normal sidebar remains applied in memory when storage is unavailable.
+      } catch {}
+      sidebarDrawerExitTimerRef.current = setTimeout(() => {
+        sidebarDrawerExitTimerRef.current = null;
+        setSidebarWideDrawer(false);
+      }, SIDEBAR_ANIMATION_MS + 32);
+    });
+  }
+
+  const frameDrawerEnabled = sidebarWideDrawer;
+  const showFrameDrawerPlaceholder = frameDrawerEnabled && renderFrameSidebar;
+
   return (
     <div
       className="agent-frame-shell flex h-screen w-screen overflow-hidden"
@@ -464,17 +558,10 @@ export function App() {
         color: "hsl(var(--foreground))",
       }}
     >
-      {/* App iframe — takes all remaining space. Hidden when sidebar is fullscreen. */}
+      {/* App iframe — takes all remaining space. */}
       <div
         className="agent-frame-main-surface flex-1 min-w-0 relative overflow-hidden"
-        data-agent-frame-main-state={
-          showFrameSidebar && !sidebarFullscreen ? "open" : "closed"
-        }
-        style={
-          showFrameSidebar && sidebarFullscreen
-            ? { display: "none" }
-            : undefined
-        }
+        data-agent-frame-main-state={showFrameSidebar ? "open" : "closed"}
       >
         <iframe
           ref={iframeRef}
@@ -492,7 +579,7 @@ export function App() {
       {/* Dev mode sidebar — looks identical to the in-app agent panel */}
       {renderFrameSidebar && (
         <>
-          {!sidebarFullscreen && showFrameSidebar && (
+          {showFrameSidebar && (
             <div
               className="shrink-0 cursor-col-resize relative"
               style={{ width: 1, background: "hsl(var(--border))", zIndex: 50 }}
@@ -506,10 +593,21 @@ export function App() {
               />
             </div>
           )}
+          {showFrameDrawerPlaceholder && (
+            <div
+              aria-hidden="true"
+              className="agent-frame-sidebar-placeholder shrink-0"
+              data-agent-frame-sidebar-placeholder="true"
+              style={{ width: sidebarDrawerPlaceholderWidth }}
+            />
+          )}
           <div
             className="agent-frame-sidebar flex flex-col shrink-0 overflow-hidden"
             data-agent-frame-sidebar-animation={
-              animateFrameSidebar ? "desktop" : undefined
+              !frameDrawerEnabled ? "desktop" : undefined
+            }
+            data-agent-frame-sidebar-layout={
+              frameDrawerEnabled ? "drawer" : "inline"
             }
             data-agent-frame-sidebar-state={
               showFrameSidebar ? "open" : "closed"
@@ -517,17 +615,13 @@ export function App() {
             style={
               {
                 "--agent-frame-sidebar-width": `${sidebarWidth}px`,
-                width: animateFrameSidebar
-                  ? undefined
-                  : showFrameSidebar
-                    ? sidebarFullscreen
-                      ? "100%"
-                      : sidebarWidth
-                    : 0,
-                flex: showFrameSidebar && sidebarFullscreen ? 1 : undefined,
+                width: frameDrawerEnabled ? sidebarWidth : undefined,
                 maxHeight: "100vh",
                 minWidth: 0,
                 pointerEvents: showFrameSidebar ? undefined : "none",
+                ...(sidebarMorphing
+                  ? { viewTransitionName: "agent-native-frame-sidebar" }
+                  : null),
               } as CSSProperties & { "--agent-frame-sidebar-width": string }
             }
             inert={showFrameSidebar ? undefined : true}
@@ -548,18 +642,27 @@ export function App() {
                   emptyStateText={`Ask me anything about ${app?.label || "your app"}`}
                   suggestions={suggestions}
                   onCollapse={() => setSidebarOpen(false)}
-                  isFullscreen={sidebarFullscreen}
-                  onToggleFullscreen={() =>
-                    setSidebarFullscreen((prev) => !prev)
-                  }
-                  devAppUrl={appUrl}
+                  onSnapTo75Percent={snapSidebarTo75Percent}
+                  isWideDrawer={sidebarWideDrawer}
+                  onExitWideDrawer={exitSidebarDrawer}
                   storageKey={appId}
+                  scope={
+                    appId
+                      ? {
+                          type: "workspace-app",
+                          id: appId,
+                          label: app?.label,
+                          contextKey: `workspace-app:${appId}`,
+                        }
+                      : null
+                  }
+                  isolateHistoryByScope
                   agentChatSurface="dev-frame"
                   codeAccess={{
                     enabled: isDesktop,
                     unavailableTitle: "Open Desktop to use CLI",
                     unavailableDescription:
-                      "Open Agent Native Desktop, click the + button, and add this app with its local dev URL to use CLI.",
+                      "Open Agent-Native Desktop, click the + button, and add this app with its local dev URL to use CLI.",
                     unavailableCtaLabel: "Open Desktop",
                     unavailableCtaHref: OPEN_DESKTOP_URL,
                     unavailableSecondaryCtaLabel: "Download",

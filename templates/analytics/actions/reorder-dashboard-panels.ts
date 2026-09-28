@@ -1,16 +1,12 @@
 import { defineAction, embedApp } from "@agent-native/core";
 import {
-  applyText,
-  hasCollabState,
-  seedFromText,
-} from "@agent-native/core/collab";
-import {
   buildDeepLink,
   getRequestOrgId,
   getRequestUserEmail,
 } from "@agent-native/core/server";
 import { z } from "zod";
 
+import { queueDashboardCollabSync } from "../server/lib/dashboard-collab-sync";
 import { upsertDashboardWithRetry } from "../server/lib/dashboards-store";
 import {
   compactDashboardResult,
@@ -72,24 +68,6 @@ function resolveTarget(args: {
   if (args.afterPanelId) return { afterPanelId: args.afterPanelId };
   if (args.index !== undefined) return { index: args.index };
   return { position: args.position ?? "top" };
-}
-
-async function syncToCollab(
-  dashboardId: string,
-  config: Record<string, unknown>,
-): Promise<void> {
-  const docId = `dash-${dashboardId}`;
-  const configStr = JSON.stringify(config);
-  try {
-    const exists = await hasCollabState(docId);
-    if (exists) {
-      await applyText(docId, configStr, "content", "agent");
-    } else {
-      await seedFromText(docId, configStr);
-    }
-  } catch {
-    // SQL remains the source of truth; live collab sync is best-effort.
-  }
 }
 
 export default defineAction({
@@ -157,10 +135,6 @@ export default defineAction({
     const scope = resolveScope();
     const ctx = { email: scope.email, orgId: scope.orgId };
 
-    // Recomputed on every attempt from whichever dashboard state
-    // `upsertDashboardWithRetry` hands us, so a retry after a concurrent
-    // writer's save re-applies this move against their fresh panel order
-    // instead of silently discarding it.
     let orderResult!: PanelOrderResult;
     const saved = await upsertDashboardWithRetry(
       dashboardId,
@@ -172,7 +146,7 @@ export default defineAction({
       },
     );
     const root = saved.config as Record<string, unknown>;
-    await syncToCollab(dashboardId, root);
+    queueDashboardCollabSync(dashboardId, root, "agent");
 
     const compact = compactDashboardResult(root, orderResult.movedPanelIds);
     return {

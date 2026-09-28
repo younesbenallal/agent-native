@@ -11,12 +11,13 @@ The analytics app connects to multiple data sources. This skill covers general p
 
 ## Approach
 
-0. **Orient catalog-first** — before querying, consult what already exists: the injected `<data-dictionary>` and data-source status tell you which sources are configured and which table/columns/join paths to use. Use them to pick the one source that owns the fact instead of fanning out blind queries.
-1. **Read the relevant provider skill first** — check `.agents/skills/<provider>/SKILL.md` for table names, column mappings, auth, and gotchas. For BigQuery, read `.agents/skills/bigquery/SKILL.md` and use `search-bigquery-schema` before guessing table or column names.
-2. **Clarify if ambiguous** — if the metric definition, date range, or grain is unclear and a wrong guess would change the numbers, use the `ask-question` clarifying tool (multiple-choice) before querying. Ask at most once per turn; skip it when the dictionary or the user already answered.
-3. **Use existing actions or connected provider MCP tools** — call the provider action/tool with structured arguments, then filter or aggregate the returned records in your answer
-4. **Write ad-hoc scripts** — if no existing script covers the question, create one in `actions/`
-5. **Present data in chat** — don't just say "check the dashboard" — actually query, get the data, and present it. Only present numbers you actually retrieved; never report a value you did not query.
+0. **Use retrieved references first** — data questions may start with a small set of relevant data-dictionary entries and saved dashboard panels in `<resource scope="analytics-catalog">`. Treat them as definitions and query examples, never live results. If they do not fit, call `search-analytics-query-catalog` before querying; use data-source status when provider availability matters.
+1. **Route named account health deliberately** — for a customer/org health, QBR, renewal, contract-utilization, risk, or adoption request, read `account-health` before writing SQL. It adds identity-lock and metric-definition checks that an ordinary lookup does not need.
+2. **Read the relevant provider skill first** — check `.agents/skills/<provider>/SKILL.md` for table names, column mappings, auth, and gotchas. For BigQuery, read `.agents/skills/bigquery/SKILL.md` and use `search-bigquery-schema` before guessing table or column names.
+3. **Clarify if ambiguous** — if the metric definition, date range, or grain is unclear and a wrong guess would change the numbers, use the `ask-question` clarifying tool (multiple-choice) before querying. Ask at most once per turn; skip it when the dictionary or the user already answered.
+4. **Use existing actions or connected provider MCP tools** — call the provider action/tool with structured arguments, then filter or aggregate the returned records in your answer
+5. **Write ad-hoc scripts** — if no existing script covers the question, create one in `actions/`
+6. **Present data in chat** — don't just say "check the dashboard" — actually query, get the data, and present it. Only present numbers you actually retrieved; never report a value you did not query.
 
 For events recorded by the analytics template itself via its `/track` endpoint, use `pnpm action query-agent-native-analytics --sql "SELECT ... FROM analytics_events ..."`. This includes pageviews, site/app traffic, template usage, app usage, and event counts collected by this analytics app. Pageviews and traffic can also live in GA4, BigQuery/warehouse tables, Mixpanel, PostHog, Amplitude, or another configured provider, so choose the source from the user's wording, connected-source status, existing dashboards, data dictionary, and user/org resources. Ask one concise clarification if multiple configured sources are plausible. Do not use `db-query` for data-source analysis; `db-query` is only for internal app tables and will confuse analytics questions. The shipped `agent-native-templates-first-party` SQL dashboard is the template engagement dashboard for the first-party collector source.
 
@@ -42,10 +43,12 @@ If a suitable backend is not configured, use its returned setup link or
 Data Sources walkthrough. Connecting a query backend alone does not move the
 collector or copy existing Neon events. For the Builder.io production
 organization, the hidden `migrate-first-party-analytics-to-bigquery` action is
-the explicit state machine: prepare dual-write, backfill with its cursor, then
-cut over with confirmation. After cutover, `/track` writes and event queries
-use BigQuery; public-key metadata, derived exception issues, and session-replay
-data remain in SQL.
+the explicit state machine: prepare dual-write, backfill through bounded,
+newest-first UTC time shards with per-shard leases, then cut over with
+confirmation. The worker excludes `http.response` by default and uses
+BigQuery `insertId` values for retry-safe writes. After cutover, `/track`
+writes and event queries use BigQuery; public-key metadata, derived exception
+issues, and session-replay data remain in SQL.
 
 Example pageviews query for a local calendar day:
 
@@ -169,7 +172,10 @@ For complete answers, combine data from multiple sources:
 - **Gong** for sales-call evidence — use `gong-calls` with `includeTranscripts=true` for deep dives, objections, risks, or next steps
 - **Jira** for engineering metrics — tickets, sprints
 - **GitHub** for code metrics — PRs, reviews
-- **Sentry** for error rates and trends
+- **Agent-Native Analytics Monitoring -> Errors** for first-party captured
+  client/server issues; use `list-error-issues` and `get-error-issue` for
+  grouped details
+- **Sentry** for external error rates and trends when connected
 - **Grafana** for infrastructure metrics
 
 ## After Completing an Analysis — Capture New Knowledge
@@ -181,8 +187,25 @@ When you complete an analysis and discover:
 - A schema discovery (table exists but wasn't in the dictionary, a column name differs)
 - An identity-stitching rule (how to match users across two specific sources)
 
-Capture it immediately using `save-memory` or by writing to `LEARNINGS.md` via
-the `resources` tool:
+Analytics automatically captures explicit user corrections and metric
+definitions the user confirms after the thread has been idle. State corrections
+plainly. Before asking for confirmation, restate the complete proposed metric
+definition in plain language, including its key conditions and time window or
+grain when applicable; a bare “yes” to a metric-name-only question is not
+confirmation. Captures stay private to the user and, when learned in an
+organization, are retrieved only in that same organization. Do not call
+`save-memory` again for those same items.
+
+Use `save-memory` for other verified, durable personal Analytics knowledge,
+with a short actionable description; read the existing entry first when
+updating it. Do not save guesses, one-off result values, raw queries,
+credentials, or personal or customer-identifying details such as names, contact
+information, street/billing/mailing addresses, or personal identifiers. If the
+finding is uncertain or only applies to the current analysis, leave it in the
+answer instead of creating a memory.
+
+For entries not suitable for personal memory, use the project `LEARNINGS.md`
+only when it contains genuinely reusable, non-sensitive guidance:
 
 ```
 resources(action: "read", path: "LEARNINGS.md")  -- read first to merge
@@ -196,6 +219,7 @@ future analyses.
 ## Important Notes
 
 - Always query real data — never guess or approximate. Only present numbers you actually retrieved; do not claim a figure you did not query.
+- State confidence explicitly instead of refusing. Cite the dashboard or saved query you used when a query ran; say so when you're answering from an existing dashboard, especially a certified one. When no live query ran this turn, label every figure "Unverified" instead of asserting it or falling back to a connect-a-source dead end. Never refuse a question just because no certified source exists — try the catalog, then a bounded query, before declining.
 - Answer questions directly in chat with tables, inline charts, and findings. Never deflect to "check the dashboard" — actually run the query and present the answer.
 - Before finalizing an analytics answer, make the evidence trail explicit enough
   to audit: source(s), time window, filters, sample size or row count, join or

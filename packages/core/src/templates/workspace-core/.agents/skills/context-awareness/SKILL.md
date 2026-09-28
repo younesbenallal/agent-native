@@ -47,6 +47,8 @@ export function useNavigationState() {
 }
 ```
 
+`TAB_ID` comes from the framework's `getBrowserTabId()` (see the scaffolded `app/lib/tab-id.ts`; never redefine it). The server resolves tab-scoped `application_state` writes and page-local WebMCP calls (`X-Agent-Native-Browser-Tab`) against this same id, so a hand-rolled random id silently breaks selection sync for hidden and background tabs.
+
 **Agent side** — read before acting:
 
 ```ts
@@ -69,11 +71,19 @@ Keep `application_state` values small. Do not store pasted files, base64 images,
 recording chunks, screenshots, or other large blobs in navigation or app-state
 keys; upload them and store only a URL or storage handle.
 
+### Selection state
+
+The editor writes the user's current selection to tab-scoped app state under `selection` whenever it changes: `writeClientAppState("selection", { kind: "text", id: <artifact id>, elementId?, range?: { start, end }, text?: <short excerpt>, capturedAt }, { requestSource: TAB_ID })` — stable ids and a short label, never the whole document. `view-screen` reads it and returns `selection` plus the exact next call, e.g. `nextRequiredAction: "update-slide"` with `nextArgs: { slideId, edits: [{ find: selection.text, replace: "…", expectedMatches: 1 }] }`. External agents act on that hint directly; only when `selection` is null should the agent ask which item.
+
 ### 2. Current URL (`__url__` key)
 
 `AgentPanel` automatically writes `__url__` with `{ pathname, search, hash, searchParams }`. The built-in agent sees it as a `<current-url>` block in every turn.
 
 Use this for URL-reachable filters and search state. The agent can update it with the built-in `set-search-params` and `set-url-path` tools; do not duplicate the whole query string into `navigation`.
+
+### Settings page (`settings-view` key)
+
+The redesigned Settings shell writes tab-scoped `settings-view` = `{ page, sub, label }` (for example `{ page: "integrations", sub: "builder", label: "Connections › Integrations › Builder.io" }`) and deletes it when Settings closes. `<current-url>` shows it as a `settingsPage:` line, because a legacy or mounted pathname doesn't name the page the shell resolved. To send the user to a page, call the built-in `open-settings-page` tool with a page id (plus `sub` or `anchor`); it resolves old tab and section ids through the same redirect table as links. A template's own `navigate` action only needs a Settings branch for its app areas (`/settings/app/<area>`), built with `buildSettingsRoute`.
 
 ### 3. The `view-screen` Script
 
@@ -106,6 +116,12 @@ export default async function main() {
   if (navigation?.threadId) {
     const thread = await fetchThread(navigation.threadId);
     screen.thread = thread;
+  }
+
+  const selection = await readAppState("selection");
+  if (selection) {
+    screen.selection = selection;
+    screen.nextRequiredAction = "update-email";
   }
 
   console.log(JSON.stringify(screen, null, 2));

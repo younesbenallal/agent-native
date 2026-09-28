@@ -9,8 +9,8 @@ import {
   useCallback,
   useImperativeHandle,
   useMemo,
+  useRef,
   useState,
-  type CSSProperties,
   type ReactNode,
 } from "react";
 
@@ -26,49 +26,13 @@ import {
   ContextMenuSubTrigger,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import { useApplePlatform } from "@/hooks/use-shortcut-label";
 import { cn } from "@/lib/utils";
 
 import { IconText } from "./inspector/design-icons";
+import { formatShortcutLabel } from "./keyboard-shortcuts";
 import type { CanvasLayerHitCandidate } from "./types";
 
-// LIVE-VERIFIED (real Figma, UI3) canvas context menus:
-//
-// WITH a selection:
-//   Copy ⌘C · Paste here · Paste to replace ⇧⌘R · Copy/Paste as ▸
-//     (Copy as code · Copy as SVG · Copy as PNG ⇧⌘C · [sep] ·
-//      Copy properties ⌥⌘C · Paste properties ⌥⌘V · [sep] ·
-//      Copy animation · Paste animation)
-//   [sep]
-//   Bring to front ] · Send to back [
-//   [sep]
-//   Group selection ⌘G · Frame selection ⌥⌘G
-//   [sep]
-//   Add auto layout ⇧A · Create component ⌥⌘K
-//   [sep]
-//   Show/Hide ⇧⌘H · Lock/Unlock ⇧⌘L
-//   [sep]
-//   Flip horizontal ⇧H · Flip vertical ⇧V
-//
-// EMPTY canvas (no selection):
-//   Paste here
-//   [sep]
-//   Show/Hide UI ⇧\ · Show/Hide comments ⇧C
-//
-// Real Figma has no Duplicate/Delete/Select-all/Zoom items on either canvas
-// menu (all keyboard-only there) — those are intentionally NOT rendered here
-// even though some callers may still pass the callback/capability props for
-// back-compat. App-specific extras with no Figma equivalent (e.g. "Edit
-// screen") are appended at the very bottom, below one more separator, so the
-// Figma-muscle-memory zone above stays byte-identical to the real menu.
-//
-// NOTE — instance-only cluster (Go to main component / Swap instance /
-// Detach instance): added for component-instance selections, gated behind
-// `isComponentInstance` so it renders nothing for existing callers (fully
-// backward compatible). Real Figma groups these together for an instance
-// selection, but this exact placement (right after Add auto layout / Create
-// component) was NOT independently re-verified against a live Figma session
-// in this pass — reposition if a future LIVE-VERIFIED sweep finds a
-// different spot.
 export type CanvasContextMenuAction =
   | "paste-here"
   | "select-all"
@@ -117,6 +81,7 @@ export interface CanvasContextMenuPoint {
   clientY: number;
   canvasX?: number;
   canvasY?: number;
+  screenId?: string;
 }
 
 export interface CanvasContextMenuHandle {
@@ -248,8 +213,6 @@ export interface CanvasContextMenuProps {
   isUiHidden?: boolean;
   isCommentsHidden?: boolean;
   canPasteHere?: boolean;
-  // Kept for back-compat with existing callers; real Figma has no
-  // select-all/zoom items on this menu, so these no longer render anything.
   canSelectAll?: boolean;
   canZoomToFit?: boolean;
   canZoomToSelection?: boolean;
@@ -259,8 +222,6 @@ export interface CanvasContextMenuProps {
   canPaste?: boolean;
   canPasteOver?: boolean;
   canPasteToReplace?: boolean;
-  // Kept for back-compat; real Figma has no Duplicate/Delete on this menu
-  // (keyboard-only there), so these no longer render anything.
   canDuplicate?: boolean;
   canDelete?: boolean;
   canReorder?: boolean;
@@ -271,24 +232,10 @@ export interface CanvasContextMenuProps {
   canSuggestAutoLayout?: boolean;
   canCreateComponent?: boolean;
   canReprompt?: boolean;
-  // Whether the current selection IS a component instance — gates the
-  // whole Go to main component / Swap instance / Detach instance cluster on
-  // (rather than showing them permanently disabled for non-instance
-  // selections, since real Figma doesn't show this cluster at all then).
   isComponentInstance?: boolean;
   canGoToMainComponent?: boolean;
   canSwapInstance?: boolean;
   canDetachInstance?: boolean;
-  // L12: this menu is target-agnostic — it has no built-in notion of "design
-  // title" vs "layer". Rename is enabled by default for a single selection
-  // (see the canRename default below) and fires through the onRename
-  // callback / onAction("rename", ...) regardless of what's selected. Any
-  // "only rename the design title" restriction is a CALL-SITE decision (e.g.
-  // passing canRename={false} and/or hiddenActions={["rename"]} when a layer
-  // is selected instead of the design title) — it does not live here.
-  // NOTE: real Figma's canvas menu doesn't show Rename at all — only the
-  // layer-row menu does. Kept here (opt-in via a wired-up onRename) purely
-  // for existing callers; no default UI relies on it being shown.
   canRename?: boolean;
   canToggleLocked?: boolean;
   canToggleHidden?: boolean;
@@ -318,7 +265,6 @@ export interface CanvasContextMenuProps {
     details: CanvasContextMenuActionDetails,
   ) => void;
   onPasteHere?: CanvasContextMenuActionHandler;
-  // Kept for back-compat; no longer rendered (see canSelectAll/canZoomToFit).
   onSelectAll?: CanvasContextMenuActionHandler;
   onZoomToFit?: CanvasContextMenuActionHandler;
   onZoomToSelection?: CanvasContextMenuActionHandler;
@@ -328,7 +274,6 @@ export interface CanvasContextMenuProps {
   onPaste?: CanvasContextMenuActionHandler;
   onPasteOver?: CanvasContextMenuActionHandler;
   onPasteToReplace?: CanvasContextMenuActionHandler;
-  // Kept for back-compat; no longer rendered (see canDuplicate/canDelete).
   onDuplicate?: CanvasContextMenuActionHandler;
   onDelete?: CanvasContextMenuActionHandler;
   onBringForward?: CanvasContextMenuActionHandler;
@@ -345,11 +290,6 @@ export interface CanvasContextMenuProps {
   onGoToMainComponent?: CanvasContextMenuActionHandler;
   onSwapInstance?: CanvasContextMenuActionHandler;
   onDetachInstance?: CanvasContextMenuActionHandler;
-  // L12: fired when the Rename item is selected (details.selectedCount tells
-  // the caller how many things are selected). The caller decides what
-  // "rename" means for the current target — e.g. calling a LayersPanel
-  // ref's beginRename(layerId) when exactly one layer is selected, vs.
-  // starting design-title rename when nothing is selected.
   onRename?: CanvasContextMenuActionHandler;
   onToggleLocked?: CanvasContextMenuActionHandler;
   onToggleHidden?: CanvasContextMenuActionHandler;
@@ -365,16 +305,12 @@ export interface CanvasContextMenuProps {
   onFlipVertical?: CanvasContextMenuActionHandler;
   onToggleUi?: CanvasContextMenuActionHandler;
   onToggleComments?: CanvasContextMenuActionHandler;
-  // App-specific items with no Figma equivalent (e.g. "Edit screen"). Render
-  // below a trailing separator, after the Figma-muscle-memory zone, only for
-  // the WITH-selection menu — matching the existing call site's need without
-  // polluting the empty-canvas menu.
   appendedItems?: ReactNode;
 }
 
 const DEFAULT_LABELS: CanvasContextMenuLabels = {
   selectLayer: "Select layer",
-  reprompt: "Regenerate…",
+  reprompt: "Edit with AI…",
   pasteHere: "Paste here",
   selectAll: "Select all",
   zoomToFit: "Zoom to fit",
@@ -423,65 +359,92 @@ const DEFAULT_LABELS: CanvasContextMenuLabels = {
   toggleCommentsHide: "Hide comments",
 };
 
-const DEFAULT_SHORTCUTS: CanvasContextMenuShortcuts = {
+const DEFAULT_SHORTCUT_BINDINGS: Record<
+  keyof CanvasContextMenuShortcuts,
+  string
+> = {
   pasteHere: "",
-  selectAll: "⌘A",
-  zoomToFit: "⇧1",
-  zoomToSelection: "⇧2",
+  selectAll: "$mod+a",
+  zoomToFit: "shift+1",
+  zoomToSelection: "shift+2",
   zoomIn: "+",
   zoomOut: "-",
-  copy: "⌘C",
-  paste: "⌘V",
-  pasteOver: "⇧⌘V",
-  pasteToReplace: "⇧⌘R",
-  duplicate: "⌘D",
-  delete: "⌫",
-  bringForward: "⌘]",
+  copy: "$mod+c",
+  paste: "$mod+v",
+  pasteOver: "$mod+shift+v",
+  pasteToReplace: "$mod+shift+r",
+  duplicate: "$mod+d",
+  delete: "backspace",
+  bringForward: "$mod+]",
   bringToFront: "]",
-  sendBackward: "⌘[",
+  sendBackward: "$mod+[",
   sendToBack: "[",
-  group: "⌘G",
-  ungroup: "⇧⌘G",
-  frameSelection: "⌥⌘G",
-  addAutoLayout: "⇧A",
-  createComponent: "⌥⌘K",
+  group: "$mod+g",
+  ungroup: "$mod+shift+g",
+  frameSelection: "$mod+alt+g",
+  addAutoLayout: "shift+a",
+  createComponent: "$mod+alt+k",
   goToMainComponent: "",
   swapInstance: "",
-  detachInstance: "⌥⌘B",
-  rename: "⌘R",
-  toggleLock: "⇧⌘L",
-  toggleHide: "⇧⌘H",
-  copyProps: "⌥⌘C",
-  pasteProps: "⌥⌘V",
+  detachInstance: "$mod+alt+b",
+  rename: "$mod+r",
+  toggleLock: "$mod+shift+l",
+  toggleHide: "$mod+shift+h",
+  copyProps: "$mod+alt+c",
+  pasteProps: "$mod+alt+v",
   copyAnimation: "",
   pasteAnimation: "",
   copyAsCode: "",
   copyAsSvg: "",
-  copyAsPng: "⇧⌘C",
+  copyAsPng: "$mod+shift+c",
   rotateClockwise: "",
-  flipHorizontal: "⇧H",
-  flipVertical: "⇧V",
-  toggleUi: "⇧\\",
-  toggleComments: "⇧C",
+  flipHorizontal: "shift+h",
+  flipVertical: "shift+v",
+  toggleUi: "$mod+\\",
+  toggleComments: "shift+c",
 };
+
+function defaultShortcutLabels(
+  applePlatform: boolean,
+): CanvasContextMenuShortcuts {
+  const labels = {} as CanvasContextMenuShortcuts;
+  for (const action of Object.keys(
+    DEFAULT_SHORTCUT_BINDINGS,
+  ) as (keyof CanvasContextMenuShortcuts)[]) {
+    labels[action] = formatShortcutLabel(
+      DEFAULT_SHORTCUT_BINDINGS[action],
+      applePlatform,
+    );
+  }
+  return labels;
+}
 
 type ActionCallbackMap = Partial<
   Record<CanvasContextMenuAction, CanvasContextMenuActionHandler>
 >;
 
-// design-editor menu chrome: compact, dark-border, subtle shadow, no animation jitter
+export function dispatchContextMenuAt(
+  target: HTMLElement,
+  point: CanvasContextMenuPoint,
+) {
+  target.dispatchEvent(
+    new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      clientX: point.clientX,
+      clientY: point.clientY,
+    }),
+  );
+}
+
 const MENU_CONTENT_CLASS =
   "w-52 min-w-[200px] rounded-[6px] border border-[var(--design-editor-control-border)] bg-[var(--design-editor-panel-bg)] py-[3px] px-[3px] text-[12px] text-foreground shadow-[0_4px_16px_rgba(0,0,0,0.16),0_0_0_0.5px_rgba(0,0,0,0.08)] outline-none data-[state=open]:!animate-none data-[state=closed]:!animate-none";
-// design row height ~28px, full-width highlight on hover, no icon gap waste
 const MENU_ITEM_CLASS =
-  "flex h-7 cursor-default select-none items-center rounded-[4px] px-2 py-0 text-[12px] leading-none gap-0 focus:bg-[var(--design-editor-selection-color)] focus:text-white data-[disabled]:pointer-events-none data-[disabled]:opacity-35";
-// Submenu trigger mirrors item styles + chevron sizing
+  "flex h-7 cursor-default select-none items-center rounded-[4px] px-2 py-0 text-[12px] leading-none gap-0 focus:bg-[var(--design-editor-layer-hover-color)] focus:text-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-35";
 const MENU_SUB_TRIGGER_CLASS =
-  "flex h-7 cursor-default select-none items-center rounded-[4px] px-2 py-0 text-[12px] leading-none focus:bg-[var(--design-editor-selection-color)] focus:text-white data-[state=open]:bg-[var(--design-editor-selection-color)] data-[state=open]:text-white [&>svg:last-child]:ms-auto [&>svg:last-child]:size-3 [&>svg:last-child]:opacity-50";
-// Separator: 1px, full-width flush, design-editor muted line
+  "flex h-7 cursor-default select-none items-center rounded-[4px] px-2 py-0 text-[12px] leading-none focus:bg-[var(--design-editor-layer-hover-color)] focus:text-foreground data-[state=open]:bg-[var(--design-editor-layer-hover-color)] data-[state=open]:text-foreground [&>svg:last-child]:ms-auto [&>svg:last-child]:size-3 [&>svg:last-child]:opacity-50";
 const MENU_SEPARATOR_CLASS =
   "mx-0 my-[3px] h-px bg-[var(--design-editor-control-border)] opacity-80";
-// Shortcut: right-aligned, muted, use system UI for symbol rendering
 const MENU_SHORTCUT_CLASS =
   "ms-auto ps-4 font-normal !text-[11px] tracking-normal text-muted-foreground/70 tabular-nums";
 
@@ -511,7 +474,7 @@ export const CanvasContextMenu = forwardRef<
     canPasteOver = hasClipboard && selectedCount > 0,
     canPasteToReplace = hasClipboard && selectedCount > 0,
     canReorder = selectedCount > 0,
-    canGroup = selectedCount > 1,
+    canGroup = selectedCount > 0,
     canUngroup = false,
     canFrameSelection = selectedCount > 0,
     canAddAutoLayout = selectedCount > 0,
@@ -586,9 +549,10 @@ export const CanvasContextMenu = forwardRef<
     () => ({ ...DEFAULT_LABELS, ...labelsProp }),
     [labelsProp],
   );
+  const applePlatform = useApplePlatform();
   const shortcuts = useMemo(
-    () => ({ ...DEFAULT_SHORTCUTS, ...shortcutsProp }),
-    [shortcutsProp],
+    () => ({ ...defaultShortcutLabels(applePlatform), ...shortcutsProp }),
+    [applePlatform, shortcutsProp],
   );
   const hiddenActionSet = useMemo(
     () => new Set(hiddenActions),
@@ -600,14 +564,13 @@ export const CanvasContextMenu = forwardRef<
   );
   const [point, setPoint] = useState<CanvasContextMenuPoint | null>(null);
   const [open, setOpen] = useState(false);
-  const [manualPoint, setManualPoint] = useState<CanvasContextMenuPoint | null>(
-    null,
-  );
+  const triggerRef = useRef<HTMLDivElement>(null);
+  const imperativePointRef = useRef<CanvasContextMenuPoint | null>(null);
+  const preventContextMenuFocusRestoreRef = useRef(false);
 
   const handleOpenChange = useCallback(
     (nextOpen: boolean) => {
       setOpen(nextOpen);
-      if (!nextOpen) setManualPoint(null);
       onOpenChange?.(nextOpen);
     },
     [onOpenChange],
@@ -618,8 +581,11 @@ export const CanvasContextMenu = forwardRef<
     () => ({
       openAt(nextPoint) {
         setPoint(nextPoint);
-        setManualPoint(nextPoint);
-        setOpen(true);
+        imperativePointRef.current = nextPoint;
+        if (triggerRef.current) {
+          dispatchContextMenuAt(triggerRef.current, nextPoint);
+        }
+        imperativePointRef.current = null;
       },
       close() {
         handleOpenChange(false);
@@ -734,24 +700,19 @@ export const CanvasContextMenu = forwardRef<
     return <>{children}</>;
   }
 
-  const manualContentStyle = manualPoint
-    ? ({
-        position: "fixed",
-        left: manualPoint.clientX,
-        top: manualPoint.clientY,
-        transform: "none",
-        zIndex: 250,
-      } satisfies CSSProperties)
-    : undefined;
-
   const hasSelection = selectedCount > 0;
 
   return (
     <ContextMenu open={open} onOpenChange={handleOpenChange}>
       <ContextMenuTrigger asChild>
         <div
+          ref={triggerRef}
           className={cn("contents", className)}
           onContextMenuCapture={(event) => {
+            if (imperativePointRef.current) {
+              setPoint(imperativePointRef.current);
+              return;
+            }
             const canvasPoint = getCanvasPoint?.({
               clientX: event.clientX,
               clientY: event.clientY,
@@ -769,7 +730,11 @@ export const CanvasContextMenu = forwardRef<
       </ContextMenuTrigger>
       <ContextMenuContent
         className={cn(MENU_CONTENT_CLASS, contentClassName)}
-        style={manualContentStyle}
+        onCloseAutoFocus={(event) => {
+          if (!preventContextMenuFocusRestoreRef.current) return;
+          event.preventDefault();
+          preventContextMenuFocusRestoreRef.current = false;
+        }}
       >
         {layerCandidates.length > 0 && onSelectLayer ? (
           <>
@@ -813,6 +778,7 @@ export const CanvasContextMenu = forwardRef<
                         key={`reprompt:${candidate.key}`}
                         candidate={candidate}
                         onSelect={(event) => {
+                          preventContextMenuFocusRestoreRef.current = true;
                           onRepromptLayer(candidate, {
                             action: "reprompt",
                             point,
@@ -835,8 +801,9 @@ export const CanvasContextMenu = forwardRef<
                   }
                   label={labels.reprompt}
                   onSelect={(event) => {
+                    preventContextMenuFocusRestoreRef.current = true;
                     const candidate = layerCandidates[0];
-                    if (!onReprompt && onRepromptLayer && candidate) {
+                    if (onRepromptLayer && candidate) {
                       onRepromptLayer(candidate, {
                         action: "reprompt",
                         point,

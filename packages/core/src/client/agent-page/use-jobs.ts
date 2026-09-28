@@ -1,6 +1,10 @@
 import { useQueryClient } from "@tanstack/react-query";
 
 import { useActionMutation, useActionQuery } from "../use-action.js";
+import type {
+  ScheduledTriggerState,
+  ScheduledTriggerStatus,
+} from "./scheduled-trigger-state.js";
 
 export type JobsScope = "user" | "org";
 
@@ -29,8 +33,9 @@ export interface Automation {
   name: string;
   path: string;
   scope: "personal" | "organization";
-  triggerType: "event" | "schedule";
+  triggerType: "event" | "schedule" | "webhook";
   event: string | null;
+  webhookPath: string | null;
   schedule: string | null;
   timezone: string | null;
   scheduleDescription: string | null;
@@ -62,10 +67,16 @@ export type ManageJobInput = {
   timezone?: string;
 };
 
-export type ManageAutomationInput = ManageJobInput;
+export type ManageAutomationInput = ManageJobInput & {
+  operation: "create" | "update" | "delete";
+  triggerType?: "event" | "schedule" | "webhook";
+  body?: string;
+  event?: string;
+};
 
 export interface RunAutomationNowInput {
-  name: string;
+  name?: string;
+  path?: string;
   scope: "personal" | "organization";
 }
 
@@ -85,6 +96,7 @@ export interface AutomationRun {
   startedAt: number;
   finishedAt: number | null;
   error: string | null;
+  errorCode: string | null;
 }
 
 function recurringParams(scope: JobsScope) {
@@ -93,6 +105,19 @@ function recurringParams(scope: JobsScope) {
 
 function automationParams(scope: JobsScope) {
   return { scope: scope === "org" ? "organization" : "personal" } as const;
+}
+
+export type { ScheduledTriggerState, ScheduledTriggerStatus };
+
+export function useScheduledTriggerState(): ScheduledTriggerState {
+  const query = useActionQuery<ScheduledTriggerStatus>(
+    "get-scheduled-trigger-status",
+    {},
+    { staleTime: 5 * 60_000 },
+  );
+  if (query.data) return { kind: "resolved", status: query.data };
+  if (query.error) return { kind: "unknown", error: query.error };
+  return { kind: "loading" };
 }
 
 export function useRecurringJobs(scope: JobsScope) {
@@ -189,17 +214,16 @@ export function useRunAutomationNow() {
       onSuccess: (_result, variables) => {
         const scope =
           variables.scope === "organization" ? "organization" : "personal";
-        queryClient.invalidateQueries({
-          queryKey: [
-            "action",
-            "list-automation-runs",
-            { scope, name: variables.name },
-          ],
+        const name =
+          variables.name ??
+          variables.path?.replace(/^jobs\//, "").replace(/\.md$/, "");
+        void queryClient.invalidateQueries({
+          queryKey: ["action", "list-automation-runs", { scope, name }],
         });
-        queryClient.invalidateQueries({
+        void queryClient.invalidateQueries({
           queryKey: ["action", "list-automations", { scope }],
         });
-        queryClient.invalidateQueries({
+        void queryClient.invalidateQueries({
           queryKey: ["action", "list-recurring-jobs", { scope }],
         });
       },
@@ -207,7 +231,9 @@ export function useRunAutomationNow() {
   );
 }
 
-function optimisticPatch(variables: ManageJobInput) {
+function optimisticPatch(
+  variables: Pick<ManageJobInput, "enabled" | "schedule" | "timezone">,
+) {
   const patch: {
     enabled?: boolean;
     schedule?: string;

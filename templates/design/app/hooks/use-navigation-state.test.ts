@@ -20,7 +20,7 @@ describe("design navigation state", () => {
     const path = editorPathFromCommand(command);
 
     expect(path).toBe(
-      "/design/design_123?view=single&mode=interact&screen=empty-state.html&zoom=100",
+      "/design/design_123?editorView=single&mode=interact&screen=empty-state.html&zoom=100",
     );
     expect(editorCommandFromNavigate(command, path!)).toMatchObject({
       designId: "design_123",
@@ -42,7 +42,7 @@ describe("design navigation state", () => {
 
     const path = editorPathFromCommand(command);
 
-    expect(path).toBe("/design/design_123?view=overview&tool=pen");
+    expect(path).toBe("/design/design_123?editorView=overview&tool=pen");
     expect(editorCommandFromNavigate(command, path!)).toMatchObject({
       designId: "design_123",
       editorView: "overview",
@@ -63,7 +63,7 @@ describe("design navigation state", () => {
     const path = editorPathFromCommand(command);
 
     expect(path).toBe(
-      "/design/design_123?view=overview&screen=screen-abc&selection=node-def",
+      "/design/design_123?editorView=overview&screen=screen-abc&selection=node-def",
     );
     expect(editorCommandFromNavigate(command, path!)).toMatchObject({
       designId: "design_123",
@@ -74,20 +74,51 @@ describe("design navigation state", () => {
     });
   });
 
-  it("round-trips the active left rail panel through editor navigation", () => {
+  it("round-trips an enabled left rail panel through editor navigation", () => {
     const command = {
       view: "editor",
       designId: "design_123",
-      leftPanel: "tokens" as const,
+      leftPanel: "import" as const,
     };
 
     const path = editorPathFromCommand(command);
 
-    expect(path).toBe("/design/design_123?panel=tokens");
+    expect(path).toBe("/design/design_123?panel=import");
     expect(editorCommandFromNavigate(command, path!)).toMatchObject({
       designId: "design_123",
-      leftPanel: "tokens",
+      leftPanel: "import",
       path,
+    });
+  });
+
+  it("drops gated left rail panels from editor navigation", () => {
+    const command = {
+      view: "editor",
+      designId: "design_123",
+      leftPanel: "assets" as const,
+    };
+
+    const path = editorPathFromCommand(command);
+
+    expect(path).toBe("/design/design_123");
+    expect(editorCommandFromNavigate(command, path!)).not.toMatchObject({
+      leftPanel: expect.anything(),
+    });
+  });
+
+  it("drops the legacy extensions inspector alias when Tools is gated", () => {
+    const command = {
+      view: "editor",
+      designId: "design_123",
+      inspectorTab: "extensions" as const,
+    };
+
+    const path = editorPathFromCommand(command);
+
+    expect(path).toBe("/design/design_123");
+    expect(editorCommandFromNavigate(command, path!)).not.toMatchObject({
+      inspectorTab: expect.anything(),
+      leftPanel: expect.anything(),
     });
   });
 
@@ -101,7 +132,7 @@ describe("design navigation state", () => {
 
     const path = editorPathFromCommand(command);
 
-    expect(path).toBe("/design/design_123?view=overview");
+    expect(path).toBe("/design/design_123?editorView=overview");
     expect(editorCommandFromNavigate(command, path!)).not.toMatchObject({
       tool: expect.anything(),
     });

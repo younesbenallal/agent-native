@@ -1,8 +1,10 @@
 import { createAuthPlugin } from "@agent-native/core/server";
 
 export default createAuthPlugin({
+  workspaceAppPublicPaths: ["/"],
   marketing: {
     appName: "Assets",
+    learnMoreUrl: "https://agent-native.com/apps/assets",
     tagline:
       "Your AI agent creates, refines, and organizes on-brand assets alongside you.",
     features: [

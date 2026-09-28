@@ -1,5 +1,327 @@
 # @agent-native/creative-context
 
+## 0.8.16
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.8.15
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- ed3801e: Remove nonessential source comments.
+
+## 0.8.14
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.8.13
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.8.12
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.8.11
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.8.10
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.8.9
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.8.8
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.8.7
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.8.6
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.8.5
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.8.4
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.8.3
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.8.2
+
+### Patch Changes
+
+- 421910f: Return deterministic client errors for disabled Creative Context and preserve the singular app-role setter for existing integrations.
+- Release all public npm packages with a patch version bump.
+
+## 0.8.1
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.8.0
+
+### Minor Changes
+
+- 24ed917: Add a default-off Creative Context lab and keep What's new in its own settings group.
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.7.25
+
+### Patch Changes
+
+- fba0dbc: Let a host declare the role that recording generation provenance requires, so drafting in a resource you can only read no longer fails on its own provenance write.
+- Release all public npm packages with a patch version bump.
+- bd3e96e: Use the shared serverless Chromium runtime for Design exports and copy it for apps that declare Playwright directly.
+
+## 0.7.24
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.7.23
+
+### Patch Changes
+
+- a53a789: Clean up and streamline the Creative Context share tab interface.
+- Release all public npm packages with a patch version bump.
+
+## 0.7.22
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.7.21
+
+### Patch Changes
+
+- cb3a95f: Add opt-in canonical organization federation across Agent-Native app deployments.
+- Release all public npm packages with a patch version bump.
+- cc2a915: Standardize framework persistence on PostgreSQL. Local development uses PGlite,
+  hosted deployments use PostgreSQL, and the database client, schema, migrations,
+  templates, docs, and tooling now target PostgreSQL directly.
+
+## 0.7.20
+
+### Patch Changes
+
+- 345fcd7: Allow signed Creative Context background processors to bypass session auth and
+  cover both processor HMAC routes.
+- Release all public npm packages with a patch version bump.
+
+## 0.7.19
+
+### Patch Changes
+
+- 56404c7: Restore Creative context as a Share tab and compact its submission controls.
+- Release all public npm packages with a patch version bump.
+
+## 0.7.18
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.7.17
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.7.16
+
+### Patch Changes
+
+- 1f8e13c: Route managed Google OAuth through the provider-aware root callback on standalone apps.
+- Release all public npm packages with a patch version bump.
+
+## 0.7.15
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.7.14
+
+### Patch Changes
+
+- 4776e61: Reduce CI lint warnings across publishable packages.
+- Release all public npm packages with a patch version bump.
+
+## 0.7.13
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.7.12
+
+### Patch Changes
+
+- db91905: Standardize Agent-Native product naming while preserving compatibility aliases for existing releases and profiles.
+- Release all public npm packages with a patch version bump.
+
+## 0.7.11
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.7.10
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.7.9
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.7.8
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.7.7
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.7.6
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.7.5
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.7.4
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.7.3
+
+### Patch Changes
+
+- baedb60: Fetch the headless browser at launch instead of embedding it in every serverless function. `@agent-native/creative-context` now depends on `@sparticuz/chromium-min` (46KB) rather than `@sparticuz/chromium` (66.4MB), and passes a version-pinned pack URL to `executablePath()`. The hosted Builder Browser path is unchanged and still preferred; this only affects the local-launch fallback, which now downloads the pack once per container. Set `AGENT_NATIVE_CHROMIUM_PACK_URL` to serve the pack from your own mirror. Measured on slides: server function 126.0MB → 59.6MB, total upload 243.8MB → 111.0MB.
+
+## 0.7.2
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.7.1
+
+### Patch Changes
+
+- 10de7b9: Remove unused imports and unreachable declarations. Dispatch drops unused
+  imports from its layout, transactional email pages, and MCP gateway;
+  creative-context drops unused type imports and an unread `headingStyle`;
+  recap-cli drops the `node:os` import and two unread locals; skills drops the
+  unreferenced `maybeUpdateInstructions` helper; toolkit drops unused imports and
+  an unread `REALTIME_VOICE_REQUEST_SOURCE`. No runtime behavior changes.
+  `eslint/no-unused-vars` is now an oxlint error instead of a warning, so CI
+  blocks new ones.
+
+## 0.7.0
+
+### Minor Changes
+
+- 39383b5: designs can be generated using creative context
+
+## 0.6.6
+
+### Patch Changes
+
+- 4c7c289: Keep browser-rendered website style extraction working when the shared evaluator
+  is bundled before it is serialized into Chromium.
+
+## 0.6.5
+
+### Patch Changes
+
+- b3b4580: Normalize commenter access to the read-only creative-context role contract.
+
+## 0.6.4
+
+### Patch Changes
+
+- 9204f85: Fix the Context tab's dropdown in the Share dialog rendering invisibly behind the host popover and dismissing the whole dialog on interaction. The select now matches the popover's nested-overlay z-index and is marked so `ShareButton` doesn't treat clicks inside it as outside clicks.
+
+## 0.6.3
+
+### Patch Changes
+
+- 25f588e: Redirect legacy `/agent` management URLs to the canonical settings routes and preserve app-owned settings tabs.
+
+## 0.6.2
+
+### Patch Changes
+
+- e177059: Restore the serverless Playwright fallback so production URL extraction can use packaged Chromium.
+
+## 0.6.1
+
+### Patch Changes
+
+- aa24c7e: Use the declared optional Playwright runtime through a literal import so Cloudflare deployments can apply their fail-closed browser stub.
+- 9d8ae68: Run website brand extraction in an isolated real browser through the SSRF-safe network proxy, with serverless Chromium support and an explicit static fallback.
+
 ## 0.6.0
 
 ### Minor Changes

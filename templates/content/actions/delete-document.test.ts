@@ -24,8 +24,6 @@ vi.mock("./_database-membership-lock.js", () => ({
   lockDatabaseMemberships: membershipLock,
 }));
 
-// Minimal schema stand-in: each table is identified by name so a fake db can
-// record which table a delete/select targeted.
 const { schema } = vi.hoisted(() => ({
   schema: {
     documents: {
@@ -87,6 +85,14 @@ const { schema } = vi.hoisted(() => ({
     documentBlockFieldContents: {
       propertyId: "documentBlockFieldContents.propertyId",
       documentId: "documentBlockFieldContents.documentId",
+    },
+    documentBlockFields: {
+      id: "documentBlockFields.id",
+      documentId: "documentBlockFields.documentId",
+      propertyId: "documentBlockFields.propertyId",
+    },
+    documentBlocks: {
+      fieldId: "documentBlocks.fieldId",
     },
     documentSyncLinks: {
       documentId: "documentSyncLinks.documentId",
@@ -251,12 +257,14 @@ describe("deleteDocumentRecursive", () => {
       "owner-a@example.com",
     );
 
-    expect(deleted.sort()).toEqual(["child-1", "child-2", "doc-1"].sort());
+    expect(deleted.sort((a, b) => a.localeCompare(b))).toEqual(
+      ["child-1", "child-2", "doc-1"].sort((a, b) => a.localeCompare(b)),
+    );
     const commentDeleteDocIds = deleteCalls
       .filter((c) => c.table === "documentComments")
       .flatMap((c: any) => c.cond.__and[0].__inArray[1]);
-    expect(commentDeleteDocIds.sort()).toEqual(
-      ["child-1", "child-2", "doc-1"].sort(),
+    expect(commentDeleteDocIds.sort((a, b) => a.localeCompare(b))).toEqual(
+      ["child-1", "child-2", "doc-1"].sort((a, b) => a.localeCompare(b)),
     );
   });
 

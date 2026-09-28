@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 export type CodeAgentRunnerSubcommand =
@@ -12,6 +13,8 @@ export interface CodeAgentRunnerInvocationOptions {
   resourcesPath: string;
   electronPath: string;
   repoRoot: string;
+  cwd?: string;
+  environment?: NodeJS.ProcessEnv;
 }
 
 export interface CodeAgentRunnerInvocation {
@@ -24,6 +27,16 @@ export interface CodeAgentRunnerInvocation {
 export interface CodeAgentRunnerSignalProcess {
   once(signal: NodeJS.Signals, listener: () => void): unknown;
   removeListener(signal: NodeJS.Signals, listener: () => void): unknown;
+}
+
+type CodeAgentRunIdCollection = Pick<ReadonlySet<string>, "has">;
+
+export function isCodeAgentRunnerInFlight(
+  runId: string,
+  activeRunIds: CodeAgentRunIdCollection,
+  startingRunIds: CodeAgentRunIdCollection,
+): boolean {
+  return activeRunIds.has(runId) || startingRunIds.has(runId);
 }
 
 export async function runCodeAgentRunnerWithSignal<T>(
@@ -47,6 +60,10 @@ export function resolveCodeAgentRunnerInvocation(
   subcommand: CodeAgentRunnerSubcommand,
   runId: string,
 ): CodeAgentRunnerInvocation {
+  const workingDirectory =
+    options.cwd ??
+    (options.appIsPackaged ? options.resourcesPath : options.repoRoot);
+
   if (options.appIsPackaged) {
     return {
       command: options.electronPath,
@@ -61,7 +78,7 @@ export function resolveCodeAgentRunnerInvocation(
         subcommand,
         runId,
       ],
-      cwd: options.resourcesPath,
+      cwd: workingDirectory,
       env: { ELECTRON_RUN_AS_NODE: "1" },
     };
   }
@@ -73,19 +90,60 @@ export function resolveCodeAgentRunnerInvocation(
   if (fs.existsSync(localCli)) {
     return {
       command: "node",
+      args: [localCli, "code", subcommand, runId],
+      cwd: workingDirectory,
+      env: { AGENT_NATIVE_CODE_AGENT_STRUCTURED_STDOUT: "1" },
+    };
+  }
+
+  const packageManager = resolveExecutable("pnpm", options.environment);
+  if (packageManager) {
+    return {
+      command: packageManager,
       args: [
-        path.relative(options.repoRoot, localCli),
+        "--dir",
+        options.repoRoot,
+        "--filter",
+        "@agent-native/core",
+        "exec",
+        "node",
+        "dist/cli/index.js",
         "code",
         subcommand,
         runId,
       ],
-      cwd: options.repoRoot,
+      cwd: workingDirectory,
+      env: { AGENT_NATIVE_CODE_AGENT_STRUCTURED_STDOUT: "1" },
+    };
+  }
+
+  const corepack = resolveExecutable("corepack", options.environment);
+  if (corepack) {
+    return {
+      command: corepack,
+      args: [
+        "pnpm",
+        "--dir",
+        options.repoRoot,
+        "--filter",
+        "@agent-native/core",
+        "exec",
+        "node",
+        "dist/cli/index.js",
+        "code",
+        subcommand,
+        runId,
+      ],
+      cwd: workingDirectory,
+      env: { AGENT_NATIVE_CODE_AGENT_STRUCTURED_STDOUT: "1" },
     };
   }
 
   return {
     command: "pnpm",
     args: [
+      "--dir",
+      options.repoRoot,
       "--filter",
       "@agent-native/core",
       "exec",
@@ -95,6 +153,82 @@ export function resolveCodeAgentRunnerInvocation(
       subcommand,
       runId,
     ],
-    cwd: options.repoRoot,
+    cwd: workingDirectory,
+    env: { AGENT_NATIVE_CODE_AGENT_STRUCTURED_STDOUT: "1" },
   };
+}
+
+export function resolveExecutable(
+  executable: string,
+  environment: NodeJS.ProcessEnv | undefined,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  if (!environment) return null;
+
+  const home = environment.HOME || os.homedir();
+  const pathEntries = (environment.PATH ?? "")
+    .split(path.delimiter)
+    .filter(Boolean);
+  const searchDirectories = [
+    ...pathEntries,
+    environment.PNPM_HOME,
+    home ? path.join(home, ".local", "bin") : undefined,
+    home ? path.join(home, ".local", "share", "pnpm") : undefined,
+    home ? path.join(home, "Library", "pnpm") : undefined,
+    home ? path.join(home, ".opencode", "bin") : undefined,
+    home ? path.join(home, ".cargo", "bin") : undefined,
+    ...(home
+      ? (() => {
+          try {
+            return fs
+              .readdirSync(path.join(home, ".nvm", "versions", "node"))
+              .map((version) =>
+                path.join(home, ".nvm", "versions", "node", version, "bin"),
+              );
+          } catch {
+            // coercion-ok: NVM is optional in desktop launch environments.
+            return [];
+          }
+        })()
+      : []),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+  ].filter((value): value is string => Boolean(value));
+
+  const names =
+    platform === "win32" && !path.extname(executable)
+      ? [`${executable}.exe`, `${executable}.com`]
+      : [executable];
+  for (const directory of [...new Set(searchDirectories)]) {
+    for (const name of names) {
+      const candidate = path.join(directory, name);
+      try {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return candidate;
+      } catch {
+        // coercion-ok: an unreadable candidate is an expected search miss.
+        // Continue through the standard package-manager locations.
+      }
+    }
+  }
+  return null;
+}
+
+export function withResolvedExecutablePaths(
+  environment: NodeJS.ProcessEnv,
+  executables: readonly string[],
+): NodeJS.ProcessEnv {
+  const resolvedDirectories = executables
+    .map((executable) => resolveExecutable(executable, environment))
+    .filter((resolved): resolved is string => Boolean(resolved))
+    .map((resolved) => path.dirname(resolved));
+  const resolvedNode = resolveExecutable("node", environment);
+  if (resolvedNode) resolvedDirectories.push(path.dirname(resolvedNode));
+  const existingPath = (environment.PATH ?? "")
+    .split(path.delimiter)
+    .filter(Boolean);
+  const pathEntries = [...new Set([...resolvedDirectories, ...existingPath])];
+  return pathEntries.length > 0
+    ? { ...environment, PATH: pathEntries.join(path.delimiter) }
+    : environment;
 }

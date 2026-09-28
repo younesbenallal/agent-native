@@ -1,6 +1,6 @@
 import { isToolVisibilityModelOnly } from "@modelcontextprotocol/ext-apps/app-bridge";
 
-import { getGlobalMcpManager } from "../server/agent-chat/mcp-glue.js";
+import { waitForGlobalMcpManager } from "../server/agent-chat/mcp-glue.js";
 import { getRequestContext } from "../server/request-context.js";
 import {
   buildMcpToolName,
@@ -11,9 +11,7 @@ import { parseMergedKey } from "./remote-store.js";
 import { isMcpToolAllowedForRequest } from "./visibility.js";
 
 export interface AppMcpTool {
-  /** Configured MCP server id. */
   serverId: string;
-  /** Original, unprefixed name reported by the MCP server. */
   name: string;
   title?: string;
   description: string;
@@ -24,7 +22,6 @@ export interface AppMcpTool {
 }
 
 export interface ListVisibleMcpToolsOptions {
-  /** Restrict the result to one configured server. */
   serverId?: string;
 }
 
@@ -38,17 +35,11 @@ export class McpAppApiError extends Error {
   }
 }
 
-/**
- * List MCP tools that the authenticated request may expose to an app.
- *
- * The manager owns connection state and credentials; this API deliberately
- * projects only the tool contract and never returns server configuration.
- */
 export async function listVisibleMcpTools(
   options: ListVisibleMcpToolsOptions = {},
 ): Promise<AppMcpTool[]> {
   const context = requireAuthenticatedRequest();
-  const manager = requireMcpManager();
+  const manager = await requireMcpManager();
   const tools = options.serverId
     ? manager.getToolsForServer(options.serverId)
     : manager.getTools();
@@ -58,18 +49,13 @@ export async function listVisibleMcpTools(
     .map(toAppMcpTool);
 }
 
-/**
- * Call an app-visible MCP tool by server id and its original server-reported
- * name. The prefixed manager name is built only after the tool is found in
- * that server's current, request-visible tool list.
- */
 export async function callMcpTool(
   serverId: string,
   originalToolName: string,
   args: Record<string, unknown> = {},
 ): Promise<unknown> {
   const context = requireAuthenticatedRequest();
-  const manager = requireMcpManager();
+  const manager = await requireMcpManager();
   const tool = manager
     .getToolsForServer(serverId)
     .find((candidate) => candidate.originalName === originalToolName);
@@ -92,8 +78,8 @@ function requireAuthenticatedRequest() {
   return context;
 }
 
-function requireMcpManager(): McpClientManager {
-  const manager = getGlobalMcpManager();
+async function requireMcpManager(): Promise<McpClientManager> {
+  const manager = await waitForGlobalMcpManager();
   if (!manager) {
     throw new McpAppApiError("MCP client is not configured.", 503);
   }
@@ -106,16 +92,12 @@ function isToolVisibleToApp(
 ): boolean {
   if (!context) return false;
 
-  // `isMcpToolAllowedForRequest` intentionally permits missing identity in
-  // development for CLI/startup enumeration. App calls are stricter: an
-  // active org-scoped tool requires an active org even in development.
   if (!isMcpToolAllowedForRequest(tool.name)) return false;
   const merged = parseMergedKey(tool.name);
   if (merged?.scope === "user" && !context.userEmail?.trim()) return false;
   if (merged?.scope === "org" && !context.orgId?.trim()) return false;
 
   try {
-    // A malformed visibility declaration is not safe to expose to an app.
     return !isToolVisibilityModelOnly(tool.raw as any);
   } catch {
     return false;

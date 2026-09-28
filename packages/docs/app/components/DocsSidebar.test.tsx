@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest";
 
 import { docsI18nCatalog } from "../i18n";
 import { docsSlugFromPathname } from "./docs-locale";
-import { getDocsNavItems } from "./docsNavItems";
+import { getDocsNavItems, getDocsNavSections } from "./docsNavItems";
 import DocsSidebar from "./DocsSidebar";
 
 function renderSidebar(path: string) {
@@ -79,8 +79,109 @@ describe("DocsSidebar", () => {
     const html = renderSidebar("/docs");
 
     expect(html).toContain("Overview");
-    expect(html).toContain('href="/docs"');
+    expect(html).toContain('href="/docs/"');
     expect(html).not.toContain('aria-controls="docs-sidebar-section-0"');
+  });
+
+  it("keeps Deployment in its own top-level section with grouped links", () => {
+    const sections = getDocsNavSections("en-US");
+    const overview = sections.find((section) => section.id === "overview");
+    const deployment = sections.find((section) => section.id === "deployment");
+    const coreArchitecture = sections.find(
+      (section) => section.id === "core-architecture",
+    );
+    const sectionIds = sections.map((section) => section.id);
+
+    expect(overview?.items.map((item) => item.id)).toEqual([
+      "getting-started",
+      "what-is-agent-native",
+      "key-concepts",
+    ]);
+    expect(deployment?.items.map((item) => item.id)).toEqual([
+      "deployment",
+      "deploy-an-app",
+      "workspace-deployment",
+      "deployment-providers",
+      "database-providers",
+      "deployment-production",
+    ]);
+    const providerGroup = deployment?.items.find(
+      (item) => item.id === "deployment-providers",
+    );
+    expect(providerGroup?.children?.map((item) => item.id)).toEqual([
+      "node-js",
+      "docker",
+      "vercel",
+      "netlify",
+      "cloudflare",
+      "aws-lambda",
+      "deno-deploy",
+      "azure-static-web-apps",
+      "koyeb",
+      "render",
+    ]);
+    const databaseGroup = deployment?.items.find(
+      (item) => item.id === "database-providers",
+    );
+    expect(databaseGroup?.children?.map((item) => item.id)).toEqual([
+      "database-neon",
+      "database-supabase",
+      "database-aws-rds",
+      "database-cloud-sql",
+      "database-azure-postgres",
+      "database-postgres",
+    ]);
+    const productionGroup = deployment?.items.find(
+      (item) => item.id === "deployment-production",
+    );
+    expect(productionGroup?.children?.map((item) => item.id)).toEqual([
+      "ssr-caching",
+      "deployment-environment-variables",
+      "updating-ui-in-production",
+    ]);
+    expect(sectionIds.indexOf("overview")).toBeLessThan(
+      sectionIds.indexOf("deployment"),
+    );
+    const coreItemIds = coreArchitecture?.items.map((item) => item.id) ?? [];
+    expect(coreItemIds).toContain("agent-surfaces");
+    expect(coreItemIds.indexOf("actions-section")).toBeLessThan(
+      coreItemIds.indexOf("agent-surfaces"),
+    );
+    expect(coreItemIds.slice(-2)).toEqual([
+      "environment-variables",
+      "agent-native-config",
+    ]);
+    expect(sectionIds.slice(0, 5)).toEqual([
+      "overview",
+      "deployment",
+      "toolkits",
+      "core-architecture",
+      "apps",
+    ]);
+
+    const apps = sections.find((section) => section.id === "apps");
+    expect(apps?.items.slice(0, 4).map((item) => item.id)).toEqual([
+      "cloneable-saas",
+      "creating-templates",
+      "syncing-template-changes",
+      "pure-agent-apps",
+    ]);
+    expect(sectionIds).not.toContain("build-apps");
+
+    const usingYourAgent = sections.find(
+      (section) => section.id === "using-your-agent",
+    );
+    expect(usingYourAgent?.items.map((item) => item.id)).toContain(
+      "embedding-sdk",
+    );
+
+    const agentResources = sections.find(
+      (section) => section.id === "agent-resources",
+    );
+    expect(agentResources?.items.map((item) => item.id)).toContain(
+      "writing-agent-instructions",
+    );
+    expect(getDocsNavItems().map((item) => item.id)).not.toContain("frames");
   });
 
   it("uses the Agent Resources section and canonical overview link", () => {
@@ -88,19 +189,19 @@ describe("DocsSidebar", () => {
 
     expect(html).toContain("Agent Resources");
     expect(html).toContain("Agent Resources Overview");
-    expect(html).toContain('href="/docs/agent-resources"');
-    expect(html).not.toContain('href="/docs/workspace"');
+    expect(html).toContain('href="/docs/agent-resources/"');
+    expect(html).not.toContain('href="/docs/workspace/"');
   });
 
   it("expands the section that contains the active docs page", () => {
     const html = renderSidebar("/docs/tracking");
 
     expect(html).toContain("Tracking &amp; Analytics");
-    expect(html).toContain('href="/docs/tracking"');
+    expect(html).toContain('href="/docs/tracking/"');
     expect(html).toContain('aria-expanded="true"');
 
-    const activeLink = getLinkMarkup(html, "/docs/tracking");
-    const closedLink = getLinkMarkup(html, "/docs/creating-templates");
+    const activeLink = getLinkMarkup(html, "/docs/tracking/");
+    const closedLink = getLinkMarkup(html, "/docs/creating-templates/");
 
     expect(activeLink).toContain('data-an-prefetch="viewport"');
     expect(activeLink).not.toContain("tabindex");
@@ -112,23 +213,21 @@ describe("DocsSidebar", () => {
   it("renders the Plans group as a chevron-only toggle with nested sub-items", () => {
     const html = renderSidebar("/docs/template-plan");
 
-    // "Plans" is a chevron-only group trigger, not a link.
     expect(html).toContain("sidebar-group-trigger");
-    expect(html).not.toContain('href="/docs/visual-plans"');
+    expect(html).not.toContain('href="/docs/visual-plans/"');
 
-    // The main Plans doc is the first child, plus the two satellites.
     expect(html).toContain("docs-sidebar-subitems");
-    const mainDocLink = getLinkMarkup(html, "/docs/template-plan");
+    const mainDocLink = getLinkMarkup(html, "/docs/template-plan/");
     expect(mainDocLink).toContain("sidebar-sublink");
-    expect(html).toContain('href="/docs/pr-visual-recap"');
-    expect(html).toContain('href="/docs/plan-plugin"');
+    expect(html).toContain('href="/docs/pr-visual-recap/"');
+    expect(html).toContain('href="/docs/plan-plugin/"');
   });
 
   it("renders Toolkits as a top-level section with focused docs", () => {
     const html = renderSidebar("/docs/toolkit-collaboration");
     const toolkitLinks = getDocsNavItems().filter(
       (item) =>
-        item.to === "/docs/agent-native-toolkit" ||
+        item.to === "/docs/agent-native-toolkit/" ||
         item.to.startsWith("/docs/toolkit-"),
     );
 
@@ -137,8 +236,9 @@ describe("DocsSidebar", () => {
     for (const item of toolkitLinks) {
       expect(html).toContain(`href="${item.to}"`);
     }
+    expect(html).not.toContain('href="/docs/custom-design-system/"');
 
-    const activeLink = getLinkMarkup(html, "/docs/toolkit-collaboration");
+    const activeLink = getLinkMarkup(html, "/docs/toolkit-collaboration/");
     expect(activeLink).toContain("is-active");
   });
 
@@ -148,8 +248,7 @@ describe("DocsSidebar", () => {
     expect(html).toContain("Apps");
     expect(html).toContain('aria-expanded="true"');
 
-    // The active child link is highlighted and the group is open.
-    const activeLink = getLinkMarkup(html, "/docs/template-plan");
+    const activeLink = getLinkMarkup(html, "/docs/template-plan/");
     expect(activeLink).toContain("is-active");
     expect(activeLink).toContain('data-an-prefetch="viewport"');
   });

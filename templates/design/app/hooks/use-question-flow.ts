@@ -4,9 +4,16 @@ import {
   type GuidedQuestionAnswers,
 } from "@agent-native/core/client/agent-chat";
 import { type PromptComposerSubmitOptions } from "@agent-native/core/client/composer";
+import { isLocalRuntimeEngine } from "@agent-native/toolkit/composer";
+import { DESIGN_MUTATION_REQUIRED_DIRECTIVE } from "@shared/mutation-turn";
 import { useCallback } from "react";
 
 import { sendToDesignAgentChat } from "@/lib/agent-chat";
+import {
+  formatComposerContext,
+  hasComposerSystemContext,
+} from "@/lib/composer-context";
+import { loadDesignSystemGenerationContext } from "@/pages/design-editor/generation-prompt-directives";
 
 export interface QuestionFlowModelSelection {
   model?: string;
@@ -14,32 +21,75 @@ export interface QuestionFlowModelSelection {
   effort?: PromptComposerSubmitOptions["effort"];
 }
 
+export interface QuestionFlowGenerationBrief {
+  contextItems?: PromptComposerSubmitOptions["contextItems"];
+  prompt?: string;
+  designSystemId?: string | null;
+  images?: string[];
+  uploadedFileContext?: string;
+}
+
 interface UseQuestionFlowOptions {
   enabled?: boolean;
   continuationTabId?: string | null;
   onContinue?: (tabId: string) => void;
-  /**
-   * The model this generation started with, read AT SEND TIME. The continuation
-   * is the turn that generates and it opens a fresh thread, which has no
-   * override to inherit. A getter, not a value: the caller's source is a ref
-   * filled after render, so a snapshot taken here would be the pre-kickoff one.
-   */
   getModelSelection?: () => QuestionFlowModelSelection | null | undefined;
+  getGenerationBrief?: () => QuestionFlowGenerationBrief | null | undefined;
 }
 
 function designQuestionsStateKey(designId: string | undefined): string {
   return designId ? `show-questions:${designId}` : "show-questions";
 }
 
+export function buildGenerationBriefContext(
+  brief: QuestionFlowGenerationBrief | null | undefined,
+  designSystemContext: string,
+): string {
+  return [
+    brief?.prompt?.trim()
+      ? [
+          "## The user's original request (verbatim)",
+          "This is the spec for what to build. The answers below refine it;",
+          "they do not replace it. Do not restate it as a looser paraphrase.",
+          "",
+          brief.prompt.trim(),
+        ].join("\n")
+      : "",
+    brief?.images?.length
+      ? [
+          `## ${brief.images.length} reference image(s) re-attached to this message`,
+          "Treat an attached UI screenshot as a layout specification to",
+          "reproduce — its structure, hierarchy, density, and component",
+          "grammar — not as loose inspiration. Match it unless an answer",
+          "below explicitly overrides a part of it.",
+        ].join("\n")
+      : "",
+    brief?.uploadedFileContext?.trim() ?? "",
+    formatComposerContext(brief?.contextItems),
+    designSystemContext,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 const RESPONSIVE_GENERATION_REQUIREMENTS =
   'Responsive behavior is mandatory for every web design. Read the form-factor answer above: for Desktop or Both/responsive, call generate-design with `primaryViewport: "desktop"` and a 1440x1024 canvas frame; use `primaryViewport: "mobile"` only for an explicitly mobile-primary choice. Use mobile-first responsive CSS, then take desktop and mobile screenshots and fix any overflow before reporting the design complete.';
 
-/**
- * Polls design-scoped question state. When the agent writes structured
- * questions, the editor surfaces a full-canvas overlay for only this design.
- * On submit, answers are formatted and posted back to the agent chat; on skip,
- * the agent is told to proceed.
- */
+function existingDesignContinuationContext(
+  designId: string | undefined,
+): string {
+  return designId
+    ? [
+        `This is a continuation of the new-design flow for existing design "${designId}".`,
+        "The design shell already exists and is the only design to modify.",
+        `Use designId "${designId}" for generation. Never call create-design or create-design-from-template in this continuation.`,
+      ].join(" ")
+    : "";
+}
+
+const SETTLED_ANSWERS_INSTRUCTION =
+  "Treat every question below as settled: do not ask it again, and do not ask for a confirmation of it. Continue the work these answers were blocking.";
+
 export function useQuestionFlow(
   designId: string | undefined,
   {
@@ -47,11 +97,17 @@ export function useQuestionFlow(
     continuationTabId,
     onContinue,
     getModelSelection,
+    getGenerationBrief,
   }: UseQuestionFlowOptions = {},
 ) {
   const stateKey = designQuestionsStateKey(designId);
+  const existingDesignContext = existingDesignContinuationContext(designId);
+  const providerStatusChecksEnabled = !isLocalRuntimeEngine(
+    getModelSelection?.()?.engine,
+  );
   const flow = useGuidedQuestionFlow({
     enabled,
+    providerStatusChecksEnabled,
     stateKey,
     queryKey: [stateKey],
     submitMessage: "Here are my answers — go ahead.",
@@ -59,6 +115,7 @@ export function useQuestionFlow(
     buildSubmitContext: ({ formattedAnswers }) =>
       [
         "The user answered the pre-generation questions.",
+        existingDesignContext,
         designId ? `Design ID: ${designId}` : "",
         "",
         "Answers:",
@@ -73,48 +130,65 @@ export function useQuestionFlow(
         .filter(Boolean)
         .join("\n"),
     buildSkipContext: () =>
-      designId
-        ? `The user skipped the pre-generation questions for design ${designId}. Proceed with reasonable defaults. Generate one polished first direction unless the original prompt explicitly requested options.`
-        : "The user skipped the pre-generation questions. Proceed with reasonable defaults. Generate one polished first direction unless the original prompt explicitly requested options.",
+      [
+        existingDesignContext,
+        designId
+          ? `The user skipped the pre-generation questions for design ${designId}. Proceed with reasonable defaults. Generate one polished first direction unless the original prompt explicitly requested options.`
+          : "The user skipped the pre-generation questions. Proceed with reasonable defaults. Generate one polished first direction unless the original prompt explicitly requested options.",
+      ]
+        .filter(Boolean)
+        .join(" "),
   });
 
   const sendContinuation = useCallback(
-    (message: string, context?: string) => {
+    async (message: string, context?: string) => {
+      flow.clear();
       const selection = getModelSelection?.() ?? {};
       const { model, engine, effort } = selection;
-      // Always request `newTab` (mirroring useAgentGenerating.submit's
-      // default). Without it, when there is no continuationTabId yet the
-      // message goes to whatever tab is currently active, but the id we
-      // return here would still be a freshly generated one that was never
-      // actually used — trackAgentGeneration/onContinue would then watch a
-      // tabId that never matches real chatRunning events, so the design
-      // "generating" UI silently desyncs (false "stopped, please retry"
-      // toasts, completion never detected). Passing tabId only when we have
-      // a continuationTabId still reuses that existing thread (addOptimistic
-      // thread is idempotent for known ids); omitting it lets a fresh id be
-      // generated and actually created, so the returned tabId is always the
-      // real destination thread.
+      const brief = getGenerationBrief?.() ?? null;
+      const designSystemContext =
+        brief?.designSystemId && !hasComposerSystemContext(brief.contextItems)
+          ? await loadDesignSystemGenerationContext(brief.designSystemId)
+          : "";
+      const briefContext = buildGenerationBriefContext(
+        brief,
+        designSystemContext,
+      );
       const tabId = sendToDesignAgentChat({
         message,
-        context,
+        context: [briefContext, context, DESIGN_MUTATION_REQUIRED_DIRECTIVE]
+          .filter(Boolean)
+          .join("\n\n"),
         submit: true,
         newTab: true,
+        ...(brief?.images?.length ? { images: brief.images } : {}),
         ...(continuationTabId ? { tabId: continuationTabId } : {}),
         ...(model ? { model } : {}),
         ...(engine ? { engine } : {}),
         ...(effort ? { effort } : {}),
       });
       onContinue?.(tabId);
-      flow.clear();
     },
-    [continuationTabId, designId, flow, getModelSelection, onContinue],
+    [
+      continuationTabId,
+      flow,
+      getGenerationBrief,
+      getModelSelection,
+      onContinue,
+    ],
   );
 
   const handleSubmit = useCallback(
     (answers: GuidedQuestionAnswers) => {
-      const formattedAnswers = formatGuidedAnswersForAgent(answers);
+      if (flow.isSubmissionBlocked) return;
+      const formattedAnswers = formatGuidedAnswersForAgent(
+        answers,
+        flow.questions ?? undefined,
+      );
       const context = [
         "The user answered the pre-generation questions.",
+        existingDesignContext,
+        SETTLED_ANSWERS_INSTRUCTION,
         designId ? `Design ID: ${designId}` : "",
         "",
         "Answers:",
@@ -129,19 +203,20 @@ export function useQuestionFlow(
         .filter(Boolean)
         .join("\n");
 
-      sendContinuation("Here are my answers — go ahead.", context);
+      void sendContinuation("Here are my answers — go ahead.", context);
     },
-    [designId, sendContinuation],
+    [designId, flow.isSubmissionBlocked, flow.questions, sendContinuation],
   );
 
   const handleSkip = useCallback(() => {
-    sendContinuation(
+    if (flow.isSubmissionBlocked) return;
+    void sendContinuation(
       "Skip the questions — decide for me.",
       designId
-        ? `The user skipped the pre-generation questions for design ${designId}. Proceed with reasonable defaults. ${RESPONSIVE_GENERATION_REQUIREMENTS} Generate one polished first direction unless the original prompt explicitly requested options.`
+        ? `${existingDesignContext} The user skipped the pre-generation questions for design ${designId}. Proceed with reasonable defaults. ${RESPONSIVE_GENERATION_REQUIREMENTS} Generate one polished first direction unless the original prompt explicitly requested options.`
         : `The user skipped the pre-generation questions. Proceed with reasonable defaults. ${RESPONSIVE_GENERATION_REQUIREMENTS} Generate one polished first direction unless the original prompt explicitly requested options.`,
     );
-  }, [designId, sendContinuation]);
+  }, [designId, flow.isSubmissionBlocked, sendContinuation]);
 
   return {
     ...flow,

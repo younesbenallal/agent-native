@@ -5,6 +5,13 @@ export type {
   TraceSummary,
   FeedbackType,
   FeedbackEntry,
+  InstructionUpdateStatus,
+  InstructionUpdate,
+  HumanReviewArtifactRef,
+  HumanReviewSummaryPayload,
+  HumanReviewSummary,
+  OutputReviewListRow,
+  OutputReviewRow,
   SatisfactionScore,
   EvalType,
   EvalResult,
@@ -17,10 +24,7 @@ export type {
   ExperimentAssignment,
   ExperimentMetricResult,
   ObservabilityConfig,
-  ObservabilityExporterConfig,
 } from "./types.js";
-
-export { DEFAULT_OBSERVABILITY_CONFIG } from "./types.js";
 
 export {
   ensureObservabilityTables,
@@ -33,6 +37,8 @@ export {
   insertFeedback,
   getFeedback,
   getFeedbackStats,
+  insertInstructionUpdate,
+  getInstructionUpdates,
   upsertSatisfactionScore,
   getSatisfactionScores,
   insertEvalResult,

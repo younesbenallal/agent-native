@@ -31,14 +31,15 @@ function asPanels(config: Record<string, unknown>): DashboardPanel[] {
     : [];
 }
 
-function missingKeyMessage(result: unknown): string | null {
+function panelFailureMessage(result: unknown): string | null {
   if (!result || typeof result !== "object" || Array.isArray(result)) {
     return null;
   }
   const value = result as { error?: unknown; message?: unknown };
-  return value.error === "missing_api_key" && typeof value.message === "string"
+  if (typeof value.error !== "string" || !value.error) return null;
+  return typeof value.message === "string" && value.message
     ? value.message
-    : null;
+    : value.error;
 }
 
 export default defineAction({
@@ -97,8 +98,8 @@ export default defineAction({
       { source: panel.source, query },
       context,
     );
-    const missing = missingKeyMessage(result);
-    if (missing) throw new Error(missing);
+    const failure = panelFailureMessage(result);
+    if (failure) throw new Error(failure);
     if (
       !result ||
       typeof result !== "object" ||

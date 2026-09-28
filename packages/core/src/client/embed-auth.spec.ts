@@ -11,15 +11,21 @@ import {
 
 const STORAGE_KEY = "agent-native:embed-auth-token";
 const BRIDGE_STORAGE_KEY = "agent-native:mcp-chat-bridge";
+type EmbedAuthModule = typeof import("./embed-auth.js");
+let lastEmbedAuthModule: EmbedAuthModule | undefined;
 
 async function loadEmbedAuth() {
+  lastEmbedAuthModule?._resetEmbedAuthForTests();
   vi.resetModules();
-  return import("./embed-auth.js");
+  lastEmbedAuthModule = await import("./embed-auth.js");
+  return lastEmbedAuthModule;
 }
 
 describe("embed auth client", () => {
   beforeEach(() => {
+    lastEmbedAuthModule?._resetEmbedAuthForTests();
     vi.resetModules();
+    vi.useRealTimers();
     sessionStorage.clear();
     window.history.replaceState(null, "", "/");
     Object.defineProperty(window, "fetch", {
@@ -146,7 +152,6 @@ describe("embed auth client", () => {
   });
 
   it("keeps MCP chat bridge mode active when sessionStorage starts throwing mid-session", async () => {
-    // Boot with sessionStorage working so the bridge enrolls normally.
     window.history.replaceState(
       null,
       "",
@@ -157,8 +162,6 @@ describe("embed auth client", () => {
     first.ensureEmbedAuthFetchInterceptor();
     expect(first.isEmbedMcpChatBridgeActive()).toBe(true);
 
-    // Mid-session, sessionStorage starts denying access (e.g. third-party-cookie
-    // policy update in a sandboxed iframe, Safari private-browsing throttling).
     const getItem = vi
       .spyOn(Storage.prototype, "getItem")
       .mockImplementation(() => {
@@ -166,11 +169,8 @@ describe("embed auth client", () => {
       });
 
     try {
-      // The flag should still be true even though sessionStorage now throws,
-      // because the in-memory bridge state was already captured.
       expect(first.isEmbedMcpChatBridgeActive()).toBe(true);
 
-      // And it should survive even if the URL token also gets stripped.
       window.history.replaceState(null, "", "/inbox?embedded=1");
       expect(first.isEmbedMcpChatBridgeActive()).toBe(true);
     } finally {
@@ -189,10 +189,8 @@ describe("embed auth client", () => {
     first.ensureEmbedAuthFetchInterceptor();
     expect(first.isEmbedMcpChatBridgeActive()).toBe(true);
 
-    // Mimic a host that strips the bridge flag from the URL too after boot.
     window.history.replaceState(null, "", "/inbox?embedded=1");
 
-    // The in-memory bridge state should still be authoritative.
     expect(first.isEmbedMcpChatBridgeActive()).toBe(true);
   });
 
@@ -241,6 +239,47 @@ describe("embed auth client", () => {
     expect(style?.textContent).toContain("height: 560px !important");
     expect(style?.textContent).toContain("overflow: hidden !important");
     expect(notifyIntrinsicHeight).toHaveBeenCalledWith({ height: 560 });
+  });
+
+  it("dedupes delayed viewport notifications across repeated bridge setup", async () => {
+    vi.useFakeTimers();
+    const notifyIntrinsicHeight = vi.fn();
+    const requestAnimationFrame = vi.fn((callback: FrameRequestCallback) =>
+      window.setTimeout(() => callback(performance.now()), 0),
+    );
+    Object.defineProperty(window, "openai", {
+      configurable: true,
+      writable: true,
+      value: { notifyIntrinsicHeight },
+    });
+    Object.defineProperty(window, "requestAnimationFrame", {
+      configurable: true,
+      writable: true,
+      value: requestAnimationFrame,
+    });
+    Object.defineProperty(window, "cancelAnimationFrame", {
+      configurable: true,
+      writable: true,
+      value: (id: number) => window.clearTimeout(id),
+    });
+    window.history.replaceState(
+      null,
+      "",
+      `/inbox?embedded=1&${MCP_APP_CHAT_BRIDGE_QUERY_PARAM}=1&${EMBED_TOKEN_QUERY_PARAM}=signed-token`,
+    );
+
+    try {
+      const first = await loadEmbedAuth();
+      first.ensureEmbedAuthFetchInterceptor();
+      first.ensureEmbedAuthFetchInterceptor();
+
+      expect(notifyIntrinsicHeight).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(notifyIntrinsicHeight).toHaveBeenCalledTimes(5);
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+    }
   });
 
   it("does not leak a stored MCP chat bridge flag to a different embed token", async () => {

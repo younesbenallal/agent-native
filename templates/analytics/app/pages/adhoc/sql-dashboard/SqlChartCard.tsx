@@ -11,6 +11,7 @@ import {
   IconTrash,
   IconCode,
   IconDownload,
+  IconCopy,
   IconMessageCircle,
   IconBrandGoogle,
   IconArrowUpRight,
@@ -55,6 +56,7 @@ import { buildCustomBlockPromotionRequest } from "@/lib/custom-block-promotion";
 import { cn } from "@/lib/utils";
 
 import { serializePanelSql } from "./panel-sql";
+import { timeRangeDays } from "./pivot";
 import type { SqlPanel } from "./types";
 import { ViewSqlPopover } from "./ViewSqlPopover";
 
@@ -63,8 +65,6 @@ interface SqlChartCardProps {
   resolvedSql?: string;
   onRemove: () => void;
   onEdit?: () => void;
-  /** Persist a SQL-only edit from the inline View SQL popover. Should throw on
-   *  validation failure so the popover can stay open and surface the error. */
   onSaveSql?: (sql: string) => Promise<void>;
   editable?: boolean;
   eagerLoad?: boolean;
@@ -136,6 +136,7 @@ export function SqlChartCard({
   filters,
 }: SqlChartCardProps) {
   const t = useT();
+  const timeRange = timeRangeDays(filters?.timeRange);
   const queryClient = useQueryClient();
   const exportToGoogleSheets = useActionMutation(
     "export-dashboard-panel-to-google-sheet",
@@ -148,6 +149,9 @@ export function SqlChartCard({
   const [expanded, setExpanded] = useState(false);
   const [extRefreshKey, setExtRefreshKey] = useState(0);
   const [exportCsv, setExportCsv] = useState<(() => void) | null>(null);
+  const [copyTable, setCopyTable] = useState<(() => Promise<void>) | null>(
+    null,
+  );
   const [shouldLoadData, setShouldLoadData] = useState(
     eagerLoad ||
       panel.chartType === "section" ||
@@ -158,11 +162,11 @@ export function SqlChartCard({
     () =>
       [
         "sql-chart",
-        panel.id,
+        dashboardId || panel.id,
         serializePanelSql(resolvedSql ?? panel.sql),
         panel.source,
       ] as const,
-    [panel.id, panel.source, panel.sql, resolvedSql],
+    [dashboardId, panel.id, panel.source, panel.sql, resolvedSql],
   );
   const setCardNodeRef = useCallback((node: HTMLDivElement | null) => {
     cardRef.current = node;
@@ -171,6 +175,23 @@ export function SqlChartCard({
   const handleExportCsvChange = useCallback((handler: (() => void) | null) => {
     setExportCsv(handler ? () => handler : null);
   }, []);
+
+  const handleCopyTableChange = useCallback(
+    (handler: (() => Promise<void>) | null) => {
+      setCopyTable(handler ? () => handler : null);
+    },
+    [],
+  );
+
+  const handleCopyTable = useCallback(async () => {
+    if (!copyTable) return;
+    try {
+      await copyTable();
+      toast.success(t("sqlDashboard.copied"));
+    } catch {
+      toast.error(t("sqlDashboard.couldNotCopyTable"));
+    }
+  }, [copyTable, t]);
 
   const handleRefresh = useCallback(() => {
     setShouldLoadData(true);
@@ -256,8 +277,6 @@ export function SqlChartCard({
       setShouldLoadData(true);
       return;
     }
-    // Sections are layout-only and extensions render their own iframe — neither
-    // waits on the intersection observer that gates SQL panels.
     if (panel.chartType === "section" || panel.chartType === "extension") {
       setShouldLoadData(true);
       return;
@@ -278,7 +297,7 @@ export function SqlChartCard({
         }
       },
       {
-        rootMargin: "320px 0px",
+        rootMargin: "64px 0px",
         threshold: 0.01,
       },
     );
@@ -288,6 +307,7 @@ export function SqlChartCard({
 
   useEffect(() => {
     setExportCsv(null);
+    setCopyTable(null);
   }, [panel.id]);
 
   useEffect(() => {
@@ -304,9 +324,6 @@ export function SqlChartCard({
     setMenuOpen(false);
   }, []);
 
-  // Section panels render as a flush header row (no card chrome, full width)
-  // so they read as dividers between groups of panels rather than as another
-  // tile in the grid.
   if (panel.chartType === "section") {
     return (
       <div
@@ -399,10 +416,6 @@ export function SqlChartCard({
     );
   }
 
-  // Extension panels render their sandboxed iframe full-bleed with no card chrome
-  // or title — the extension owns its own UI. All viewers get the read-only
-  // actions (full screen and refresh); editable
-  // dashboards also get delete and drag.
   if (panel.chartType === "extension") {
     return (
       <div
@@ -424,7 +437,9 @@ export function SqlChartCard({
             panel={panel}
             resolvedSql={resolvedSql}
             loadData
+            timeRange={timeRange}
             reportScreenshot={reportScreenshot}
+            dashboardId={dashboardId}
             extensionContext={extensionContext}
           />
         )}
@@ -527,7 +542,9 @@ export function SqlChartCard({
                   panel={panel}
                   resolvedSql={resolvedSql}
                   loadData
+                  timeRange={timeRange}
                   reportScreenshot={reportScreenshot}
+                  dashboardId={dashboardId}
                   extensionContext={extensionContext}
                 />
               </ChartFillHeight>
@@ -565,8 +582,6 @@ export function SqlChartCard({
     );
   }
 
-  // Every non-section panel exposes at least the Full screen view action, so the
-  // options menu always renders — including on read-only / shared dashboards.
   const showPanelMenu = true;
 
   return (
@@ -591,11 +606,12 @@ export function SqlChartCard({
             {panel.title}
           </CardTitle>
           <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
-            {editable && onSaveSql ? (
+            {!editable || onSaveSql ? (
               <ViewSqlPopover
                 panel={panel}
                 resolvedSql={resolvedSql}
                 onSaveSql={onSaveSql}
+                editable={editable}
               >
                 <button
                   className="p-1 rounded text-muted-foreground hover:text-foreground"
@@ -647,6 +663,15 @@ export function SqlChartCard({
                     >
                       <IconDownload className="h-4 w-4 mr-2" />
                       {t("sqlDashboard.downloadCsv")}
+                    </DropdownMenuItem>
+                  )}
+                  {panel.chartType === "table" && (
+                    <DropdownMenuItem
+                      disabled={!copyTable}
+                      onSelect={() => void handleCopyTable()}
+                    >
+                      <IconCopy className="h-4 w-4 mr-2" />
+                      {t("sqlDashboard.copyTable")}
                     </DropdownMenuItem>
                   )}
                   {panel.chartType === "table" && dashboardId ? (
@@ -703,8 +728,11 @@ export function SqlChartCard({
             panel={panel}
             resolvedSql={resolvedSql}
             loadData={shouldLoadData}
+            timeRange={timeRange}
             reportScreenshot={reportScreenshot}
+            dashboardId={dashboardId}
             onExportCsvChange={handleExportCsvChange}
+            onCopyTableChange={handleCopyTableChange}
             extensionContext={extensionContext}
           />
         </CardContent>
@@ -721,7 +749,9 @@ export function SqlChartCard({
                 panel={panel}
                 resolvedSql={resolvedSql}
                 loadData
+                timeRange={timeRange}
                 reportScreenshot={reportScreenshot}
+                dashboardId={dashboardId}
                 extensionContext={extensionContext}
               />
             </ChartFillHeight>

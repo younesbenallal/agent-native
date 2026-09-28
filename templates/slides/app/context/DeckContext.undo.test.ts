@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   applyOpToDeck,
+  applyUndoOpToDecks,
   deriveInverseOp,
+  reorderSlidesById,
   type Deck,
   type PatchDeckOp,
   type Slide,
@@ -30,26 +32,16 @@ function deck(slides: Slide[], over: Partial<Deck> = {}): Deck {
   };
 }
 
-/**
- * A deck comparison that ignores `updatedAt` (every op bumps it) so we can
- * assert the meaningful content round-trips exactly.
- */
 function stripTimestamps(d: Deck): Omit<Deck, "updatedAt"> {
   const { updatedAt: _u, ...rest } = d;
   void _u;
   return rest;
 }
 
-/**
- * Property under test: applying an op then its derived inverse restores the
- * deck to its exact prior state (content-wise). This is the guarantee the
- * inverse-op undo system relies on.
- */
 function expectRoundTrip(before: Deck, op: PatchDeckOp) {
   const inverseOps = deriveInverseOp(before, op);
   expect(inverseOps).not.toBeNull();
   const after = applyOpToDeck(before, op);
-  // Apply every inverse op in order (delete-slide's inverse is two ops).
   let restored = after;
   for (const inv of inverseOps!) {
     restored = applyOpToDeck(restored, inv);
@@ -58,6 +50,13 @@ function expectRoundTrip(before: Deck, op: PatchDeckOp) {
 }
 
 describe("deriveInverseOp / applyOpToDeck round-trips", () => {
+  it("moves a selected slide group together while preserving its order", () => {
+    const slides = [slide("a"), slide("b"), slide("c"), slide("d")];
+    expect(
+      reorderSlidesById(slides, "b", "d", ["b", "c"])?.map((s) => s.id),
+    ).toEqual(["a", "d", "b", "c"]);
+  });
+
   it("patch-slide: inverse restores the prior field values", () => {
     const before = deck([
       slide("a", { content: "<div>original</div>", background: "bg-black" }),
@@ -75,14 +74,13 @@ describe("deriveInverseOp / applyOpToDeck round-trips", () => {
   });
 
   it("patch-slide inverse captures prior value even when a field was undefined", () => {
-    const before = deck([slide("a")]); // no background set
+    const before = deck([slide("a")]);
     const op: PatchDeckOp = {
       op: "patch-slide",
       slideId: "a",
       fields: { background: "bg-red" },
     };
     const inverse = deriveInverseOp(before, op);
-    // Inverse must set background back to undefined (its prior value).
     expect(inverse).toEqual([
       {
         op: "patch-slide",
@@ -101,7 +99,20 @@ describe("deriveInverseOp / applyOpToDeck round-trips", () => {
       fields: { content: "x" },
     };
     expect(deriveInverseOp(before, op)).toBeNull();
-    // applying to a missing slide is a no-op
+    expect(applyOpToDeck(before, op)).toBe(before);
+  });
+
+  it("does not create an inverse for an unchanged slide patch", () => {
+    const before = deck([
+      slide("a", { content: "same", background: "bg-black" }),
+    ]);
+    const op: PatchDeckOp = {
+      op: "patch-slide",
+      slideId: "a",
+      fields: { content: "same", background: "bg-black" },
+    };
+
+    expect(deriveInverseOp(before, op)).toBeNull();
     expect(applyOpToDeck(before, op)).toBe(before);
   });
 
@@ -151,7 +162,6 @@ describe("deriveInverseOp / applyOpToDeck round-trips", () => {
     const after = applyOpToDeck(before, op);
     expect(after.slides.map((s) => s.id)).toEqual(["a", "c"]);
     const inverse = deriveInverseOp(before, op);
-    // Inverse is [add-slide (after "a"), reorder to prior order].
     expect(inverse?.[0]).toMatchObject({
       op: "add-slide",
       slideId: "b",
@@ -166,8 +176,6 @@ describe("deriveInverseOp / applyOpToDeck round-trips", () => {
     const before = deck([slide("a"), slide("b")]);
     const op: PatchDeckOp = { op: "delete-slide", slideId: "a" };
     const inverse = deriveInverseOp(before, op);
-    // The add-slide alone can't target the head, so the inverse includes a
-    // reorder that guarantees "a" lands back at index 0.
     expect(inverse?.[0]).toMatchObject({ op: "add-slide", slideId: "a" });
     const after = applyOpToDeck(before, op);
     let restored = after;
@@ -181,8 +189,6 @@ describe("deriveInverseOp / applyOpToDeck round-trips", () => {
       op: "delete-slide",
       slideId: "only",
     });
-    // Unlike the user-facing delete + server merge, the undo-apply path leaves
-    // the deck genuinely empty so undoing an add on a freshly-empty deck works.
     expect(after.slides).toEqual([]);
   });
 
@@ -210,8 +216,47 @@ describe("deriveInverseOp / applyOpToDeck round-trips", () => {
       orderedIds: ["b", "a"], // concurrent add not named
     };
     const after = applyOpToDeck(before, op);
-    // The unnamed concurrent slide is preserved at the end.
     expect(after.slides.map((s) => s.id)).toEqual(["b", "a", "concurrent"]);
+  });
+
+  it("clears imported source provenance only for structural changes", () => {
+    const before = deck([slide("a"), slide("b")], {
+      sourceImport: { mode: "source-preserving" },
+    });
+    const contentEdit = applyOpToDeck(before, {
+      op: "patch-slide",
+      slideId: "a",
+      fields: { content: "<div>edited</div>" },
+    });
+    expect(contentEdit.sourceImport).toEqual({ mode: "source-preserving" });
+
+    const structuralOps: PatchDeckOp[] = [
+      { op: "delete-slide", slideId: "a" },
+      { op: "reorder-slides", orderedIds: ["b", "a"] },
+      { op: "add-slide", slideId: "c", fields: { content: "<div>c</div>" } },
+    ];
+    for (const op of structuralOps) {
+      expect(applyOpToDeck(before, op).sourceImport).toBeUndefined();
+    }
+  });
+
+  it("restores imported source provenance through a replacement undo", () => {
+    const before = deck([slide("a"), slide("b")], {
+      sourceImport: { mode: "source-preserving", slideIds: ["a", "b"] },
+    });
+    const after = applyOpToDeck(before, {
+      op: "delete-slide",
+      slideId: "a",
+    });
+
+    expect(after.sourceImport).toBeUndefined();
+    expect(
+      applyUndoOpToDecks([after], {
+        op: "replace-deck",
+        deckId: before.id,
+        deck: before,
+      }),
+    ).toEqual([before]);
   });
 
   it("patch-deck-fields: inverse restores prior deck fields", () => {
@@ -229,6 +274,17 @@ describe("deriveInverseOp / applyOpToDeck round-trips", () => {
       },
     ]);
     expectRoundTrip(before, op);
+  });
+
+  it("does not create an inverse for unchanged deck fields", () => {
+    const before = deck([slide("a")], { title: "Same title" });
+    const op: PatchDeckOp = {
+      op: "patch-deck-fields",
+      fields: { title: "Same title" },
+    };
+
+    expect(deriveInverseOp(before, op)).toBeNull();
+    expect(applyOpToDeck(before, op)).toBe(before);
   });
 
   it("applying an add-slide that already exists is idempotent", () => {

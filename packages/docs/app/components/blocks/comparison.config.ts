@@ -1,9 +1,12 @@
 import type { BlockMdxConfig } from "@agent-native/core/blocks";
 import { z } from "zod";
 
+import { splitMarkdownHeadingSections } from "./markdown-heading-sections";
+
 export interface ComparisonSide {
   label: string;
   body: string;
+  color?: string;
 }
 
 export interface ComparisonData {
@@ -12,26 +15,35 @@ export interface ComparisonData {
 
 export const comparisonSchema = z.object({
   sides: z
-    .array(z.object({ label: z.string(), body: z.string() }))
+    .array(
+      z.object({
+        label: z.string(),
+        body: z.string(),
+        color: z.string().optional(),
+      }),
+    )
     .min(2)
     .max(4),
 }) as unknown as z.ZodType<ComparisonData>;
 
 export function parseSidesFromMarkdown(children: string): ComparisonSide[] {
-  const parts = children.split(/\n(?=###\s)/);
-  const sides: ComparisonSide[] = [];
-  for (const part of parts) {
-    const match = part.match(/^###\s+(.+?)\n([\s\S]*)$/);
-    if (!match) continue;
-    const label = match[1].trim();
-    const body = match[2].trim();
-    if (label) sides.push({ label, body });
-  }
-  return sides;
+  return splitMarkdownHeadingSections(children).map(({ title, body }) => {
+    const colorMatch = title.match(/^:([a-z0-9-]+):\s*(.+)$/);
+    return {
+      label: colorMatch ? colorMatch[2] : title,
+      color: colorMatch?.[1],
+      body,
+    };
+  });
 }
 
 export function serializeSidesToMarkdown(sides: ComparisonSide[]): string {
-  return sides.map((s) => `### ${s.label}\n\n${s.body}`).join("\n\n");
+  return sides
+    .map((s) => {
+      const heading = s.color ? `:${s.color}: ${s.label}` : s.label;
+      return `### ${heading}\n\n${s.body}`;
+    })
+    .join("\n\n");
 }
 
 export const comparisonMdx: BlockMdxConfig<ComparisonData> = {

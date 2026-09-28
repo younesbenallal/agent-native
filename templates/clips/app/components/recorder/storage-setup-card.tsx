@@ -1,15 +1,19 @@
-import { agentNativePath, appPath } from "@agent-native/core/client/api-path";
+import { agentNativePath } from "@agent-native/core/client/api-path";
 import { useT } from "@agent-native/core/client/i18n";
-import { openBuilderConnectPopup } from "@agent-native/core/client/settings";
+import {
+  hasBuilderOAuthCredential,
+  useBuilderConnectFlow,
+} from "@agent-native/core/client/settings";
 import {
   IconCheck,
   IconCloud,
-  IconExternalLink,
   IconLoader2,
   IconServer,
 } from "@tabler/icons-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { useStorageSetupHref } from "@/components/settings/settings-links";
+import { Button } from "@/components/ui/button";
 import {
   Tooltip,
   TooltipContent,
@@ -40,9 +44,7 @@ export interface StorageSetupCardProps {
   description?: string;
   connectDescription?: string;
   connectedDescription?: string;
-  /** Analytics source for the Builder connect popup. */
   connectSource?: string;
-  /** Analytics flow for the Builder connect popup. */
   connectFlow?: string;
 }
 
@@ -56,35 +58,37 @@ export function StorageSetupCard({
   connectFlow = "file_upload",
 }: StorageSetupCardProps) {
   const t = useT();
+  const storageSetupHref = useStorageSetupHref();
   const [connecting, setConnecting] = useState(false);
   const [connected, setConnected] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [retryingBuilderStatus, setRetryingBuilderStatus] = useState(false);
+  const retryingBuilderStatusAtCountRef = useRef<number | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const mountedRef = useRef(true);
+  const inFlightRef = useRef(false);
+  const visibilityHandlerRef = useRef<(() => void) | null>(null);
+  const connectRequestedRef = useRef(false);
 
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
-        pollRef.current = null;
-      }
-    };
+  const stopVisibilityHandler = useCallback(() => {
+    if (visibilityHandlerRef.current) {
+      document.removeEventListener(
+        "visibilitychange",
+        visibilityHandlerRef.current,
+      );
+      visibilityHandlerRef.current = null;
+    }
   }, []);
 
-  const handleConnect = useCallback(() => {
+  const startFileUploadPoll = useCallback(() => {
     if (pollRef.current) {
       clearInterval(pollRef.current);
       pollRef.current = null;
     }
+    stopVisibilityHandler();
+    inFlightRef.current = false;
     setConnecting(true);
     setErr(null);
-
-    openBuilderConnectPopup({
-      source: connectSource,
-      flow: connectFlow,
-    });
 
     const start = Date.now();
     const timeoutMs = 5 * 60 * 1000;
@@ -93,16 +97,34 @@ export function StorageSetupCard({
         clearInterval(pollRef.current);
         pollRef.current = null;
       }
+      stopVisibilityHandler();
     };
-    pollRef.current = setInterval(async () => {
+    const showTimeout = (): void => {
+      if (!mountedRef.current || Date.now() - start <= timeoutMs) return;
+      stop();
+      setConnecting(false);
+      setErr(t("storageSetup.builderTimeout"));
+    };
+    const tick = async () => {
+      if (document.hidden || inFlightRef.current) return;
+      inFlightRef.current = true;
+      const controller = new AbortController();
+      const abortTimer = setTimeout(
+        () => controller.abort(),
+        Math.max(10_000, 2000 * 4),
+      );
       try {
         const r = await fetch(
           new URL(
-            agentNativePath("/_agent-native/builder/status"),
+            agentNativePath("/_agent-native/file-upload/status"),
             window.location.origin,
           ).toString(),
+          { signal: controller.signal },
         );
-        if (!r.ok) return;
+        if (!r.ok) {
+          showTimeout();
+          return;
+        }
         const s = (await r.json()) as { configured: boolean };
         if (!mountedRef.current) {
           stop();
@@ -113,16 +135,90 @@ export function StorageSetupCard({
           setConnecting(false);
           setConnected(true);
           setTimeout(() => void onConfigured(), 800);
-        } else if (Date.now() - start > timeoutMs) {
-          stop();
-          setConnecting(false);
-          setErr(t("storageSetup.builderTimeout"));
+        } else {
+          showTimeout();
         }
       } catch {
-        // transient poll error
+        showTimeout();
+      } finally {
+        clearTimeout(abortTimer);
+        inFlightRef.current = false;
       }
-    }, 2000);
-  }, [onConfigured, connectSource, connectFlow]);
+    };
+    pollRef.current = setInterval(() => void tick(), 2000);
+    visibilityHandlerRef.current = () => {
+      if (!document.hidden) void tick();
+    };
+    document.addEventListener("visibilitychange", visibilityHandlerRef.current);
+  }, [onConfigured, stopVisibilityHandler, t]);
+
+  const handleBuilderConnected = useCallback(() => {
+    if (!connectRequestedRef.current) return;
+    connectRequestedRef.current = false;
+    startFileUploadPoll();
+  }, [startFileUploadPoll]);
+
+  const builderConnect = useBuilderConnectFlow({
+    provisionAccount: true,
+    trackingSource: connectSource,
+    trackingFlow: connectFlow,
+    onConnected: handleBuilderConnected,
+  });
+  useEffect(() => {
+    const startedAt = retryingBuilderStatusAtCountRef.current;
+    if (
+      startedAt !== null &&
+      builderConnect.statusReadSettledCount > startedAt
+    ) {
+      retryingBuilderStatusAtCountRef.current = null;
+      setRetryingBuilderStatus(false);
+    }
+  }, [builderConnect.statusReadSettledCount]);
+  const retryBuilderStatus = useCallback(() => {
+    retryingBuilderStatusAtCountRef.current =
+      builderConnect.statusReadSettledCount;
+    setRetryingBuilderStatus(true);
+    if (!builderConnect.retry()) {
+      retryingBuilderStatusAtCountRef.current = null;
+      setRetryingBuilderStatus(false);
+    }
+  }, [builderConnect.retry, builderConnect.statusReadSettledCount]);
+  const handleBuilderConnect = useCallback(
+    (provisionAccount: boolean) => {
+      connectRequestedRef.current = true;
+      builderConnect.start({ provisionAccount });
+    },
+    [builderConnect.start],
+  );
+  const handleBuilderCancel = useCallback(() => {
+    connectRequestedRef.current = false;
+    builderConnect.cancel();
+  }, [builderConnect.cancel]);
+  const hasBuilderAccount =
+    builderConnect.accountExists || hasBuilderOAuthCredential(builderConnect);
+  const provisionAccount =
+    !hasBuilderAccount &&
+    builderConnect.statusResolved &&
+    builderConnect.agentNativeProvisioningEnabled;
+  const builderConnectErrorMessage = builderConnect.error
+    ? /popup|chat host/i.test(builderConnect.error)
+      ? t("storageSetup.builderConnectPopupError")
+      : t("storageSetup.builderConnectError")
+    : null;
+  const builderConnecting = builderConnect.connecting;
+  const actionConnecting = connecting || builderConnecting;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+      stopVisibilityHandler();
+    };
+  }, [stopVisibilityHandler]);
 
   return (
     <div className="mx-auto flex w-full max-w-md flex-col gap-5 rounded-2xl border border-border bg-card p-6 shadow-lg">
@@ -134,50 +230,135 @@ export function StorageSetupCard({
         <p className="text-sm text-muted-foreground">{description}</p>
       </div>
 
-      {/* Builder.io — primary option, one-click Connect flow. */}
-      <button
-        type="button"
-        onClick={handleConnect}
-        disabled={connecting || connected}
-        className={
-          "flex items-start gap-3 rounded-xl border px-4 py-3.5 text-start " +
-          (connected
-            ? "border-primary/50 bg-primary/5"
-            : "border-border bg-background hover:border-foreground/30")
-        }
-      >
-        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-foreground text-background">
-          {connected ? (
-            <IconCheck className="h-5 w-5" />
-          ) : connecting ? (
-            <IconLoader2 className="h-5 w-5 animate-spin" />
-          ) : (
-            <BuilderBMark className="h-5 w-5" />
-          )}
-        </div>
-        <div className="flex-1">
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-medium">
-              {connected
-                ? t("storageSetup.builderConnected")
-                : connecting
-                  ? t("storageSetup.waitingForBuilder")
-                  : t("storageSetup.connectBuilder")}
-            </span>
-            {!connected && !connecting && (
-              <>
-                <span className="rounded-sm bg-primary/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-primary">
-                  {t("storageSetup.free")}
-                </span>
-                <IconExternalLink className="h-3.5 w-3.5 text-muted-foreground" />
-              </>
+      {/* Builder.io — primary option. */}
+      <div className="space-y-2">
+        <button
+          type="button"
+          disabled={actionConnecting || connected}
+          data-testid="storage-setup-builder-primary"
+          onClick={() => handleBuilderConnect(provisionAccount)}
+          className={
+            "flex items-start gap-3 rounded-xl border px-4 py-3.5 text-start transition-colors " +
+            (connected
+              ? "border-primary/50 bg-primary/5"
+              : "border-primary bg-primary text-primary-foreground hover:bg-primary/90")
+          }
+        >
+          <div
+            className={
+              "flex h-9 w-9 shrink-0 items-center justify-center rounded-lg " +
+              (connected
+                ? "bg-foreground text-background"
+                : "bg-primary-foreground/15 text-primary-foreground")
+            }
+          >
+            {connected ? (
+              <IconCheck className="h-5 w-5" />
+            ) : actionConnecting ? (
+              <IconLoader2 className="h-5 w-5 animate-spin" />
+            ) : (
+              <BuilderBMark className="h-5 w-5" />
             )}
           </div>
-          <span className="mt-0.5 block text-xs text-muted-foreground">
-            {connected ? connectedDescription : connectDescription}
-          </span>
-        </div>
-      </button>
+          <div className="flex-1">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-medium">
+                {connected
+                  ? t("storageSetup.builderConnected")
+                  : actionConnecting
+                    ? t("storageSetup.waitingForBuilder")
+                    : provisionAccount
+                      ? t("storageSetup.createBuilderAccount")
+                      : hasBuilderAccount
+                        ? t("storageSetup.signInWithBuilderAccount")
+                        : t("storageSetup.connectBuilder")}
+              </span>
+            </div>
+            <span
+              className={
+                "mt-0.5 block text-xs " +
+                (connected
+                  ? "text-muted-foreground"
+                  : "text-primary-foreground/80")
+              }
+            >
+              {connected ? connectedDescription : connectDescription}
+            </span>
+          </div>
+        </button>
+        {provisionAccount && (
+          <button
+            type="button"
+            disabled={actionConnecting || connected}
+            data-testid="storage-setup-builder-sign-in"
+            onClick={() => handleBuilderConnect(false)}
+            className="w-full text-center text-xs text-muted-foreground underline underline-offset-4 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {t("storageSetup.signInWithBuilderAccount")}
+          </button>
+        )}
+      </div>
+      {builderConnect.error && (
+        <p className="text-xs text-destructive" role="alert">
+          {builderConnectErrorMessage}
+        </p>
+      )}
+      {!builderConnect.statusResolved &&
+        builderConnect.hasFetchedStatus &&
+        builderConnect.error && (
+          <button
+            type="button"
+            aria-busy={retryingBuilderStatus}
+            disabled={retryingBuilderStatus}
+            className="text-xs text-foreground underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            onClick={retryBuilderStatus}
+          >
+            {retryingBuilderStatus ? (
+              <span className="inline-flex items-center gap-1.5">
+                <IconLoader2 className="h-3 w-3 animate-spin" aria-hidden />
+                {t("storageSetup.checkingBuilderConnection")}
+              </span>
+            ) : (
+              t("meetingDetail.retry")
+            )}
+          </button>
+        )}
+      {builderConnecting && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          data-testid="storage-setup-builder-cancel"
+          className="self-end text-xs font-normal text-muted-foreground"
+          onClick={handleBuilderCancel}
+        >
+          {t("common.cancel")}
+        </Button>
+      )}
+
+      {provisionAccount && (
+        <p className="text-center text-xs leading-5 text-muted-foreground">
+          {t("storageSetup.builderConsentPrefix")}{" "}
+          <a
+            href="https://www.builder.io/legal/terms"
+            target="_blank"
+            rel="noreferrer"
+            className="text-foreground underline decoration-border underline-offset-2 hover:decoration-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {t("storageSetup.builderTerms")}
+          </a>{" "}
+          {t("storageSetup.builderConsentAnd")}{" "}
+          <a
+            href="https://www.builder.io/legal/privacy"
+            target="_blank"
+            rel="noreferrer"
+            className="text-foreground underline decoration-border underline-offset-2 hover:decoration-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {t("storageSetup.builderPrivacy")}
+          </a>
+          .
+        </p>
+      )}
 
       {err && <p className="text-xs text-muted-foreground">{err}</p>}
 
@@ -187,18 +368,26 @@ export function StorageSetupCard({
           <div className="flex items-center gap-3 border-t border-border pt-4">
             <IconServer className="h-4 w-4 text-muted-foreground" />
             <div className="flex-1">
-              <span className="text-sm text-muted-foreground">
-                Or{" "}
-                <a
-                  href={appPath("/settings/general#video-storage")}
-                  className="font-medium text-foreground underline underline-offset-2 hover:text-foreground/80"
-                >
-                  {t("storageSetup.configureS3")}
-                </a>
-              </span>
-              <span className="mt-0.5 block text-[11px] text-muted-foreground">
-                AWS S3, Cloudflare R2, DigitalOcean Spaces, MinIO
-              </span>
+              {storageSetupHref ? (
+                <>
+                  <span className="text-sm text-muted-foreground">
+                    Or{" "}
+                    <a
+                      href={storageSetupHref}
+                      className="font-medium text-foreground underline underline-offset-2 hover:text-foreground/80"
+                    >
+                      {t("storageSetup.configureS3")}
+                    </a>
+                  </span>
+                  <span className="mt-0.5 block text-[11px] text-muted-foreground">
+                    AWS S3, Cloudflare R2, DigitalOcean Spaces, MinIO
+                  </span>
+                </>
+              ) : (
+                <span className="text-sm text-muted-foreground">
+                  {t("clipsSettings.storageAskAdmin")}
+                </span>
+              )}
             </div>
           </div>
           <TooltipProvider delayDuration={150}>

@@ -5,42 +5,74 @@ import {
   normalizeModelForEngine,
   resolveEngine,
 } from "../agent/engine/index.js";
+import { resolveMainChatMaxOutputTokens } from "../agent/engine/output-tokens.js";
 import type { AgentEngine } from "../agent/engine/types.js";
 import {
   actionsToEngineTools,
   filterInitialEngineTools,
-  getOwnerActiveApiKey,
+  resolveOwnerEngineApiKey,
   runAgentLoop,
   type ActionEntry,
 } from "../agent/production-agent.js";
 import { runAgentLoopDirectWithSoftTimeout } from "../agent/run-loop-with-resume.js";
-import { resolveRunSoftTimeoutMs, startRun } from "../agent/run-manager.js";
+import {
+  abortRun,
+  resolveBackgroundAutomationSoftTimeoutMs,
+  resolveBackgroundRunHardTimeoutMs,
+  startRun,
+  type ActiveRun,
+} from "../agent/run-manager.js";
 import { claimBackgroundRun, insertRun } from "../agent/run-store.js";
+import {
+  buildAssistantMessage,
+  buildUserMessage,
+  extractThreadMeta,
+  foldAssistantTurn,
+  upsertUserMessage,
+} from "../agent/thread-data-builder.js";
 import { attachToolSearch } from "../agent/tool-search.js";
 import {
   resolveAutomationExecutionIdentity,
   type AutomationExecutionIdentity,
 } from "../automations/service.js";
-import { createThread } from "../chat-threads/store.js";
+import {
+  createThread,
+  getThread,
+  updateThreadData,
+  withThreadDataLock,
+} from "../chat-threads/store.js";
 import { queryOrgMembers } from "../org/context.js";
 import {
   organizationIdFromResourceOwner,
   organizationResourceOwner,
   type Resource,
 } from "../resources/store.js";
+import { captureError } from "../server/capture-error.js";
 import {
   runWithRequestContext,
   type RequestContext,
 } from "../server/request-context.js";
-import type { JobFrontmatter } from "./frontmatter.js";
+import { normalizeReasoningEffortForRequest } from "../shared/reasoning-effort.js";
+import {
+  recoveredFactoryOwnerOrgId,
+  type JobFrontmatter,
+} from "./frontmatter.js";
 import {
   attachAutomationRunThread,
   finishAutomationRun,
   startAutomationRun,
 } from "./run-history.js";
 
-const BACKGROUND_RUN_STUCK_MS = 10 * 60_000;
-const BACKGROUND_RUN_HARD_TIMEOUT_MS = 5 * 60_000;
+export const BACKGROUND_RUN_HARD_TIMEOUT_MS = 10 * 60_000;
+
+export class BackgroundAutomationRunError extends Error {
+  readonly errorCode: string;
+  constructor(message: string, errorCode: string) {
+    super(message);
+    this.name = "BackgroundAutomationRunError";
+    this.errorCode = errorCode;
+  }
+}
 
 export interface BackgroundAutomationContext {
   name: string;
@@ -52,7 +84,7 @@ export interface BackgroundAutomationContext {
 export interface BackgroundAutomationDeps {
   getActions: (
     automation?: BackgroundAutomationContext,
-  ) => Record<string, ActionEntry>;
+  ) => Record<string, ActionEntry> | Promise<Record<string, ActionEntry>>;
   getSystemPrompt: (owner: string) => Promise<string>;
   getInitialToolNames?: (
     automation?: BackgroundAutomationContext,
@@ -75,8 +107,9 @@ export interface BackgroundAutomationRunOptions {
   requestContext?: Omit<RequestContext, "userEmail" | "orgId">;
   actionCaller?: ActionCaller;
   actionAutomation?: ActionAutomationContext;
-  /** Reuse a history row created by a durable run-now enqueue. */
   historyId?: string;
+  noProgressTimeoutMs?: number;
+  backgroundNoProgressTimeoutMs?: number;
 }
 
 export interface BackgroundAutomationRunResult {
@@ -92,12 +125,6 @@ export type BackgroundAutomationIdentityResult =
   | { ok: true; identity: AutomationExecutionIdentity }
   | { ok: false; reason: string };
 
-/**
- * A persisted background run must not outlive its execution identity.
- * Organization runs fail closed when membership state cannot be read. A
- * brand-new personal install without auth tables remains a distinct
- * not-applicable case so local/CLI jobs keep working before auth is configured.
- */
 export async function validateAutomationRunIdentity(
   ownerEmail: string,
   orgId?: string,
@@ -124,7 +151,6 @@ export async function validateAutomationRunIdentity(
     const authTablesAreUnconfigured =
       !orgId &&
       (message.includes("does not exist") ||
-        message.includes("no such table") ||
         message.includes("undefined table"));
     if (authTablesAreUnconfigured) return { ok: true };
     return {
@@ -137,7 +163,10 @@ export async function validateAutomationRunIdentity(
 
   try {
     const memberRows = await queryOrgMembers({
-      sql: `SELECT 1 FROM org_members WHERE org_id = ? AND LOWER(email) = LOWER(?) LIMIT 1`,
+      sql: `SELECT 1 FROM org_members
+            WHERE org_id = ? AND LOWER(email) = LOWER(?)
+              AND federation_removal_pending_at IS NULL
+            LIMIT 1`,
       args: [orgId, ownerEmail],
     });
     if (memberRows === null) {
@@ -183,7 +212,14 @@ export async function resolveBackgroundAutomationIdentity(
     effectiveRunAs === "creator"
       ? automation.meta.createdBy || automation.resource.owner
       : automation.resource.owner;
-  const orgId = automation.meta.orgId ?? undefined;
+  const orgId =
+    recoveredFactoryOwnerOrgId(
+      automation.meta,
+      automation.resource.path,
+      automation.resource.owner,
+    ) ??
+    automation.meta.orgId ??
+    undefined;
   const validity = await validateAutomationRunIdentity(userEmail, orgId);
   return validity.ok
     ? {
@@ -206,15 +242,10 @@ export function isBackgroundAutomationRunActive(
   const startedAt = new Date(meta.lastRun).getTime();
   return (
     Number.isFinite(startedAt) &&
-    now.getTime() - startedAt < BACKGROUND_RUN_STUCK_MS
+    now.getTime() - startedAt < resolveBackgroundRunHardTimeoutMs()
   );
 }
 
-/**
- * A soft-timeout/no-progress checkpoint is a continuation boundary, not a
- * successful finish. Only the last terminal event decides whether an
- * in-invocation resume recovered from the boundary.
- */
 export function backgroundRunCutOffReason(run: {
   events?: readonly { event: { type: string; reason?: string } }[];
 }): string | null {
@@ -242,8 +273,9 @@ function assertRequestedMcpToolsAvailable(
   const requested = automation.meta.mcpTools ?? [];
   const missing = requested.filter((toolName) => !actions[toolName]);
   if (missing.length > 0) {
-    throw new Error(
+    throw new BackgroundAutomationRunError(
       `Configured MCP tools are unavailable in this run: ${missing.join(", ")}. Reconnect the MCP server or update the automation's capability list.`,
+      "background_automation_mcp_tools_unavailable",
     );
   }
 }
@@ -258,9 +290,6 @@ export async function runBackgroundAutomation(
   deps: BackgroundAutomationDeps,
 ): Promise<BackgroundAutomationRunResult> {
   const { automation } = options;
-  // Bookkeeping, so it must not gate the work it describes: a history table
-  // that cannot be written should cost us the record, not the automation.
-  // Everything downstream tolerates a null id by skipping its own write.
   let historyId: string | null = null;
   if (options.historyId) {
     historyId = options.historyId;
@@ -277,6 +306,8 @@ export async function runBackgroundAutomation(
         path: automation.resource.path,
         scope: options.orgId ? "organization" : "personal",
         orgId: options.orgId ?? null,
+        appId: deps.appId,
+        notificationEmail: options.ownerEmail,
       });
     } catch (err) {
       console.error(
@@ -287,28 +318,45 @@ export async function runBackgroundAutomation(
   }
 
   let result: BackgroundAutomationRunResult;
+  const runIdRef: { current: string | null } = { current: null };
   try {
-    result = await executeBackgroundAutomation(options, deps, historyId);
+    result = await executeBackgroundAutomation(
+      options,
+      deps,
+      historyId,
+      runIdRef,
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    const errorCode =
+      err instanceof BackgroundAutomationRunError
+        ? err.errorCode
+        : "background_automation_failed";
+    captureError(err, {
+      tags: {
+        area: "background-automation",
+        automation: automation.name,
+        scope: options.orgId ? "organization" : "personal",
+      },
+      extra: {
+        automationPath: automation.resource.path,
+        appId: deps.appId,
+        historyId,
+      },
+      ...(runIdRef.current ? { aiTraceId: runIdRef.current } : {}),
+    });
     await recordRunOutcome(
       historyId,
       "error",
       `${message}. No delivery was confirmed.`,
+      errorCode,
     );
     throw err;
   }
-  // Outside the try: history is bookkeeping about the run, so a failure to
-  // write it must not turn a completed automation into a reported failure.
   await recordRunOutcome(historyId, "success");
   return result;
 }
 
-/**
- * Link the run to its agent thread. Bookkeeping again: the automation is
- * already executing by this point, so a failed write costs the cross-reference
- * in the history view, not the run.
- */
 async function recordRunThread(
   historyId: string | null,
   threadId: string,
@@ -325,14 +373,108 @@ async function recordRunThread(
   }
 }
 
+function backgroundAutomationPersistFailure(input: {
+  run: ActiveRun;
+  hardTimedOut: boolean;
+  hardTimeoutMs?: number;
+}): { message: string; errorCode: string } | undefined {
+  if (input.hardTimedOut) {
+    const minutes = Math.round(
+      (input.hardTimeoutMs ?? BACKGROUND_RUN_HARD_TIMEOUT_MS) / 60_000,
+    );
+    return {
+      message: `Background automation timed out after ${minutes} minutes`,
+      errorCode: "background_automation_hard_timeout",
+    };
+  }
+  const cutOffReason = backgroundRunCutOffReason(input.run);
+  if (!cutOffReason) return undefined;
+  return {
+    message: `Background automation was cut off before finishing (${cutOffReason})`,
+    errorCode: "background_automation_cut_off",
+  };
+}
+
+async function persistBackgroundAutomationTurn(input: {
+  threadId: string;
+  threadTitle: string;
+  prompt: string;
+  run: ActiveRun;
+  persistFailure?: { message: string; errorCode: string };
+}): Promise<void> {
+  await withThreadDataLock(input.threadId, async () => {
+    const row = await getThread(input.threadId);
+    if (!row) {
+      throw new Error(
+        `Background automation thread ${input.threadId} was not found while saving run ${input.run.runId}.`,
+      );
+    }
+
+    let repo: unknown;
+    try {
+      repo = JSON.parse(row.threadData || "{}");
+    } catch {
+      throw new Error(
+        `Background automation thread ${input.threadId} has unreadable thread data.`,
+      );
+    }
+    if (!repo || typeof repo !== "object" || Array.isArray(repo)) {
+      throw new Error(
+        `Background automation thread ${input.threadId} has unreadable thread data.`,
+      );
+    }
+
+    repo = upsertUserMessage(
+      repo,
+      buildUserMessage({ text: input.prompt, runId: input.run.runId }),
+    );
+    const events = [...(input.run.events ?? [])];
+    if (input.persistFailure) {
+      events.push({
+        seq: events.length,
+        event: {
+          type: "error",
+          error: input.persistFailure.message,
+          errorCode: input.persistFailure.errorCode,
+          recoverable: false,
+        },
+      });
+    }
+    const assistantMsg = buildAssistantMessage(events, input.run.runId, {
+      suppressInternalContinuation: !input.persistFailure,
+      turnId: input.run.turnId,
+      runDurationMs: Number.isFinite(input.run.startedAt)
+        ? Math.max(0, Date.now() - input.run.startedAt)
+        : undefined,
+    });
+    if (assistantMsg) {
+      repo = foldAssistantTurn(repo, assistantMsg, {
+        runId: input.run.runId,
+        turnId: input.run.turnId,
+      });
+    }
+
+    const meta = extractThreadMeta(repo);
+    const messages = (repo as { messages?: unknown[] }).messages;
+    await updateThreadData(
+      input.threadId,
+      JSON.stringify(repo),
+      input.threadTitle || row.title,
+      meta.preview || row.preview,
+      Array.isArray(messages) ? messages.length : 0,
+    );
+  });
+}
+
 async function recordRunOutcome(
   historyId: string | null,
   status: "success" | "error",
   error?: string,
+  errorCode?: string,
 ): Promise<void> {
   if (!historyId) return;
   try {
-    await finishAutomationRun(historyId, status, error);
+    await finishAutomationRun(historyId, status, error, errorCode);
   } catch (err) {
     console.error(
       `[automations] Could not record run ${historyId} as ${status}:`,
@@ -345,6 +487,7 @@ async function executeBackgroundAutomation(
   options: BackgroundAutomationRunOptions,
   deps: BackgroundAutomationDeps,
   historyId: string | null,
+  runIdRef?: { current: string | null },
 ): Promise<BackgroundAutomationRunResult> {
   const { automation, ownerEmail, orgId, prompt, threadTitle, usageLabel } =
     options;
@@ -356,7 +499,7 @@ async function executeBackgroundAutomation(
       orgId,
     },
     async () => {
-      const baseActions = deps.getActions(automation);
+      const baseActions = await deps.getActions(automation);
       assertRequestedMcpToolsAvailable(automation, baseActions);
 
       const configuredInitialTools = deps.getInitialToolNames?.(automation);
@@ -372,12 +515,23 @@ async function executeBackgroundAutomation(
       const availableTools = actionsToEngineTools(actions);
       const tools = filterInitialEngineTools(availableTools, initialToolNames);
 
-      const userApiKey = await getOwnerActiveApiKey(ownerEmail);
+      const ownerApiKey = await resolveOwnerEngineApiKey({ ownerEmail });
+      const apiKey = ownerApiKey.apiKey ?? deps.apiKey;
+      const apiKeyProvenance = ownerApiKey.apiKey
+        ? ownerApiKey.credentialProvenance
+        : deps.apiKey
+          ? { scope: "deployment" as const }
+          : undefined;
       const engine =
         deps.engine ??
         (await resolveEngine({
-          apiKey: userApiKey ?? deps.apiKey,
+          apiKey,
+          apiKeyEnvVar: ownerApiKey.apiKey
+            ? ownerApiKey.apiKeyEnvVar
+            : undefined,
+          apiKeyProvenance,
           appId: deps.appId,
+          credentialIdentity: { userEmail: ownerEmail, orgId },
         }));
       const modelCandidate =
         automation.meta.model ??
@@ -386,45 +540,24 @@ async function executeBackgroundAutomation(
         engine.defaultModel;
       const model = normalizeModelForEngine(engine, modelCandidate);
       const systemPrompt = await deps.getSystemPrompt(ownerEmail);
-      const thread = await createThread(ownerEmail, { title: threadTitle });
+      const thread = await createThread(ownerEmail, {
+        title: threadTitle,
+        orgId: orgId ?? null,
+      });
       const runId = createRunId(options.runIdPrefix);
+      if (runIdRef) runIdRef.current = runId;
       await recordRunThread(historyId, thread.id, runId);
 
-      // Scheduled work is background work: it has no synchronous serverless
-      // caller waiting on it, so it must not inherit the interactive clamp
-      // (40s soft timeout, a 30s no-progress backstop at 0.75x that, and 6
-      // continuations). A dashboard render or digest legitimately spends
-      // minutes across many tool calls, and dies the first time any gap
-      // between two of them exceeds 30s — recorded as `no_progress` after
-      // several minutes of real work, because the backstop is suspended
-      // while a tool is in flight but not between tools.
-      //
-      // Hardcoded rather than `isInBackgroundFunctionRuntime()` (what
-      // webhook-handler.ts uses): a webhook can arrive on either runtime, but
-      // a scheduler tick never serves a synchronous request, so the
-      // interactive clamp never applies to it. The wider soft ceiling stays
-      // bounded by this runner's own BACKGROUND_RUN_HARD_TIMEOUT_MS abort.
-      const softTimeoutMs = resolveRunSoftTimeoutMs(undefined, {
-        useHostedDefault: true,
-        backgroundFunction: true,
-      });
+      const hardTimeoutMs = resolveBackgroundRunHardTimeoutMs();
+      const softTimeoutMs = resolveBackgroundAutomationSoftTimeoutMs();
 
       const usageRef: {
         current: Awaited<ReturnType<typeof runAgentLoop>> | null;
       } = { current: null };
       let responseText = "";
       let hardAbortTimer: ReturnType<typeof setTimeout> | null = null;
+      let hardTimedOut = false;
 
-      // This runner executes in-process, synchronously — there is no HTTP
-      // self-dispatch to a separate worker. Self-claim the row into
-      // 'background-processing' right away, exactly like a genuine HTTP
-      // background worker does immediately after its own insert (see
-      // production-agent.ts's `claimBackgroundWorkerRunEarly`). Without this,
-      // the row sits at dispatch_mode='background' for its whole life with no
-      // worker ever claiming it, which is indistinguishable from a lost HTTP
-      // handoff to the unclaimed-background-run sweep — it gets reaped as
-      // "background_worker_never_started" out from under a still-executing
-      // job the moment any single tool call runs past the 25s grace window.
       await insertRun(runId, thread.id, undefined, {
         dispatchMode: "background",
       });
@@ -439,52 +572,112 @@ async function executeBackgroundAutomation(
         const activeRun = startRun(
           runId,
           thread.id,
-          async (send, signal) => {
-            usageRef.current = await runAgentLoopDirectWithSoftTimeout(
-              {
-                engine,
+          async (send, signal, control) => {
+            const loopOpts = {
+              engine,
+              model,
+              systemPrompt,
+              tools,
+              availableTools,
+              messages: [
+                {
+                  role: "user" as const,
+                  content: [{ type: "text" as const, text: prompt }],
+                },
+              ],
+              actions,
+              send,
+              signal,
+              threadId: thread.id,
+              ownerEmail,
+              orgId,
+              appId: deps.appId,
+              actionCaller: options.actionCaller,
+              automation: options.actionAutomation,
+              runId,
+              maxIterations: automation.meta.maxIterations,
+              maxRunInputTokens: automation.meta.maxRunInputTokens,
+              reasoningEffort: normalizeReasoningEffortForRequest(
                 model,
-                systemPrompt,
-                tools,
-                availableTools,
-                messages: [
-                  {
-                    role: "user",
-                    content: [{ type: "text", text: prompt }],
+                automation.meta.reasoningEffort,
+              ),
+              maxOutputTokens: resolveMainChatMaxOutputTokens(model),
+            };
+            const execute = (o: typeof loopOpts = loopOpts) =>
+              runAgentLoopDirectWithSoftTimeout(
+                o,
+                softTimeoutMs,
+                { backgroundFunction: true },
+                control,
+              );
+
+            let instrumented = false;
+            try {
+              const { getObservabilityConfig, instrumentAgentLoop } =
+                await import("../observability/traces.js");
+              const config = await getObservabilityConfig();
+              if (config.enabled) {
+                instrumented = true;
+                usageRef.current = await instrumentAgentLoop({
+                  runAgentLoop: (o) => execute(o as typeof loopOpts),
+                  loopOpts,
+                  runId,
+                  threadId: thread.id,
+                  userId: ownerEmail,
+                  config,
+                  spanName: `background_automation_run:${automation.name}`,
+                  metadata: {
+                    automation: automation.name,
+                    automationId: automation.resource.id,
+                    trigger: "background_automation",
+                    label: usageLabel,
+                    scope: orgId ? "organization" : "personal",
                   },
-                ],
-                actions,
-                send,
-                signal,
-                threadId: thread.id,
-                ownerEmail,
-                orgId,
-                actionCaller: options.actionCaller,
-                automation: options.actionAutomation,
-                runId,
-              },
-              softTimeoutMs,
-              { backgroundFunction: true },
-            );
+                });
+                return;
+              }
+            } catch (error) {
+              if (instrumented) throw error;
+            }
+            usageRef.current = await execute();
           },
           async (run) => {
             if (hardAbortTimer) {
               clearTimeout(hardAbortTimer);
               hardAbortTimer = null;
             }
-            const cutOffReason = backgroundRunCutOffReason(run);
-            if (cutOffReason) {
+            const persistFailure = backgroundAutomationPersistFailure({
+              run,
+              hardTimedOut,
+              hardTimeoutMs,
+            });
+            try {
+              await persistBackgroundAutomationTurn({
+                threadId: thread.id,
+                threadTitle,
+                prompt,
+                run,
+                persistFailure,
+              });
+            } catch (err) {
+              reject(err instanceof Error ? err : new Error(String(err)));
+              throw err;
+            }
+            if (hardTimedOut) return;
+            if (persistFailure) {
               reject(
-                new Error(
-                  `Background automation was cut off before finishing (${cutOffReason})`,
+                new BackgroundAutomationRunError(
+                  persistFailure.message,
+                  persistFailure.errorCode,
                 ),
               );
               return;
             }
             if (run.status !== "completed") {
               reject(
-                new Error(
+                new BackgroundAutomationRunError(
                   `Background automation ended with status: ${run.status}`,
+                  `background_automation_${run.status}`,
                 ),
               );
               return;
@@ -497,20 +690,32 @@ async function executeBackgroundAutomation(
           {
             softTimeoutMs,
             backgroundFunction: true,
+            recoverChunkBoundaries: true,
+            dispatchMode: "background",
+            noProgressTimeoutMs: options.noProgressTimeoutMs,
+            backgroundNoProgressTimeoutMs:
+              options.backgroundNoProgressTimeoutMs,
             model,
             engineName: engine.name,
+            userId: ownerEmail,
           },
         );
 
         hardAbortTimer = setTimeout(() => {
           hardAbortTimer = null;
-          if (activeRun.status === "running") {
-            activeRun.abort.abort("background_automation_hard_timeout");
-            reject(
-              new Error("Background automation timed out after 5 minutes"),
-            );
-          }
-        }, BACKGROUND_RUN_HARD_TIMEOUT_MS);
+          if (activeRun.status !== "running") return;
+          hardTimedOut = true;
+          abortRun(runId, "background_automation_hard_timeout");
+          const timeoutError = new BackgroundAutomationRunError(
+            `Background automation timed out after ${Math.round(hardTimeoutMs / 60_000)} minutes`,
+            "background_automation_hard_timeout",
+          );
+          void activeRun.finalized
+            .catch(() => {})
+            .then(() => {
+              reject(timeoutError);
+            });
+        }, hardTimeoutMs);
       }).finally(() => {
         if (hardAbortTimer) {
           clearTimeout(hardAbortTimer);
@@ -524,7 +729,8 @@ async function executeBackgroundAutomation(
         (usage.inputTokens > 0 ||
           usage.outputTokens > 0 ||
           usage.cacheReadTokens > 0 ||
-          usage.cacheWriteTokens > 0)
+          usage.cacheWriteTokens > 0 ||
+          usage.builderCreditsUsed != null)
       ) {
         try {
           const { recordUsage } = await import("../usage/store.js");
@@ -534,6 +740,10 @@ async function executeBackgroundAutomation(
             outputTokens: usage.outputTokens,
             cacheReadTokens: usage.cacheReadTokens,
             cacheWriteTokens: usage.cacheWriteTokens,
+            ...(usage.builderCreditsUsed == null
+              ? {}
+              : { builderCreditsUsed: usage.builderCreditsUsed }),
+            engineName: usage.engineName ?? engine.name,
             model: usage.model,
             label: usageLabel,
             app: deps.appId,

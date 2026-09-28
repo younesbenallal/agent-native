@@ -1,42 +1,46 @@
 import { defineAction, embedApp } from "@agent-native/core";
-import {
-  hasCollabState,
-  applyText,
-  seedFromText,
-} from "@agent-native/core/collab";
+import { fail } from "@agent-native/core/action";
+import type { ActionRunContext } from "@agent-native/core/action";
 import {
   getRequestUserEmail,
   getRequestOrgId,
   buildDeepLink,
 } from "@agent-native/core/server";
+import { track } from "@agent-native/core/tracking";
 import { z } from "zod";
 
 import { interpolate } from "../app/pages/adhoc/sql-dashboard/interpolate";
 import { dryRunQuery } from "../server/lib/bigquery";
+import { queueDashboardCollabSync } from "../server/lib/dashboard-collab-sync";
+import { serializeProgramDescriptorInput } from "../server/lib/dashboard-panel-query";
 import { validateFirstPartyDashboardTimeScope } from "../server/lib/dashboard-time-scope";
 import {
   upsertDashboard,
   upsertDashboardWithRetry,
+  DashboardConflictError,
+  type DashboardRecord,
 } from "../server/lib/dashboards-store";
 import { parseDemoDescriptor } from "../server/lib/demo-source";
-import { validateFirstPartyAnalyticsSql } from "../server/lib/first-party-analytics.js";
+import { FirstPartyAnalyticsUnsupportedSqlError } from "../server/lib/first-party-analytics-backend.js";
+import { validateFirstPartyAnalyticsSqlForScope } from "../server/lib/first-party-analytics.js";
+import { normalizeDashboardConfig } from "../shared/dashboard-config-normalization";
+import { DASHBOARD_SQL_VALIDATION_TIMEOUT_MS } from "../shared/dashboard-report-timeouts.js";
 import {
   applyPanelOrder,
   compactDashboardResult,
   type PanelOrderResult,
 } from "./dashboard-panel-order";
 
-/**
- * Same validation shape used in the sql-dashboard save path.
- * Variables declared on the dashboard take priority; filter `default` values
- * fill in anything missing so parametric SQL validates against a real value.
- *
- * date-range filters expand into `<id>Start` / `<id>End` to match the runtime
- * expansion in DashboardFilterBar; without this, any panel that uses
- * `{{dateStart}}` / `{{dateEnd}}` fails the dry-run.
- */
 function todayUtc(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+function printable(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return JSON.stringify(value) ?? "";
 }
 
 function resolveDateDefault(raw: string | undefined): string {
@@ -188,9 +192,6 @@ function resolveParent(
   return [node, last];
 }
 
-/** Reject out-of-bounds array indices so a bad pointer can't silently
- *  create sparse arrays. `mode` controls whether the index may equal
- *  length (insertion-style) or must be strictly less (access-style). */
 function checkArrayIndex(
   parent: unknown[],
   key: number,
@@ -251,9 +252,6 @@ function applyJsonOp(root: any, op: JsonOp): string {
         value = fromParent[fromKey as string];
         delete fromParent[fromKey as string];
       }
-      // Destination path is resolved AFTER the source splice, so natural
-      // splice semantics place the element at the requested index in the
-      // final array. No adjustment needed for same-array moves.
       const [toParent, toKey] = resolveParent(root, parsePointer(op.path));
       if (Array.isArray(toParent)) {
         checkArrayIndex(toParent, toKey as number, op.path, "insert");
@@ -268,17 +266,14 @@ function applyJsonOp(root: any, op: JsonOp): string {
   }
 }
 
-/**
- * Reject configs missing the fields the UI assumes are always present.
- * Returns a human-readable error string, or `null` when the config passes.
- * Mirrors the shape required by `app/pages/adhoc/sql-dashboard/types.ts`.
- */
 export function validateDashboardConfig(
   config: Record<string, unknown>,
 ): string | null {
   if (!config || typeof config !== "object") {
     return "config must be an object";
   }
+  const normalized = normalizeDashboardConfig(config);
+  if (normalized !== config) config.panels = normalized.panels;
   if (typeof config.name !== "string" || config.name.trim().length === 0) {
     return "config.name is required (non-empty string) — without it the dashboard renders as a blank row in the sidebar";
   }
@@ -290,10 +285,6 @@ export function validateDashboardConfig(
       return "config.parentId must be a non-empty dashboard id (or omitted) — it nests this dashboard under that parent in the sidebar";
     }
   }
-  // Filter ID collisions cause two controls to read/write the same URL param.
-  // For paired start/end dates use a single date-range filter — the FilterBar
-  // expands it to <id>Start / <id>End at runtime, so the SQL can still
-  // reference both halves.
   const filters = config.filters;
   if (filters !== undefined && !Array.isArray(filters)) {
     return "config.filters must be an array";
@@ -340,9 +331,6 @@ export function validateDashboardConfig(
     if (!p || typeof p !== "object") {
       return `panel[${i}] must be an object`;
     }
-    // Section panels are pure layout dividers and extension panels render their
-    // own iframe, so both make source and sql optional. Width stays required for
-    // backward-compatible dashboard payloads.
     const isSection = p.chartType === "section";
     const isExtension = p.chartType === "extension";
     const required =
@@ -362,7 +350,14 @@ export function validateDashboardConfig(
       }
     }
     if (!isSection && !isExtension && !validSources.has(p.source as string)) {
-      return `panel[${i}].source must be 'bigquery', 'ga4', 'amplitude', 'first-party', 'demo', 'prometheus', or 'program' (got '${p.source}'). source selects the backend — put the PromQL/SQL/table name or program descriptor in sql, not here.`;
+      return `panel[${i}].source must be 'bigquery', 'ga4', 'amplitude', 'first-party', 'demo', 'prometheus', or 'program' (got '${printable(p.source)}'). source selects the backend — put the PromQL/SQL/table name or program descriptor in sql, not here.`;
+    }
+    if (p.source === "program") {
+      try {
+        serializeProgramDescriptorInput(p.sql);
+      } catch (e: any) {
+        return `panel[${i}] "${printable(p.title || p.id)}" program descriptor is invalid: ${e instanceof Error ? e.message : printable(e)}`;
+      }
     }
     if (isExtension) {
       const cfg = p.config as Record<string, unknown> | undefined;
@@ -392,22 +387,38 @@ export function validateDashboardConfig(
   return null;
 }
 
-/** Validate every query panel, or only the supplied ids for a targeted edit. */
+const MAX_CONCURRENT_SQL_VALIDATIONS = 8;
+
+function firstPartyScope() {
+  const { email, orgId } = resolveScope();
+  return { userEmail: email, orgId };
+}
+
+export interface ValidatePanelSqlOptions {
+  signal?: AbortSignal;
+}
+
 export async function validatePanelSql(
   config: Record<string, unknown>,
   panelIds?: ReadonlySet<string>,
+  options: ValidatePanelSqlOptions = {},
 ): Promise<string | null> {
   const panels = config.panels;
   if (!Array.isArray(panels)) return null;
   const vars = buildDryRunVars(config);
+  const bigQueryPanels: Array<{
+    index: number;
+    panel: Record<string, unknown>;
+    sql: string;
+  }> = [];
   for (let i = 0; i < panels.length; i++) {
+    if (options.signal?.aborted) {
+      throw new Error("Dashboard SQL validation was cancelled");
+    }
     const p = panels[i] as Record<string, unknown>;
     if (panelIds && (typeof p.id !== "string" || !panelIds.has(p.id))) {
       continue;
     }
-    // Sections are layout-only and extensions render their own iframe — neither
-    // has SQL to dry-run. heatmap, callout, and other query panels still
-    // validate normally below.
     if (p.chartType === "section" || p.chartType === "extension") continue;
     if (p.source === "amplitude") {
       const raw = typeof p.sql === "string" ? p.sql : "";
@@ -415,10 +426,10 @@ export async function validatePanelSql(
         try {
           const desc = JSON.parse(interpolate(raw, vars));
           if (!desc?.event || typeof desc.event !== "string") {
-            return `panel[${i}] "${p.title || p.id}" Amplitude descriptor requires an 'event' field`;
+            return `panel[${i}] "${printable(p.title || p.id)}" Amplitude descriptor requires an 'event' field`;
           }
         } catch (e: any) {
-          return `panel[${i}] "${p.title || p.id}" Amplitude descriptor is not valid JSON: ${e?.message}`;
+          return `panel[${i}] "${printable(p.title || p.id)}" Amplitude descriptor is not valid JSON: ${e instanceof Error ? e.message : printable(e)}`;
         }
       }
       continue;
@@ -433,7 +444,10 @@ export async function validatePanelSql(
             i,
           );
           if (timeScopeError) return timeScopeError;
-          validateFirstPartyAnalyticsSql(interpolate(raw, vars));
+          await validateFirstPartyAnalyticsSqlForScope(
+            interpolate(raw, vars),
+            firstPartyScope(),
+          );
         } catch (e: any) {
           if (
             typeof e?.message === "string" &&
@@ -441,7 +455,10 @@ export async function validatePanelSql(
           ) {
             return e.message;
           }
-          return `panel[${i}] "${p.title || p.id}" first-party analytics SQL is invalid: ${e?.message ?? e}`;
+          if (e instanceof FirstPartyAnalyticsUnsupportedSqlError) {
+            return `panel[${i}] "${printable(p.title || p.id)}" cannot run on this scope's active data backend (BigQuery) because its SQL uses ${e.construct}. Rewrite it with BigQuery-compatible SQL, or move the scope back to the PostgreSQL backend.`;
+          }
+          return `panel[${i}] "${printable(p.title || p.id)}" first-party analytics SQL is invalid: ${e instanceof Error ? e.message : printable(e)}`;
         }
       }
       continue;
@@ -452,7 +469,7 @@ export async function validatePanelSql(
         try {
           parseDemoDescriptor(interpolate(raw, vars));
         } catch (e: any) {
-          return `panel[${i}] "${p.title || p.id}" demo descriptor is invalid: ${e?.message ?? e}`;
+          return `panel[${i}] "${printable(p.title || p.id)}" demo descriptor is invalid: ${e instanceof Error ? e.message : printable(e)}`;
         }
       }
       continue;
@@ -462,14 +479,69 @@ export async function validatePanelSql(
     if (!raw.trim()) continue;
     const sql = interpolate(raw, vars);
     if (!sql.trim()) continue;
-    let err: string | null;
-    try {
-      err = await dryRunQuery(sql);
-    } catch (e: any) {
-      err = e?.message ?? String(e);
+    bigQueryPanels.push({ index: i, panel: p, sql });
+  }
+
+  if (bigQueryPanels.length === 0) return null;
+
+  const validationController = new AbortController();
+  const abortFromCaller = () => validationController.abort();
+  options.signal?.addEventListener("abort", abortFromCaller, { once: true });
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    validationController.abort();
+  }, DASHBOARD_SQL_VALIDATION_TIMEOUT_MS);
+  const errors: Array<string | null> = Array(bigQueryPanels.length).fill(null);
+  let nextIndex = 0;
+
+  const worker = async () => {
+    while (!validationController.signal.aborted) {
+      const taskIndex = nextIndex++;
+      const task = bigQueryPanels[taskIndex];
+      if (!task) return;
+
+      let err: string | null;
+      try {
+        err = await dryRunQuery(task.sql, {
+          signal: validationController.signal,
+        });
+      } catch (e: any) {
+        err = e?.message ?? String(e);
+      }
+      errors[taskIndex] = err;
     }
+  };
+
+  try {
+    await Promise.all(
+      Array.from(
+        {
+          length: Math.min(
+            MAX_CONCURRENT_SQL_VALIDATIONS,
+            bigQueryPanels.length,
+          ),
+        },
+        () => worker(),
+      ),
+    );
+  } finally {
+    clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", abortFromCaller);
+  }
+
+  if (options.signal?.aborted && !timedOut) {
+    throw new Error("Dashboard SQL validation was cancelled");
+  }
+  if (timedOut) {
+    return `Dashboard SQL validation timed out after ${Math.round(DASHBOARD_SQL_VALIDATION_TIMEOUT_MS / 1000)} seconds`;
+  }
+
+  for (let i = 0; i < bigQueryPanels.length; i++) {
+    const err = errors[i];
     if (err) {
-      return `panel[${i}] "${p.title || p.id}" SQL is invalid: ${err}`;
+      const task = bigQueryPanels[i];
+      return `panel[${task.index}] "${printable(task.panel.title || task.panel.id)}" SQL is invalid: ${printable(err)}`;
     }
   }
   return null;
@@ -482,7 +554,6 @@ function resolveScope() {
   return { orgId, email };
 }
 
-/** Resulting panel count, used for the proof-of-done return summary. */
 function countPanels(config: Record<string, unknown>): number {
   return Array.isArray(config.panels) ? config.panels.length : 0;
 }
@@ -502,6 +573,7 @@ function dashboardResult(
   summary: string,
   movedPanelIds: string[] = [],
   returnConfig = false,
+  updatedAt?: string,
 ) {
   const compact = compactDashboardResult(config, movedPanelIds);
   return {
@@ -511,6 +583,7 @@ function dashboardResult(
     ...compact,
     appliedOps,
     summary,
+    ...(updatedAt ? { updatedAt } : {}),
     ...(returnConfig ? { config } : {}),
     urlPath: `/dashboards/${dashboardId}`,
     deepLink: buildDeepLink({
@@ -526,6 +599,25 @@ function dashboardResult(
   };
 }
 
+function trackDashboardSaved(
+  dashboardId: string,
+  config: Record<string, unknown>,
+  actionContext?: ActionRunContext,
+) {
+  track(
+    "dashboard_saved",
+    {
+      app_name: "analytics",
+      template_name: "analytics",
+      output_id: dashboardId,
+      output_type: "dashboard",
+      dashboard_id: dashboardId,
+      panel_count: countPanels(config),
+    },
+    actionContext,
+  );
+}
+
 function opCanChangePanelSql(op: JsonOp): boolean {
   if (op.op === "move" || op.op === "move-before" || op.op === "remove") {
     return false;
@@ -536,37 +628,9 @@ function opCanChangePanelSql(op: JsonOp): boolean {
   );
 }
 
-/**
- * Push a config update through the collab layer so open dashboard editors
- * receive the change in real time. Seeds the collab state if it doesn't
- * exist yet (e.g. dashboard was created before the collab plugin was added).
- */
-async function syncToCollab(
-  dashboardId: string,
-  config: Record<string, unknown>,
-  requestSource?: string,
-): Promise<void> {
-  const docId = `dash-${dashboardId}`;
-  const configStr = JSON.stringify(config);
-  try {
-    const exists = await hasCollabState(docId);
-    if (exists) {
-      await applyText(docId, configStr, "content", requestSource);
-    } else {
-      await seedFromText(docId, configStr);
-    }
-  } catch {
-    // Collab sync is best-effort — the SQL write is the source of truth
-  }
-}
-
 function isAgentCaller(caller: string | undefined): boolean {
   return caller === "tool" || caller === "mcp" || caller === "a2a";
 }
-
-// Reads + writes now go through the SQL-backed dashboards store, which
-// lazy-migrates legacy settings keys on first access. See
-// `server/lib/dashboards-store.ts`.
 
 export default defineAction({
   description:
@@ -598,6 +662,13 @@ export default defineAction({
     config: configInputSchema.describe(
       "Replace the whole dashboard config (or a JSON string).",
     ),
+    expectedUpdatedAt: z
+      .string()
+      .optional()
+      .describe(
+        "Only used with `config`. The dashboard `updatedAt` observed before this edit was built (from get-sql-dashboard or a prior update-dashboard result). " +
+          "When provided, the save is fenced against concurrent writers: if someone else (another tab, user, or agent call) saved in between, this call is rejected with a conflict error instead of silently overwriting their change — re-fetch and reapply. Omit only for a brand-new dashboard or a one-shot write that isn't derived from a prior read.",
+      ),
     returnConfig: z
       .boolean()
       .optional()
@@ -605,8 +676,6 @@ export default defineAction({
         "If true, include the full dashboard config in the result. Defaults to false to keep tool output compact.",
       ),
   }),
-  // The SQL dashboard editor persists user edits through callAction(), which
-  // needs this action mounted under /_agent-native/actions/update-dashboard.
   http: { method: "POST" },
   mcpApp: {
     compactCatalog: true,
@@ -625,12 +694,12 @@ export default defineAction({
     ).length;
 
     if (modeCount === 0) {
-      throw new Error(
+      fail(
         "provide `ops` (surgical edits), `panelOrder` (id reorder), or `config` (full replace).",
       );
     }
     if (modeCount > 1) {
-      throw new Error("provide only one of `ops`, `panelOrder`, or `config`.");
+      fail("provide only one of `ops`, `panelOrder`, or `config`.");
     }
 
     const scope = resolveScope();
@@ -638,16 +707,37 @@ export default defineAction({
 
     if (args.config) {
       const validation = validateDashboardConfig(args.config);
-      if (validation) throw new Error(validation);
+      if (validation) fail(validation);
       const sqlError = await validatePanelSql(args.config);
-      if (sqlError) throw new Error(sqlError);
-      await upsertDashboard(dashboardId, "sql", args.config, ctx);
-      await syncToCollab(
+      if (sqlError) fail(sqlError);
+      let saved: DashboardRecord;
+      try {
+        saved =
+          args.expectedUpdatedAt !== undefined
+            ? await upsertDashboard(
+                dashboardId,
+                "sql",
+                args.config,
+                ctx,
+                args.expectedUpdatedAt,
+              )
+            : await upsertDashboard(dashboardId, "sql", args.config, ctx);
+      } catch (err) {
+        if (err instanceof DashboardConflictError) {
+          fail(
+            `Dashboard "${dashboardId}" was changed by someone else since you loaded it (another tab, user, or agent saved in between). Reload the dashboard and reapply your edit — your change was NOT saved, so nothing was lost.`,
+            { errorCode: "dashboard_conflict", statusCode: 409 },
+          );
+        }
+        throw err;
+      }
+      queueDashboardCollabSync(
         dashboardId,
         args.config,
         isAgentCaller(actionContext?.caller) ? "agent" : undefined,
       );
       const panelCount = countPanels(args.config);
+      trackDashboardSaved(dashboardId, args.config, actionContext);
       return dashboardResult(
         dashboardId,
         args.config,
@@ -655,31 +745,34 @@ export default defineAction({
         `Replaced dashboard "${dashboardId}"; it now has ${panelCount} panel(s).`,
         [],
         args.returnConfig === true,
+        saved.updatedAt,
       );
     }
 
     if (args.panelOrder) {
-      // Recomputed on every retry attempt from the freshest dashboard config,
-      // so a concurrent writer's edit is never silently overwritten by this
-      // move.
       let orderDetails!: PanelOrderResult;
       const saved = await upsertDashboardWithRetry(
         dashboardId,
         ctx,
         (existing) => {
           const root = existing.config as Record<string, unknown>;
-          orderDetails = applyPanelOrder(root, args.panelOrder!);
+          try {
+            orderDetails = applyPanelOrder(root, args.panelOrder!);
+          } catch (err: any) {
+            fail(err instanceof Error ? err.message : String(err));
+          }
           const validation = validateDashboardConfig(root);
-          if (validation) throw new Error(validation);
+          if (validation) fail(validation);
           return { kind: existing.kind, body: root };
         },
       );
       const root = saved.config as Record<string, unknown>;
-      await syncToCollab(
+      queueDashboardCollabSync(
         dashboardId,
         root,
         isAgentCaller(actionContext?.caller) ? "agent" : undefined,
       );
+      trackDashboardSaved(dashboardId, root, actionContext);
       return dashboardResult(
         dashboardId,
         root,
@@ -687,12 +780,10 @@ export default defineAction({
         `Moved ${orderDetails.movedPanelIds.length} panel id(s) to the front of dashboard "${dashboardId}"; it now has ${orderDetails.panelCount} panel(s).`,
         orderDetails.movedPanelIds,
         args.returnConfig === true,
+        saved.updatedAt,
       );
     }
 
-    // Recomputed on every retry attempt from the freshest dashboard config —
-    // JSON-pointer ops are replayed against fresh state, not the stale config
-    // that produced the first (lost) attempt.
     let appliedDetails: string[] = [];
     const saved = await upsertDashboardWithRetry(
       dashboardId,
@@ -704,30 +795,29 @@ export default defineAction({
           try {
             details.push(applyJsonOp(root, op as JsonOp));
           } catch (err: any) {
-            throw new Error(
-              `applying op ${JSON.stringify(op)}: ${err.message}`,
-            );
+            fail(`applying op ${JSON.stringify(op)}: ${err.message}`);
           }
         }
 
         const validation = validateDashboardConfig(root);
-        if (validation) throw new Error(validation);
+        if (validation) fail(validation);
         if (args.ops!.some((op) => opCanChangePanelSql(op as JsonOp))) {
           const sqlError = await validatePanelSql(root);
-          if (sqlError) throw new Error(sqlError);
+          if (sqlError) fail(sqlError);
         }
         appliedDetails = details;
         return { kind: existing.kind, body: root };
       },
     );
     const root = saved.config as Record<string, unknown>;
-    await syncToCollab(
+    queueDashboardCollabSync(
       dashboardId,
       root,
       isAgentCaller(actionContext?.caller) ? "agent" : undefined,
     );
 
     const panelCount = countPanels(root);
+    trackDashboardSaved(dashboardId, root, actionContext);
     return dashboardResult(
       dashboardId,
       root,
@@ -735,6 +825,7 @@ export default defineAction({
       `Applied ${appliedDetails.length} op(s); dashboard "${dashboardId}" now has ${panelCount} panel(s).`,
       [],
       args.returnConfig === true,
+      saved.updatedAt,
     );
   },
   link: ({ result }) => {

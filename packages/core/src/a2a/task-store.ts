@@ -1,6 +1,6 @@
 import crypto from "crypto";
 
-import { getDbExec, intType, isPostgres } from "../db/client.js";
+import { getDbExec } from "../db/client.js";
 import {
   ensureTableExists,
   ensureColumnExists,
@@ -13,10 +13,9 @@ export const MAX_A2A_IDEMPOTENCY_KEY_CHARS = 128;
 const A2A_IDEMPOTENCY_INDEX = "idx_a2a_tasks_owner_scope_idempotency";
 export const A2A_PERSONAL_OWNER_SCOPE = "__personal__";
 
-async function ensureTable(): Promise<void> {
+export async function ensureTable(): Promise<void> {
   if (!_initPromise) {
     _initPromise = (async () => {
-      const client = getDbExec();
       const createSql = `
         CREATE TABLE IF NOT EXISTS a2a_tasks (
           id TEXT PRIMARY KEY,
@@ -30,8 +29,8 @@ async function ensureTable(): Promise<void> {
           owner_email TEXT,
           owner_scope TEXT NOT NULL DEFAULT '',
           idempotency_key TEXT,
-          created_at ${intType()} NOT NULL,
-          updated_at ${intType()} NOT NULL
+          created_at BIGINT NOT NULL,
+          updated_at BIGINT NOT NULL
         )
       `;
       const createIdempotencyIndexSql =
@@ -49,78 +48,31 @@ async function ensureTable(): Promise<void> {
           call_id TEXT NOT NULL,
           status TEXT NOT NULL DEFAULT 'pending',
           result TEXT,
-          expires_at ${intType()} NOT NULL,
-          created_at ${intType()} NOT NULL,
-          updated_at ${intType()} NOT NULL
+          expires_at BIGINT NOT NULL,
+          created_at BIGINT NOT NULL,
+          updated_at BIGINT NOT NULL
         )
       `;
 
-      if (isPostgres()) {
-        // PG-guard: probe information_schema before issuing DDL to avoid ACCESS
-        // EXCLUSIVE lock contention in fresh background-worker processes.
-        await ensureTableExists("a2a_tasks", createSql);
-        // Additive migration: owner_email column. Bound to the JWT-verified
-        // caller at task-creation time so handleGet / handleCancel can reject
-        // mismatched callers (the IDOR class fixed in PR #369). Existing rows
-        // have NULL owner_email and remain accessible to legacy callers via
-        // the legacy-token apiKeyEnv path; new rows are scoped from this point
-        // forward.
-        await ensureColumnExists(
-          "a2a_tasks",
-          "owner_email",
-          `ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS owner_email TEXT`,
-        );
-        await ensureColumnExists(
-          "a2a_tasks",
-          "owner_scope",
-          `ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS owner_scope TEXT NOT NULL DEFAULT ''`,
-        );
-        await ensureColumnExists(
-          "a2a_tasks",
-          "idempotency_key",
-          `ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS idempotency_key TEXT`,
-        );
-        await ensureIndexExists(
-          A2A_IDEMPOTENCY_INDEX,
-          createIdempotencyIndexSql,
-        );
-        await ensureTableExists("a2a_approvals", createApprovalsSql);
-        return;
-      }
-
-      // SQLite (local dev): no lock problem — keep the original behaviour.
-      await client.execute(createSql);
-      // Additive migration: owner_email column. Bound to the JWT-verified
-      // caller at task-creation time so handleGet / handleCancel can reject
-      // mismatched callers (the IDOR class fixed in PR #369). Existing rows
-      // have NULL owner_email and remain accessible to legacy callers via
-      // the legacy-token apiKeyEnv path; new rows are scoped from this point
-      // forward.
-      try {
-        await client.execute(
-          `ALTER TABLE a2a_tasks ADD COLUMN owner_scope TEXT NOT NULL DEFAULT ''`,
-        );
-      } catch {
-        // Column already exists — expected on every restart after first run.
-      }
-      try {
-        await client.execute(
-          `ALTER TABLE a2a_tasks ADD COLUMN owner_email TEXT`,
-        );
-      } catch {
-        // Column already exists — expected on every restart after first run.
-      }
-      try {
-        await client.execute(
-          `ALTER TABLE a2a_tasks ADD COLUMN idempotency_key TEXT`,
-        );
-      } catch {
-        // Column already exists — expected on every restart after first run.
-      }
-      await client.execute(createIdempotencyIndexSql);
-      await client.execute(createApprovalsSql);
+      await ensureTableExists("a2a_tasks", createSql);
+      await ensureColumnExists(
+        "a2a_tasks",
+        "owner_email",
+        `ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS owner_email TEXT`,
+      );
+      await ensureColumnExists(
+        "a2a_tasks",
+        "owner_scope",
+        `ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS owner_scope TEXT NOT NULL DEFAULT ''`,
+      );
+      await ensureColumnExists(
+        "a2a_tasks",
+        "idempotency_key",
+        `ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS idempotency_key TEXT`,
+      );
+      await ensureIndexExists(A2A_IDEMPOTENCY_INDEX, createIdempotencyIndexSql);
+      await ensureTableExists("a2a_approvals", createApprovalsSql);
     })().catch((err) => {
-      // Retry init on the next call after a failed startup.
       _initPromise = undefined;
       throw err;
     });
@@ -147,7 +99,7 @@ async function withDbTransaction<T>(
   fn: (tx: ReturnType<typeof getDbExec>) => Promise<T>,
 ): Promise<T> {
   if (client.transaction) return client.transaction(fn);
-  await client.execute(isPostgres() ? "BEGIN" : "BEGIN IMMEDIATE");
+  await client.execute("BEGIN");
   try {
     const result = await fn(client);
     await client.execute("COMMIT");
@@ -521,14 +473,6 @@ export interface A2ATaskOwnership {
   ownerScope: string | null;
 }
 
-/**
- * Fetch the verified owner email recorded against a task at creation time.
- * Returns null when the task has no owner (legacy rows or unauthenticated
- * deployments) or when the task is missing.
- *
- * Used by `handleGet` / `handleCancel` to reject IDOR access — the JWT-
- * verified caller's email must match `owner_email` to read or cancel.
- */
 export async function getTaskOwner(id: string): Promise<string | null> {
   return (await getTaskOwnership(id)).ownerEmail;
 }
@@ -551,15 +495,6 @@ export async function getTaskOwnership(id: string): Promise<A2ATaskOwnership> {
   };
 }
 
-/**
- * Atomically claim a task for processing. Only succeeds when the task is in
- * state 'submitted' or 'working' — flipping it to 'processing' so concurrent
- * processors can't pick it up twice. Returns the task if claimed, null if it
- * was already claimed/completed/missing.
- *
- * Used by the cross-platform async processor (`_process-task` route) to avoid
- * duplicate handler runs when retries fire.
- */
 export async function claimA2ATaskForProcessing(
   id: string,
 ): Promise<Task | null> {
@@ -664,16 +599,6 @@ export async function resetStuckA2ATaskForRetry(
   return affected !== 0;
 }
 
-/**
- * Fail a processing task once it is stuck. Two independent conditions can
- * trigger this, either of which alone is sufficient:
- *   - `updated_at <= processingCutoff`: no heartbeat/progress touch in a
- *     while — the processor likely died.
- *   - `created_at <= createdAtCutoff` — a hard wall on total run time. A
- *     hung await inside a still-alive process keeps `updated_at` fresh via
- *     the liveness heartbeat forever, so staleness alone never trips; age
- *     since creation is the only bound that catches it.
- */
 export async function failStuckA2ATask(
   id: string,
   processingCutoff: number,
@@ -717,13 +642,6 @@ export async function failStuckA2ATask(
   return affected !== 0;
 }
 
-/**
- * Fail a queued (submitted/working) task whose age since creation exceeds
- * `createdAtCutoff` — the dispatch-retry loop kept throttling/refiring
- * without ever reaching `processing`. Mirrors `failStuckA2ATask` but is
- * gated on the queued state set and on `created_at` (queued tasks have no
- * heartbeat, so staleness of `updated_at` isn't a meaningful signal here).
- */
 export async function failStuckQueuedA2ATask(
   id: string,
   createdAtCutoff: number,
@@ -774,7 +692,6 @@ export async function updateTask(
   await ensureTable();
   const client = getDbExec();
 
-  // Read current task
   const { rows } = await client.execute({
     sql: `SELECT * FROM a2a_tasks WHERE id = ?`,
     args: [id],

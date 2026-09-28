@@ -41,7 +41,6 @@ export interface WalkthroughStep {
   inputPlaceholder?: string;
   inputType?: "text" | "password" | "textarea";
   optional?: boolean;
-  /** Allow file upload for this input (e.g. ".json") */
   inputAcceptFile?: string;
 }
 
@@ -80,7 +79,6 @@ export const categoryOrder: DataSourceCategory[] = [
 ];
 
 export const dataSources: DataSource[] = [
-  // --- Analytics & Product ---
   {
     id: "google-analytics",
     name: "Google Analytics",
@@ -315,8 +313,35 @@ export const dataSources: DataSource[] = [
       },
     ],
   },
+  {
+    id: "builder",
+    name: "Builder.io Content",
+    description:
+      "Published Builder.io content for content performance analysis",
+    category: "analytics",
+    icon: IconFileText,
+    envKeys: ["BUILDER_PUBLIC_KEY"],
+    docsUrl: "https://www.builder.io/c/docs/content-api",
+    walkthroughSteps: [
+      {
+        title: "Get your Builder.io public API key",
+        description:
+          "Open Builder.io account settings and copy a public API key.",
+        url: "https://builder.io/account/space",
+        linkText: "Builder.io account settings",
+      },
+      {
+        title: "Enter your public API key",
+        description:
+          "Paste the public API key for the space containing your content.",
+        inputKey: "BUILDER_PUBLIC_KEY",
+        inputLabel: "Public API key",
+        inputPlaceholder: "your-builder-public-key",
+        inputType: "password",
+      },
+    ],
+  },
 
-  // --- IconDatabase ---
   {
     id: "postgresql",
     name: "PostgreSQL",
@@ -345,7 +370,6 @@ export const dataSources: DataSource[] = [
     ],
   },
 
-  // --- Payments ---
   {
     id: "stripe",
     name: "Stripe",
@@ -374,7 +398,6 @@ export const dataSources: DataSource[] = [
     ],
   },
 
-  // --- CRM & Sales ---
   {
     id: "hubspot",
     name: "HubSpot",
@@ -510,7 +533,6 @@ export const dataSources: DataSource[] = [
     ],
   },
 
-  // --- Engineering ---
   {
     id: "github",
     name: "GitHub",
@@ -744,7 +766,6 @@ export const dataSources: DataSource[] = [
     ],
   },
 
-  // --- Communication ---
   {
     id: "slack",
     name: "Slack",
@@ -841,7 +862,6 @@ export const dataSources: DataSource[] = [
     ],
   },
 
-  // --- Support ---
   {
     id: "pylon",
     name: "Pylon",
@@ -890,7 +910,6 @@ export const dataSources: DataSource[] = [
     ],
   },
 
-  // --- SEO ---
   {
     id: "dataforseo",
     name: "DataForSEO",

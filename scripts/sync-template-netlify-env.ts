@@ -7,7 +7,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { TEMPLATES } from "../packages/core/src/cli/templates-meta.js";
 
 type TemplateSite = {
+  betaSiteId?: string;
   name: string;
+  betaHost?: string;
   siteId: string;
   sourceTemplate: string;
 };
@@ -45,17 +47,31 @@ const REPO_ROOT = path.resolve(
 const NETLIFY_SITES = JSON.parse(
   readFileSync(path.join(REPO_ROOT, "scripts/netlify-sites.json"), "utf8"),
 ) as Record<string, string>;
+const NETLIFY_BETA_SITES = JSON.parse(
+  readFileSync(path.join(REPO_ROOT, "scripts/netlify-beta-sites.json"), "utf8"),
+) as Array<{ host: string; id: string; siteId: string }>;
 
 const NETLIFY_SITE_SOURCE_TEMPLATES = new Map([["starter", "chat"]]);
 const NETLIFY_TEMPLATE_ALIASES = new Map([["chat", "starter"]]);
 const NETLIFY_SITE_PRODUCTION_URLS = new Map([
-  ["starter", "https://starter.agent-native.com"],
+  ["starter", "https://chat.agent-native.com"],
 ]);
+const NETLIFY_BETA_SITE_BY_NAME = new Map(
+  NETLIFY_BETA_SITES.flatMap((site) => {
+    const names = new Set([
+      site.id,
+      NETLIFY_TEMPLATE_ALIASES.get(site.id) ?? site.id,
+    ]);
+    return [...names].map((name) => [name, site] as const);
+  }),
+);
 
 const TEMPLATE_SITES: TemplateSite[] = Object.entries(NETLIFY_SITES)
   // fw is the public framework site, not a template environment target.
   .filter(([name]) => name !== "fw")
   .map(([name, siteId]) => ({
+    betaHost: NETLIFY_BETA_SITE_BY_NAME.get(name)?.host,
+    betaSiteId: NETLIFY_BETA_SITE_BY_NAME.get(name)?.siteId,
     name,
     siteId,
     sourceTemplate: NETLIFY_SITE_SOURCE_TEMPLATES.get(name) ?? name,
@@ -64,10 +80,12 @@ const TEMPLATE_SITES: TemplateSite[] = Object.entries(NETLIFY_SITES)
 const SITE_BY_NAME = new Map(TEMPLATE_SITES.map((site) => [site.name, site]));
 const DEFAULT_SOURCES = [".env", ".env.local"];
 const DEFAULT_SCOPES = ["builds", "functions", "runtime"];
+const ENV_SCOPES_BY_KEY = new Map([["SENTRY_AUTH_TOKEN", ["builds"]]]);
 const DEFAULT_CONTEXT = "production";
 const DEFAULT_HOSTED_TEMPLATE_ENV = new Map([
   ["GA_MEASUREMENT_ID", "G-ESF7FYXGN9"],
   ["GTM_CONTAINER_ID", "GTM-N3WSTXZ"],
+  ["AGENT_NATIVE_HOSTED_HARNESS", "true"],
   [
     "VITE_AGENT_NATIVE_FEEDBACK_URL",
     "https://forms.agent-native.com/f/agent-native-feedback/_16ewV",
@@ -83,52 +101,73 @@ const AGENT_NATIVE_ANALYTICS_PUBLIC_ENV_KEYS = [
 ];
 const HOSTED_TEMPLATE_ENV_ALLOWLIST_EXACT = new Set([
   ...AGENT_NATIVE_ANALYTICS_PUBLIC_ENV_KEYS,
+  "AGENT_NATIVE_HOSTED_HARNESS",
   "APP_URL",
   "BETTER_AUTH_URL",
-  "DATABASE_AUTH_TOKEN",
+  "BETTER_AUTH_TRUSTED_ORIGINS",
   "DATABASE_URL",
   "EMAIL_FROM",
   "ENABLE_BUILDER",
+  "FIGMA_ACCESS_TOKEN",
   "GA4_PROPERTY_ID",
   "GA_MEASUREMENT_ID",
   "GTM_CONTAINER_ID",
-  "GOOGLE_CLIENT_ID",
-  "GOOGLE_CLIENT_SECRET",
-  "GOOGLE_LEGACY_CLIENT_ID",
-  "GOOGLE_LEGACY_CLIENT_SECRET",
   "GOOGLE_PICKER_API_KEY",
   "GOOGLE_PICKER_APP_ID",
-  "GOOGLE_SIGN_IN_CLIENT_ID",
-  "GOOGLE_SIGN_IN_CLIENT_SECRET",
+  "LAUNCHDARKLY_SDK_KEY",
   "NEON_AUTH_BASE_URL",
-  "NETLIFY_DATABASE_AUTH_TOKEN",
   "NETLIFY_DATABASE_URL",
   "NETLIFY_DATABASE_URL_UNPOOLED",
   "NITRO_PRESET",
   "SENDGRID_API_KEY",
+  "SENTRY_AUTH_TOKEN",
   "SENTRY_DSN",
+  "SENTRY_ORG",
+  "SENTRY_PROJECT",
   "SENTRY_SERVER_DSN",
   "SUPABASE_URL",
+  "SUPABASE_ANON_KEY",
   "ZOOM_CLIENT_ID",
 ]);
 const HOSTED_TEMPLATE_ENV_ALLOWLIST_PREFIXES = ["VITE_"];
 const HOSTED_TEMPLATE_ALLOWED_SECRET_EXACT = new Set([
-  "DATABASE_AUTH_TOKEN",
   "DATABASE_URL",
-  "GOOGLE_CLIENT_SECRET",
-  "GOOGLE_LEGACY_CLIENT_SECRET",
-  "GOOGLE_SIGN_IN_CLIENT_SECRET",
-  "NETLIFY_DATABASE_AUTH_TOKEN",
+  "FIGMA_ACCESS_TOKEN",
+  "LAUNCHDARKLY_SDK_KEY",
   "NETLIFY_DATABASE_URL",
   "NETLIFY_DATABASE_URL_UNPOOLED",
   "SENDGRID_API_KEY",
+  "SENTRY_AUTH_TOKEN",
   "SENTRY_DSN",
   "SENTRY_SERVER_DSN",
 ]);
+// Sentry build-time upload credentials are one org/project shared by every
+// hosted site, unlike SENTRY_DSN which can vary per site. LaunchDarkly's SDK
+// key is the same: one project shared fleet-wide. Pulling them from the
+// invoking shell (rather than each template's committed .env) means the
+// token is never written to disk in this repo.
+const FLEET_WIDE_ENV_KEYS = [
+  "SENTRY_AUTH_TOKEN",
+  "SENTRY_ORG",
+  "SENTRY_PROJECT",
+  "LAUNCHDARKLY_SDK_KEY",
+];
 const FORBIDDEN_HOSTED_TEMPLATE_ENV_EXACT = new Set([
   "ANTHROPIC_API_KEY",
+  "AMPLITUDE_API_KEY",
   "DEMO_MODE",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "GOOGLE_GENERATIVE_AI_API_KEY",
+  "GEMINI_API_KEY",
+  "GROQ_API_KEY",
+  "JEV_API_KEY",
+  "MISTRAL_API_KEY",
+  "COHERE_API_KEY",
   "OPENAI_API_KEY",
+  "OPENROUTER_API_KEY",
+  "TYPESAFE_API_KEY",
+  "VOYAGE_API_KEY",
+  "VITE_AMPLITUDE_API_KEY",
 ]);
 const FORBIDDEN_HOSTED_TEMPLATE_ENV_PREFIXES = ["BUILDER_"];
 const SECRET_LIKE_ENV_KEY_PATTERN =
@@ -137,18 +176,20 @@ const PUBLIC_KEY_EXACT = new Set([
   ...AGENT_NATIVE_ANALYTICS_PUBLIC_ENV_KEYS,
   "APP_URL",
   "BETTER_AUTH_URL",
+  "BETTER_AUTH_TRUSTED_ORIGINS",
   "EMAIL_FROM",
   "ENABLE_BUILDER",
   "GA4_PROPERTY_ID",
   "GA_MEASUREMENT_ID",
   "GTM_CONTAINER_ID",
-  "GOOGLE_CLIENT_ID",
   "GOOGLE_PICKER_API_KEY",
-  "GOOGLE_SIGN_IN_CLIENT_ID",
   "GOOGLE_PICKER_APP_ID",
   "NEON_AUTH_BASE_URL",
   "NITRO_PRESET",
+  "SENTRY_ORG",
+  "SENTRY_PROJECT",
   "SUPABASE_URL",
+  "SUPABASE_ANON_KEY",
   "ZOOM_CLIENT_ID",
 ]);
 const PUBLIC_KEY_PREFIXES = HOSTED_TEMPLATE_ENV_ALLOWLIST_PREFIXES;
@@ -159,6 +200,15 @@ const TEMPLATE_PROD_URL_BY_NAME = new Map([
   ),
   ...NETLIFY_SITE_PRODUCTION_URLS,
 ]);
+const TEMPLATE_BETA_URL_BY_NAME = new Map(
+  NETLIFY_BETA_SITES.flatMap((site) => {
+    const names = new Set([
+      site.id,
+      NETLIFY_TEMPLATE_ALIASES.get(site.id) ?? site.id,
+    ]);
+    return [...names].map((name) => [name, `https://${site.host}`] as const);
+  }),
+);
 
 export function resolveNetlifyTemplateName(name: string): string {
   return NETLIFY_TEMPLATE_ALIASES.get(name) ?? name;
@@ -183,6 +233,11 @@ Options:
                            GA_MEASUREMENT_ID and GTM_CONTAINER_ID default to the
                            hosted Agent-Native analytics configuration unless an
                            env source overrides them.
+                           SENTRY_AUTH_TOKEN, SENTRY_ORG, SENTRY_PROJECT, and
+                           LAUNCHDARKLY_SDK_KEY are read from this shell's
+                           environment (not any template .env) since they're
+                           the same for every hosted site.
+                           SENTRY_AUTH_TOKEN is always scoped to builds only.
   --help                  Show this help.
 
 Known templates:
@@ -338,6 +393,8 @@ function findClosingDoubleQuote(value: string): number {
   return -1;
 }
 
+const FLEET_WIDE_ENV_KEY_SET = new Set(FLEET_WIDE_ENV_KEYS);
+
 function loadTemplateEnv(template: string, sources: string[]) {
   const values = new Map<string, string>(DEFAULT_HOSTED_TEMPLATE_ENV);
   const foundSources: string[] = [];
@@ -350,9 +407,19 @@ function loadTemplateEnv(template: string, sources: string[]) {
     const relativePath = path.relative(REPO_ROOT, filePath);
     foundSources.push(relativePath);
     for (const [key, value] of parseEnvFile(filePath)) {
+      // Fleet-wide keys are shell-only (see FLEET_WIDE_ENV_KEYS below): a
+      // template file's value for one of them is never eligible, so it can't
+      // sync a stale or developer-local credential when the shell key is
+      // simply unset.
+      if (FLEET_WIDE_ENV_KEY_SET.has(key)) continue;
       values.set(key, value);
       sourcesByKey.set(key, [...(sourcesByKey.get(key) ?? []), relativePath]);
     }
+  }
+
+  for (const key of FLEET_WIDE_ENV_KEYS) {
+    const value = process.env[key];
+    if (value) values.set(key, value);
   }
 
   return { foundSources, sourcesByKey, values };
@@ -445,18 +512,46 @@ export function normalizeProductionUrlEntry(
   key: string,
   value: string,
 ): { value: string; normalized: boolean } {
-  if (context !== "production" || !PRODUCTION_URL_KEYS.has(key)) {
+  if (!PRODUCTION_URL_KEYS.has(key)) {
     return { value, normalized: false };
   }
 
-  const prodUrl = TEMPLATE_PROD_URL_BY_NAME.get(template);
-  if (!prodUrl || value === prodUrl) {
+  const targetUrl =
+    context === "production"
+      ? TEMPLATE_PROD_URL_BY_NAME.get(template)
+      : isBetaContext(context)
+        ? TEMPLATE_BETA_URL_BY_NAME.get(template)
+        : undefined;
+  if (!targetUrl || value === targetUrl) {
     return { value, normalized: false };
   }
 
-  // This syncs first-party Netlify sites. A local workspace URL must never
-  // become the production auth origin because Google validates the exact URI.
-  return { value: prodUrl, normalized: true };
+  return { value: targetUrl, normalized: true };
+}
+
+function isBetaContext(context: string): boolean {
+  return context === "beta" || context === "branch:beta";
+}
+
+export function resolveNetlifyApiContext(context: string): string {
+  return isBetaContext(context) ? "production" : context;
+}
+
+export function resolveNetlifyEnvScopes(
+  key: string,
+  scopes: string[],
+): string[] {
+  return ENV_SCOPES_BY_KEY.get(key) ?? scopes;
+}
+
+function siteIdForContext(site: TemplateSite, context: string): string {
+  if (!isBetaContext(context)) return site.siteId;
+  if (!site.betaSiteId) {
+    throw new Error(
+      `No beta Netlify site mapping exists for template ${site.name}.`,
+    );
+  }
+  return site.betaSiteId;
 }
 
 function netlifyEnvUrl(
@@ -534,6 +629,7 @@ async function syncKey({
   value: string;
 }): Promise<"created" | "updated"> {
   const is_secret = isSecretKey(key);
+  const apiContext = resolveNetlifyApiContext(context);
   const create = await requestNetlifyEnv(
     token,
     "POST",
@@ -543,7 +639,7 @@ async function syncKey({
         key,
         is_secret,
         scopes,
-        values: [{ context, value }],
+        values: [{ context: apiContext, value }],
       },
     ],
   );
@@ -571,7 +667,7 @@ async function syncKey({
           key,
           is_secret,
           scopes,
-          values: [{ context, value }],
+          values: [{ context: apiContext, value }],
         },
       ],
     );
@@ -589,7 +685,7 @@ async function syncKey({
       key,
       is_secret,
       scopes,
-      values: [{ context, value }],
+      values: [{ context: apiContext, value }],
     },
   );
 
@@ -646,13 +742,14 @@ async function main() {
   for (const plan of plans) {
     const site = SITE_BY_NAME.get(plan.siteName);
     if (!site) throw new Error(`Missing site mapping for ${plan.template}.`);
+    const targetSiteId = siteIdForContext(site, options.context);
 
     const entries = plan.entries;
     const keys = entries.map(([key]) => key).sort();
 
     console.log("");
     console.log(
-      `[${plan.siteName}] template=${plan.template} site=${site.siteId}`,
+      `[${plan.siteName}] template=${plan.template} site=${targetSiteId}`,
     );
     console.log(
       `  sources: ${plan.foundSources.length > 0 ? plan.foundSources.join(", ") : "(none)"}`,
@@ -691,8 +788,8 @@ async function main() {
         accountId: options.accountId!,
         context: options.context,
         key,
-        scopes: options.scopes,
-        siteId: site.siteId,
+        scopes: resolveNetlifyEnvScopes(key, options.scopes),
+        siteId: targetSiteId,
         token: token!,
         value,
       });

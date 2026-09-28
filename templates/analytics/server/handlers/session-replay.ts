@@ -1,6 +1,10 @@
 import { gunzipSync } from "node:zlib";
 
 import {
+  SYNTHETIC_TRAFFIC_HEADER,
+  isSyntheticTrafficValue,
+} from "@agent-native/core/shared";
+import {
   defineEventHandler,
   getHeader,
   getQuery,
@@ -58,13 +62,21 @@ function setCors(event: any): void {
   setResponseHeader(
     event,
     "Access-Control-Allow-Headers",
-    "content-type, content-encoding, x-agent-native-analytics-key",
+    `content-type, content-encoding, x-agent-native-analytics-key, ${SYNTHETIC_TRAFFIC_HEADER.toLowerCase()}`,
   );
   setResponseHeader(event, "Access-Control-Max-Age", "86400");
+  setResponseHeader(event, "Access-Control-Expose-Headers", "retry-after");
 }
 
 function statusFromError(error: any): number {
   return typeof error?.statusCode === "number" ? error.statusCode : 400;
+}
+
+function retryAfterFromError(error: any): number | null {
+  const seconds = error?.retryAfterSeconds;
+  return typeof seconds === "number" && Number.isFinite(seconds) && seconds >= 0
+    ? Math.ceil(seconds)
+    : null;
 }
 
 function messageFromError(error: any): string {
@@ -136,14 +148,9 @@ export function decodeSessionReplayRequestBody(
     if (gunzipped) {
       decoded = gunzipped;
     } else {
-      // Netlify may hand Nitro an already-decoded body while preserving the
-      // original browser Content-Encoding header.
       if (looksLikeDecodedJson(bytes)) {
         decoded = bytes;
       } else {
-        // Some Netlify paths wrap binary request bodies in a JS string before
-        // Nitro reads them back as UTF-8. Reinterpret that text as one-byte
-        // binary data so real browser CompressionStream uploads survive.
         const textWrappedGzip = decodeTextWrappedGzip(bytes);
         if (textWrappedGzip) {
           decoded = textWrappedGzip.decoded;
@@ -274,6 +281,11 @@ export const handleSessionReplayOptions = defineEventHandler((event) => {
 
 export const handleSessionReplayIngest = defineEventHandler(async (event) => {
   setCors(event);
+  if (isSyntheticTrafficValue(getHeader(event, SYNTHETIC_TRAFFIC_HEADER))) {
+    setResponseStatus(event, 202);
+    return { success: true, accepted: 0 };
+  }
+
   try {
     const query = getQuery(event);
     if (hasQueryKey(query)) {
@@ -297,6 +309,10 @@ export const handleSessionReplayIngest = defineEventHandler(async (event) => {
     setResponseStatus(event, 202);
     return { success: true, ...result };
   } catch (error: any) {
+    const retryAfter = retryAfterFromError(error);
+    if (retryAfter !== null) {
+      setResponseHeader(event, "Retry-After", String(retryAfter));
+    }
     setResponseStatus(event, statusFromError(error));
     return { error: messageFromError(error) };
   }
@@ -450,10 +466,6 @@ export const handleSessionReplayChunkBytes = defineEventHandler(
           userEmail: ctx.userEmail,
           orgId: ctx.orgId ?? null,
         });
-        // Serve decompressed JSON and let the platform negotiate wire
-        // compression. Manually returning a pre-gzipped body with a
-        // `Content-Encoding: gzip` header corrupted replay downloads on
-        // serverless hosts and left playback blank in production.
         setResponseHeader(event, "Content-Type", "application/json");
         setResponseHeader(event, "Cache-Control", "no-store");
         setResponseHeader(event, "X-Session-Replay-Seq", String(result.seq));

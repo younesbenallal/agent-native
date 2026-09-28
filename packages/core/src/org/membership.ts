@@ -1,9 +1,34 @@
 import { getDbExec } from "../db/client.js";
+import { evaluateFeatureFlagStrict } from "../feature-flags/store.js";
+import { CROSS_APP_ORG_FEDERATION_FLAG } from "./feature-flags.js";
 
-/**
- * One resolver for "is this email in this org". Two private copies of this
- * query already existed; a third would be the one that drifts.
- */
+export function isMissingOrganizationTableError(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  while (
+    current &&
+    (typeof current === "object" || typeof current === "function") &&
+    !seen.has(current)
+  ) {
+    seen.add(current);
+    const candidate = current as {
+      code?: unknown;
+      message?: unknown;
+      cause?: unknown;
+    };
+    const message = String(candidate.message ?? "");
+    if (
+      /no such table:\s*["'`]?(?:organizations|org_members)["'`]?|relation\s+["'`]?(?:organizations|org_members)["'`]?\s+does not exist/i.test(
+        message,
+      )
+    ) {
+      return true;
+    }
+    current = candidate.cause;
+  }
+  return false;
+}
+
 export async function isOrgMember(
   orgId: string,
   email: string,
@@ -11,8 +36,52 @@ export async function isOrgMember(
   const normalized = email.trim().toLowerCase();
   if (!orgId || !normalized) return false;
   const { rows } = await getDbExec().execute({
-    sql: `SELECT 1 FROM org_members WHERE org_id = ? AND LOWER(email) = ? LIMIT 1`,
+    sql: `SELECT role, federation_removal_pending_at
+          FROM org_members
+          WHERE org_id = ? AND LOWER(email) = ?
+            AND federation_removal_pending_at IS NULL
+          LIMIT 1`,
     args: [orgId, normalized],
   });
-  return rows.length > 0;
+  const row = rows[0] as any;
+  if (!row) return false;
+
+  let organizationRows: any[];
+  try {
+    organizationRows = (
+      await getDbExec().execute({
+        sql: `SELECT identity_authority, identity_id
+              FROM organizations WHERE id = ? LIMIT 1`,
+        args: [orgId],
+      })
+    ).rows;
+  } catch (error) {
+    if (!isMissingOrganizationTableError(error)) throw error;
+    return true;
+  }
+
+  const organization = organizationRows[0] as any;
+  const linked =
+    String(organization?.identity_authority ?? "").trim() ||
+    String(organization?.identity_id ?? "").trim();
+  if (!linked) return true;
+
+  if (
+    !(await evaluateFeatureFlagStrict(CROSS_APP_ORG_FEDERATION_FLAG.key, {
+      userEmail: normalized,
+      userKey: normalized,
+      orgId,
+    }))
+  ) {
+    return true;
+  }
+
+  const { validateFederatedOrganizationMembershipForCurrentRequest } =
+    await import("./federation.js");
+  const validation =
+    await validateFederatedOrganizationMembershipForCurrentRequest({
+      orgId,
+      email: normalized,
+    });
+  return validation.active;
 }

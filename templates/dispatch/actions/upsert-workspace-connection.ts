@@ -1,13 +1,26 @@
-import { defineAction } from "@agent-native/core";
+import { isDeepStrictEqual } from "node:util";
+
+import { defineAction } from "@agent-native/core/action";
+import {
+  ACTION_CHAT_UI_RECORD_CHANGE_RENDERER,
+  normalizeActionChangeResult,
+} from "@agent-native/core/action-ui";
 import {
   getWorkspaceConnectionProvider,
   type WorkspaceConnectionProvider,
 } from "@agent-native/core/connections";
+import { isOrgMember } from "@agent-native/core/org";
+import { track } from "@agent-native/core/tracking";
 import {
+  assertWorkspaceUserGroupIds,
+  getWorkspaceConnection,
+  normalizeWorkspaceConnectionAllowedUsers,
   upsertWorkspaceConnection,
   type WorkspaceConnectionStatus,
 } from "@agent-native/core/workspace-connections";
 import { z } from "zod";
+
+import { assertWorkspaceConnectionManager } from "./connection-permissions.js";
 
 const statusSchema = z.enum([
   "connected",
@@ -57,9 +70,89 @@ function normalizeCredentialRefs(
     });
 }
 
+function connectionChanged(
+  before: Awaited<ReturnType<typeof getWorkspaceConnection>>,
+  after: NonNullable<Awaited<ReturnType<typeof getWorkspaceConnection>>>,
+): boolean {
+  if (!before) return true;
+  return (
+    before.provider !== after.provider ||
+    before.label !== after.label ||
+    before.accountId !== after.accountId ||
+    before.accountLabel !== after.accountLabel ||
+    before.status !== after.status ||
+    !isDeepStrictEqual(before.scopes, after.scopes) ||
+    !isDeepStrictEqual(before.config, after.config) ||
+    !isDeepStrictEqual(before.allowedApps, after.allowedApps) ||
+    !isDeepStrictEqual(before.allowedUsers, after.allowedUsers) ||
+    !isDeepStrictEqual(before.allowedUserGroups, after.allowedUserGroups) ||
+    !isDeepStrictEqual(before.credentialRefs, after.credentialRefs) ||
+    before.lastCheckedAt !== after.lastCheckedAt ||
+    before.lastError !== after.lastError
+  );
+}
+
+function connectionChange(
+  verb: "created" | "updated",
+  connection: NonNullable<Awaited<ReturnType<typeof getWorkspaceConnection>>>,
+) {
+  return {
+    change: {
+      verb,
+      kind: "workspace-connection",
+      title: connection.label.slice(0, 180),
+      ...(connection.accountLabel
+        ? { detail: connection.accountLabel.slice(0, 500) }
+        : {}),
+      url: "/integrations",
+    },
+  };
+}
+
+export async function assertWorkspaceConnectionAllowedUsers(
+  allowedUsers: string[] | undefined,
+  orgId: string | null | undefined,
+): Promise<string[] | undefined> {
+  if (allowedUsers === undefined) return undefined;
+
+  const normalized = normalizeWorkspaceConnectionAllowedUsers(allowedUsers);
+  if (normalized.length === 0) return normalized;
+  if (!orgId?.trim()) {
+    throw new Error(
+      "Selected people require a workspace connection. Personal connections are only available to you.",
+    );
+  }
+
+  const missing = (
+    await Promise.all(
+      normalized.map(async (email) =>
+        (await isOrgMember(orgId, email)) ? null : email,
+      ),
+    )
+  ).filter((email): email is string => Boolean(email));
+  if (missing.length > 0) {
+    throw new Error(
+      `Selected people must be members of this workspace: ${missing.join(", ")}.`,
+    );
+  }
+  return normalized;
+}
+
+export async function assertWorkspaceConnectionAllowedUserGroups(
+  allowedUserGroups: string[] | undefined,
+  orgId: string | null | undefined,
+): Promise<string[] | undefined> {
+  return assertWorkspaceUserGroupIds(allowedUserGroups, orgId);
+}
+
 export default defineAction({
   description:
     "Create or update a shared workspace integration connection and its app access list.",
+  chatUI: {
+    renderer: ACTION_CHAT_UI_RECORD_CHANGE_RENDERER,
+    when: (_args, result) => normalizeActionChangeResult(result) !== null,
+    projectResult: (_args, result) => normalizeActionChangeResult(result),
+  },
   schema: z.object({
     id: z.string().optional().describe("Existing connection ID to update."),
     provider: z
@@ -91,6 +184,18 @@ export default defineAction({
       .array(z.string())
       .default([])
       .describe("App IDs that may use this connection. Empty means all apps."),
+    allowedUsers: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Workspace member email addresses that may use this connection. Empty means all workspace members.",
+      ),
+    allowedUserGroups: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Workspace user group IDs that may use this connection. Groups are unioned with selected people.",
+      ),
     credentialRefs: z
       .array(credentialRefSchema)
       .default([])
@@ -99,7 +204,8 @@ export default defineAction({
       ),
     lastError: z.string().nullable().optional(),
   }),
-  run: async (args) => {
+  run: async (args, ctx) => {
+    await assertWorkspaceConnectionManager(ctx, args.allowedApps);
     const provider = getWorkspaceConnectionProvider(args.provider);
     if (!provider) {
       throw new Error(
@@ -107,10 +213,42 @@ export default defineAction({
       );
     }
 
-    return upsertWorkspaceConnection({
+    const allowedUsers = await assertWorkspaceConnectionAllowedUsers(
+      args.allowedUsers,
+      ctx?.orgId,
+    );
+    const allowedUserGroups = await assertWorkspaceConnectionAllowedUserGroups(
+      args.allowedUserGroups,
+      ctx?.orgId,
+    );
+
+    const before = args.id?.trim()
+      ? await getWorkspaceConnection(args.id.trim())
+      : null;
+    const result = await upsertWorkspaceConnection({
       ...args,
       status: args.status as WorkspaceConnectionStatus,
+      allowedUsers,
+      allowedUserGroups,
       credentialRefs: normalizeCredentialRefs(args.credentialRefs, provider),
     });
+    const channel = args.provider.trim().toLowerCase();
+    if (channel === "slack" || channel === "telegram") {
+      track(
+        "messenger_connected",
+        {
+          app_name: "dispatch",
+          template_name: "dispatch",
+          channel,
+          connection_id: result.id,
+        },
+        ctx,
+      );
+    }
+    if (!connectionChanged(before, result)) return result;
+    return {
+      ...result,
+      ...connectionChange(before ? "updated" : "created", result),
+    };
   },
 });

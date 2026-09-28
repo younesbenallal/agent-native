@@ -1,36 +1,27 @@
-import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { createTestPglite } from "../a2a/test-pglite.js";
 import type { DbExec } from "../db/client.js";
 import type { Message } from "./types.js";
 
-// Real in-memory SQLite DbExec adapter (mirrors the better-sqlite3 branch of
-// db/client.ts). Using a real engine — instead of a hand-rolled mock that
-// ignores WHERE clauses — is what makes the state-gated transitions
-// (claim / touch / reset-stuck / fail-stuck) and owner scoping meaningful to
-// test: the conditional UPDATEs actually have to match rows.
-let sqlite: Database.Database;
+let pglite: Awaited<ReturnType<typeof createTestPglite>>;
 
 const dbExec: DbExec = {
   async execute(sql) {
     const rawSql = typeof sql === "string" ? sql : sql.sql;
     const args = typeof sql === "string" ? [] : sql.args || [];
-    // libsql/our wrapper convert undefined -> null; mimic that so INSERTs of
-    // optional columns (owner_email, context_id, metadata) behave like prod.
     const bound = args.map((a) => (a === undefined ? null : a));
-    const stmt = sqlite.prepare(rawSql);
-    if (stmt.reader) {
-      return { rows: stmt.all(...bound), rowsAffected: 0 };
-    }
-    const result = stmt.run(...bound);
-    return { rows: [], rowsAffected: result.changes ?? 0 };
+    const result = await pglite.query(rawSql, bound);
+    return {
+      rows: Array.from(result.rows ?? []),
+      rowsAffected: result.affectedRows ?? result.rowCount ?? 0,
+    };
   },
 };
 
 vi.mock("../db/client.js", () => ({
   getDbExec: () => dbExec,
-  isPostgres: () => false,
-  intType: () => "INTEGER",
+  isProductionServerlessFunctionRuntime: () => false,
 }));
 
 function makeMessage(text: string, role: "user" | "agent" = "user"): Message {
@@ -40,19 +31,17 @@ function makeMessage(text: string, role: "user" | "agent" = "user"): Message {
 type Store = typeof import("./task-store.js");
 
 async function loadStore(): Promise<Store> {
-  // Re-import after resetModules so the module-level _initPromise re-runs
-  // ensureTable against the fresh in-memory database each test.
   return import("./task-store.js");
 }
 
-describe("task-store lifecycle (real sqlite)", () => {
-  beforeEach(() => {
-    sqlite = new Database(":memory:");
+describe("task-store lifecycle (real pglite)", () => {
+  beforeEach(async () => {
+    pglite = await createTestPglite();
     vi.resetModules();
   });
 
-  afterEach(() => {
-    sqlite.close();
+  afterEach(async () => {
+    await pglite.close();
   });
 
   describe("createTask owner scoping", () => {
@@ -70,7 +59,6 @@ describe("task-store lifecycle (real sqlite)", () => {
     it("treats a null owner (legacy/unauthenticated) as unscoped", async () => {
       const { createTask, getTaskOwner } = await loadStore();
       const task = await createTask(makeMessage("hi"));
-      // Legacy rows have NULL owner_email and must read back as null, not "".
       expect(await getTaskOwner(task.id)).toBeNull();
     });
 
@@ -390,7 +378,6 @@ describe("task-store lifecycle (real sqlite)", () => {
       const { createTask, claimA2ATaskForProcessing, touchProcessingA2ATask } =
         await loadStore();
       const task = await createTask(makeMessage("go"));
-      // Not yet processing.
       expect(await touchProcessingA2ATask(task.id)).toBe(false);
       await claimA2ATaskForProcessing(task.id);
       expect(await touchProcessingA2ATask(task.id)).toBe(true);
@@ -408,7 +395,6 @@ describe("task-store lifecycle (real sqlite)", () => {
       const task = await createTask(makeMessage("go"));
       await claimA2ATaskForProcessing(task.id);
 
-      // Future cutoff => the row's updated_at is <= cutoff => eligible.
       const ok = await resetStuckA2ATaskForRetry(task.id, Date.now() + 60_000);
       expect(ok).toBe(true);
       expect((await getTask(task.id))!.status.state).toBe("working");
@@ -424,7 +410,6 @@ describe("task-store lifecycle (real sqlite)", () => {
       const task = await createTask(makeMessage("go"));
       await claimA2ATaskForProcessing(task.id);
 
-      // Cutoff in the past => updated_at > cutoff => still considered alive.
       const ok = await resetStuckA2ATaskForRetry(task.id, Date.now() - 60_000);
       expect(ok).toBe(false);
       expect((await getTask(task.id))!.status.state).toBe("processing");
@@ -432,7 +417,7 @@ describe("task-store lifecycle (real sqlite)", () => {
 
     it("does NOT reset a task that is not in processing state", async () => {
       const { createTask, resetStuckA2ATaskForRetry } = await loadStore();
-      const task = await createTask(makeMessage("go")); // submitted
+      const task = await createTask(makeMessage("go"));
       expect(
         await resetStuckA2ATaskForRetry(task.id, Date.now() + 60_000),
       ).toBe(false);
@@ -476,7 +461,7 @@ describe("task-store lifecycle (real sqlite)", () => {
 
     it("does NOT fail a task that is not processing", async () => {
       const { createTask, failStuckA2ATask } = await loadStore();
-      const task = await createTask(makeMessage("go")); // submitted
+      const task = await createTask(makeMessage("go"));
       expect(await failStuckA2ATask(task.id, Date.now() + 60_000, "nope")).toBe(
         false,
       );
@@ -492,13 +477,8 @@ describe("task-store lifecycle (real sqlite)", () => {
       } = await loadStore();
       const task = await createTask(makeMessage("go"));
       await claimA2ATaskForProcessing(task.id);
-      // Simulate a live heartbeat: updated_at is fresh, well above any
-      // processingCutoff in the past.
       await touchProcessingA2ATask(task.id);
 
-      // processingCutoff (updated_at test) is in the past — would not match
-      // alone. createdAtCutoff is in the future — the row's created_at is
-      // always <= "now + 60s", so the OR condition matches on age alone.
       const ok = await failStuckA2ATask(
         task.id,
         Date.now() - 60_000,
@@ -681,7 +661,6 @@ describe("task-store lifecycle (real sqlite)", () => {
       await updateTaskStatusMessage(task.id, progress);
       const loaded = await getTask(task.id);
       expect(loaded!.status.message).toEqual(progress);
-      // State itself is untouched — only the message/timestamp move.
       expect(loaded!.status.state).toBe("submitted");
     });
 
@@ -693,8 +672,6 @@ describe("task-store lifecycle (real sqlite)", () => {
 
       await updateTaskStatusMessage(task.id, makeMessage("late note", "agent"));
       const loaded = await getTask(task.id);
-      // Gated by `status_state IN ('submitted','working','processing')`, so a
-      // completed task keeps its original (empty) status message.
       expect(loaded!.status.message).toBeUndefined();
     });
   });
@@ -706,10 +683,6 @@ describe("task-store lifecycle (real sqlite)", () => {
       const middle = await createTask(makeMessage("b"));
       const newest = await createTask(makeMessage("c"));
 
-      // createTask stamps all three with the same Date.now() millisecond, which
-      // would make the DESC ordering untestable. Rewrite created_at to distinct,
-      // out-of-insertion-order values so the ORDER BY clause is actually
-      // exercised rather than incidentally satisfied by insertion order.
       await dbExec.execute({
         sql: `UPDATE a2a_tasks SET created_at = ? WHERE id = ?`,
         args: [1000, oldest.id],

@@ -1,4 +1,4 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
 import { getRequestUserEmail } from "@agent-native/core/server/request-context";
 import { assertAccess } from "@agent-native/core/sharing";
@@ -34,7 +34,7 @@ export default defineAction({
 
     const userEmail = getRequestUserEmail();
     if (comment.authorEmail === userEmail) {
-      await assertAccess("document", comment.documentId, "viewer");
+      await assertAccess("document", comment.documentId, "commenter");
     } else {
       await assertAccess("document", comment.documentId, "editor");
     }
@@ -45,6 +45,15 @@ export default defineAction({
         and(
           eq(schema.documentComments.id, args.id),
           eq(schema.documentComments.documentId, comment.documentId),
+        ),
+      );
+
+    await db
+      .delete(schema.documentCommentReactions)
+      .where(
+        and(
+          eq(schema.documentCommentReactions.commentId, args.id),
+          eq(schema.documentCommentReactions.documentId, comment.documentId),
         ),
       );
 

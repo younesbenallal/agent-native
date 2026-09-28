@@ -5,7 +5,6 @@ import {
   IconDatabase,
   IconFileText,
   IconMessageQuestion,
-  IconSettings,
 } from "@tabler/icons-react";
 
 export type BrainView =
@@ -20,7 +19,14 @@ export type BrainView =
   | "settings";
 
 export type KnowledgeStatus = "approved" | "needs_review" | "draft" | "stale";
-export type SourceHealth = "healthy" | "degraded" | "paused" | "error";
+export type SourceHealth =
+  | "healthy"
+  | "needs_setup"
+  | "needs_sync"
+  | "stale"
+  | "degraded"
+  | "paused"
+  | "error";
 export type ReviewPriority = "high" | "medium" | "low";
 
 export interface Citation {
@@ -68,7 +74,7 @@ export interface KnowledgeRow {
     timestampMs?: number | null;
   }>;
   publishedResourcePath?: string | null;
-  publishTier?: "private" | "team" | "company" | string;
+  publishTier?: "private" | "team" | "company" | (string & {});
   updatedAt?: string | null;
   owner?: string | null;
 }
@@ -128,6 +134,7 @@ export interface BrainSource {
   lastSyncedAt?: string | null;
   nextSyncAt?: string | null;
   reviewRequired?: boolean;
+  visibility?: "private" | "org" | "public";
   config?: Record<string, unknown>;
   cursor?: Record<string, unknown>;
   lastError?: string | null;
@@ -144,6 +151,27 @@ export interface BrainSource {
 export interface CreateSourceResponse {
   source: BrainSource;
   ingestToken?: string;
+}
+
+export interface MarkdownImportFileResult {
+  path: string;
+  status: "imported" | "blocked" | "failed";
+  captureId?: string;
+  distillation?: "queued" | "existing" | "skipped" | "failed";
+  error?: string;
+  sensitivityReceipt?: Record<string, unknown>;
+}
+
+export interface MarkdownImportResponse {
+  source?: BrainSource;
+  files: MarkdownImportFileResult[];
+  summary: {
+    requested: number;
+    imported: number;
+    queued: number;
+    blocked: number;
+    failed: number;
+  };
 }
 
 export interface BrainOverviewResponse {
@@ -163,7 +191,11 @@ export interface KnowledgeResponse {
   };
 }
 
-export type SearchResultType = "knowledge" | "capture" | "source" | string;
+export type SearchResultType =
+  | "knowledge"
+  | "capture"
+  | "source"
+  | (string & {});
 
 export interface SearchEverythingResult {
   id: string;
@@ -192,7 +224,7 @@ export interface SearchEverythingResult {
   confidence?: number | null;
   updatedAt?: string | null;
   score?: number | null;
-  matchLane?: "semantic" | "keyword" | "hybrid" | string | null;
+  matchLane?: "semantic" | "keyword" | "hybrid" | (string & {}) | null;
   retrievalReason?: string | null;
 }
 
@@ -280,7 +312,7 @@ export interface BrainHealthResponse {
       lastError?: string | null;
       latestRun?: {
         id: string;
-        status: "running" | "success" | "error" | string;
+        status: "running" | "success" | "error" | (string & {});
         startedAt?: string | null;
         completedAt?: string | null;
         error?: string | null;
@@ -311,8 +343,10 @@ export interface BrainHealthResponse {
   privacy: {
     classifier: {
       configured: boolean;
+      classifier: "jev" | "model" | "deterministic";
       model: string | null;
       engine: string | null;
+      jevCredential: "stored-key" | "builder-gateway" | "none" | "unavailable";
       warning: string | null;
     };
     events: {
@@ -366,6 +400,24 @@ export interface BrainHealthResponse {
       counts?: Record<string, number>;
     };
     embeddings: {
+      readiness: {
+        status: "ready" | "not-configured" | "ambiguous" | "unavailable";
+        ready: boolean;
+        configuredProviders: string[];
+        unavailableProviders: string[];
+        configuredFamilies: number;
+        provider: string | null;
+        model: string | null;
+        embeddingSetId: string | null;
+        dimensions: number | null;
+        warning: string | null;
+      };
+      coverage: {
+        eligibleArtifacts: number;
+        embeddedArtifacts: number;
+        missingArtifacts: number;
+        percent: number;
+      };
       total: number;
       active: number;
       stale: number;
@@ -382,7 +434,7 @@ export interface BrainHealthResponse {
   };
   retrieval: {
     lastEval?: {
-      mode: "product-demo" | "retrieval" | string;
+      mode: "product-demo" | "retrieval" | (string & {});
       seedId?: string;
       dataset?: string;
       dataMode?: string;
@@ -672,7 +724,7 @@ export interface EnqueueCapturesDistillationResult {
     | "already-distilled"
     | "already-ignored"
     | "queue-failed"
-    | string;
+    | (string & {});
   error?: string;
 }
 
@@ -839,7 +891,7 @@ export interface BrainPilotReport {
   latestSyncRun: {
     id: string;
     provider: string;
-    status: "running" | "success" | "error" | string;
+    status: "running" | "success" | "error" | (string & {});
     stats?: Record<string, unknown>;
     error?: string | null;
     startedAt?: string | null;
@@ -900,7 +952,7 @@ export interface BrainPilotReport {
       captureId?: string | null;
       title: string;
       proposedAction?: string | null;
-      status: "pending" | "approved" | "rejected" | string;
+      status: "pending" | "approved" | "rejected" | (string & {});
       rationale?: string | null;
       sourceUrl?: string | null;
       reviewerNotes?: string | null;
@@ -953,6 +1005,7 @@ export interface BrainSettings {
   requireCitations?: boolean;
   autoArchiveResolved?: boolean;
   notifyOnSourceErrors?: boolean;
+  privacyClassifier?: "jev" | "model" | "deterministic";
   privacyClassifierModel?: string;
   privacyClassifierEngine?: string;
   sensitivityCustomInstructions?: string;
@@ -1001,7 +1054,7 @@ export const navItems: Array<{
   href: string;
   icon: Icon;
 }> = [
-  { view: "ask", label: "Ask", href: "/", icon: IconMessageQuestion },
+  { view: "ask", label: "Ask", href: "/home", icon: IconMessageQuestion },
   { view: "sources", label: "Sources", href: "/sources", icon: IconDatabase },
   { view: "review", label: "Review", href: "/review", icon: IconChecks },
   {
@@ -1009,12 +1062,6 @@ export const navItems: Array<{
     label: "Knowledge",
     href: "/knowledge",
     icon: IconBook2,
-  },
-  {
-    view: "settings",
-    label: "Settings",
-    href: "/settings",
-    icon: IconSettings,
   },
 ];
 
@@ -1050,7 +1097,9 @@ export function viewFromPath(pathname: string): BrainView {
   if (pathname.startsWith("/review")) return "review";
   if (pathname.startsWith("/sources")) return "sources";
   if (pathname.startsWith("/ops")) return "ops";
-  if (pathname.startsWith("/agent")) return "agent";
+  if (pathname.startsWith("/settings/agent") || pathname.startsWith("/agent")) {
+    return "agent";
+  }
   if (pathname.startsWith("/settings")) return "settings";
   return "ask";
 }
@@ -1070,12 +1119,12 @@ export function pathFromView(view?: string): string {
     case "ops":
       return "/ops";
     case "agent":
-      return "/agent";
+      return "/settings/agent";
     case "settings":
       return "/settings";
     case "ask":
     default:
-      return "/";
+      return "/home";
   }
 }
 
@@ -1111,7 +1160,7 @@ export function sourceDescription(source: BrainSource) {
     case "generic":
       return "Signed webhook or manual API source for transcripts and structured context.";
     case "manual":
-      return "Direct imports created from the agent or UI.";
+      return "Import Markdown folders, pasted notes, or agent-created captures. Imported files remain searchable captures and follow this source's access setting.";
     default:
       return "Company knowledge source.";
   }
@@ -1120,8 +1169,11 @@ export function sourceDescription(source: BrainSource) {
 export function sourceHealth(source: BrainSource): SourceHealth {
   if (source.health) return source.health;
   if (sourceRetryAfter(source)) return "degraded";
-  if (source.status === "active")
-    return source.lastError ? "degraded" : "healthy";
+  if (source.status === "active") {
+    if (source.lastError) return "degraded";
+    if (sourceAutoSync(source) && !source.lastSyncedAt) return "needs_sync";
+    return "healthy";
+  }
   if (source.status === "error") return "error";
   if (source.status === "paused" || source.status === "archived")
     return "paused";

@@ -42,7 +42,8 @@ import type { GuardFinding, GuardResult, GuardScanOptions } from "./types.js";
 
 const ALLOWLIST_EXACT = new Set([
   "DATABASE_URL",
-  "DATABASE_AUTH_TOKEN",
+  "DATABASE_URL_UNPOOLED",
+  "FUSION_BRANCH_KIND",
   "NODE_ENV",
   "CI",
   "DEBUG",
@@ -54,6 +55,8 @@ const ALLOWLIST_EXACT = new Set([
   "AWS_LAMBDA_FUNCTION_NAME",
   "BETTER_AUTH_SECRET",
   "BETTER_AUTH_URL",
+  "APP_URL",
+  "IDENTITY_SSO_APP_REGISTRY_JSON",
   "NOTION_CLIENT_ID",
   "NOTION_CLIENT_SECRET",
   "NOTION_STATE_SECRET",
@@ -78,10 +81,6 @@ const ALLOWLIST_PREFIX = [
   "CF_",
 ];
 
-/** Dev-only paths where ANTHROPIC_API_KEY etc. may legitimately be read
- * from env (local dev tooling, scripts, tests). Portable subset of the
- * original — the monorepo-only `packages/core/src/dev` predicate is
- * dropped (see report 005's V1 guard set table). */
 const DEV_ONLY_PATH_PATTERNS = [
   /\.spec\.[tj]sx?$/,
   /\.test\.[tj]sx?$/,

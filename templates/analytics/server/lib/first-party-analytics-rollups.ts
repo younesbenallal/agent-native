@@ -1,17 +1,7 @@
-import { isPostgres } from "@agent-native/core/db";
 import { sql } from "@agent-native/core/db/schema";
 
 import { getDb, schema } from "../db/index.js";
-import {
-  FIRST_PARTY_ANALYTICS_ROLLUP_LOCK_KEY,
-  FIRST_PARTY_ANALYTICS_ROLLUP_LOCK_SQL,
-} from "./analytics-rollup-lock.js";
 
-/**
- * The normalized subset emitted by first-party analytics ingest. Keeping this
- * contract smaller than the raw event row makes it clear that rollups never
- * need to parse properties or context JSON.
- */
 export interface NormalizedFirstPartyAnalyticsEventRow {
   eventName: string;
   eventDate: string;
@@ -77,10 +67,6 @@ function stableId(prefix: string, parts: readonly string[]): string {
   return `${prefix}_${parts.map((part) => encodeURIComponent(part)).join("|")}`;
 }
 
-/**
- * Upsert compact rollups for a normalized batch. When ingestion passes its
- * transaction through, raw events and rollups share one commit boundary.
- */
 export async function upsertFirstPartyAnalyticsRollups(
   rows: readonly NormalizedFirstPartyAnalyticsEventRow[],
   transaction?: any,
@@ -146,16 +132,6 @@ export async function upsertFirstPartyAnalyticsRollups(
   }
 
   const writeRollups = async (tx: any) => {
-    if (isPostgres()) {
-      // The historical backfill takes this lock before its raw-event
-      // snapshot. Holding it through ingest's rollup increment prevents the
-      // backfill's monotonic upsert from losing a concurrently committed
-      // event.
-      await tx.execute({
-        sql: FIRST_PARTY_ANALYTICS_ROLLUP_LOCK_SQL,
-        args: [FIRST_PARTY_ANALYTICS_ROLLUP_LOCK_KEY],
-      });
-    }
     const dailyRows = [...dailyRollups.values()];
     await tx
       .insert(schema.analyticsEventDailyRollups)

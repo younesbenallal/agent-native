@@ -1,38 +1,11 @@
-/**
- * Short-lived HMAC-signed access tokens for media URLs.
- *
- * Used by clips and calls to mint a single-use bearer token after a password
- * gate passes, then bake `?t=<token>` into the video/blob URL handed to the
- * `<video>` element — instead of `?password=<plaintext>` (which ends up in
- * browser history, CDN logs, and Referer headers).
- *
- * Token shape: `<payloadB64Url>.<sigB64Url>`
- *   payload = base64url(JSON.stringify({ resourceId, viewerEmail?, exp }))
- *   sig     = base64url(HMAC-SHA256(payload, key))
- *
- * Key resolution mirrors `google-oauth.ts:getStateSigningKey`:
- *   1. OAUTH_STATE_SECRET (preferred — dedicated to short-lived signing)
- *   2. BETTER_AUTH_SECRET (already used as a server secret)
- *   3. Hosted workspace deploys derive a per-purpose key from A2A_SECRET
- *   4. In dev only, an ephemeral random key (per-process)
- *
- * In production, throws if no usable server secret is set.
- */
-
 import crypto from "node:crypto";
 
 import { getWorkspaceA2ADerivedSecret } from "./derived-secret.js";
 
-/** Default token TTL, in seconds. 10 minutes covers a typical video session. */
 const DEFAULT_TTL_SECONDS = 600;
 
-/**
- * Inputs for {@link signShortLivedToken}.
- */
 export interface ShortLivedTokenClaims {
-  /** Resource id the token authorises (recording id, call id, snippet id, …). */
   resourceId: string;
-  /** Optional viewer email for audit / analytics — not used for authorisation. */
   viewerEmail?: string;
   /**
    * Optional display name of the agent the token was minted for. Signed so a
@@ -40,7 +13,6 @@ export interface ShortLivedTokenClaims {
    * never consult it for authorisation.
    */
   agentLabel?: string;
-  /** Override default TTL (seconds). */
   ttlSeconds?: number;
 }
 
@@ -51,10 +23,6 @@ interface DecodedClaims {
   exp: number;
 }
 
-/**
- * Result of {@link verifyShortLivedToken}. Discriminated by the literal
- * `ok` field so callers can `if (!result.ok) return …`.
- */
 export type VerifyResult =
   | { ok: true; viewerEmail?: string; agentLabel?: string }
   | { ok: false; reason: string };
@@ -91,17 +59,10 @@ function base64UrlEncode(buf: Buffer | string): string {
 }
 
 function base64UrlDecode(s: string): Buffer {
-  // Re-pad to a multiple of 4 so Buffer.from('base64') decodes cleanly.
   const padded = s + "=".repeat((4 - (s.length % 4)) % 4);
   return Buffer.from(padded.replace(/-/g, "+").replace(/_/g, "/"), "base64");
 }
 
-/**
- * Mint a signed token authorising read access to `claims.resourceId` until
- * `exp = now + ttl`. The result is safe to drop into a query string —
- * `?t=<token>` — and verified by {@link verifyShortLivedToken} on the
- * downstream route.
- */
 export function signShortLivedToken(claims: ShortLivedTokenClaims): string {
   const ttl = claims.ttlSeconds ?? DEFAULT_TTL_SECONDS;
   const payload: DecodedClaims = {
@@ -144,13 +105,10 @@ export function verifyShortLivedToken(
     crypto.createHmac("sha256", getSigningKey()).update(payloadStr).digest(),
   );
 
-  // Constant-time compare. Length-mismatched inputs would throw under
-  // `crypto.timingSafeEqual`, so we check length first and fall back to a
-  // dummy compare to keep timing roughly constant on the failure path.
   const sigBuf = Buffer.from(sig, "utf8");
   const expBuf = Buffer.from(expected, "utf8");
   if (sigBuf.length !== expBuf.length) {
-    crypto.timingSafeEqual(expBuf, expBuf); // burn ~equal cycles
+    crypto.timingSafeEqual(expBuf, expBuf);
     return { ok: false, reason: "bad_signature" };
   }
   if (!crypto.timingSafeEqual(sigBuf, expBuf)) {
@@ -202,19 +160,18 @@ export function verifyShortLivedToken(
 export const REALTIME_SUBSCRIBE_TOKEN_TYPE = "rt-subscribe";
 const DEFAULT_REALTIME_TTL_SECONDS = 600;
 
-/** Inputs for {@link signRealtimeSubscribeToken}. */
 export interface RealtimeSubscribeClaims {
-  /** Channel — one Neon project per app. Verified at connect, not just carried. */
   projectId: string;
-  /**
-   * App end-user session email (NOT a Builder.io account — see the tech spec).
-   * Fed to `canSeeChangeForUser`. Present in v0.
-   */
   owner?: string;
-  /** Framework org id for the app's end-user. */
   orgId?: string;
-  /** Override default TTL (seconds). */
   ttlSeconds?: number;
+  /**
+   * Absolute unix-seconds ceiling, independent of `exp`. The gateway re-signs a
+   * stream's token every few minutes without consulting the app, so `exp` alone
+   * lets one mint be extended forever and a revoked session keeps streaming.
+   * Rotation copies this verbatim and never extends it.
+   */
+  absExp?: number;
 }
 
 interface DecodedRealtimeClaims {
@@ -223,12 +180,9 @@ interface DecodedRealtimeClaims {
   owner?: string;
   orgId?: string;
   exp: number;
+  absExp?: number;
 }
 
-/**
- * Result of {@link verifyRealtimeSubscribeToken}. On success it returns the
- * identity claims the gateway uses to scope delivery.
- */
 export type RealtimeVerifyResult =
   | {
       ok: true;
@@ -236,6 +190,7 @@ export type RealtimeVerifyResult =
       owner?: string;
       orgId?: string;
       exp: number;
+      absExp?: number;
     }
   | { ok: false; reason: string };
 
@@ -249,18 +204,12 @@ function timingSafeEqualB64(sig: string, expected: string): boolean {
   const sigBuf = Buffer.from(sig, "utf8");
   const expBuf = Buffer.from(expected, "utf8");
   if (sigBuf.length !== expBuf.length) {
-    crypto.timingSafeEqual(expBuf, expBuf); // burn ~equal cycles
+    crypto.timingSafeEqual(expBuf, expBuf);
     return false;
   }
   return crypto.timingSafeEqual(sigBuf, expBuf);
 }
 
-/**
- * Mint a realtime subscribe token for `claims.projectId`, signed with the
- * app's per-project `key`. Safe to place on the connect query string (short
- * TTL, single-purpose, channel-bound). Verified by
- * {@link verifyRealtimeSubscribeToken} at connect.
- */
 export function signRealtimeSubscribeToken(
   claims: RealtimeSubscribeClaims,
   key: string,
@@ -283,6 +232,7 @@ export function signRealtimeSubscribeToken(
   };
   if (claims.owner) payload.owner = claims.owner;
   if (claims.orgId) payload.orgId = claims.orgId;
+  if (claims.absExp) payload.absExp = claims.absExp;
 
   const payloadStr = base64UrlEncode(JSON.stringify(payload));
   return `${payloadStr}.${hmacB64(payloadStr, key)}`;
@@ -324,6 +274,14 @@ export function verifyRealtimeSubscribeToken(
   if (claims.exp * 1000 < Date.now()) {
     return { ok: false, reason: "expired" };
   }
+  if (claims.absExp !== undefined) {
+    if (typeof claims.absExp !== "number") {
+      return { ok: false, reason: "bad_payload" };
+    }
+    if (claims.absExp * 1000 <= Date.now()) {
+      return { ok: false, reason: "session_expired" };
+    }
+  }
   if (claims.projectId !== expected.projectId) {
     return { ok: false, reason: "wrong_project" };
   }
@@ -334,6 +292,116 @@ export function verifyRealtimeSubscribeToken(
     owner: claims.owner,
     orgId: claims.orgId,
     exp: claims.exp,
+    absExp: claims.absExp,
+  };
+}
+
+export const REALTIME_VOICE_CAPABILITY_TOKEN_TYPE = "rt-voice-capability";
+
+export interface RealtimeVoiceCapabilityClaims {
+  userEmail: string;
+  orgId?: string;
+  browserTabId?: string;
+  toolNames: readonly string[];
+  discoveredToolNames?: readonly string[];
+  ttlSeconds?: number;
+}
+
+interface DecodedRealtimeVoiceCapabilityClaims {
+  typ: string;
+  userEmail: string;
+  orgId?: string;
+  browserTabId?: string;
+  toolNames: string[];
+  discovered?: string[];
+  exp: number;
+}
+
+export type RealtimeVoiceCapabilityVerifyResult =
+  | {
+      ok: true;
+      userEmail: string;
+      orgId?: string;
+      browserTabId?: string;
+      toolNames: string[];
+      discoveredToolNames: string[];
+    }
+  | { ok: false; reason: string };
+
+/**
+ * Mint a capability authorising `claims.toolNames` for one realtime voice
+ * session. The token is a bounded manifest scope layered on top of the
+ * caller's session cookie — never a standalone credential.
+ */
+export function signRealtimeVoiceCapability(
+  claims: RealtimeVoiceCapabilityClaims,
+  ttlSecondsDefault: number,
+): string {
+  const payload: DecodedRealtimeVoiceCapabilityClaims = {
+    typ: REALTIME_VOICE_CAPABILITY_TOKEN_TYPE,
+    userEmail: claims.userEmail.trim().toLowerCase(),
+    toolNames: [...claims.toolNames],
+    exp:
+      Math.floor(Date.now() / 1000) + (claims.ttlSeconds ?? ttlSecondsDefault),
+  };
+  if (claims.orgId) payload.orgId = claims.orgId;
+  if (claims.browserTabId) payload.browserTabId = claims.browserTabId;
+  if (claims.discoveredToolNames?.length) {
+    payload.discovered = [...claims.discoveredToolNames];
+  }
+
+  const payloadStr = base64UrlEncode(JSON.stringify(payload));
+  return `${payloadStr}.${hmacB64(payloadStr, getSigningKey())}`;
+}
+
+export function verifyRealtimeVoiceCapability(
+  token: string | undefined,
+  expected: { userEmail: string; orgId?: string; browserTabId?: string },
+): RealtimeVoiceCapabilityVerifyResult {
+  if (typeof token !== "string" || !token.includes(".")) {
+    return { ok: false, reason: "malformed" };
+  }
+  const [payloadStr, sig] = token.split(".", 2);
+  if (!payloadStr || !sig) return { ok: false, reason: "malformed" };
+
+  if (!timingSafeEqualB64(sig, hmacB64(payloadStr, getSigningKey()))) {
+    return { ok: false, reason: "bad_signature" };
+  }
+
+  let claims: DecodedRealtimeVoiceCapabilityClaims;
+  try {
+    claims = JSON.parse(base64UrlDecode(payloadStr).toString("utf8"));
+  } catch {
+    return { ok: false, reason: "bad_payload" };
+  }
+
+  if (claims.typ !== REALTIME_VOICE_CAPABILITY_TOKEN_TYPE) {
+    return { ok: false, reason: "wrong_type" };
+  }
+  if (typeof claims.exp !== "number" || !Array.isArray(claims.toolNames)) {
+    return { ok: false, reason: "bad_payload" };
+  }
+  if (claims.exp * 1000 < Date.now()) return { ok: false, reason: "expired" };
+  if (
+    claims.userEmail !== expected.userEmail.trim().toLowerCase() ||
+    claims.orgId !== expected.orgId ||
+    claims.browserTabId !== expected.browserTabId
+  ) {
+    return { ok: false, reason: "identity_mismatch" };
+  }
+
+  const stringsOnly = (value: unknown): string[] =>
+    Array.isArray(value)
+      ? value.filter((name): name is string => typeof name === "string")
+      : [];
+
+  return {
+    ok: true,
+    userEmail: claims.userEmail,
+    orgId: claims.orgId,
+    browserTabId: claims.browserTabId,
+    toolNames: stringsOnly(claims.toolNames),
+    discoveredToolNames: stringsOnly(claims.discovered),
   };
 }
 
@@ -347,15 +415,12 @@ export function verifyRealtimeSubscribeToken(
 
 /** Payload `typ` discriminator for gateway access-check tokens. */
 export const GATEWAY_ACCESS_TOKEN_TYPE = "rt-access-check";
-/** Short TTL: minted per check, used immediately server-to-server. */
 const DEFAULT_GATEWAY_ACCESS_TTL_SECONDS = 60;
 
-/** Inputs for {@link signGatewayAccessToken}. */
 export interface GatewayAccessClaims {
   projectId: string;
   resourceType: string;
   resourceId: string;
-  /** App end-user whose visibility of the resource is being checked. */
   userEmail: string;
   orgId?: string;
   ttlSeconds?: number;
@@ -371,7 +436,6 @@ interface DecodedGatewayAccessClaims {
   exp: number;
 }
 
-/** Result of {@link verifyGatewayAccessToken}; on success carries the bound query. */
 export type GatewayAccessVerifyResult =
   | {
       ok: true;
@@ -383,7 +447,6 @@ export type GatewayAccessVerifyResult =
     }
   | { ok: false; reason: string };
 
-/** Mint a gateway access-check token, signed with the app's per-project `key`. */
 export function signGatewayAccessToken(
   claims: GatewayAccessClaims,
   key: string,
@@ -403,7 +466,6 @@ export function signGatewayAccessToken(
   return `${payloadStr}.${hmacB64(payloadStr, key)}`;
 }
 
-/** Verify a gateway access-check token against the app's per-project `key`. */
 export function verifyGatewayAccessToken(
   token: string,
   key: string,

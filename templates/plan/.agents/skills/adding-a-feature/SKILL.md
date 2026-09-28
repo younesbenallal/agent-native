@@ -18,7 +18,7 @@ Scope check first: this is the checklist for a feature that adds app data or a n
 
 ## Why
 
-Agent-native apps are defined by parity: everything the UI can do, the agent can do, and vice versa. A feature that only has UI is invisible to the agent. A feature that only has scripts is invisible to the user. A feature without app-state sync means the agent is blind to what the user is doing.
+Agent-Native apps are defined by parity: everything the UI can do, the agent can do, and vice versa. A feature that only has UI is invisible to the agent. A feature that only has scripts is invisible to the user. A feature without app-state sync means the agent is blind to what the user is doing.
 
 ## The Checklist
 
@@ -76,12 +76,31 @@ Builder/internal data, or customer data in the action, UI, seed data, fixtures,
 docs, prompts, or generated extension/app content. Register required secrets,
 use OAuth helpers, or read scoped values from the vault/credential store.
 
+Before writing custom setup or credential UI, perform the shared-primitive
+preflight from `agent-native-toolkit`: inspect the workspace/provider connection
+catalog first, then settings, secrets/vault, OAuth, onboarding, and provider API
+support. Reuse an existing connection's app grant and scoped credential
+resolver; only use app-local vault or OAuth primitives when no reusable
+connection exists. Keep any wizard thin and provider-specific - it may explain
+prerequisites, ordering, or readiness, but must not become a second vault or
+custom credential transport. Do not mark each field `required` by reflex;
+model onboarding around the logical connection outcome.
+
 If the feature involves attachments, images, recordings, screenshots, exports,
 or other file-like payloads, design the upload path in the same change:
 provider upload first, then URL/id/blob handle in SQL. Do not add base64/binary
 columns or stuff files into `application_state`.
 
+If the feature adds a server-side dependency carrying a native binary or heavy
+runtime — headless browser, ffmpeg, image/video processing, ML runtime — read
+the `performance` skill §9 before adding it. A deployed app has one `/*` page
+function that every visitor's cache miss wakes, and it ships whatever the server
+bundle depends on. Run that work from a background function or a job so the page
+function never carries the weight.
+
 **If the action produces or lists a navigable resource**, add a `link` builder that returns `{ url: buildDeepLink({ app, view, params }), label }`. External coding agents and MCP hosts (Claude / ChatGPT / Claude Code / Cowork / Codex, over MCP/A2A) then surface an "Open in … →" deep link that drops the user back into the running UI focused on the record — for free. If a compatible MCP host should render an inline review/edit surface, also add `mcpApp` with `embedApp()` so the action embeds the real React app route instead of a one-off HTML UI. The `link` builder and `mcpApp` metadata must be pure and synchronous (no I/O). Any external-agent read/ingest action must be `http: { method: "GET" }` + `readOnly: true` + `publicAgent: { expose: true, readOnly: true, requiresAuth: true }`. See the `external-agents` skill.
+
+Scaffolding a new app of a known type (slides, design, content, forms)? Start from that template's `AGENTS.md` and `.agents/skills/`, not a blank app.
 
 ### 3. Skills / Instructions
 
@@ -94,8 +113,9 @@ placeholders such as `${keys.SLACK_WEBHOOK}` or `<SLACK_WEBHOOK>`. Do not paste
 real keys, internal data, or customer data into instructions as examples.
 
 If the feature adds or changes visible UI copy, prompts, toasts, labels, empty
-states, or formatting, read `internationalization` and update the app's i18n
-catalogs in the same change.
+states, or formatting, update the English source copy. Read the optional
+`internationalization` skill and update additional catalogs only when
+`translations.locales` in `agent-native.config.ts` includes them.
 
 For app-backed skills, declare skill visibility in the app-skill manifest:
 
@@ -111,30 +131,30 @@ Expose navigation and selection state so the agent knows what the user is lookin
 
 ### Adding "compose email" to a mail app
 
-| Area            | What to build                                                                            |
-| --------------- | ---------------------------------------------------------------------------------------- |
-| UI              | Compose panel with tabs, to/cc/bcc fields, body editor. Use `useActionQuery`/`useActionMutation` for data. |
-| Action          | `manage-draft` action (create/update/delete drafts), `send-email` action                 |
-| Skills/AGENTS   | Document compose state shape, draft lifecycle, action args in AGENTS.md                  |
-| App-state sync  | `compose-{id}` keys for each draft tab, `navigation` includes compose state              |
+| Area | What to build |
+| --- | --- |
+| UI | Compose panel with tabs, to/cc/bcc fields, body editor. Use `useActionQuery`/`useActionMutation` for data. |
+| Action | `manage-draft` action (create/update/delete drafts), `send-email` action |
+| Skills/AGENTS | Document compose state shape, draft lifecycle, action args in AGENTS.md |
+| App-state sync | `compose-{id}` keys for each draft tab, `navigation` includes compose state |
 
 ### Adding "create form" to a forms app
 
-| Area            | What to build                                                                            |
-| --------------- | ---------------------------------------------------------------------------------------- |
-| UI              | Form builder page with drag-and-drop fields, preview, settings. Use `useActionQuery` for lists. |
-| Action          | `create-form` action, `update-form` action, `list-forms` action (GET)                    |
-| Skills/AGENTS   | Document form schema shape, field types, validation rules in AGENTS.md                   |
-| App-state sync  | `navigation` includes `{ view: "form-builder", formId: "..." }`, `view-screen` fetches form data |
+| Area | What to build |
+| --- | --- |
+| UI | Form builder page with drag-and-drop fields, preview, settings. Use `useActionQuery` for lists. |
+| Action | `create-form` action, `update-form` action, `list-forms` action (GET) |
+| Skills/AGENTS | Document form schema shape, field types, validation rules in AGENTS.md |
+| App-state sync | `navigation` includes `{ view: "form-builder", formId: "..." }`, `view-screen` fetches form data |
 
 ### Adding "chart type" to an analytics app
 
-| Area            | What to build                                                                            |
-| --------------- | ---------------------------------------------------------------------------------------- |
-| UI              | New chart component, chart type selector in dashboard                                    |
-| Action          | `create-chart` or `update-dashboard` action that sets chart type and config              |
-| Skills/AGENTS   | Document supported chart types, config options, data requirements                        |
-| App-state sync  | `navigation` includes selected chart/dashboard, `view-screen` returns chart config       |
+| Area | What to build |
+| --- | --- |
+| UI | New chart component, chart type selector in dashboard |
+| Action | `create-chart` or `update-dashboard` action that sets chart type and config |
+| Skills/AGENTS | Document supported chart types, config options, data requirements |
+| App-state sync | `navigation` includes selected chart/dashboard, `view-screen` returns chart config |
 
 ## Adding a new route
 
@@ -195,4 +215,6 @@ TL;DR: declare the vocabulary once with `defineAppRoles({ appId, roles, defaultR
 - **create-skill** — How to create skills for new patterns (area 3 in detail)
 - **storing-data** — Where to store the feature's data
 - **real-time-sync** — How the UI stays in sync when the agent writes data
+- **performance** — Query/load cost, and (§9) cold-start artifact size when a
+  feature adds a server-side dependency
 - **internationalization** — How to update localized UI copy and catalogs

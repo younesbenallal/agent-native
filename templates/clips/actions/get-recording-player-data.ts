@@ -1,23 +1,3 @@
-/**
- * Fetch all data the player page needs in one call:
- *   - recording fields
- *   - visibility + access role
- *   - transcript
- *   - comments (flat list — UI groups into threads)
- *   - reactions
- *   - chapters (parsed from recording.chaptersJson)
- *   - CTAs
- *   - counted-view total
- *
- * This is the read endpoint the player/:id and share/:id routes use.
- * Access is gated by assertAccess at viewer level — for public-visibility
- * recordings, any signed-in user can view; for password-protected ones, the
- * route enforces the password before invoking this action.
- *
- * Usage:
- *   pnpm action get-recording-player-data --recordingId=<id>
- */
-
 import { defineAction, embedApp } from "@agent-native/core";
 import { readAppState } from "@agent-native/core/application-state";
 import { buildDeepLink } from "@agent-native/core/server";
@@ -29,21 +9,26 @@ import { getDb, schema } from "../server/db/index.js";
 import { isAgentRecordingCaller } from "../server/lib/agent-recording-access.js";
 import { countRecordingAgentViews } from "../server/lib/agent-views.js";
 import { isMediaVerificationPending } from "../server/lib/media-verification-state.js";
+import { isHeldForRedaction } from "../server/lib/pending-redactions.js";
+import { resolvePlayerThumbnailUrl } from "../server/lib/player-thumbnail-url.js";
 import { resolvePlayerVideoUrl } from "../server/lib/player-video-url.js";
 import {
   canOpenDirectRecordingPage,
-  isRecordingExpired,
+  isRecordingExpiredForViewer,
 } from "../server/lib/recording-page-access.js";
 import { hasExplicitRecordingShare } from "../server/lib/recording-share-grant.js";
 import {
   countRecordingViews,
   parseSpaceIds,
 } from "../server/lib/recordings.js";
+import { isSeekableRepairPending } from "../server/lib/seekable-media-state.js";
+import { hydrateCommentAuthorNames } from "../server/lib/user-identities.js";
 import { parseBrowserDiagnosticsRow } from "../shared/browser-diagnostics.js";
 import {
   CLIPS_BUILDER_CREDITS_STATE_KEY,
   normalizeBuilderCreditsStatus,
 } from "../shared/builder-credits.js";
+import { displayCommentMentions } from "../shared/comment-mentions.js";
 import {
   normalizeTranscriptSegments,
   parseTranscriptSegments,
@@ -95,9 +80,10 @@ function recordingDeepLink(recordingId: string): string {
 
 export default defineAction({
   description:
-    "Fetch everything the player page needs for a recording: metadata, transcript, comments, reactions, chapters, CTAs, the counted-view total, and the caller's effective role. Agent calls receive a bounded transcript payload; browser player calls receive the full transcript.",
+    "Fetch everything the player page needs for a recording: metadata, transcript, comments, reactions, chapters, tags, CTAs, the counted-view total, and the caller's effective role. Agent calls receive a bounded transcript chunk; pass transcriptOffset from nextFullTextOffset until it is null to read the complete transcript. Browser player calls receive the full transcript.",
   schema: z.object({
     recordingId: z.string().describe("Recording ID"),
+    transcriptOffset: z.coerce.number().int().min(0).optional(),
   }),
   mcpApp: {
     compactCatalog: true,
@@ -119,7 +105,12 @@ export default defineAction({
     const db = getDb();
     const rec: any = access.resource;
 
-    if (isRecordingExpired(rec.expiresAt)) {
+    if (
+      isRecordingExpiredForViewer({
+        expiresAt: rec.expiresAt,
+        viewerIsOwner: access.role === "owner",
+      })
+    ) {
       throw new ForbiddenError("Recording has expired");
     }
 
@@ -153,12 +144,12 @@ export default defineAction({
       access.role === "owner" ||
       access.role === "admin" ||
       access.role === "editor";
-    // This action is on a 1-3s poll from the player, so every read here shares
-    // one Promise.all instead of adding serial round-trips.
+    const canCommentRecording = true;
     const [
       cleanupStateRaw,
       builderCreditsRaw,
       verificationPending,
+      seekableRepairPending,
       viewCount,
       agentViewCount,
     ] = await Promise.all([
@@ -170,6 +161,12 @@ export default defineAction({
         ownerEmail: rec.ownerEmail,
         recordingId: args.recordingId,
         recordingStatus: rec.status,
+      }),
+      isSeekableRepairPending({
+        ownerEmail: rec.ownerEmail,
+        recordingId: args.recordingId,
+        recordingStatus: rec.status,
+        videoUrl: rec.videoUrl,
       }),
       countRecordingViews(args.recordingId).catch(() => 0),
       countRecordingAgentViews(args.recordingId).catch(() => 0),
@@ -190,6 +187,7 @@ export default defineAction({
         asc(schema.recordingComments.videoTimestampMs),
         asc(schema.recordingComments.createdAt),
       );
+    const hydratedComments = await hydrateCommentAuthorNames(comments);
 
     const reactions = await db
       .select()
@@ -202,6 +200,13 @@ export default defineAction({
       .from(schema.recordingCtas)
       .where(eq(schema.recordingCtas.recordingId, args.recordingId))
       .orderBy(asc(schema.recordingCtas.createdAt));
+
+    const tagRows = await db
+      .selectDistinct({ tag: schema.recordingTags.tag })
+      .from(schema.recordingTags)
+      .where(eq(schema.recordingTags.recordingId, args.recordingId))
+      .orderBy(asc(schema.recordingTags.tag));
+    const tags = tagRows.map((row) => row.tag);
 
     const [browserDiagnosticsRow] = await db
       .select()
@@ -223,10 +228,6 @@ export default defineAction({
       .where(eq(schema.recordingBugReports.recordingId, args.recordingId))
       .limit(1);
 
-    // Reverse-lookup: if a meeting captured this recording, surface it so the
-    // player can show a "From meeting: <title>" badge linking back to the
-    // meeting detail page. We don't need an FK on recordings — the meetings
-    // table already points at recording_id.
     let meeting: { id: string; title: string } | null = null;
     try {
       const [linkedMeeting] = await db
@@ -241,8 +242,6 @@ export default defineAction({
         meeting = { id: linkedMeeting.id, title: linkedMeeting.title };
       }
     } catch (err) {
-      // Best-effort — a missing meetings table on a fresh install shouldn't
-      // break the player.
       console.warn(
         "[get-recording-player-data] meeting lookup failed:",
         (err as Error)?.message ?? err,
@@ -275,29 +274,10 @@ export default defineAction({
         ? boundTranscriptForAgent({
             fullText: transcript?.fullText,
             segments: transcriptSegments,
+            fullTextOffset: args.transcriptOffset,
           })
         : null;
 
-    // Normalize the dev-fallback videoUrl:
-    //   1. Rewrite legacy `/api/uploads/:id/blob` to `/api/video/:id` so old
-    //      rows keep playing after the route move.
-    //   2. Keep Loom imports behind the same-origin `/api/video/:id` access
-    //      gate. Legacy Loom rows render an iframe inside that route; reuploaded
-    //      Loom rows proxy their stored provider URL from the server.
-    //   3. For password-protected recordings, mint a short-lived HMAC token
-    //      bound to this recording id and pass it via `?t=<token>` instead of
-    //      the plaintext password. Sticking the password in the URL leaks it
-    //      into browser history, CDN logs, the Referer header on outbound
-    //      requests, and — most importantly here — into MCP-host tool results
-    //      (any MCP client receiving this action's structured output would
-    //      otherwise see the plaintext password). The downstream
-    //      `/api/video/:id` route accepts either `?t=<token>` (preferred) or
-    //      `?password=<pw>` (legacy fallback) so old share pages keep
-    //      working during rollout. (audit 11 F-07)
-    //      Owners are skipped — the blob route bypasses the password gate
-    //      for them, so they don't need the token. Remote provider URLs are
-    //      still proxied through same-origin media serving so CORS, range
-    //      requests, and signed URL quirks match public share playback.
     const resolvedVideoUrl = resolvePlayerVideoUrl(rec, {
       addPasswordToken: access.role !== "owner",
       proxyRemoteMedia: true,
@@ -305,6 +285,7 @@ export default defineAction({
 
     return {
       role: access.role,
+      canComment: canCommentRecording,
       viewCount,
       agentViewCount,
       recording: {
@@ -312,9 +293,13 @@ export default defineAction({
         organizationId: rec.organizationId,
         title: rec.title,
         description: rec.description,
-        thumbnailUrl: rec.thumbnailUrl,
-        animatedThumbnailUrl: rec.animatedThumbnailUrl,
-        filmstripUrl: rec.filmstripUrl ?? null,
+        thumbnailUrl: resolvePlayerThumbnailUrl(rec),
+        animatedThumbnailUrl: rec.animatedThumbnailUrl
+          ? resolvePlayerThumbnailUrl(rec, { animated: true })
+          : null,
+        filmstripUrl: isHeldForRedaction(rec.editsJson, access.role)
+          ? null
+          : (rec.filmstripUrl ?? null),
         filmstripFrameCount: rec.filmstripFrameCount ?? 0,
         filmstripColumns: rec.filmstripColumns ?? 0,
         filmstripRows: rec.filmstripRows ?? 0,
@@ -327,19 +312,22 @@ export default defineAction({
         videoUrl: resolvedVideoUrl,
         videoFormat: rec.videoFormat,
         videoSizeBytes: rec.videoSizeBytes ?? null,
+        mediaUpdatedAt: rec.mediaUpdatedAt ?? null,
         width: rec.width,
         height: rec.height,
         hasAudio: Boolean(rec.hasAudio),
         hasCamera: Boolean(rec.hasCamera),
         status: rec.status,
         verificationPending,
+        seekableRepairPending,
         uploadProgress: rec.uploadProgress,
         failureReason: rec.failureReason,
-        // Don't leak the password to clients (especially to MCP hosts that
-        // surface action results to third-party agents); just indicate
-        // whether one was set. The videoUrl above already carries a
-        // short-lived `?t=<token>` for non-owner viewers, so the player
-        // can stream without ever seeing the plaintext password.
+        ...(canEditRecording
+          ? {
+              uploadAttemptId: rec.uploadAttemptId ?? null,
+              uploadGenerationId: rec.uploadGenerationId ?? null,
+            }
+          : {}),
         hasPassword: !!rec.password,
         expiresAt: rec.expiresAt,
         enableComments: Boolean(rec.enableComments),
@@ -349,9 +337,11 @@ export default defineAction({
         animatedThumbnailEnabled: Boolean(rec.animatedThumbnailEnabled),
         visibility: rec.visibility,
         ownerEmail: rec.ownerEmail,
+        folderId: rec.folderId,
         spaceIds: parseSpaceIds(rec.spaceIds),
         createdAt: rec.createdAt,
         updatedAt: rec.updatedAt,
+        trashedAt: rec.trashedAt,
       },
       transcript: transcript
         ? {
@@ -363,6 +353,8 @@ export default defineAction({
             ...(agentTranscript
               ? {
                   fullTextLength: agentTranscript.fullTextLength,
+                  fullTextOffset: agentTranscript.fullTextOffset,
+                  nextFullTextOffset: agentTranscript.nextFullTextOffset,
                   segmentCount: agentTranscript.segmentCount,
                   previewTruncated: agentTranscript.previewTruncated,
                   note: agentTranscript.note,
@@ -395,7 +387,7 @@ export default defineAction({
           }
         : null,
       builderCredits,
-      comments: comments.map((c) => ({
+      comments: hydratedComments.map((c) => ({
         id: c.id,
         recordingId: c.recordingId,
         threadId: c.threadId,
@@ -403,6 +395,7 @@ export default defineAction({
         authorEmail: c.authorEmail,
         authorName: c.authorName,
         content: c.content,
+        mentions: displayCommentMentions(c.mentionsJson),
         videoTimestampMs: c.videoTimestampMs,
         emojiReactionsJson: c.emojiReactionsJson,
         resolved: Boolean(c.resolved),
@@ -418,6 +411,7 @@ export default defineAction({
         createdAt: r.createdAt,
       })),
       chapters,
+      tags,
       ctas: ctas.map((c) => ({
         id: c.id,
         label: c.label,

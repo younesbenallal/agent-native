@@ -3,9 +3,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   signGatewayAccessToken,
   signRealtimeSubscribeToken,
+  signRealtimeVoiceCapability,
   signShortLivedToken,
   verifyGatewayAccessToken,
   verifyRealtimeSubscribeToken,
+  verifyRealtimeVoiceCapability,
   verifyShortLivedToken,
 } from "./short-lived-token.js";
 
@@ -60,7 +62,6 @@ describe("short-lived-token", () => {
   it("rejects a tampered payload (signature no longer matches)", () => {
     const token = signShortLivedToken({ resourceId: "rec_abc" });
     const [, sig] = token.split(".");
-    // Forge a payload claiming a different resource — old sig won't match.
     const forged =
       Buffer.from(JSON.stringify({ resourceId: "rec_xyz", exp: 9e12 }))
         .toString("base64")
@@ -80,7 +81,6 @@ describe("short-lived-token", () => {
       resourceId: "rec_abc",
       ttlSeconds: 60,
     });
-    // Advance past expiry.
     vi.setSystemTime(new Date("2026-04-30T12:02:00Z"));
     const result = verifyShortLivedToken(token, "rec_abc");
     expect(result).toEqual({ ok: false, reason: "expired" });
@@ -107,6 +107,103 @@ describe("short-lived-token", () => {
     expect(verifyShortLivedToken(token, "rec_abc")).toEqual({
       ok: false,
       reason: "bad_signature",
+    });
+  });
+});
+
+describe("realtime voice capability", () => {
+  const originalEnv = { ...process.env };
+  const CALLER = {
+    userEmail: "person@example.com",
+    orgId: "org-1",
+    browserTabId: "tab-1",
+  };
+
+  beforeEach(() => {
+    process.env.OAUTH_STATE_SECRET = "test-secret-do-not-use-in-prod";
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, originalEnv);
+  });
+
+  it("round-trips the manifest and discovered names for the same caller", () => {
+    const token = signRealtimeVoiceCapability(
+      {
+        ...CALLER,
+        toolNames: ["navigate", "view-screen"],
+        discoveredToolNames: ["rare-action"],
+      },
+      600,
+    );
+    expect(verifyRealtimeVoiceCapability(token, CALLER)).toEqual({
+      ok: true,
+      userEmail: "person@example.com",
+      orgId: "org-1",
+      browserTabId: "tab-1",
+      toolNames: ["navigate", "view-screen"],
+      discoveredToolNames: ["rare-action"],
+    });
+  });
+
+  it("rejects a capability replayed by another user, org, or tab", () => {
+    const token = signRealtimeVoiceCapability(
+      { ...CALLER, toolNames: ["navigate"] },
+      600,
+    );
+    for (const impostor of [
+      { ...CALLER, userEmail: "someone-else@example.com" },
+      { ...CALLER, orgId: "org-2" },
+      { ...CALLER, browserTabId: "tab-2" },
+    ]) {
+      expect(verifyRealtimeVoiceCapability(token, impostor)).toEqual({
+        ok: false,
+        reason: "identity_mismatch",
+      });
+    }
+  });
+
+  it("rejects a tool name appended to the payload without re-signing", () => {
+    const token = signRealtimeVoiceCapability(
+      { ...CALLER, toolNames: ["navigate"] },
+      600,
+    );
+    const [payload, sig] = token.split(".");
+    const decoded = JSON.parse(
+      Buffer.from(payload!, "base64url").toString("utf8"),
+    );
+    decoded.toolNames.push("delete-everything");
+    const forged = `${Buffer.from(JSON.stringify(decoded), "utf8").toString(
+      "base64url",
+    )}.${sig}`;
+    expect(verifyRealtimeVoiceCapability(forged, CALLER)).toEqual({
+      ok: false,
+      reason: "bad_signature",
+    });
+  });
+
+  it("rejects an expired capability", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-11T12:00:00.000Z"));
+    const token = signRealtimeVoiceCapability(
+      { ...CALLER, toolNames: ["navigate"] },
+      600,
+    );
+    vi.advanceTimersByTime(601_000);
+    expect(verifyRealtimeVoiceCapability(token, CALLER)).toEqual({
+      ok: false,
+      reason: "expired",
+    });
+  });
+
+  it("reports a missing capability as malformed rather than throwing", () => {
+    expect(verifyRealtimeVoiceCapability(undefined, CALLER)).toEqual({
+      ok: false,
+      reason: "malformed",
     });
   });
 });
@@ -177,13 +274,60 @@ describe("realtime subscribe token", () => {
     expect(() =>
       signRealtimeSubscribeToken({ projectId: "proj_a" }, KEY_A),
     ).toThrow(/owner or orgId/);
-    // orgId alone is sufficient.
     expect(() =>
       signRealtimeSubscribeToken(
         { projectId: "proj_a", orgId: "org-1" },
         KEY_A,
       ),
     ).not.toThrow();
+  });
+
+  it("rejects a token past its absolute ceiling even when exp is live", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    const absExp = Math.floor(Date.now() / 1000) + 60;
+    const token = signRealtimeSubscribeToken(
+      {
+        projectId: "proj_a",
+        owner: "alice@example.com",
+        ttlSeconds: 600,
+        absExp,
+      },
+      KEY_A,
+    );
+    expect(
+      verifyRealtimeSubscribeToken(token, { projectId: "proj_a", key: KEY_A }),
+    ).toMatchObject({ ok: true, absExp });
+
+    vi.advanceTimersByTime(61_000);
+    expect(
+      verifyRealtimeSubscribeToken(token, { projectId: "proj_a", key: KEY_A }),
+    ).toEqual({ ok: false, reason: "session_expired" });
+  });
+
+  it("rejects at the exact ceiling instant, not one tick after", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    const absExp = Math.floor(Date.now() / 1000) + 60;
+    const token = signRealtimeSubscribeToken(
+      {
+        projectId: "proj_a",
+        owner: "alice@example.com",
+        ttlSeconds: 600,
+        absExp,
+      },
+      KEY_A,
+    );
+
+    vi.setSystemTime(absExp * 1000 - 1);
+    expect(
+      verifyRealtimeSubscribeToken(token, { projectId: "proj_a", key: KEY_A }),
+    ).toMatchObject({ ok: true });
+
+    vi.setSystemTime(absExp * 1000);
+    expect(
+      verifyRealtimeSubscribeToken(token, { projectId: "proj_a", key: KEY_A }),
+    ).toEqual({ ok: false, reason: "session_expired" });
   });
 });
 
@@ -264,7 +408,7 @@ describe("gateway access-check token", () => {
   });
 
   it("binds the projectId channel when an expected value is provided", () => {
-    const token = signGatewayAccessToken(claims, KEY_A); // projectId proj_a
+    const token = signGatewayAccessToken(claims, KEY_A);
     expect(verifyGatewayAccessToken(token, KEY_A, "proj_a")).toMatchObject({
       ok: true,
       projectId: "proj_a",

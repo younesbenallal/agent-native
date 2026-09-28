@@ -10,7 +10,7 @@ A **surface** is the way users (or other systems) interact with your app: a chat
 
 ## How surfaces relate to each other
 
-The four main product shapes sit on a spectrum from most interactive to fully headless. What makes them composable is that the foundation stays the same throughout: the same actions, the same SQL database, and the same agent loop power every shape. Adding a new surface doesn't mean rewriting what's underneath — you're just adding a new way to reach the same operations.
+The four main product shapes sit on a spectrum from most interactive to fully headless. What makes them composable is that they share the same actions and SQL-backed app state. Use the framework agent loop when a surface needs an agent. Adding a new surface doesn't mean rewriting what's underneath — you're adding a new way to reach the same operations.
 
 <Diagram id="doc-block-hvdxgh" title="The surface spectrum" summary={"One action surface, four product shapes, each adding UI without changing the operation underneath."}>
 
@@ -37,7 +37,9 @@ The four main product shapes sit on a spectrum from most interactive to fully he
   </div>
 </div>
 <div class="diagram-base" data-rough>
-  <span class="diagram-muted">same actions · same SQL · same agent loop</span>
+  <span class="diagram-muted"
+    >same actions · SQL-backed state · agent loop where used</span
+  >
 </div>
 ```
 
@@ -92,7 +94,7 @@ approve work, inspect native results, and keep a durable thread history.
 For a full app starting point, use the [Chat template](/docs/template-chat):
 
 ```bash
-npx @agent-native/core@latest create my-chat-app --template chat
+npx --yes @agent-native/core@latest create my-chat-app --template chat
 ```
 
 The simplest full-page chat:
@@ -165,6 +167,42 @@ React widget, use [Generative UI](/docs/generative-ui): it renders sandboxed
 Alpine/Tailwind UI inline, can read app state and slot context, and can send
 selected values back to chat.
 
+### Request-scoped action surfaces
+
+Use `resolveActionSurface` when the selected agent or thread must expose only a
+server-authorized subset of native actions. The callback runs for every
+interactive chat request after `prepareRequest`. Returned names form a hard
+allowlist for that request: omitted actions are absent from provider schemas,
+the execution registry, plan-mode preloading, and `tool-search` discovery.
+
+```ts
+createAgentChatPlugin({
+  actions,
+  nativeActionsInDev: true,
+  resolveActionSurface: async ({ threadId, availableActionNames }) => ({
+    allowedActionNames: await loadAllowedActions(
+      threadId,
+      availableActionNames,
+    ),
+  }),
+});
+```
+
+When the same resolver also handles unrestricted chat, return
+`{ mode: "default" }`. This preserves the normal `initialToolNames` filtering
+and `tool-search` discovery instead of loading every available schema on the
+first model request. The explicit mode is preserved across durable
+continuations.
+
+An empty list exposes no native actions. Unknown names fail the request instead
+of widening access. Every allowed action is loaded directly on the first model
+request; include `tool-search` explicitly only when discovery inside the
+already-authorized catalog is wanted. The callback scopes interactive agent
+chat only—it does not change HTTP, MCP, A2A, job, or trigger exposure. Default
+framework guidance and spawned sub-agents inherit the same surface. Trusted
+shell tools are automatically reduced to the request-filtered sandbox because
+an unrestricted shell cannot enforce a hard action boundary.
+
 ## Native inline UI {#native-inline-ui}
 
 Use this when your actions return structured data — a list of records, a chart dataset, a status summary — that should render as a real UI component inside the chat thread rather than a plain text description. You define a `chatUI` renderer on the action, and Agent-Native renders it as a first-party React component: no iframes, no separate rendering path.
@@ -192,7 +230,7 @@ Full apps add product UI around the same action and agent contract:
 
 ### SQL state
 
-App data, navigation, settings, and chat history are all durable. The agent reads and writes the same rows the UI does.
+App data, navigation, settings, and chat history are durable in SQL. The agent reads and writes the same rows the UI does.
 
 ### Context awareness
 
@@ -200,7 +238,7 @@ The agent knows the current route, selection, and focused object, so "edit this"
 
 ### Live sync
 
-Agent changes update the UI in real time, and UI changes update the agent's context. No polling, no refresh.
+Agent changes update the UI through live sync, and UI changes update the agent's context. The framework uses SSE with polling fallback, so users do not need to refresh manually.
 
 ### Deep links
 
@@ -224,7 +262,7 @@ want a complete product shape.
 
 Every Agent-Native app eventually needs a place where users can configure their agent: set standing instructions, review what it's done, connect MCP servers, manage automations, and control access. Building that UI from scratch is a lot of work. Agent-Native ships a pre-built full-page component, `AgentTabsPage`, that covers all of it across twelve tabs.
 
-Mount it at `/agent` in your app. Current templates pair that route with an app-navigation entry and pass `agentPageHref="/agent"` to `AgentSidebar`, so the sidebar's Resources and Settings modes can link to the full page without duplicating those flows.
+First-party templates don't mount it: Settings covers the same ground (Agent › Model, Instructions, Memory, Skills, Files, and Sub-agents, plus the app's Automations and MCP server pages), `/agent` redirects into Settings, and `agentPageHref="/settings/agent"` on `AgentSidebar` opens Settings › Agent › Model. Mount `AgentTabsPage` on its own route when an app wants the whole agent surface on one page.
 
 ```tsx filename="app/routes/agent.tsx"
 import { AgentTabsPage } from "@agent-native/core/client/agent-chat";
@@ -235,22 +273,22 @@ export default function AgentRoute() {
 
 The shared page currently provides twelve tabs across two groups:
 
-| Group     | Tab               | Shows                                                                                                                                                                                                                |
-| --------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Resources | **Files**         | The existing `ResourcesPanel` for personal or organization files                                                                                                                                                     |
-| Resources | **Instructions**  | Always-on AGENTS.md-style rules                                                                                                                                                                                      |
-| Resources | **Agents**        | Custom sub-agent profiles                                                                                                                                                                                            |
-| Resources | **Memory**        | Long-term recall notes                                                                                                                                                                                               |
-| Resources | **Skills**        | Reusable workflows                                                                                                                                                                                                   |
-| Resources | **Learnings**     | Corrections and patterns captured over time                                                                                                                                                                          |
-| Resources | **Remote agents** | A2A connections to other agent-native apps (replaces what the Connections tab used to show)                                                                                                                          |
-| Agent     | **Snapshots**     | A scope preview, token budget, ordered system sections grouped by provenance/governance/source, and the latest live-thread snapshot. Renamed from "Context"; old `#context` links redirect here.                     |
-| Agent     | **Connections**   | MCP server management only                                                                                                                                                                                           |
-| Agent     | **Automations**   | Personal and organization Scheduled/Event automations with pause/resume, details, and delete flows. The stable compatibility URL remains `/agent#jobs`.                                                              |
-| Agent     | **Settings**      | Agent model, API keys, limits, voice, and automation settings                                                                                                                                                        |
-| Agent     | **Access**        | The app MCP URL, an A2A agent card when available, and shared setup guides for Claude, ChatGPT, Cursor, Claude Code, Codex, and other clients. Links to `/mcp/connect` for the full connect flow and token fallback. |
+| Group     | Tab               | Shows                                                                                                                                                                                                                                                   |
+| --------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Resources | **Files**         | The existing `ResourcesPanel` for personal or organization files                                                                                                                                                                                        |
+| Resources | **Instructions**  | Always-on AGENTS.md-style rules                                                                                                                                                                                                                         |
+| Resources | **Agents**        | Custom sub-agent profiles                                                                                                                                                                                                                               |
+| Resources | **Memory**        | Long-term recall notes                                                                                                                                                                                                                                  |
+| Resources | **Skills**        | Reusable workflows                                                                                                                                                                                                                                      |
+| Resources | **Learnings**     | Corrections and patterns captured over time                                                                                                                                                                                                             |
+| Resources | **Remote agents** | A2A connections to other agent-native apps (replaces what the Connections tab used to show)                                                                                                                                                             |
+| Agent     | **Snapshots**     | A scope preview, token budget, ordered system sections grouped by provenance/governance/source, and the latest live-thread snapshot. Renamed from "Context"; old `#context` links redirect here.                                                        |
+| Agent     | **Connections**   | MCP server management only                                                                                                                                                                                                                              |
+| Agent     | **Automations**   | Personal and organization Scheduled/Event automations with pause/resume, details, and delete flows. The stable compatibility URL remains `/agent#jobs`.                                                                                                 |
+| Agent     | **Settings**      | Agent model, API keys, limits, voice, and automation settings                                                                                                                                                                                           |
+| Agent     | **MCP**           | The app MCP URL, an A2A agent card when available, and shared setup guides for Claude, ChatGPT, Cursor, Claude Code, Codex, and other clients. Find it in **Settings → MCP server** or use `/mcp/connect` for the full connect flow and token fallback. |
 
-The page shows personal (`user`-scope) data only. There is no org-level toggle today. It is a thin shell over existing components and access checks, not a new admin console: Connections describes what the app can call; Access describes how external clients connect to it.
+The page shows personal (`user`-scope) data only. There is no org-level toggle today. It is a thin shell over existing components and access checks, not a new admin console: Connections describes what the app can call; MCP describes how external clients connect to it.
 
 Not yet included:
 
@@ -396,7 +434,7 @@ point with Slack/Telegram, scheduled jobs, and shared secrets out of the box.
 The smallest no-browser local path is a scaffold plus one action:
 
 ```bash
-npx @agent-native/core@latest create my-agent --headless
+npx --yes @agent-native/core@latest create my-agent --headless
 cd my-agent
 pnpm install
 ```
@@ -407,6 +445,7 @@ Then define the durable operation:
 import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
 
+// One action powers every app surface: UI, agent, HTTP, MCP, A2A, and CLI.
 export default defineAction({
   description: "Summarize this week's submissions.",
   readOnly: true,
@@ -448,8 +487,8 @@ Every `defineAction` is auto-mounted at `/_agent-native/actions/<name>`. The JSO
 
 This is not a no-database or stateless mode. The app-agent loop stores sessions,
 threads, runs, settings, credentials, application state, and share records in
-SQL. Local development defaults to SQLite; hosted automation-first apps should
-use a persistent SQL database.
+SQL. Local development uses PGlite; hosted automation-first apps should use a
+persistent PostgreSQL database.
 
 If you need the whole agent loop headlessly from the project folder, use:
 
@@ -559,7 +598,7 @@ tool-result metadata. Start there when wiring an external agent into the chat.
 
 <Cards>
 
-### [Actions](/docs/actions)
+### [Actions](/docs/actions-overview)
 
 Define the operation once. Every surface above calls the same one.
 

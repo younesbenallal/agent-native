@@ -1,20 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
-// ---------------------------------------------------------------------------
-// buildResilientNeonPool — unit tests
-//
-// Tests the three retry-safety scenarios mandated by the task:
-//   1. read (SELECT) retried on connection-class errors
-//   2. write NOT retried on post-send errors
-//   3. write retried once on acquire-timeout (pre-send CONNECT_TIMEOUT)
-//
-// Pool and client are plain mocks — no real DB required.
-// ---------------------------------------------------------------------------
-
-// Use a tight per-test timeout so hung-pool scenarios resolve quickly.
 const TIMEOUT_MS = 20;
 
-/** Build a minimal mock pool that records calls and can be configured to fail. */
 function makeMockPool(
   opts: {
     connectBehavior?: "ok" | "fail" | "timeout";
@@ -31,7 +18,6 @@ function makeMockPool(
   let connectCalls = 0;
   let queryCalls = 0;
 
-  // Track released clients
   const releaseCalls: Array<{ err: any }> = [];
 
   function makeClient() {
@@ -70,14 +56,12 @@ function makeMockPool(
         throw err;
       }
       if (connectBehavior === "timeout") {
-        // Never resolves — simulates a frozen WebSocket.
         return new Promise<never>(() => {});
       }
       return makeClient();
     }),
 
     query: vi.fn(async (sql: string, args?: any[]) => {
-      // Pool-level query (used by drizzle for simple queries outside transactions)
       const client = await pool.connect();
       try {
         const result = await client.query(sql, args);
@@ -102,8 +86,6 @@ describe("buildResilientNeonPool", () => {
     vi.unstubAllEnvs();
   });
 
-  // Override DB_OP_TIMEOUT_MS so tests run fast without relying on the
-  // serverless/non-serverless default (8 s or 30 s).
   beforeEach(() => {
     vi.stubEnv("DB_OP_TIMEOUT_MS", String(TIMEOUT_MS));
   });
@@ -116,7 +98,6 @@ describe("buildResilientNeonPool", () => {
       connect: vi.fn(async () => {
         callCount++;
         if (callCount === 1) {
-          // First acquire succeeds, but query fails with ECONNRESET.
           return {
             query: vi.fn(async () => {
               const err: any = new Error("ECONNRESET");
@@ -126,7 +107,6 @@ describe("buildResilientNeonPool", () => {
             release: vi.fn(),
           };
         }
-        // Second attempt succeeds.
         return {
           query: vi.fn(async () => ({ rows: [{ id: 42 }], rowCount: 1 })),
           release: vi.fn(),
@@ -140,7 +120,6 @@ describe("buildResilientNeonPool", () => {
     const resilient = buildResilientNeonPool(pool as any);
     const result = await resilient.query("SELECT id FROM users");
 
-    // Should have retried: connect called twice.
     expect(pool.connect).toHaveBeenCalledTimes(2);
     expect(result.rows).toEqual([{ id: 42 }]);
   });
@@ -194,7 +173,6 @@ describe("buildResilientNeonPool", () => {
         connectCount++;
         return {
           query: vi.fn(async () => {
-            // Error surfaces after the statement was sent — post-send failure.
             const err: any = new Error("ECONNRESET after write");
             err.code = "ECONNRESET";
             throw err;
@@ -213,7 +191,6 @@ describe("buildResilientNeonPool", () => {
       resilient.query("INSERT INTO users (name) VALUES ($1)", ["alice"]),
     ).rejects.toMatchObject({ code: "ECONNRESET" });
 
-    // Connect must have been called only once — no retry on post-send write errors.
     expect(connectCount).toBe(1);
   });
 
@@ -225,10 +202,8 @@ describe("buildResilientNeonPool", () => {
       connect: vi.fn(async () => {
         connectCount++;
         if (connectCount === 1) {
-          // First acquire: never resolves → withDbTimeout fires CONNECT_TIMEOUT.
           return new Promise<never>(() => {});
         }
-        // Second acquire: succeeds.
         return {
           query: vi.fn(async () => ({ rows: [], rowCount: 1 })),
           release: vi.fn(),
@@ -246,7 +221,6 @@ describe("buildResilientNeonPool", () => {
       ["bob"],
     );
 
-    // Should have retried after the acquire timeout.
     expect(connectCount).toBe(2);
     expect(result.rowCount).toBe(1);
   });
@@ -257,7 +231,6 @@ describe("buildResilientNeonPool", () => {
     const pool = makeMockPool();
     const resilient = buildResilientNeonPool(pool as any);
 
-    // end() and on() are forwarded
     await resilient.end();
     expect(pool.end).toHaveBeenCalledTimes(1);
 
@@ -283,8 +256,73 @@ describe("buildResilientNeonPool", () => {
     await resilient.query("SELECT 1");
 
     expect(releasesMock).toHaveBeenCalledTimes(1);
-    // Called with no error argument on clean release (undefined = return slot to pool)
     expect(releasesMock).toHaveBeenCalledWith(undefined);
+  });
+
+  it("arms Neon idle transaction cleanup when Drizzle starts a transaction", async () => {
+    const { buildResilientNeonPool } = await import("./create-get-db.js");
+
+    const client = {
+      query: vi.fn(async () => ({ rows: [], rowCount: 0 })),
+      release: vi.fn(),
+    };
+    const pool = {
+      connect: vi.fn(async () => client),
+      query: vi.fn(),
+      end: vi.fn(),
+      on: vi.fn(),
+    };
+
+    const resilient = buildResilientNeonPool(pool as any);
+    const transactionClient = await resilient.connect();
+
+    await transactionClient.query({ text: "begin", rowMode: "array" }, []);
+    await transactionClient.query("SELECT 1");
+
+    expect(client.query).toHaveBeenNthCalledWith(
+      1,
+      "begin; SET LOCAL idle_in_transaction_session_timeout = 30000",
+    );
+    expect(client.query).toHaveBeenNthCalledWith(2, "SELECT 1");
+  });
+
+  it("bounds Drizzle transaction acquires and releases late clients", async () => {
+    const { buildResilientNeonPool } = await import("./create-get-db.js");
+
+    let resolveLateAcquire!: (client: any) => void;
+    const lateClient = {
+      query: vi.fn(),
+      release: vi.fn(),
+    };
+    const client = {
+      query: vi.fn(async () => ({ rows: [], rowCount: 0 })),
+      release: vi.fn(),
+    };
+    const pool = {
+      connect: vi
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              resolveLateAcquire = resolve;
+            }),
+        )
+        .mockResolvedValueOnce(client),
+      query: vi.fn(),
+      end: vi.fn(),
+      on: vi.fn(),
+    };
+
+    const resilient = buildResilientNeonPool(pool as any);
+    const transactionClient = await resilient.connect();
+
+    expect(pool.connect).toHaveBeenCalledTimes(2);
+    await transactionClient.query("SELECT 1");
+    transactionClient.release();
+
+    resolveLateAcquire(lateClient);
+    await Promise.resolve();
+    expect(lateClient.release).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -301,5 +339,99 @@ describe("isSqlRead", () => {
     expect(isSqlRead("INSERT INTO users (name) VALUES ($1)")).toBe(false);
     expect(isSqlRead("UPDATE users SET name=$1 WHERE id=$2")).toBe(false);
     expect(isSqlRead("DELETE FROM sessions WHERE id=$1")).toBe(false);
+  });
+});
+
+describe("createGetDb — lazy proxy before init resolves", () => {
+  afterEach(() => {
+    vi.resetModules();
+  });
+
+  async function getLazyDbFactory(): Promise<() => any> {
+    vi.doMock("./client.js", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("./client.js")>();
+      return {
+        ...actual,
+        isPgliteUrl: vi.fn(() => true),
+        loadPgliteDrizzle: vi.fn(() => new Promise(() => {})),
+      };
+    });
+    const { createGetDb } = await import("./create-get-db.js");
+    return createGetDb({});
+  }
+
+  it("fails loudly instead of masquerading as a resolved SQL entity when probed via getSQL/shouldOmitSQLParens", async () => {
+    const getDb = await getLazyDbFactory();
+    const db = getDb();
+
+    const subqueryChain = db.select({ id: "recordingId" }).from("meetings");
+
+    for (const prop of ["getSQL", "shouldOmitSQLParens"] as const) {
+      expect(() => subqueryChain[prop]).toThrow(/unresolved|await/i);
+    }
+  });
+
+  it("does not recurse forever when duck-typed the way SQL.buildQueryFromSourceParams does", async () => {
+    const getDb = await getLazyDbFactory();
+    const db = getDb();
+    const subqueryChain = db.select({ id: "recordingId" }).from("meetings");
+
+    function isSQLWrapper(value: any): boolean {
+      return (
+        value !== null &&
+        value !== undefined &&
+        typeof value.getSQL === "function"
+      );
+    }
+    function drainAsSql(value: any): any {
+      if (isSQLWrapper(value)) return drainAsSql(value.getSQL());
+      return value;
+    }
+
+    expect(() => drainAsSql(subqueryChain)).toThrow(/unresolved|await/i);
+  });
+});
+
+describe("createGetDb hosted-runtime local database guard", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+    Reflect.deleteProperty(globalThis as Record<string, unknown>, "__env__");
+    Reflect.deleteProperty(globalThis as Record<string, unknown>, "__cf_env");
+  });
+
+  it("rejects instead of opening PGlite on a hosted function invocation with no database URL", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("AWS_LAMBDA_FUNCTION_NAME", "app-server");
+    vi.stubEnv("APP_NAME", "");
+    vi.stubEnv("DATABASE_URL", "");
+    vi.stubEnv("DATABASE_URL_UNPOOLED", "");
+    vi.stubEnv("NETLIFY_DATABASE_URL", "");
+    vi.stubEnv("NETLIFY_DATABASE_URL_UNPOOLED", "");
+
+    const { createGetDb } = await import("./create-get-db.js");
+    const { HostedRuntimeLocalDatabaseError } = await import("./client.js");
+    const getDb = createGetDb({});
+
+    await expect(getDb().select()).rejects.toThrow(
+      HostedRuntimeLocalDatabaseError,
+    );
+  });
+
+  it("rejects on a Cloudflare Worker/Pages invocation with no database URL", async () => {
+    vi.stubEnv("APP_NAME", "");
+    vi.stubEnv("DATABASE_URL", "");
+    vi.stubEnv("DATABASE_URL_UNPOOLED", "");
+    vi.stubEnv("NETLIFY_DATABASE_URL", "");
+    vi.stubEnv("NETLIFY_DATABASE_URL_UNPOOLED", "");
+    vi.stubGlobal("__cf_env", {});
+
+    const { createGetDb } = await import("./create-get-db.js");
+    const { HostedRuntimeLocalDatabaseError } = await import("./client.js");
+    const getDb = createGetDb({});
+
+    await expect(getDb().select()).rejects.toThrow(
+      HostedRuntimeLocalDatabaseError,
+    );
   });
 });

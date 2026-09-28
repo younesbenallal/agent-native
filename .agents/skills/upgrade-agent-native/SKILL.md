@@ -1,7 +1,7 @@
 ---
 name: upgrade-agent-native
 description: >-
-  Bring an older Agent Native app or workspace current. Use when updating
+  Bring an older Agent-Native app or workspace current. Use when updating
   @agent-native/core, fixing a broken upgrade, or when tempted to patch or
   override core/dispatch packages to make an old branch run.
 scope: dev
@@ -9,14 +9,15 @@ metadata:
   internal: true
 ---
 
-# Upgrade Agent Native
+# Upgrade Agent-Native
 
 ## Rule
 
-When an older Agent Native app/branch needs to run on current packages, use
+When an older Agent-Native app/branch needs to run on current packages, use
 `agent-native upgrade`. Never "fix" upgrade breakage with
-`pnpm.overrides`, `patchedDependencies`, `resolutions`, local patches, or
-edits under `node_modules/@agent-native/*` — especially not against
+`pnpm patch`, `pnpm patch-commit`, `pnpm.patchedDependencies`,
+`pnpm.overrides`, `patchedDependencies`, `resolutions`, local patch artifacts,
+or edits under `node_modules/@agent-native/*` — especially not against
 `@agent-native/core` or `@agent-native/dispatch`.
 
 ## Why
@@ -109,6 +110,8 @@ install → refresh scaffold skills → verify, then fix **app** code only.
 
 - Don't add `pnpm.overrides`, `overrides`, `resolutions`, or
   `patchedDependencies` for any `@agent-native/*` package
+- Don't run `pnpm patch` or `pnpm patch-commit`, or commit files under
+  `patches/`, for any dependency
 - Don't edit `node_modules/@agent-native/core` or
   `node_modules/@agent-native/dispatch`
 - Don't invent local "dispatch behavior" shims to paper over version skew

@@ -14,13 +14,14 @@ import {
   getRequestOrgId,
   getRequestUserEmail,
 } from "@agent-native/core/server/request-context";
-import { getSetting, putSetting } from "@agent-native/core/settings";
+import { getSetting, mutateSetting } from "@agent-native/core/settings";
 import {
   accessFilter,
   assertAccess,
   resolveAccess,
   type ResolvedAccess,
 } from "@agent-native/core/sharing";
+import { track } from "@agent-native/core/tracking";
 import {
   and,
   desc,
@@ -58,9 +59,10 @@ import {
   enqueueCaptureInvalidation,
   enqueueBrainOperation,
 } from "./ingest-queue.js";
-import type {
-  BrainAudienceAssignment,
-  BrainSensitivityDecision,
+import {
+  BRAIN_SENSITIVITY_POLICY_VERSION,
+  type BrainAudienceAssignment,
+  type BrainSensitivityDecision,
 } from "./search-index-contracts.js";
 
 export const BRAIN_SETTINGS_KEY = "brain-settings";
@@ -197,15 +199,18 @@ export async function readBrainSettings(): Promise<BrainSettings> {
   } as BrainSettings;
 }
 
+// Patches merge inside the store's compare-and-swap so concurrent one-field
+// saves both land, and a failed read fails the save instead of merging the
+// patch into defaults and wiping every other stored field.
 export async function writeBrainSettings(
   patch: Partial<BrainSettings>,
 ): Promise<BrainSettings> {
-  const next = {
-    ...(await readBrainSettings()),
+  const stored = await mutateSetting(BRAIN_SETTINGS_KEY, (current) => ({
+    ...DEFAULT_BRAIN_SETTINGS,
+    ...(current ?? {}),
     ...patch,
-  };
-  await putSetting(BRAIN_SETTINGS_KEY, next);
-  return next;
+  }));
+  return { ...DEFAULT_BRAIN_SETTINGS, ...stored } as BrainSettings;
 }
 
 export interface BrainAgentGuidance {
@@ -272,7 +277,7 @@ function retrievalPolicy(
         rawCaptureFallback: "allowed-leads" as const,
         instructions: [
           "Start with reviewed Brain knowledge, then include accessible raw captures and source records as clearly labeled leads.",
-          "Never present raw capture matches as approved company knowledge.",
+          "Never present raw capture matches as approved company knowledge or answer evidence; use them only as leads for review.",
           "Say when a result is unreviewed and needs distillation or review.",
         ],
       };
@@ -282,7 +287,7 @@ function retrievalPolicy(
         rawCaptureFallback: "thin-results" as const,
         instructions: [
           "Prefer reviewed Brain knowledge.",
-          "Use accessible raw captures only when reviewed knowledge is missing or too thin, and label them as raw capture matches.",
+          "Use accessible raw captures only when reviewed knowledge is missing or too thin, return them as clearly labeled leads, and never use their text as answer evidence.",
           "Do not invent facts beyond returned Brain results.",
         ],
       };
@@ -355,8 +360,8 @@ export function buildBrainAgentGuidance(
     response: {
       toneInstruction: toneInstruction(tone),
       citationInstruction: requireCitations
-        ? "Cite Brain evidence or source URLs for factual claims; say when support is missing."
-        : "Include citations when helpful, but concise uncited summaries are allowed by workspace settings.",
+        ? "Cite published Brain knowledge evidence or source URLs for factual claims; raw captures are leads, not answer citations; say when approved support is missing."
+        : "Include published Brain knowledge citations when helpful; raw captures are leads, not answer evidence, and concise uncited summaries are allowed by workspace settings.",
     },
   };
 }
@@ -524,7 +529,7 @@ export function serializeProposal(
 
 export async function getAccessibleSource(
   sourceId: string,
-  role: "viewer" | "editor" | "admin" | "owner" = "viewer",
+  role: "viewer" | "commenter" | "editor" | "admin" | "owner" = "viewer",
 ): Promise<ResolvedAccess> {
   if (role !== "viewer") {
     return assertAccess("brain-source", sourceId, role);
@@ -609,7 +614,7 @@ export async function createSource(values: {
     lastError: null,
     ownerEmail,
     orgId,
-    visibility: values.visibility ?? "org",
+    visibility: values.visibility ?? "private",
     createdAt: now,
     updatedAt: now,
   });
@@ -643,8 +648,30 @@ export async function ensureManualSource(title = "Manual imports") {
 }
 
 function isUniqueConflict(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return /unique constraint|duplicate key|unique/i.test(message);
+  if (!error || typeof error !== "object") {
+    return /unique constraint|duplicate key|duplicate entry|unique/i.test(
+      String(error),
+    );
+  }
+
+  const candidate = error as {
+    code?: unknown;
+    message?: unknown;
+    cause?: unknown;
+  };
+  if (candidate.code === "23505") {
+    return true;
+  }
+  if (typeof candidate.message === "string") {
+    if (
+      /unique constraint|duplicate key|duplicate entry|unique violation|unique/i.test(
+        candidate.message,
+      )
+    ) {
+      return true;
+    }
+  }
+  return candidate.cause !== error && isUniqueConflict(candidate.cause);
 }
 
 const UPSTREAM_DELETED_POLICY_VERSION = "upstream-deleted-v1";
@@ -755,6 +782,7 @@ export async function createCapture(values: {
       title: source.title,
       provider: source.provider as BrainSourceProvider,
       ownerEmail: source.ownerEmail,
+      orgId: source.orgId,
     },
     sourceConfig: parseJson<Record<string, unknown>>(source.configJson, {}),
     settings,
@@ -769,11 +797,12 @@ export async function createCapture(values: {
         disposition: "quarantined",
         categories: [],
         confidenceBand: "uncertain",
-        policyVersion: "1",
+        policyVersion: BRAIN_SENSITIVITY_POLICY_VERSION,
         safeSegments: [],
         safeContent: "",
         classifier: "deterministic",
       },
+      classifierFailureReason: sanitized.classifierFailureReason,
       retentionHours: settings.quarantineRetentionHours ?? 72,
     });
     throw new BrainCaptureBlockedError(receipt);
@@ -892,7 +921,7 @@ export async function createCapture(values: {
       ),
     );
   }
-  const finalized = await db
+  const finalized = (await db
     .update(schema.brainRawCaptures)
     .set({
       title: sanitized.title,
@@ -908,7 +937,7 @@ export async function createCapture(values: {
       audienceAclHash: audience.aclHash,
       updatedAt: now,
     })
-    .where(and(...finalizationClauses));
+    .where(and(...finalizationClauses))) as { rowsAffected: number };
   if (finalized.rowsAffected === 0 && values.externalId) {
     await db
       .delete(schema.brainCaptureAudiences)
@@ -1224,6 +1253,7 @@ export async function recordBlockedCapture(input: {
   source: typeof schema.brainSources.$inferSelect;
   values: Parameters<typeof createCapture>[0];
   decision: BrainSensitivityDecision;
+  classifierFailureReason?: string;
   retentionHours: number;
 }): Promise<BrainSensitivityReceipt> {
   const db = getDb();
@@ -1283,6 +1313,10 @@ export async function recordBlockedCapture(input: {
       locatorHmac,
       disposition,
       categoriesJson: stableJson(input.decision.categories),
+      decisionScoresJson: input.decision.categoryScores
+        ? stableJson(input.decision.categoryScores)
+        : null,
+      classifierFailureReason: input.classifierFailureReason ?? null,
       confidenceBand: input.decision.confidenceBand,
       policyVersion: input.decision.policyVersion,
       upstreamProvider: input.source.provider,
@@ -1300,6 +1334,10 @@ export async function recordBlockedCapture(input: {
         captureId: input.existing?.id ?? null,
         disposition,
         categoriesJson: stableJson(input.decision.categories),
+        decisionScoresJson: input.decision.categoryScores
+          ? stableJson(input.decision.categoryScores)
+          : null,
+        classifierFailureReason: input.classifierFailureReason ?? null,
         confidenceBand: input.decision.confidenceBand,
         quarantineBlobHandle,
         expiresAt,
@@ -2143,6 +2181,24 @@ export async function writeKnowledgeRecord(
       .set({ supersededById: id, status: "archived", updatedAt: nowIso() })
       .where(eq(schema.brainKnowledge.id, input.supersedesId));
   }
+  if (!existing) {
+    try {
+      track(
+        "knowledge_created",
+        {
+          app_name: "brain",
+          template_name: "brain",
+          output_id: id,
+          output_type: "knowledge",
+          kind: input.kind ?? "fact",
+          publish_tier: tier,
+        },
+        { userId: userEmail },
+      );
+    } catch {
+      console.warn("[brain] Could not emit knowledge creation telemetry");
+    }
+  }
   return {
     mode: "knowledge" as const,
     knowledge: serializeKnowledge(returned),
@@ -2183,6 +2239,9 @@ export async function searchKnowledgeRows(args: {
         like(schema.brainKnowledge.title, q),
         like(schema.brainKnowledge.body, q),
         like(schema.brainKnowledge.summary, q),
+        like(schema.brainKnowledge.topic, q),
+        like(schema.brainKnowledge.tagsJson, q),
+        like(schema.brainKnowledge.entitiesJson, q),
       )!,
     );
   }

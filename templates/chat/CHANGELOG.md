@@ -1,10 +1,17 @@
 # Changelog
 
-All notable user-facing changes to Chat are documented here. Open it any
-time from the command menu (Cmd+K → "What's new").
+All notable user-facing changes to this app are documented here.
 
-## 2026-06-23
+## 2026-09-27
 
-### Added
+### Fixed
 
-- See what's new right inside Chat — a changelog now lives in the command menu (Cmd+K).
+- Chat retries the original request with its attachments after model setup.
+
+## 2026-08-27
+
+### Fixed
+
+- Chat includes the runtime packages needed for provider keys after deployment.
+
+For the full list of updates, see the [changelog folder](./changelog/).

@@ -51,6 +51,10 @@ describe("AutomationScheduleDialog", () => {
           schedule={props.schedule ?? "0 8 * * *"}
           timezone={props.timezone ?? null}
           saving={false}
+          scheduledTriggerState={{
+            kind: "resolved",
+            status: { available: true, driver: "netlify-scheduled-function" },
+          }}
           onCancel={() => {}}
           onSave={onSave}
         />,
@@ -75,8 +79,6 @@ describe("AutomationScheduleDialog", () => {
   });
 
   it("keeps Save disabled until something actually changes", () => {
-    // A legacy automation has no stored zone, so the picker defaults to the
-    // browser's. That default is not an edit and must not arm the button.
     render({ schedule: "0 8 * * *", timezone: null });
 
     expect(findButton(document.body, "Save").disabled).toBe(true);

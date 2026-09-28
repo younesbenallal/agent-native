@@ -25,14 +25,14 @@ const DropdownMenuSubTrigger = React.forwardRef<
   <DropdownMenuPrimitive.SubTrigger
     ref={ref}
     className={cn(
-      "flex cursor-default select-none items-center rounded-sm px-2 py-1.5 text-sm outline-none focus:bg-accent data-[state=open]:bg-accent",
+      "flex cursor-default select-none items-center gap-2 rounded-sm px-2 py-1.5 text-sm outline-none focus:bg-accent data-[state=open]:bg-accent",
       inset && "ps-8",
       className,
     )}
     {...props}
   >
     {children}
-    <IconChevronRight className="ms-auto h-4 w-4 rtl:-scale-x-100" />
+    <IconChevronRight className="ms-auto h-4 w-4 shrink-0 rtl:-scale-x-100" />
   </DropdownMenuPrimitive.SubTrigger>
 ));
 DropdownMenuSubTrigger.displayName =
@@ -54,6 +54,8 @@ const DropdownMenuSubContent = React.forwardRef<
     <DropdownMenuPrimitive.SubContent
       ref={ref}
       className={cn(
+        // compositing-ok: Radix content mounts on open and unmounts on close,
+        // so the promoted layer is retired with it.
         "z-[290] min-w-[8rem] origin-[var(--radix-dropdown-menu-content-transform-origin)] overflow-hidden rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-lg will-change-[transform,opacity] data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:duration-100 data-[state=open]:duration-150 data-[state=closed]:ease-out data-[state=open]:ease-out data-[side=bottom]:slide-in-from-top-1 data-[side=left]:slide-in-from-right-1 data-[side=right]:slide-in-from-left-1 data-[side=top]:slide-in-from-bottom-1 motion-reduce:data-[state=open]:zoom-in-100 motion-reduce:data-[state=closed]:zoom-out-100 motion-reduce:data-[side=bottom]:slide-in-from-top-0 motion-reduce:data-[side=left]:slide-in-from-right-0 motion-reduce:data-[side=right]:slide-in-from-left-0 motion-reduce:data-[side=top]:slide-in-from-bottom-0",
         className,
       )}
@@ -67,8 +69,6 @@ DropdownMenuSubContent.displayName =
 type DropdownMenuContentProps = React.ComponentPropsWithoutRef<
   typeof DropdownMenuPrimitive.Content
 > & {
-  // Allows rendering the portal into a custom container; useful when the menu
-  // must appear above a specific stacking context (e.g. a fullscreen video player).
   container?: React.ComponentPropsWithoutRef<
     typeof DropdownMenuPrimitive.Portal
   >["container"];
@@ -83,6 +83,8 @@ const DropdownMenuContent = React.forwardRef<
       ref={ref}
       sideOffset={sideOffset}
       className={cn(
+        // compositing-ok: Radix content mounts on open and unmounts on close,
+        // so the promoted layer is retired with it.
         "z-[290] min-w-[8rem] origin-[var(--radix-dropdown-menu-content-transform-origin)] overflow-hidden rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md will-change-[transform,opacity] data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:duration-100 data-[state=open]:duration-150 data-[state=closed]:ease-out data-[state=open]:ease-out data-[side=bottom]:slide-in-from-top-1 data-[side=left]:slide-in-from-right-1 data-[side=right]:slide-in-from-left-1 data-[side=top]:slide-in-from-bottom-1 motion-reduce:data-[state=open]:zoom-in-100 motion-reduce:data-[state=closed]:zoom-out-100 motion-reduce:data-[side=bottom]:slide-in-from-top-0 motion-reduce:data-[side=left]:slide-in-from-right-0 motion-reduce:data-[side=right]:slide-in-from-left-0 motion-reduce:data-[side=top]:slide-in-from-bottom-0",
         className,
       )}
@@ -192,7 +194,10 @@ const DropdownMenuShortcut = ({
 }: React.HTMLAttributes<HTMLSpanElement>) => {
   return (
     <span
-      className={cn("ms-auto text-xs tracking-widest opacity-60", className)}
+      className={cn(
+        "ms-auto ps-4 text-xs tracking-widest opacity-60",
+        className,
+      )}
       {...props}
     />
   );

@@ -1,16 +1,4 @@
-/**
- * See what the user is currently looking at on screen.
- *
- * Reads `navigation` application state and fetches the relevant context
- * (recording + transcript + comments if viewing a recording, folder contents
- * if on library/shared-with-me, space list if on spaces, etc.). Returns a single JSON
- * snapshot the agent can reason over.
- *
- * Usage:
- *   pnpm action view-screen
- */
-
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import {
   readAppState,
   readAppStateForCurrentTab,
@@ -38,6 +26,7 @@ import {
   ownerEmailMatches,
   parseSpaceIds,
 } from "../server/lib/recordings.js";
+import { hydrateCommentAuthorNames } from "../server/lib/user-identities.js";
 import { parseBrowserDiagnosticsRow } from "../shared/browser-diagnostics.js";
 import { buildTranscriptPreview } from "./lib/transcript-preview.js";
 
@@ -128,17 +117,19 @@ async function fetchComments(recordingId: string) {
     .from(schema.recordingComments)
     .where(eq(schema.recordingComments.recordingId, recordingId))
     .orderBy(asc(schema.recordingComments.videoTimestampMs));
-  return rows.map((c) => ({
-    id: c.id,
-    threadId: c.threadId,
-    parentId: c.parentId,
-    authorEmail: c.authorEmail,
-    authorName: c.authorName,
-    content: c.content,
-    videoTimestampMs: c.videoTimestampMs,
-    resolved: Boolean(c.resolved),
-    createdAt: c.createdAt,
-  }));
+  return hydrateCommentAuthorNames(
+    rows.map((c) => ({
+      id: c.id,
+      threadId: c.threadId,
+      parentId: c.parentId,
+      authorEmail: c.authorEmail,
+      authorName: c.authorName,
+      content: c.content,
+      videoTimestampMs: c.videoTimestampMs,
+      resolved: Boolean(c.resolved),
+      createdAt: c.createdAt,
+    })),
+  );
 }
 
 async function fetchBrowserDiagnosticsSummary(recordingId: string) {
@@ -210,7 +201,8 @@ async function fetchLibrary({
       conditions.push(eq(schema.recordings.organizationId, organizationId));
     }
   }
-  const meetingRecordingIds = db
+  const resolvedDb = await Promise.resolve(db);
+  const meetingRecordingIds = resolvedDb
     .select({ id: schema.meetings.recordingId })
     .from(schema.meetings)
     .where(isNotNull(schema.meetings.recordingId));
@@ -260,8 +252,6 @@ async function fetchFoldersForSpace(spaceId: string | null) {
 }
 
 async function fetchSpaces(organizationId: string | null) {
-  // No active org -> don't leak cross-tenant spaces. The org switcher in the
-  // UI is responsible for prompting the user to choose an organization.
   if (!organizationId) return [];
   const db = getDb();
   const rows = await db
@@ -309,8 +299,6 @@ async function fetchUpcomingMeetings() {
     )
     .orderBy(asc(schema.meetings.scheduledStart))
     .limit(10);
-  // Pre-fetch participants for all upcoming meetings so the agent can see
-  // attendees without a follow-up call. Cheap: top 10 meetings.
   const ids = rows.map((m) => m.id);
   const participantsByMeeting = new Map<
     string,
@@ -425,7 +413,7 @@ async function fetchMeetingDetail(meetingId: string) {
       source: meeting.source,
       userNotesMd: meeting.userNotesMd,
       transcriptStatus: meeting.transcriptStatus,
-      shareTranscript: Boolean(meeting.shareTranscript),
+      shareTranscript: meeting.shareTranscript === true,
       summaryMd: meeting.summaryMd,
       bullets: safeJsonArray<{ text: string }>(meeting.bulletsJson),
     },
@@ -461,7 +449,6 @@ async function fetchRecentDictations() {
     durationMs: d.durationMs,
     source: d.source,
     targetApp: d.targetApp,
-    // First 200 chars only — the list view doesn't need the full body.
     preview: (d.fullText ?? "").slice(0, 200),
     hasCleanedText: Boolean(d.cleanedText),
   }));
@@ -540,8 +527,6 @@ export default defineAction({
   schema: z.object({}),
   http: false,
   run: async () => {
-    // Scoped to the requesting browser tab so each tab exposes the clip it is
-    // showing, falling back to the global key for CLI/external agents.
     const navigation = (await readAppStateForCurrentTab(
       "navigation",
     )) as NavigationState | null;

@@ -11,6 +11,8 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useRef, useState } from "react";
 
+import { CLIPS_MEETINGS, isLabEnabled } from "../../../shared/labs";
+import { loadDesktopAuthToken } from "../app";
 import { dismissMeetingNotification } from "../lib/meeting-notification-dismissal";
 import {
   detectMeetingJoinProvider,
@@ -19,6 +21,7 @@ import {
   type MeetingJoinProvider,
 } from "../lib/meeting-notification-timing";
 import { openMeetingJoinUrl } from "../lib/open-meeting-join-url";
+import { loadStoredServerUrl } from "../lib/url";
 
 interface NotificationData {
   type: "calendar" | "adhoc";
@@ -40,15 +43,10 @@ interface TranscriptionStatusPayload {
 const SNOOZE_MS = 5 * 60_000;
 const FALLBACK_AUTO_HIDE_MS = 6 * 60_000;
 const DISMISSAL_TOMBSTONE_MS = 30 * 60_000;
-// Card is up to 440px wide; the extra width keeps its close control and menu
-// inside the transparent window edges.
 const NOTIFICATION_WINDOW_WIDTH = 504;
 const NOTIFICATION_COLLAPSED_HEIGHT = 120;
 const NOTIFICATION_MENU_HEIGHT = 224;
 
-/**
- * Open a meeting join URL via its native desktop app when supported.
- */
 async function openJoinUrl(url: string | null | undefined): Promise<void> {
   if (!url) return;
   try {
@@ -70,8 +68,6 @@ function resizeNotificationWindow(expanded: boolean) {
 }
 
 function ProviderGlyph({ provider }: { provider: MeetingJoinProvider }) {
-  // Lightweight glyphs — keep the overlay free of extra assets. Zoom blue
-  // camera / Meet green / Teams purple, otherwise a generic video icon.
   if (provider === "zoom") {
     return (
       <span
@@ -112,15 +108,6 @@ function ProviderGlyph({ provider }: { provider: MeetingJoinProvider }) {
   );
 }
 
-/**
- * Granola-style meeting notification — small card in the top-right corner.
- *
- * Primary split button: join the call and open Clips notes in one click.
- * Chevron exposes secondary actions (join only / notes only / snooze).
- *
- * Data arrives via Tauri event `meetings:show-notification`. Visibility holds
- * from 1 minute before start until 5 minutes after, unless dismissed.
- */
 export function MeetingNotification() {
   const [data, setData] = useState<NotificationData | null>(null);
   const [showClose, setShowClose] = useState(false);
@@ -129,13 +116,13 @@ export function MeetingNotification() {
   const [pending, setPending] = useState(false);
   const autoHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dataRef = useRef<NotificationData | null>(null);
+  const startingRef = useRef<NotificationData | null>(null);
   const dismissedKeysRef = useRef(new Map<string, number>());
-  // Real DOM hover only fires while this overlay window is key, which macOS
-  // won't grant it without a click (`show_without_activation` never
-  // activates). `polledHovered` mirrors the Rust-side global cursor poll
-  // (`meetings:notification-hover`, see `start_meeting_notification_hover_tracking`
-  // in notifications.rs) so the X still reveals on hover while another app is
-  // focused — same fallback pattern as the recording pill's `clips:pill-hover`.
+  const meetingsLabEnabledRef = useRef<boolean | null>(null);
+  const pendingNotificationRef = useRef<{
+    payload: NotificationData;
+    options?: { hydrated?: boolean };
+  } | null>(null);
   const [domHovered, setDomHovered] = useState(false);
   const [polledHovered, setPolledHovered] = useState(false);
   const hovered = domHovered || polledHovered;
@@ -161,6 +148,81 @@ export function MeetingNotification() {
   }, [data]);
 
   useEffect(() => {
+    let cancelled = false;
+    let preferenceVersion = 0;
+    let unlisten: (() => void) | null = null;
+
+    const applyValues = (values: unknown): boolean => {
+      if (!values || typeof values !== "object" || Array.isArray(values)) {
+        return false;
+      }
+      const enabled = isLabEnabled(
+        values as Record<string, unknown>,
+        CLIPS_MEETINGS,
+      );
+      meetingsLabEnabledRef.current = enabled;
+      if (!enabled) {
+        pendingNotificationRef.current = null;
+        startingRef.current = null;
+        hideNotification();
+        return true;
+      }
+      const pending = pendingNotificationRef.current;
+      pendingNotificationRef.current = null;
+      if (pending) showNotification(pending.payload, pending.options);
+      return true;
+    };
+    const serverUrl = loadStoredServerUrl();
+    const authToken = loadDesktopAuthToken(serverUrl);
+
+    const startFetch = () => {
+      const requestVersion = preferenceVersion;
+      void fetch(`${serverUrl}/_agent-native/actions/get-labs`, {
+        credentials: "include",
+        ...(authToken
+          ? { headers: { Authorization: `Bearer ${authToken}` } }
+          : {}),
+      })
+        .then((response) => {
+          if (!response.ok) {
+            throw new Error(`lab read failed (${response.status})`);
+          }
+          return response.json();
+        })
+        .then((payload) => {
+          if (!cancelled && requestVersion === preferenceVersion) {
+            applyValues(payload?.result ?? payload);
+          }
+        })
+        .catch(() => {});
+    };
+
+    const updateListener = listen<{ values?: Record<string, boolean> }>(
+      "clips:labs-updated",
+      (event) => {
+        if (cancelled || !applyValues(event.payload?.values)) return;
+        preferenceVersion += 1;
+      },
+    );
+    updateListener
+      .then((cleanup) => {
+        if (cancelled) {
+          cleanup();
+        } else {
+          unlisten = cleanup;
+          startFetch();
+        }
+      })
+      .catch(() => {
+        if (!cancelled) startFetch();
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
     resizeNotificationWindow(Boolean(data && menuOpen));
   }, [data, menuOpen]);
 
@@ -179,11 +241,6 @@ export function MeetingNotification() {
 
   useEffect(() => {
     if (!data) {
-      // Dismissing doesn't guarantee mouseleave/hovered:false fires first
-      // (e.g. dismissed while the cursor is still over the card), so clear
-      // every hover source here — otherwise the next notification can
-      // inherit hovered === true and open with its close button already
-      // showing and auto-hide already cancelled.
       prevHoveredRef.current = false;
       setDomHovered(false);
       setPolledHovered(false);
@@ -205,7 +262,18 @@ export function MeetingNotification() {
     payload: NotificationData,
     options?: { hydrated?: boolean },
   ) {
+    const labState = meetingsLabEnabledRef.current;
+    if (labState === false) return;
+    if (labState === null) {
+      pendingNotificationRef.current = {
+        payload,
+        ...(options ? { options } : {}),
+      };
+      return;
+    }
     if (isDismissed(payload)) return;
+    startingRef.current = null;
+    invoke("recording_pill_prewarm").catch(() => {});
     setData(payload);
     setError(null);
     setMenuOpen(false);
@@ -237,11 +305,13 @@ export function MeetingNotification() {
       }).catch(() => {});
     };
 
-    trackListen(
-      listen<NotificationData>("meetings:show-notification", (ev) => {
+    const showListener = listen<NotificationData>(
+      "meetings:show-notification",
+      (ev) => {
         showNotification(ev.payload);
-      }),
+      },
     );
+    trackListen(showListener);
 
     trackListen(
       listen<{ hovered: boolean }>("meetings:notification-hover", (ev) => {
@@ -249,32 +319,56 @@ export function MeetingNotification() {
       }),
     );
 
-    // Cold overlay boot: hydrate any payload stored before this webview
-    // mounted (calendar or adhoc).
-    invoke<NotificationData | null>("take_pending_meeting_notification")
+    const hideListener = listen<TranscriptionStatusPayload>(
+      "meetings:hide-notification",
+      (ev) => {
+        if (ev.payload.meetingId !== dataRef.current?.meetingId) return;
+        startingRef.current = dataRef.current;
+        hideNotification();
+      },
+    );
+    trackListen(hideListener);
+    const errorListener = listen<TranscriptionStatusPayload>(
+      "meetings:transcription-error",
+      (ev) => {
+        const starting = startingRef.current;
+        const restoring =
+          !dataRef.current &&
+          starting !== null &&
+          starting.meetingId === ev.payload.meetingId;
+        if (!restoring && ev.payload.meetingId !== dataRef.current?.meetingId)
+          return;
+        if (restoring) {
+          setData(starting);
+          setMenuOpen(false);
+        }
+        startingRef.current = null;
+        setPending(false);
+        setError(ev.payload.error || "Could not start notes.");
+        scheduleAutoHide(15_000);
+      },
+    );
+    trackListen(errorListener);
+    const startedListener = listen<TranscriptionStatusPayload>(
+      "meetings:transcription-started",
+      (ev) => {
+        if (startingRef.current?.meetingId === ev.payload.meetingId) {
+          startingRef.current = null;
+        }
+      },
+    );
+    trackListen(startedListener);
+
+    Promise.all([showListener, hideListener, errorListener, startedListener])
+      .then(() =>
+        invoke<NotificationData | null>("take_pending_meeting_notification"),
+      )
       .then((pending) => {
         if (stopped || !pending) return;
+        if (dataRef.current) return;
         showNotification(pending, { hydrated: true });
       })
       .catch(() => {});
-
-    trackListen(
-      listen<TranscriptionStatusPayload>("meetings:hide-notification", (ev) => {
-        if (ev.payload.meetingId !== dataRef.current?.meetingId) return;
-        hideNotification();
-      }),
-    );
-    trackListen(
-      listen<TranscriptionStatusPayload>(
-        "meetings:transcription-error",
-        (ev) => {
-          if (ev.payload.meetingId !== dataRef.current?.meetingId) return;
-          setPending(false);
-          setError(ev.payload.error || "Could not start notes.");
-          scheduleAutoHide(15_000);
-        },
-      ),
-    );
 
     return () => {
       stopped = true;
@@ -329,6 +423,7 @@ export function MeetingNotification() {
 
   function dismissNotification() {
     const current = dataRef.current;
+    startingRef.current = null;
     if (current) {
       dismissedKeysRef.current.set(
         notificationKey(current),
@@ -350,6 +445,7 @@ export function MeetingNotification() {
       meetingId: data.meetingId,
       joinUrl: data.joinUrl,
       reason: "user",
+      scheduledStart: data.scheduledStart,
     }).catch((err) => {
       setPending(false);
       setError((err as Error)?.message ?? "Could not start notes.");
@@ -362,7 +458,6 @@ export function MeetingNotification() {
     await openJoinUrl(data.joinUrl);
   }
 
-  /** Granola primary: join the call and start Clips notes together. */
   async function joinAndOpenClips() {
     if (!data || pending) return;
     setMenuOpen(false);
@@ -386,7 +481,6 @@ export function MeetingNotification() {
     return <div className="meeting-notification-root" />;
   }
 
-  const isCalendar = data.type === "calendar";
   const hasJoin = Boolean(data.joinUrl);
   const provider = detectMeetingJoinProvider(data.joinUrl, data.platform);
   const providerName = joinProviderLabel(provider);
@@ -404,9 +498,6 @@ export function MeetingNotification() {
         onMouseEnter={() => setDomHovered(true)}
         onMouseLeave={() => setDomHovered(false)}
       >
-        <div
-          className={`meeting-notification-bar ${isCalendar ? "meeting-notification-bar-calendar" : "meeting-notification-bar-adhoc"}`}
-        />
         <div className="meeting-notification-content">
           <div className="meeting-notification-title">{data.title}</div>
           <div className="meeting-notification-subtitle">{data.subtitle}</div>

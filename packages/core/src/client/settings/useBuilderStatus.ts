@@ -5,19 +5,71 @@ import { trackEvent } from "../analytics.js";
 import { agentNativePath } from "../api-path.js";
 import { getCallbackOrigin } from "../frame.js";
 import { openMcpAppHostLink } from "../mcp-app-host.js";
+import { oauthPopupWaitingUrl } from "../oauth-popup.js";
+import { scheduleAfterPaint } from "../use-after-paint.js";
+import { usePollLoop } from "../use-poll-loop.js";
+
+/**
+ * A Builder.io connection: the organization's shared one, or the caller's
+ * personal one. A member's personal connection wins over the org's for that
+ * member only.
+ */
+export type BuilderConnectionScope = "org" | "personal";
+
+export interface BuilderGrantStatus {
+  /** When the grant was saved; null for grants saved before that was recorded. */
+  connectedAt: number | null;
+  /** Stored but unusable until someone reconnects it. */
+  needsReconnect: boolean;
+  /**
+   * An OAuth grant, or a key pair from account activation or an older connect
+   * flow. Absent from servers that reported OAuth grants only.
+   */
+  kind?: "oauth" | "keys";
+}
+
+export interface BuilderGrantsStatus {
+  org?: BuilderGrantStatus;
+  personal?: BuilderGrantStatus & {
+    /** Stored, but the org's personal-key restriction keeps it unused. */
+    restricted: boolean;
+  };
+}
+
+/** Which connection powers this caller's Builder.io requests. */
+export type BuilderEffectiveConnection =
+  | "personal"
+  | "org"
+  | "workspace"
+  | "env";
 
 export interface BuilderStatus {
   configured: boolean;
-  builderEnabled: boolean;
   /**
-   * True when `BUILDER_PRIVATE_KEY` is set at the deploy level. This is a
-   * fallback credential; per-user/org Builder connections are still allowed
-   * and take precedence for that request.
+   * The caller's stored Builder.io connections, org and personal each read on
+   * its own. `{}` means none exist; `null` means the server could not read
+   * them. Absent from servers older than this field.
    */
+  grants?: BuilderGrantsStatus | null;
+  /** The connection in effect for this caller, or null when none is. */
+  effective?: BuilderEffectiveConnection | null;
+  /**
+   * Which connection this caller may connect or reconnect. Disconnecting the
+   * org connection needs `org`; anyone may disconnect their own personal one.
+   */
+  canConnect?: Record<BuilderConnectionScope, boolean>;
+  builderEnabled: boolean;
+  agentNativeProvisioningEnabled?: boolean;
+  agentNativeProvisioningToken?: string;
   envManaged?: boolean;
+  /** @deprecated Read `effective` and `grants`; kept for one release. */
   credentialSource?: "user" | "org" | "workspace" | "env";
+  /**
+   * Server-authorized ability to revoke the effective Builder grant.
+   * @deprecated Read `grants` and `canConnect`; kept for one release.
+   */
+  canDisconnect?: boolean;
   connectUrl: string;
-  cliAuthUrl?: string;
   appHost: string;
   apiHost: string;
   branchProjectIdConfigured?: boolean;
@@ -26,12 +78,6 @@ export interface BuilderStatus {
   privateKeyConfigured: boolean;
   userId?: string;
   orgName?: string;
-  /**
-   * Builder space(s) the effective credential can reach, with real display
-   * names derived from the Admin API. One entry today (a `bpk-` key is
-   * space-scoped); the list shape lets the Sources drill-down show multiple
-   * spaces later. Absent/empty when undeducible — fall back to `orgName`.
-   */
   spaces?: Array<{ id: string; name: string }>;
   orgKind?: string;
   subscription?: string;
@@ -39,26 +85,22 @@ export interface BuilderStatus {
   subscriptionName?: string;
   isEnterprise?: boolean;
   isFreeAccount?: boolean;
-  /**
-   * Set when the OAuth callback ran but failed to persist credentials.
-   * Surfaced as a one-shot row by the server so the connect-flow polling
-   * can stop with a clear message instead of timing out at 5min.
-   */
-  connectError?: { message: string; at: number };
-  /**
-   * Set when the currently effective Builder credential was rejected by
-   * Builder's API. Unlike connectError, this describes the old credential pair
-   * and should not abort a new reconnect attempt while the popup is open.
-   */
+  connectError?: { message: string; at: number; code?: string };
   authError?: { message: string; at: number };
 }
 
-/**
- * Fetches Builder connection status from the neutral connection-status route.
- * The legacy /_agent-native/builder/status route remains available for older
- * clients.
- * Re-fetches on window focus to detect post-redirect state changes.
- */
+export function hasBuilderOAuthCredential(
+  status: Pick<BuilderStatus, "configured" | "envManaged"> & {
+    credentialSource?: BuilderStatus["credentialSource"] | null;
+  },
+): boolean {
+  return (
+    status.configured &&
+    status.credentialSource !== "env" &&
+    (!status.envManaged || status.credentialSource != null)
+  );
+}
+
 export function useBuilderStatus({
   enabled = true,
 }: { enabled?: boolean } = {}) {
@@ -67,10 +109,15 @@ export function useBuilderStatus({
   const [error, setError] = useState<string | null>(null);
   const [stale, setStale] = useState(false);
   const lastGoodStatusRef = useRef<BuilderStatus | null>(null);
+  const requestGenerationRef = useRef(0);
 
   const fetchStatus = useCallback(async () => {
     if (!enabled) return;
+    const requestGeneration = ++requestGenerationRef.current;
+    const isCurrentRequest = () =>
+      requestGeneration === requestGenerationRef.current;
     const keepLastGoodStatus = (message: string) => {
+      if (!isCurrentRequest()) return;
       const lastGoodStatus = lastGoodStatusRef.current;
       setStatus(lastGoodStatus);
       setStale(!!lastGoodStatus);
@@ -86,6 +133,7 @@ export function useBuilderStatus({
         return;
       }
       const nextStatus = (await res.json()) as BuilderStatus;
+      if (!isCurrentRequest()) return;
       lastGoodStatusRef.current = nextStatus;
       setStatus(nextStatus);
       setStale(false);
@@ -97,12 +145,13 @@ export function useBuilderStatus({
           : "Builder status unavailable";
       keepLastGoodStatus(message);
     } finally {
-      setLoading(false);
+      if (isCurrentRequest()) setLoading(false);
     }
   }, [enabled]);
 
   useEffect(() => {
     if (!enabled) {
+      requestGenerationRef.current += 1;
       setStatus(null);
       setLoading(false);
       setError(null);
@@ -111,106 +160,106 @@ export function useBuilderStatus({
       return;
     }
     setLoading(true);
-    fetchStatus();
+    let initialFetchRan = false;
+    const cancelInitialFetch = scheduleAfterPaint(() => {
+      initialFetchRan = true;
+      void fetchStatus();
+    });
+    const refreshNow = () => {
+      if (!initialFetchRan) {
+        initialFetchRan = true;
+        cancelInitialFetch();
+      }
+      void fetchStatus();
+    };
 
     function onFocus() {
-      fetchStatus();
+      refreshNow();
     }
     function onVisibility() {
-      if (document.visibilityState === "visible") fetchStatus();
+      if (document.visibilityState === "visible") refreshNow();
     }
     window.addEventListener("focus", onFocus);
     document.addEventListener("visibilitychange", onVisibility);
-    // Engine connect/disconnect actions (e.g. the Builder disconnect button)
-    // dispatch this event so dependent cards refresh without a full reload.
-    window.addEventListener("agent-engine:configured-changed", fetchStatus);
+    window.addEventListener("agent-engine:configured-changed", refreshNow);
     return () => {
+      requestGenerationRef.current += 1;
+      cancelInitialFetch();
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onVisibility);
-      window.removeEventListener(
-        "agent-engine:configured-changed",
-        fetchStatus,
-      );
+      window.removeEventListener("agent-engine:configured-changed", refreshNow);
     };
   }, [enabled, fetchStatus]);
 
   return { status, loading, error, stale, refetch: fetchStatus };
 }
 
-// ─── useBuilderConnectFlow ──────────────────────────────────────────────────
-//
-// Shared state machine for the "open Builder CLI-auth popup + poll
-// /connection-status/builder until credentials land" interaction. Replaces three
-// near-duplicate inline implementations: `BuilderCliAuthMethod` in
-// OnboardingPanel, `ConnectBuilderCard`, and `BuilderConnectCta` in
-// AssistantChat. Each consumer supplies its own popup URL / completion
-// behavior; the hook owns the polling + timeout + focus refresh.
-//
-// `popupUrl` is what we pass to `window.open`. The default
-// `/_agent-native/builder/connect` is a server-side 302 to the real
-// cli-auth URL — using it keeps the click handler synchronous so popup
-// blockers don't downgrade the open to same-tab navigation. Pass an
-// explicit `popupUrl` (e.g. the already-computed cli-auth URL) if your
-// caller already has it in hand.
-
 export interface BuilderConnectFlowOptions {
-  /** Skip server status polling for hosts that own provider routing. */
   enabled?: boolean;
-  /** URL to synchronously open on start(). Defaults to the 302 shortcut. */
   popupUrl?: string;
-  /** Low-cardinality label for the UI surface that opened Builder connect. */
+  provisionAccount?: boolean;
   trackingSource?: string;
-  /** Product flow that needed Builder connect, e.g. connect_llm. */
   trackingFlow?: string;
-  /** Invoked after the status poll first sees `configured: true`. */
   onConnected?: (state: { orgName: string | null }) => void | Promise<void>;
 }
 
 export interface BuilderConnectStartOptions {
-  /** Override the hook-level source for this click. */
   trackingSource?: string;
-  /** Override the hook-level flow for this click. */
   trackingFlow?: string;
+  provisionAccount?: boolean;
+  /**
+   * Connect or reconnect exactly this connection. The attempt then finishes
+   * only when that grant is saved, not when any connection is configured.
+   * Omit to let the server pick by role (owner/admin: org; member: personal).
+   */
+  scope?: BuilderConnectionScope;
 }
 
 export interface BuilderConnectFlow {
   configured: boolean;
-  /** True after at least one successful Builder connection-status response. */
   statusResolved: boolean;
-  /**
-   * True when the deploy has BUILDER_PRIVATE_KEY set as a fallback. Connect
-   * is still available so users can override the fallback with their own
-   * Builder account.
-   */
+  statusReadSettledCount: number;
   envManaged: boolean;
+  /** @deprecated Read `effective` and `grants`; kept for one release. */
+  credentialSource?: BuilderStatus["credentialSource"] | null;
+  /** @deprecated Read `grants` and `canConnect`; kept for one release. */
+  canDisconnect?: boolean;
   /**
-   * True when the server has a Builder branch project configured for this
-   * request. When false, the card surfaces a waitlist CTA instead of a Send
-   * button.
+   * The caller's org and personal Builder.io grants. Null until a status read
+   * returns them, or when the server could not read them.
    */
+  grants: BuilderGrantsStatus | null;
+  /** The connection in effect for this caller, or null when none is known. */
+  effective: BuilderEffectiveConnection | null;
+  /** Which connection this caller may connect or reconnect. */
+  canConnect: Record<BuilderConnectionScope, boolean>;
+  agentNativeProvisioningEnabled: boolean;
+  codeChangeConfigured: boolean;
   builderEnabled: boolean;
   orgName: string | null;
   connecting: boolean;
   error: string | null;
-  /**
-   * True once the first Builder connection-status fetch has completed (successfully
-   * or not). Consumers that accept an `initialConfigured` prop (e.g. agent
-   * tool-call results rendered with server-side state) should treat
-   * `configured`/`orgName` as authoritative only once this flips true —
-   * otherwise the hook's starting `false` defaults would cause a flash
-   * back to "Connect Builder" on first paint.
-   */
+  accountExists: boolean;
   hasFetchedStatus: boolean;
-  /** Open the popup and begin polling. Must be called from a user-gesture handler. */
   start: (options?: BuilderConnectStartOptions) => void;
+  cancel: () => void;
+  retry: () => boolean;
 }
 
 const POLL_INTERVAL_MS = 2000;
 const POLL_TIMEOUT_MS = 5 * 60 * 1000;
+export const POPUP_CLOSED_CONFIRMATION_GRACE_MS = 20_000;
+const POPUP_LOAD_TIMEOUT_MS = 20_000;
+const STATUS_FETCH_ABORT_MS = 10_000;
+const BUILDER_STATUS_UNAVAILABLE_MESSAGE =
+  "Couldn't reach Builder to check your account. Retrying.";
 const CALLBACK_SUCCESS_STATUS_RETRY_MS = 500;
 const CALLBACK_SUCCESS_STATUS_RETRIES = 10;
 const BUILDER_CONNECT_PARAM = "_an_connect";
-const BUILDER_STATE_PARAM = "_an_state";
+const BUILDER_CONNECT_MODE_PARAM = "_an_mode";
+const BUILDER_AGENT_NATIVE_PROVISION_MODE = "agent-native";
+const BUILDER_PROVISIONING_TOKEN_PARAM = "_an_provision";
+const BUILDER_CONNECT_ATTEMPT_PARAM = "_an_connect_attempt";
 const BUILDER_SIGNUP_SOURCE_PARAM = "signupSource";
 const BUILDER_AGENT_NATIVE_FLOW_PARAM = "agentNativeFlow";
 const BUILDER_AGENT_NATIVE_CONNECT_SOURCE_PARAM = "agentNativeConnectSource";
@@ -368,27 +417,25 @@ function hasSignedConnectToken(url: string | null | undefined): boolean {
   }
 }
 
-function hasSignedCallbackState(url: string | null | undefined): boolean {
-  if (!url || typeof window === "undefined") return false;
-  try {
-    const parsed = new URL(url, window.location.origin);
-    const redirectUrl = parsed.searchParams.get("redirect_url");
-    if (!redirectUrl) return false;
-    return new URL(redirectUrl).searchParams.has(BUILDER_STATE_PARAM);
-  } catch {
-    return false;
-  }
-}
-
 function isFreshSignedConnectUrl(
   url: string | null,
   fetchedAt: number | null,
 ): url is string {
   return (
-    (hasSignedConnectToken(url) || hasSignedCallbackState(url)) &&
+    hasSignedConnectToken(url) &&
     typeof fetchedAt === "number" &&
     Date.now() - fetchedAt < STATUS_CONNECT_URL_TTL_MS
   );
+}
+
+function createBuilderConnectAttemptId(): string {
+  if (
+    typeof crypto !== "undefined" &&
+    typeof crypto.randomUUID === "function"
+  ) {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 function isCurrentConnectError(
@@ -400,10 +447,16 @@ function isCurrentConnectError(
   return typeof error.at !== "number" || error.at >= startedAt - 1000;
 }
 
+function isCodeChangeConfigured(
+  status:
+    | Pick<BuilderStatus, "privateKeyConfigured" | "publicKeyConfigured">
+    | null
+    | undefined,
+): boolean {
+  return !!status?.privateKeyConfigured && !!status?.publicKeyConfigured;
+}
+
 function showBuilderConnectPopupPlaceholder(opened: Window) {
-  // Keep opener attached: the Builder callback uses postMessage to notify the
-  // settings tab that the popup completed. We still hold the WindowProxy so the
-  // parent can navigate the blank popup after refreshing the signed connect URL.
   try {
     opened.document.title = "Opening Builder.io";
     opened.document.body.style.margin = "0";
@@ -431,6 +484,56 @@ function navigateBuilderConnectPopup(opened: Window, url: string): boolean {
     } catch {
       // Ignore close failures.
     }
+    return false;
+  }
+}
+
+function waitForBuilderConnectPopupLoad(
+  opened: Window,
+  shouldCancel: () => boolean,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let cancellationTimer: ReturnType<typeof setInterval> | null = null;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    const onLoad = () => finish(true);
+    const finish = (ready: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (cancellationTimer !== null) clearInterval(cancellationTimer);
+      if (timeoutId !== null) clearTimeout(timeoutId);
+      try {
+        opened.removeEventListener("load", onLoad);
+      } catch {
+        // coercion-ok: cleanup is best effort after a popup becomes unavailable.
+        // Ignore a popup that became unavailable before cleanup.
+      }
+      resolve(ready);
+    };
+    try {
+      if (shouldCancel()) {
+        finish(false);
+        return;
+      }
+      cancellationTimer = setInterval(() => {
+        if (shouldCancel()) finish(false);
+      }, POLL_INTERVAL_MS);
+      timeoutId = setTimeout(() => finish(false), POPUP_LOAD_TIMEOUT_MS);
+      opened.addEventListener("load", onLoad);
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+export function isPopupClosed(popup: Window | null): boolean {
+  if (!popup) return false;
+  try {
+    return popup.closed === true;
+  } catch {
+    // coercion-ok: `.closed` is readable cross-origin in every supported
+    // browser; a throw here means the reference itself is unusable, which is
+    // indistinguishable from "still open" for this check's purpose.
     return false;
   }
 }
@@ -552,117 +655,301 @@ export function openBuilderConnectPopup({
   }
 }
 
+const BUILDER_CONNECTION_SCOPE_PARAM = "scope";
+
+interface BuilderConnectionsState {
+  grants: BuilderGrantsStatus | null;
+  effective: BuilderEffectiveConnection | null;
+  canConnect: Record<BuilderConnectionScope, boolean>;
+}
+
+const NO_BUILDER_CONNECTIONS: BuilderConnectionsState = {
+  grants: null,
+  effective: null,
+  canConnect: { org: false, personal: false },
+};
+
+function builderConnectionsFromStatus(
+  s: Pick<BuilderStatus, "grants" | "effective" | "canConnect">,
+): BuilderConnectionsState {
+  return {
+    grants: s.grants ?? null,
+    effective: s.effective ?? null,
+    canConnect: {
+      org: s.canConnect?.org === true,
+      personal: s.canConnect?.personal === true,
+    },
+  };
+}
+
+/** The grant a scoped connect attempt is waiting for, as it was at start. */
+export interface BuilderConnectTarget {
+  scope: BuilderConnectionScope;
+  hadGrant: boolean;
+  connectedAtAtStart: number | null;
+}
+
+/**
+ * Whether a status read finishes the running connect attempt. An unscoped
+ * attempt finishes once an OAuth credential is configured. A scoped one waits
+ * for its own grant to be newly saved: a member already riding the org grant
+ * is "configured" before their personal connect has even begun.
+ */
+export function isBuilderConnectComplete(
+  s: Pick<BuilderStatus, "configured" | "envManaged" | "grants"> & {
+    credentialSource?: BuilderStatus["credentialSource"] | null;
+  },
+  target: BuilderConnectTarget | null,
+): boolean {
+  if (!target) return hasBuilderOAuthCredential(s);
+  const grant = s.grants?.[target.scope];
+  if (!grant || grant.needsReconnect) return false;
+  return !target.hadGrant || grant.connectedAt !== target.connectedAtAtStart;
+}
+
 export function useBuilderConnectFlow(
   opts: BuilderConnectFlowOptions = {},
 ): BuilderConnectFlow {
   const {
     enabled = true,
     popupUrl,
+    provisionAccount = false,
     trackingSource = "builder_connect_flow",
     trackingFlow,
     onConnected,
   } = opts;
   const [configured, setConfigured] = useState(false);
+  const [codeChangeConfigured, setCodeChangeConfigured] = useState(false);
   const [envManaged, setEnvManaged] = useState(false);
+  const [credentialSource, setCredentialSource] = useState<
+    BuilderStatus["credentialSource"] | null
+  >(null);
+  const [canDisconnect, setCanDisconnect] = useState(false);
+  const [connections, setConnectionsState] = useState<BuilderConnectionsState>(
+    NO_BUILDER_CONNECTIONS,
+  );
+  // Mirrors `connections` so start() can record the target grant as it was at
+  // click time without re-creating the callback on every status read.
+  const connectionsRef = useRef<BuilderConnectionsState>(
+    NO_BUILDER_CONNECTIONS,
+  );
+  const setConnections = useCallback((next: BuilderConnectionsState) => {
+    connectionsRef.current = next;
+    setConnectionsState(next);
+  }, []);
+  const connectTargetRef = useRef<BuilderConnectTarget | null>(null);
+  const [agentNativeProvisioningEnabled, setAgentNativeProvisioningEnabled] =
+    useState(false);
+  const [agentNativeProvisioningToken, setAgentNativeProvisioningToken] =
+    useState<string | null>(null);
   const [builderEnabled, setBuilderEnabled] = useState(false);
   const [orgName, setOrgName] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [accountExists, setAccountExists] = useState(false);
   const [hasFetchedStatus, setHasFetchedStatus] = useState(false);
   const [statusResolved, setStatusResolved] = useState(false);
+  const [statusReadSettledCount, setStatusReadSettledCount] = useState(0);
   const [statusConnectUrl, setStatusConnectUrl] = useState<string | null>(null);
-  // When statusConnectUrl was last fetched. The server signs the embedded
-  // _an_connect token with a 10-minute TTL; using an older URL fails the
-  // cross-origin popup gate. Track freshness so start() can either use a
-  // still-good direct URL (desktop) or refresh a new one inside the popup
-  // gesture path (browser/editor embeds).
   const statusConnectUrlAtRef = useRef<number | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const connectStartedAtRef = useRef<number | null>(null);
+  const connectAttemptIdRef = useRef<string | null>(null);
+  const cancelledConnectAttemptIdRef = useRef<string | null>(null);
+  const activePopupRef = useRef<Window | null>(null);
+  const popupClosedAtRef = useRef<number | null>(null);
+  const callbackSuccessStartedAtRef = useRef<number | null>(null);
+  const callbackSuccessInFlightAtRef = useRef<number | null>(null);
+  const callbackSuccessCancelRef = useRef<{
+    started: number;
+    cancel: () => void;
+  } | null>(null);
+  const callbackSuccessRequestControllerRef = useRef<{
+    started: number;
+    controller: AbortController;
+  } | null>(null);
+  const retryStatusRef = useRef<() => boolean>(() => false);
+  const statusUnavailableRef = useRef(false);
   const mountedRef = useRef(true);
   const notifiedConnectedRef = useRef(false);
-  // Keep onConnected in a ref so start() doesn't need to re-create when the
-  // caller passes an inline arrow function.
   const onConnectedRef = useRef(onConnected);
   onConnectedRef.current = onConnected;
+  const activeTrackingRef = useRef<{ source: string; flow?: string }>({
+    source: trackingSource,
+    flow: trackingFlow,
+  });
 
-  const stopPoll = useCallback(() => {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const desktopBridge = (
+      window as Window & {
+        agentNativeDesktop?: {
+          oauth?: {
+            onSystemBrowserReturned?: (
+              callback: (attemptId: string | null) => void,
+            ) => () => void;
+            onPopupClosed: (
+              callback: (attemptId: string | null) => void,
+            ) => () => void;
+          };
+        };
+      }
+    ).agentNativeDesktop;
+    const removeSystemBrowserReturn =
+      desktopBridge?.oauth?.onSystemBrowserReturned?.((attemptId) => {
+        if (!attemptId || attemptId !== connectAttemptIdRef.current) return;
+        retryStatusRef.current();
+      });
+    const removePopupClosed = desktopBridge?.oauth?.onPopupClosed(
+      (attemptId) => {
+        if (!attemptId || attemptId !== connectAttemptIdRef.current) return;
+        const started = connectStartedAtRef.current;
+        if (
+          started !== null &&
+          callbackSuccessStartedAtRef.current === started
+        ) {
+          popupClosedAtRef.current ??= Date.now();
+          return;
+        }
+        popupClosedAtRef.current ??= Date.now();
+        if (callbackSuccessCancelRef.current?.started === started) {
+          callbackSuccessCancelRef.current.cancel();
+        }
+        if (callbackSuccessRequestControllerRef.current?.started === started) {
+          callbackSuccessRequestControllerRef.current.controller.abort();
+        }
+      },
+    );
+    return () => {
+      removeSystemBrowserReturn?.();
+      removePopupClosed?.();
+    };
   }, []);
 
-  const fetchStatus = useCallback(async () => {
-    if (!enabled) return null;
-    const origin = getCallbackOrigin() || window.location.origin;
-    try {
-      const r = await fetch(
-        new URL(
+  const fetchStatus = useCallback(
+    async (signal?: AbortSignal, connectAttemptId?: string) => {
+      if (!enabled) return null;
+      const origin = getCallbackOrigin() || window.location.origin;
+      const ownController =
+        !signal && typeof AbortController !== "undefined"
+          ? new AbortController()
+          : null;
+      const timeoutId = ownController
+        ? setTimeout(() => ownController.abort(), STATUS_FETCH_ABORT_MS)
+        : null;
+      try {
+        const statusUrl = new URL(
           agentNativePath("/_agent-native/connection-status/builder"),
           origin,
-        ).href,
-      );
-      if (!r.ok) return null;
-      return (await r.json()) as {
-        configured: boolean;
-        envManaged?: boolean;
-        builderEnabled?: boolean;
-        orgName?: string | null;
-        connectUrl?: string;
-        cliAuthUrl?: string;
-        credentialSource?: "user" | "org" | "workspace" | "env";
-        connectError?: { message: string; at: number };
-        authError?: { message: string; at: number };
-      };
-    } catch {
-      return null;
-    }
-  }, [enabled]);
+        );
+        if (connectAttemptId) {
+          statusUrl.searchParams.set(
+            BUILDER_CONNECT_ATTEMPT_PARAM,
+            connectAttemptId,
+          );
+        }
+        const r = await fetch(statusUrl.href, {
+          signal: signal ?? ownController?.signal,
+        });
+        if (!r.ok) return null;
+        return (await r.json()) as Pick<
+          BuilderStatus,
+          | "configured"
+          | "agentNativeProvisioningEnabled"
+          | "agentNativeProvisioningToken"
+          | "envManaged"
+          | "canDisconnect"
+          | "builderEnabled"
+          | "orgName"
+          | "connectUrl"
+          | "credentialSource"
+          | "grants"
+          | "effective"
+          | "canConnect"
+          | "connectError"
+          | "authError"
+          | "privateKeyConfigured"
+          | "publicKeyConfigured"
+        >;
+      } catch {
+        // coercion-ok: null means "status unknown this tick" and callers hold
+        // their previous state rather than rendering a disconnected Builder.
+        return null;
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+      }
+    },
+    [enabled],
+  );
 
-  // Initial fetch + focus/visibility refresh so if the user completed the
-  // flow in another tab (or a downgraded same-tab nav) we notice it. Also
-  // listen for `agent-engine:configured-changed` so a Disconnect click in
-  // Settings propagates to any connect-CTA cards rendered elsewhere in
-  // the app without waiting for the next focus event.
   useEffect(() => {
     if (!enabled) {
       setConfigured(false);
+      setCodeChangeConfigured(false);
       setEnvManaged(false);
+      setCredentialSource(null);
+      setConnections(NO_BUILDER_CONNECTIONS);
+      connectTargetRef.current = null;
+      setCanDisconnect(false);
+      setAgentNativeProvisioningEnabled(false);
+      setAgentNativeProvisioningToken(null);
       setBuilderEnabled(false);
       setOrgName(null);
       setConnecting(false);
       setError(null);
+      setAccountExists(false);
       setHasFetchedStatus(false);
       setStatusResolved(false);
+      setStatusReadSettledCount(0);
       setStatusConnectUrl(null);
       statusConnectUrlAtRef.current = null;
-      stopPoll();
+      connectAttemptIdRef.current = null;
+      retryStatusRef.current = () => false;
       return;
     }
     mountedRef.current = true;
     let cancelled = false;
+    let refreshGeneration = 0;
     const refresh = async () => {
+      const generation = ++refreshGeneration;
+      const isCurrentRefresh = () => generation === refreshGeneration;
       const s = await fetchStatus();
-      if (cancelled || !mountedRef.current) return;
-      // Flip `hasFetchedStatus` even when the fetch failed — the caller's
-      // "use initial props until the hook has an answer" pattern wants to
-      // stop waiting after we've tried, regardless of network outcome.
+      if (cancelled || !mountedRef.current || !isCurrentRefresh()) return;
       setHasFetchedStatus(true);
-      if (!s) return;
+      setStatusReadSettledCount((count) => count + 1);
+      if (!s) {
+        statusUnavailableRef.current = true;
+        setError(BUILDER_STATUS_UNAVAILABLE_MESSAGE);
+        return;
+      }
+      if (statusUnavailableRef.current) {
+        statusUnavailableRef.current = false;
+        setError(null);
+      }
       setStatusResolved(true);
       setConfigured(!!s.configured);
+      setCodeChangeConfigured(isCodeChangeConfigured(s));
       setEnvManaged(!!s.envManaged);
+      setCredentialSource(s.credentialSource ?? null);
+      setConnections(builderConnectionsFromStatus(s));
+      setCanDisconnect(!!s.canDisconnect);
+      setAgentNativeProvisioningEnabled(!!s.agentNativeProvisioningEnabled);
+      setAgentNativeProvisioningToken(s.agentNativeProvisioningToken ?? null);
+      setAccountExists(s.connectError?.code === "account_exists");
       setBuilderEnabled(!!s.builderEnabled);
-      const nextConnectUrl = s.cliAuthUrl ?? s.connectUrl ?? null;
+      const nextConnectUrl = s.connectUrl ?? null;
       setStatusConnectUrl(nextConnectUrl);
       statusConnectUrlAtRef.current = nextConnectUrl ? Date.now() : null;
       const org = s.orgName ?? null;
       setOrgName(org);
-      if (s.configured) {
+      const connectComplete = isBuilderConnectComplete(
+        s,
+        connectTargetRef.current,
+      );
+      if (connectComplete) {
         connectStartedAtRef.current = null;
+        setConnecting(false);
       }
-      if (s.configured && !notifiedConnectedRef.current) {
+      if (connectComplete && !notifiedConnectedRef.current) {
         notifiedConnectedRef.current = true;
         notifyAgentEngineConfiguredChanged("builder-status");
         try {
@@ -670,12 +957,9 @@ export function useBuilderConnectFlow(
         } catch {
           // The caller's callback is a UI convenience; status is already set.
         }
-      } else if (!s.configured) {
+      } else if (!connectComplete) {
         notifiedConnectedRef.current = false;
       }
-      // Surface persisted auth-failure messages on idle refreshes, but don't
-      // let an old rejected credential abort a new reconnect popup while the
-      // user is still choosing a Builder space.
       const activeConnectStartedAt = connectStartedAtRef.current;
       if (isCurrentConnectError(s.connectError, activeConnectStartedAt)) {
         setError(s.connectError.message);
@@ -685,38 +969,112 @@ export function useBuilderConnectFlow(
         setError(null);
       }
     };
-    refresh();
-    const onVisible = () => {
-      if (document.visibilityState === "visible") refresh();
+    retryStatusRef.current = () => {
+      void refresh();
+      return true;
     };
-    window.addEventListener("focus", refresh);
+    let initialRefreshRan = false;
+    const cancelInitialRefresh = scheduleAfterPaint(() => {
+      initialRefreshRan = true;
+      void refresh();
+    });
+    const refreshNow = () => {
+      if (!initialRefreshRan) {
+        initialRefreshRan = true;
+        cancelInitialRefresh();
+      }
+      void refresh();
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") refreshNow();
+    };
+    window.addEventListener("focus", refreshNow);
     document.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("agent-engine:configured-changed", refresh);
+    window.addEventListener("agent-engine:configured-changed", refreshNow);
     return () => {
       cancelled = true;
       mountedRef.current = false;
-      window.removeEventListener("focus", refresh);
+      cancelInitialRefresh();
+      retryStatusRef.current = () => false;
+      window.removeEventListener("focus", refreshNow);
       document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("agent-engine:configured-changed", refresh);
-      stopPoll();
+      window.removeEventListener("agent-engine:configured-changed", refreshNow);
     };
-  }, [enabled, fetchStatus, stopPoll]);
+  }, [enabled, fetchStatus]);
+
+  const retry = useCallback(() => retryStatusRef.current(), []);
+  const cancel = useCallback(() => {
+    const started = connectStartedAtRef.current;
+    if (started === null) return;
+    const attemptId = connectAttemptIdRef.current;
+    cancelledConnectAttemptIdRef.current = attemptId;
+    popupClosedAtRef.current ??= Date.now();
+    if (callbackSuccessCancelRef.current?.started === started)
+      callbackSuccessCancelRef.current.cancel();
+    if (callbackSuccessRequestControllerRef.current?.started === started)
+      callbackSuccessRequestControllerRef.current.controller.abort();
+    try {
+      activePopupRef.current?.close();
+    } catch {
+      // coercion-ok: cancellation state is already recorded.
+      // The bounded cancellation path still applies if the browser refuses.
+    }
+    if (typeof window !== "undefined" && attemptId) {
+      try {
+        (
+          window as Window & {
+            agentNativeDesktop?: {
+              oauth?: { cancelPopup?: (id: string) => void };
+            };
+          }
+        ).agentNativeDesktop?.oauth?.cancelPopup?.(attemptId);
+      } catch {
+        // coercion-ok: cancellation state is already recorded.
+        // The bounded cancellation path still applies if the desktop bridge is unavailable.
+      }
+    }
+  }, []);
 
   const start = useCallback(
     (startOptions?: BuilderConnectStartOptions) => {
       if (!enabled) return;
-      stopPoll();
       const started = Date.now();
+      const connectAttemptId = createBuilderConnectAttemptId();
       const clickTrackingSource =
         startOptions?.trackingSource ?? trackingSource;
       const clickTrackingFlow = startOptions?.trackingFlow ?? trackingFlow;
+      const scopeForStart = startOptions?.scope ?? null;
+      const provisionAccountForStart =
+        startOptions?.provisionAccount ?? provisionAccount;
+      const targetGrantAtStart = scopeForStart
+        ? connectionsRef.current.grants?.[scopeForStart]
+        : undefined;
+      connectTargetRef.current = scopeForStart
+        ? {
+            scope: scopeForStart,
+            hadGrant: targetGrantAtStart !== undefined,
+            connectedAtAtStart: targetGrantAtStart?.connectedAt ?? null,
+          }
+        : null;
+      callbackSuccessCancelRef.current?.cancel();
+      callbackSuccessRequestControllerRef.current?.controller.abort();
       connectStartedAtRef.current = started;
+      connectAttemptIdRef.current = connectAttemptId;
+      cancelledConnectAttemptIdRef.current = null;
+      callbackSuccessStartedAtRef.current = null;
+      callbackSuccessInFlightAtRef.current = null;
+      callbackSuccessCancelRef.current = null;
+      callbackSuccessRequestControllerRef.current = null;
+      activePopupRef.current = null;
+      popupClosedAtRef.current = null;
+      activeTrackingRef.current = {
+        source: clickTrackingSource,
+        flow: clickTrackingFlow,
+      };
       setConnecting(true);
       setError(null);
+      if (provisionAccountForStart) setAccountExists(false);
 
-      // Open SYNCHRONOUSLY inside the caller's click handler — any await
-      // before window.open lets the user-gesture token expire, which causes
-      // popup blockers to block entirely or fall back to same-tab navigation.
       const origin = getCallbackOrigin() || window.location.origin;
       const cachedFreshUrl = isFreshSignedConnectUrl(
         statusConnectUrl,
@@ -725,19 +1083,51 @@ export function useBuilderConnectFlow(
         ? statusConnectUrl
         : null;
       // popupUrl props and statusConnectUrl are signed URLs minted before the
-      // click. In web browsers, always refresh inside an about:blank popup so a
-      // server/package restart cannot leave the user with a stale signed state.
+      // click. Top-level browsers use about:blank so the waiting document
+      // cannot race the refreshed signed URL navigation. Embedded hosts use
+      // the inert HTTP page because their popup policy can reject about:blank.
       // Desktop keeps the direct path because the Electron shell owns the popup.
       const signedPropUrl = hasSignedConnectToken(popupUrl) ? popupUrl : null;
-      const signedCliPropUrl = hasSignedCallbackState(popupUrl)
-        ? popupUrl
-        : null;
       const fallbackUrl = new URL(
         agentNativePath("/_agent-native/builder/connect"),
         origin,
       ).href;
-      const directUrl =
-        cachedFreshUrl ?? signedCliPropUrl ?? signedPropUrl ?? fallbackUrl;
+      const withProvisionMode = (
+        url: string,
+        provisioningEnabled = agentNativeProvisioningEnabled,
+        provisioningToken = agentNativeProvisioningToken,
+      ): string => {
+        const connectUrl = new URL(url, origin);
+        connectUrl.searchParams.set(
+          BUILDER_CONNECT_ATTEMPT_PARAM,
+          connectAttemptId,
+        );
+        if (scopeForStart) {
+          connectUrl.searchParams.set(
+            BUILDER_CONNECTION_SCOPE_PARAM,
+            scopeForStart,
+          );
+        }
+        if (
+          !provisionAccountForStart ||
+          !provisioningEnabled ||
+          !provisioningToken
+        ) {
+          return connectUrl.toString();
+        }
+        connectUrl.searchParams.set(
+          BUILDER_CONNECT_MODE_PARAM,
+          BUILDER_AGENT_NATIVE_PROVISION_MODE,
+        );
+        connectUrl.searchParams.set(
+          BUILDER_PROVISIONING_TOKEN_PARAM,
+          provisioningToken,
+        );
+        return connectUrl.toString();
+      };
+      const directUrl = withProvisionMode(
+        cachedFreshUrl ?? signedPropUrl ?? fallbackUrl,
+      );
 
       if (isAgentNativeDesktop()) {
         const opened = openBuilderConnectPopup({
@@ -745,19 +1135,22 @@ export function useBuilderConnectFlow(
           source: clickTrackingSource,
           flow: clickTrackingFlow,
         });
+        if (opened) activePopupRef.current = opened;
         if (!opened) {
-          // Agent Native Desktop handles the popup in Electron and reports
+          // Agent-Native Desktop handles the popup in Electron and reports
           // null to the embedded webview, so null is not a blocker here.
         }
       } else {
+        const embeddedWindow = isEmbeddedWindow();
         const opened = openBuilderConnectPopup({
-          url: "about:blank",
+          url: embeddedWindow ? oauthPopupWaitingUrl() : "about:blank",
           source: clickTrackingSource,
           flow: clickTrackingFlow,
           features: "width=600,height=700",
         });
+        if (opened) activePopupRef.current = opened;
         if (!opened) {
-          if (!isEmbeddedWindow()) {
+          if (!embeddedWindow) {
             connectStartedAtRef.current = null;
             setConnecting(false);
             setError("Couldn't open Builder. Allow popups and try again.");
@@ -765,14 +1158,32 @@ export function useBuilderConnectFlow(
           }
 
           void (async () => {
-            const s = await fetchStatus();
-            if (!mountedRef.current) return;
+            const s = await fetchStatus(undefined, connectAttemptId);
+            if (
+              !mountedRef.current ||
+              connectAttemptIdRef.current !== connectAttemptId ||
+              cancelledConnectAttemptIdRef.current === connectAttemptId
+            ) {
+              return;
+            }
             if (s) {
               setHasFetchedStatus(true);
+              setStatusResolved(true);
               setConfigured(!!s.configured);
+              setCodeChangeConfigured(isCodeChangeConfigured(s));
               setEnvManaged(!!s.envManaged);
+              setCredentialSource(s.credentialSource ?? null);
+              setConnections(builderConnectionsFromStatus(s));
+              setCanDisconnect(!!s.canDisconnect);
+              setAgentNativeProvisioningEnabled(
+                !!s.agentNativeProvisioningEnabled,
+              );
+              setAgentNativeProvisioningToken(
+                s.agentNativeProvisioningToken ?? null,
+              );
+              setAccountExists(s.connectError?.code === "account_exists");
               setBuilderEnabled(!!s.builderEnabled);
-              const nextConnectUrl = s.cliAuthUrl ?? s.connectUrl ?? null;
+              const nextConnectUrl = s.connectUrl ?? null;
               setStatusConnectUrl(nextConnectUrl);
               statusConnectUrlAtRef.current = nextConnectUrl
                 ? Date.now()
@@ -780,8 +1191,11 @@ export function useBuilderConnectFlow(
               setOrgName(s.orgName ?? null);
             }
 
-            const hostUrl =
-              s?.cliAuthUrl ?? s?.connectUrl ?? cachedFreshUrl ?? directUrl;
+            const hostUrl = withProvisionMode(
+              s?.connectUrl ?? cachedFreshUrl ?? directUrl,
+              !!s?.agentNativeProvisioningEnabled,
+              s?.agentNativeProvisioningToken ?? null,
+            );
             const trackedHostUrl = withBuilderConnectTrackingParams(hostUrl, {
               source: clickTrackingSource,
               flow: clickTrackingFlow,
@@ -789,7 +1203,6 @@ export function useBuilderConnectFlow(
             const openedByHost =
               await openBuilderConnectViaMcpHost(trackedHostUrl);
             if (!mountedRef.current || openedByHost) return;
-            stopPoll();
             connectStartedAtRef.current = null;
             setConnecting(false);
             setError(
@@ -797,23 +1210,47 @@ export function useBuilderConnectFlow(
             );
           })();
         } else {
+          const isCurrentConnectAttempt = () =>
+            mountedRef.current &&
+            connectAttemptIdRef.current === connectAttemptId &&
+            connectStartedAtRef.current === started &&
+            cancelledConnectAttemptIdRef.current !== connectAttemptId;
+          const popupReady = embeddedWindow
+            ? waitForBuilderConnectPopupLoad(
+                opened,
+                () => !isCurrentConnectAttempt() || isPopupClosed(opened),
+              )
+            : Promise.resolve(true);
           showBuilderConnectPopupPlaceholder(opened);
           void (async () => {
-            const s = await fetchStatus();
-            if (!mountedRef.current) {
+            const s = await fetchStatus(undefined, connectAttemptId);
+            if (!isCurrentConnectAttempt()) {
               try {
                 opened.close();
               } catch {
-                // Ignore close failures.
+                // coercion-ok: closing a popup from a superseded attempt is
+                // best effort.
               }
               return;
             }
             if (s) {
               setHasFetchedStatus(true);
+              setStatusResolved(true);
               setConfigured(!!s.configured);
+              setCodeChangeConfigured(isCodeChangeConfigured(s));
               setEnvManaged(!!s.envManaged);
+              setCredentialSource(s.credentialSource ?? null);
+              setConnections(builderConnectionsFromStatus(s));
+              setCanDisconnect(!!s.canDisconnect);
+              setAgentNativeProvisioningEnabled(
+                !!s.agentNativeProvisioningEnabled,
+              );
+              setAgentNativeProvisioningToken(
+                s.agentNativeProvisioningToken ?? null,
+              );
+              setAccountExists(s.connectError?.code === "account_exists");
               setBuilderEnabled(!!s.builderEnabled);
-              const nextConnectUrl = s.cliAuthUrl ?? s.connectUrl ?? null;
+              const nextConnectUrl = s.connectUrl ?? null;
               setStatusConnectUrl(nextConnectUrl);
               statusConnectUrlAtRef.current = nextConnectUrl
                 ? Date.now()
@@ -821,28 +1258,45 @@ export function useBuilderConnectFlow(
               setOrgName(s.orgName ?? null);
             }
 
-            // Prefer the click-time status response, but keep the signed URL
-            // already rendered into the CTA as a fallback. This avoids closing
-            // the popup when the refresh hits a transient 401/HTML/error
-            // response before the status cache has warmed.
-            const freshUrl =
-              s?.cliAuthUrl ??
-              s?.connectUrl ??
-              cachedFreshUrl ??
-              signedCliPropUrl ??
-              signedPropUrl ??
-              fallbackUrl;
+            const freshUrl = withProvisionMode(
+              s?.connectUrl ?? cachedFreshUrl ?? signedPropUrl ?? fallbackUrl,
+              !!s?.agentNativeProvisioningEnabled,
+              s?.agentNativeProvisioningToken ?? null,
+            );
             if (!freshUrl) {
               try {
                 opened.close();
               } catch {
                 // Ignore close failures.
               }
-              stopPoll();
               connectStartedAtRef.current = null;
               setConnecting(false);
               setError(
                 "Couldn't start Builder connect. Refresh this page and try again.",
+              );
+              return;
+            }
+            const popupLoaded = await popupReady;
+            if (!isCurrentConnectAttempt()) {
+              try {
+                opened.close();
+              } catch {
+                // coercion-ok: closing a popup from a superseded attempt is
+                // best effort.
+              }
+              return;
+            }
+            if (!popupLoaded) {
+              try {
+                opened.close();
+              } catch {
+                // coercion-ok: closing a failed popup is best effort.
+                // Ignore close failures.
+              }
+              connectStartedAtRef.current = null;
+              setConnecting(false);
+              setError(
+                "Couldn't navigate the Builder popup. Allow popups and try again.",
               );
               return;
             }
@@ -851,7 +1305,6 @@ export function useBuilderConnectFlow(
               flow: clickTrackingFlow,
             });
             if (!navigateBuilderConnectPopup(opened, trackedFreshUrl)) {
-              stopPoll();
               connectStartedAtRef.current = null;
               setConnecting(false);
               setError(
@@ -861,137 +1314,299 @@ export function useBuilderConnectFlow(
           })();
         }
       }
-
-      pollRef.current = setInterval(async () => {
-        const s = await fetchStatus();
-        if (!mountedRef.current) {
-          stopPoll();
-          return;
-        }
-        if (s?.configured) {
-          stopPoll();
-          setConfigured(true);
-          setEnvManaged(!!s.envManaged);
-          setBuilderEnabled(!!s.builderEnabled);
-          const nextConnectUrl = s.cliAuthUrl ?? s.connectUrl ?? null;
-          setStatusConnectUrl(nextConnectUrl);
-          statusConnectUrlAtRef.current = nextConnectUrl ? Date.now() : null;
-          const org = s.orgName ?? null;
-          setOrgName(org);
-          setConnecting(false);
-          connectStartedAtRef.current = null;
-          notifiedConnectedRef.current = true;
-          notifyAgentEngineConfiguredChanged("builder-connect");
-          try {
-            await onConnectedRef.current?.({ orgName: org });
-          } catch {
-            // Consumer's callback failed; we've already flipped the UI state
-            // to connected. Swallow so we don't re-arm the flow.
-          }
-        } else if (isCurrentConnectError(s?.connectError, started)) {
-          // OAuth callback ran but writeBuilderCredentials threw — surface the
-          // real error instead of letting the user wait 5 minutes for timeout.
-          stopPoll();
-          connectStartedAtRef.current = null;
-          setConnecting(false);
-          setError(
-            `Couldn't save Builder credentials: ${s.connectError.message}. Try again or contact support.`,
-          );
-        } else if (Date.now() - started > POLL_TIMEOUT_MS) {
-          stopPoll();
-          connectStartedAtRef.current = null;
-          setConnecting(false);
-          trackEvent("builder connect failed", {
-            feature: "builder",
-            stage: "client",
-            reason: "timeout",
-            source: clickTrackingSource,
-            flow:
-              cleanTrackingParam(clickTrackingFlow) ??
-              inferBuilderConnectTrackingFlow(clickTrackingSource),
-          });
-          setError(
-            "Didn't hear back from Builder in 5 minutes. Allow popups and try again.",
-          );
-        }
-      }, POLL_INTERVAL_MS);
     },
     [
       enabled,
       fetchStatus,
+      agentNativeProvisioningEnabled,
+      agentNativeProvisioningToken,
+      provisionAccount,
       popupUrl,
       statusConnectUrl,
-      stopPoll,
       trackingFlow,
       trackingSource,
     ],
   );
 
-  // Popup-side fast path: the callback page broadcasts a message so we stop
-  // polling immediately rather than waiting for the next 2s tick.
-  //
-  // We listen on BroadcastChannel (same-origin, works with noopener popups)
-  // AND on window.message (legacy path for environments without BC or for
-  // popups that still have opener access). Both paths are safe to have open
-  // simultaneously \u2014 the first one to fire wins and the error is deduplicated
-  // by the stopPoll() call which is idempotent.
+  usePollLoop(
+    async (signal) => {
+      const started = connectStartedAtRef.current;
+      if (started == null) return;
+      const s = await fetchStatus(
+        signal,
+        connectAttemptIdRef.current ?? undefined,
+      );
+      if (!mountedRef.current || connectStartedAtRef.current !== started) {
+        return;
+      }
+      const orgName = s?.orgName ?? null;
+      if (s) {
+        if (statusUnavailableRef.current) {
+          statusUnavailableRef.current = false;
+          setError(null);
+        }
+        setHasFetchedStatus(true);
+        setStatusResolved(true);
+        setConfigured(!!s.configured);
+        setCodeChangeConfigured(isCodeChangeConfigured(s));
+        setEnvManaged(!!s.envManaged);
+        setCredentialSource(s.credentialSource ?? null);
+        setConnections(builderConnectionsFromStatus(s));
+        setCanDisconnect(!!s.canDisconnect);
+        setAgentNativeProvisioningEnabled(!!s.agentNativeProvisioningEnabled);
+        setAgentNativeProvisioningToken(s.agentNativeProvisioningToken ?? null);
+        setAccountExists(s.connectError?.code === "account_exists");
+        setBuilderEnabled(!!s.builderEnabled);
+        const nextConnectUrl = s.connectUrl ?? null;
+        setStatusConnectUrl(nextConnectUrl);
+        statusConnectUrlAtRef.current = nextConnectUrl ? Date.now() : null;
+        setOrgName(orgName);
+      }
+      if (s && isBuilderConnectComplete(s, connectTargetRef.current)) {
+        setAccountExists(false);
+        setConnecting(false);
+        connectStartedAtRef.current = null;
+        notifiedConnectedRef.current = true;
+        notifyAgentEngineConfiguredChanged("builder-connect");
+        try {
+          await onConnectedRef.current?.({ orgName });
+        } catch {
+          // coercion-ok: the connection itself succeeded and the UI state is
+          // already flipped; re-arming the flow on a consumer callback failure
+          // would reconnect an account that is connected.
+        }
+      } else if (isCurrentConnectError(s?.connectError, started)) {
+        connectStartedAtRef.current = null;
+        setConnecting(false);
+        setAccountExists(s.connectError.code === "account_exists");
+        setError(
+          s.connectError.code === "account_exists"
+            ? null
+            : `Couldn't save Builder credentials: ${s.connectError.message}. Try again or contact support.`,
+        );
+      } else if (
+        (isPopupClosed(activePopupRef.current) ||
+          popupClosedAtRef.current !== null) &&
+        callbackSuccessInFlightAtRef.current !== started
+      ) {
+        popupClosedAtRef.current ??= Date.now();
+        if (
+          Date.now() - popupClosedAtRef.current >
+          POPUP_CLOSED_CONFIRMATION_GRACE_MS
+        ) {
+          connectStartedAtRef.current = null;
+          setConnecting(false);
+          const { source, flow } = activeTrackingRef.current;
+          trackEvent("builder connect failed", {
+            feature: "builder",
+            stage: "client",
+            reason: "popup_closed_without_status",
+            source,
+            flow:
+              cleanTrackingParam(flow) ??
+              inferBuilderConnectTrackingFlow(source),
+          });
+          setError(
+            "Didn't finish connecting to Builder.io. Try again, or use your own keys.",
+          );
+        }
+      } else if (Date.now() - started > POLL_TIMEOUT_MS) {
+        connectStartedAtRef.current = null;
+        setConnecting(false);
+        const { source, flow } = activeTrackingRef.current;
+        trackEvent("builder connect failed", {
+          feature: "builder",
+          stage: "client",
+          reason: "timeout",
+          source,
+          flow:
+            cleanTrackingParam(flow) ?? inferBuilderConnectTrackingFlow(source),
+        });
+        setError(
+          "Didn't hear back from Builder in 5 minutes. Allow popups and try again.",
+        );
+      }
+    },
+    {
+      intervalMs: POLL_INTERVAL_MS,
+      leading: false,
+      enabled: enabled && connecting,
+    },
+  );
+
   useEffect(() => {
     let channel: BroadcastChannel | null = null;
-    const handleError = (message: string) => {
-      stopPoll();
+    const isCurrentConnectAttempt = (attemptId: string | undefined): boolean =>
+      typeof attemptId === "string" &&
+      attemptId === connectAttemptIdRef.current &&
+      connectStartedAtRef.current !== null;
+    const handleError = (
+      message: string,
+      code: string | undefined,
+      attemptId: string | undefined,
+    ) => {
+      if (!isCurrentConnectAttempt(attemptId)) return;
       connectStartedAtRef.current = null;
       setConnecting(false);
-      setError(`Couldn't save Builder credentials: ${message}.`);
+      setAccountExists(code === "account_exists");
+      setError(
+        code === "account_exists"
+          ? null
+          : `Couldn't save Builder credentials: ${message}.`,
+      );
     };
-    const handleSuccess = async () => {
+    const handleSuccess = async (attemptId: string | undefined) => {
+      if (!isCurrentConnectAttempt(attemptId)) return;
+      const started = connectStartedAtRef.current;
+      if (started == null || callbackSuccessStartedAtRef.current === started) {
+        return;
+      }
+      callbackSuccessStartedAtRef.current = started;
+      callbackSuccessInFlightAtRef.current = started;
+      popupClosedAtRef.current = null;
       let s: Awaited<ReturnType<typeof fetchStatus>> = null;
-      for (let i = 0; i < CALLBACK_SUCCESS_STATUS_RETRIES; i += 1) {
-        s = await fetchStatus();
-        if (!mountedRef.current) return;
-        if (
-          s?.configured ||
-          isCurrentConnectError(s?.connectError, connectStartedAtRef.current)
-        ) {
-          break;
+      let cancelled = false;
+      let resolveCancelled: (value: null) => void = () => {};
+      const cancelledPromise = new Promise<null>((resolve) => {
+        resolveCancelled = resolve;
+      });
+      const cancelConfirmation = () => {
+        if (cancelled) return;
+        cancelled = true;
+        resolveCancelled(null);
+      };
+      callbackSuccessCancelRef.current = {
+        started,
+        cancel: cancelConfirmation,
+      };
+      try {
+        for (let i = 0; i < CALLBACK_SUCCESS_STATUS_RETRIES; i += 1) {
+          const controller =
+            typeof AbortController !== "undefined"
+              ? new AbortController()
+              : null;
+          if (controller) {
+            callbackSuccessRequestControllerRef.current = {
+              started,
+              controller,
+            };
+          }
+          const timeoutId = controller
+            ? setTimeout(() => controller.abort(), STATUS_FETCH_ABORT_MS)
+            : null;
+          try {
+            s = await Promise.race([
+              fetchStatus(
+                controller?.signal,
+                connectAttemptIdRef.current ?? undefined,
+              ),
+              cancelledPromise,
+            ]);
+          } finally {
+            if (timeoutId) clearTimeout(timeoutId);
+            if (
+              callbackSuccessRequestControllerRef.current?.controller ===
+              controller
+            ) {
+              callbackSuccessRequestControllerRef.current = null;
+            }
+          }
+          if (
+            cancelled ||
+            !mountedRef.current ||
+            connectStartedAtRef.current !== started
+          ) {
+            return;
+          }
+          if (
+            (s && isBuilderConnectComplete(s, connectTargetRef.current)) ||
+            isCurrentConnectError(s?.connectError, started)
+          ) {
+            break;
+          }
+          if (i < CALLBACK_SUCCESS_STATUS_RETRIES - 1) {
+            await Promise.race([
+              delay(CALLBACK_SUCCESS_STATUS_RETRY_MS),
+              cancelledPromise,
+            ]);
+            if (cancelled) return;
+          }
         }
-        if (i < CALLBACK_SUCCESS_STATUS_RETRIES - 1) {
-          await delay(CALLBACK_SUCCESS_STATUS_RETRY_MS);
+      } finally {
+        if (callbackSuccessCancelRef.current?.started === started) {
+          callbackSuccessCancelRef.current = null;
+        }
+        if (callbackSuccessRequestControllerRef.current?.started === started) {
+          callbackSuccessRequestControllerRef.current.controller.abort();
+          callbackSuccessRequestControllerRef.current = null;
+        }
+        if (callbackSuccessInFlightAtRef.current === started) {
+          callbackSuccessInFlightAtRef.current = null;
+          if (
+            popupClosedAtRef.current !== null &&
+            !(s && isBuilderConnectComplete(s, connectTargetRef.current))
+          ) {
+            popupClosedAtRef.current = Date.now();
+          }
         }
       }
-      if (!mountedRef.current) return;
-      if (!s?.configured) {
-        const connectError = isCurrentConnectError(
-          s?.connectError,
-          connectStartedAtRef.current,
-        )
+      if (!mountedRef.current || connectStartedAtRef.current !== started) {
+        return;
+      }
+      if (!s) return;
+      if (!isBuilderConnectComplete(s, connectTargetRef.current)) {
+        const connectError = isCurrentConnectError(s?.connectError, started)
           ? s?.connectError
           : null;
         setHasFetchedStatus(true);
         if (s) {
-          setConfigured(false);
+          setStatusResolved(true);
+          // A scoped attempt can still be waiting while another connection
+          // keeps the caller configured.
+          setConfigured(!!s.configured);
+          setCodeChangeConfigured(
+            s.configured ? isCodeChangeConfigured(s) : false,
+          );
           setEnvManaged(!!s.envManaged);
+          setCredentialSource(s.credentialSource ?? null);
+          setConnections(builderConnectionsFromStatus(s));
+          setCanDisconnect(!!s.canDisconnect);
+          setAgentNativeProvisioningEnabled(!!s.agentNativeProvisioningEnabled);
+          setAgentNativeProvisioningToken(
+            s.agentNativeProvisioningToken ?? null,
+          );
+          setAccountExists(s.connectError?.code === "account_exists");
           setBuilderEnabled(!!s.builderEnabled);
-          const nextConnectUrl = s.cliAuthUrl ?? s.connectUrl ?? null;
+          const nextConnectUrl = s.connectUrl ?? null;
           setStatusConnectUrl(nextConnectUrl);
           statusConnectUrlAtRef.current = nextConnectUrl ? Date.now() : null;
           setOrgName(s.orgName ?? null);
         }
         if (connectError) {
-          stopPoll();
           connectStartedAtRef.current = null;
           setConnecting(false);
+          setAccountExists(connectError.code === "account_exists");
           setError(
-            `Couldn't save Builder credentials: ${connectError.message}. Try again or contact support.`,
+            connectError.code === "account_exists"
+              ? null
+              : `Couldn't save Builder credentials: ${connectError.message}. Try again or contact support.`,
           );
         }
         return;
       }
-      stopPoll();
       setHasFetchedStatus(true);
+      setStatusResolved(true);
       setConfigured(true);
+      setCodeChangeConfigured(isCodeChangeConfigured(s));
       setEnvManaged(!!s.envManaged);
+      setCredentialSource(s.credentialSource ?? null);
+      setConnections(builderConnectionsFromStatus(s));
+      setCanDisconnect(!!s.canDisconnect);
+      setAgentNativeProvisioningEnabled(!!s.agentNativeProvisioningEnabled);
+      setAgentNativeProvisioningToken(s.agentNativeProvisioningToken ?? null);
+      setAccountExists(false);
       setBuilderEnabled(!!s.builderEnabled);
-      const nextConnectUrl = s.cliAuthUrl ?? s.connectUrl ?? null;
+      const nextConnectUrl = s.connectUrl ?? null;
       setStatusConnectUrl(nextConnectUrl);
       statusConnectUrlAtRef.current = nextConnectUrl ? Date.now() : null;
       const org = s.orgName ?? null;
@@ -1010,14 +1625,21 @@ export function useBuilderConnectFlow(
     try {
       channel = new BroadcastChannel(`builder-connect:${window.location.host}`);
       channel.onmessage = (e: MessageEvent) => {
-        const data = e.data as { type?: string; message?: string } | undefined;
+        const data = e.data as
+          | {
+              type?: string;
+              message?: string;
+              code?: string;
+              attemptId?: string;
+            }
+          | undefined;
         if (data?.type === "builder-connect-success") {
-          void handleSuccess();
+          void handleSuccess(data.attemptId);
           return;
         }
         if (data?.type === "builder-connect-error") {
           if (typeof data.message !== "string" || !data.message) return;
-          handleError(data.message);
+          handleError(data.message, data.code, data.attemptId);
         }
       };
     } catch {
@@ -1026,14 +1648,21 @@ export function useBuilderConnectFlow(
 
     const handler = (e: MessageEvent) => {
       if (!isTrustedBuilderConnectMessageOrigin(e.origin)) return;
-      const data = e.data as { type?: string; message?: string } | undefined;
+      const data = e.data as
+        | {
+            type?: string;
+            message?: string;
+            code?: string;
+            attemptId?: string;
+          }
+        | undefined;
       if (data?.type === "builder-connect-success") {
-        void handleSuccess();
+        void handleSuccess(data.attemptId);
         return;
       }
       if (data?.type === "builder-connect-error") {
         if (typeof data.message !== "string" || !data.message) return;
-        handleError(data.message);
+        handleError(data.message, data.code, data.attemptId);
       }
     };
     window.addEventListener("message", handler);
@@ -1042,17 +1671,28 @@ export function useBuilderConnectFlow(
       channel?.close();
       window.removeEventListener("message", handler);
     };
-  }, [fetchStatus, stopPoll]);
+  }, [fetchStatus]);
 
   return {
     configured,
+    codeChangeConfigured,
     statusResolved,
+    statusReadSettledCount,
     envManaged,
+    credentialSource,
+    canDisconnect,
+    grants: connections.grants,
+    effective: connections.effective,
+    canConnect: connections.canConnect,
+    agentNativeProvisioningEnabled,
     builderEnabled,
     orgName,
     connecting,
     error,
+    accountExists,
     hasFetchedStatus,
     start,
+    cancel,
+    retry,
   };
 }

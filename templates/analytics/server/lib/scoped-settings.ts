@@ -11,6 +11,7 @@ import {
   getOrgSetting,
   getUserSetting,
   listOrgSettings,
+  listSettingsByPrefix,
   putOrgSetting,
   putUserSetting,
 } from "@agent-native/core/settings";
@@ -35,11 +36,9 @@ async function listUserSettings(
   email: string,
   prefix: string,
 ): Promise<Record<string, Record<string, unknown>>> {
-  const all = await getAllSettings();
   const scopedPrefix = `${userPrefix(email)}${prefix}`;
   const out: Record<string, Record<string, unknown>> = {};
-  for (const [key, value] of Object.entries(all)) {
-    if (!key.startsWith(scopedPrefix)) continue;
+  for (const { key, value } of await listSettingsByPrefix(scopedPrefix)) {
     out[key.slice(userPrefix(email).length)] = value;
   }
   return out;
@@ -148,10 +147,6 @@ export async function migrateGlobalSettingsPrefixesToUser(
   return { migrated: migrated.length, keys: migrated };
 }
 
-/**
- * Resolve the current scope from request context for action `run` bodies,
- * which receive an `ActionRunContext` rather than an `H3Event`.
- */
 export function resolveRequestScope(): SettingsScope {
   const email = getRequestUserEmail();
   if (!email) throw new Error("no authenticated user");

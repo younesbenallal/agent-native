@@ -17,25 +17,6 @@ import type {
   WireframeTone,
 } from "./wireframe.config.js";
 
-/**
- * Shared wireframe "kit" — hand-drawn low-fi primitives, the el → component node
- * registry, the rough.js sketch overlay, and the viewer-level sketchy/clean
- * style preference. Ported verbatim (geometry-wise) from the plan template's
- * `app/components/plan/wireframe/kit/*` so any app can render wireframe blocks.
- *
- * DECOUPLING: the only behavioral change from the plan copy is theme detection —
- * core blocks read `document.documentElement.classList.contains("dark")` (the
- * MermaidBlock precedent) instead of importing `next-themes`. Everything else
- * (the `.plan-wf` / `.wf-*` / `[data-rough]` class contract the rough overlay
- * measures, the `--wf-*` / `--ink` / `--paper` token names every primitive
- * reads) is preserved exactly, so the kit looks identical in plan and renders
- * correctly in any app once the matching tokens exist in `core/styles/blocks.css`.
- */
-
-/* ========================================================================== */
-/* Viewer-level wireframe style preference (localStorage)                     */
-/* ========================================================================== */
-
 export type WireframeStyle = "sketchy" | "clean";
 
 const STYLE_STORAGE_KEY = "plan-wireframe-style";
@@ -96,7 +77,6 @@ export function useWireframeStyle(): WireframeStyle {
   );
 }
 
-/** Read the live dark-mode flag from the document root (next-themes-free). */
 export function useIsDark(): boolean {
   const [isDark, setIsDark] = useState(false);
   useEffect(() => {
@@ -111,14 +91,6 @@ export function useIsDark(): boolean {
   return isDark;
 }
 
-/* ========================================================================== */
-/* Primitives (ported from kit/primitives.tsx)                                */
-/* ========================================================================== */
-
-/**
- * Frame-level config threaded to every Screen so skeleton / theme / sketch-vs-
- * clean reach the kit no matter which path renders the root Screen.
- */
 export const KitConfigContext = createContext<{
   skeleton?: boolean;
   flushFrame?: boolean;
@@ -208,10 +180,6 @@ export function Screen({
       style={{
         position: "relative",
         width: "100%",
-        // `minHeight` (not a fixed `height: 100%`) so the screen fills an
-        // auto-height artboard's floor yet grows with its content instead of
-        // clipping. The frame shell (`ArtboardFrame`) owns the height policy; a
-        // caller can still override via `style.height` for a fixed canvas.
         minHeight: "100%",
         background: "transparent",
         color: V.ink,
@@ -1247,14 +1215,9 @@ export function Text({
   );
 }
 
-/* ========================================================================== */
-/* Node registry (ported from kit/registry.tsx)                               */
-/* ========================================================================== */
-
 type NodeRenderer = (node: WireframeNode, children: ReactNode) => ReactNode;
 
 const REGISTRY: Record<WireframeElName, NodeRenderer> = {
-  // --- Frame / structure -------------------------------------------------
   screen: (n) => {
     const kids = n.children ?? [];
     const lead = kids[0]?.el;
@@ -1309,7 +1272,6 @@ const REGISTRY: Record<WireframeElName, NodeRenderer> = {
   ),
   divider: () => <Divider />,
 
-  // --- Text --------------------------------------------------------------
   title: (n) => <Title text={n.text} script={n.script} />,
   text: (n) => (
     <Text
@@ -1324,7 +1286,6 @@ const REGISTRY: Record<WireframeElName, NodeRenderer> = {
     <SectionLabel tone={n.tone}>{n.label ?? n.text}</SectionLabel>
   ),
 
-  // --- List / task -------------------------------------------------------
   navItem: (n) => (
     <NavItem
       label={n.label ?? n.text}
@@ -1345,7 +1306,6 @@ const REGISTRY: Record<WireframeElName, NodeRenderer> = {
     />
   ),
 
-  // --- Controls ----------------------------------------------------------
   chips: (n) => <Tabs items={n.items ?? []} />,
   chip: (n) => <Chip active={n.active}>{n.label ?? n.text}</Chip>,
   pill: (n) => <Pill tone={n.tone}>{n.label ?? n.text}</Pill>,
@@ -1366,7 +1326,6 @@ const REGISTRY: Record<WireframeElName, NodeRenderer> = {
   fab: (n) => <Fab icon={n.icon} />,
   searchBar: (n) => <SearchBar placeholder={n.placeholder} />,
 
-  // --- Atoms -------------------------------------------------------------
   avatar: () => <Avatar />,
   iconSquare: (n) => <IconSquare active={n.active} />,
   kv: (n) => <KV rows={n.rows ?? []} />,
@@ -1388,7 +1347,6 @@ function renderScreenBodyNodes(nodes: WireframeNode[]): ReactNode {
   );
 }
 
-/** Render a single kit-tree node (and its children, recursively). */
 export function renderNode(
   node: WireframeNode,
   key?: string | number,
@@ -1402,36 +1360,27 @@ export function renderNode(
   return <KeyedNode key={key ?? node.id}>{rendered}</KeyedNode>;
 }
 
-/** Render an array of nodes. */
 export function renderNodes(nodes: WireframeNode[]): ReactNode {
   return nodes.map((node, i) => renderNode(node, node.id ?? i));
 }
 
-/** Lightweight keyed wrapper that does not introduce extra DOM. */
 function KeyedNode({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
-/** Whether an `el` name has a registered renderer. */
 export function hasRenderer(el: string): el is WireframeElName {
   return el in REGISTRY;
 }
 
 export { REGISTRY as NODE_REGISTRY, V as WFV, toneColors, toneInk, fontWeight };
 
-/* ========================================================================== */
-/* Rough overlay (ported from kit/rough.tsx)                                  */
-/* ========================================================================== */
-
 const gen = rough.generator();
 
 type RoughPath = { d: string; stroke: string; strokeWidth: number };
 
-/** The default selector used for HTML mockups: standard wireframe primitives plus explicit opt-ins. */
 export const HTML_ROUGH_SELECTOR =
   "[data-rough],button,input,textarea,select,hr,.wf-btn,.wf-card,.wf-box,.wf-pill,.wf-chip,.wf-icon-fallback,[style*='border:'],[style*='border-top:'],[style*='border-right:'],[style*='border-bottom:'],[style*='border-left:']";
 
-/** Stable per-element seed so a frame doesn't re-wobble on every measure. */
 function seedFrom(...parts: Array<string | number>): number {
   const value = parts.join(":");
   let hash = 2166136261;
@@ -1442,7 +1391,6 @@ function seedFrom(...parts: Array<string | number>): number {
   return ((hash >>> 0) % 2147483646) + 1;
 }
 
-/** Map the 0–100 sketch slider to a rough.js roughness (calm + legible). */
 export function sketchRoughness(sketch: number): number {
   const s = Math.max(0, Math.min(100, Number.isFinite(sketch) ? sketch : 0));
   return Number((0.32 + (s / 100) * 1.15).toFixed(2));
@@ -1457,7 +1405,6 @@ function readVar(el: Element, name: string): string {
   return getComputedStyle(el).getPropertyValue(name).trim();
 }
 
-/** Normalize a CSS color (hex or rgb[a]) to "r,g,b" for equality comparison. */
 function toRgbKey(color: string): string | null {
   const c = color.trim();
   const hex = c.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
@@ -1481,14 +1428,12 @@ function toRgbKey(color: string): string | null {
   return null;
 }
 
-/** True when two CSS colors resolve to the same RGB (hex vs rgb tolerant). */
 function sameColor(a: string, b: string): boolean {
   const ka = toRgbKey(a);
   const kb = toRgbKey(b);
   return ka !== null && ka === kb;
 }
 
-/** A rounded-rect SVG path (so the frame stroke follows the artboard radius). */
 function roundedRectPath(
   x: number,
   y: number,
@@ -1511,7 +1456,6 @@ function roundedRectPath(
   ].join(" ");
 }
 
-/** Rough.js cannot safely render paths whose inset consumes the whole box. */
 export function hasDrawableRoughBounds(
   width: number,
   height: number,
@@ -1525,7 +1469,6 @@ export function hasDrawableRoughBounds(
   );
 }
 
-/** Rough.js recursively flattens paths, so every coordinate must be finite. */
 export function hasDrawableRoughGeometry(
   x: number,
   y: number,
@@ -1544,6 +1487,19 @@ function elementStroke(node: Element, fallback: string): string {
   const explicit = readVar(node, "--rough-stroke");
   if (explicit) return explicit;
   const cs = getComputedStyle(node);
+  if (node.classList.contains("diagram-arrow")) {
+    const color = cs.color;
+    const normalizedColor = color.replace(/\s+/g, "").toLowerCase();
+    const isTransparent =
+      normalizedColor === "transparent" ||
+      normalizedColor.endsWith("/0)") ||
+      (normalizedColor.startsWith("rgb") &&
+        normalizedColor.split(",").length === 4 &&
+        normalizedColor.endsWith(",0)"));
+    if (color && !isTransparent) {
+      return color;
+    }
+  }
   for (const side of [
     "borderTopColor",
     "borderLeftColor",
@@ -1652,6 +1608,107 @@ function build(
     preserveVertices: true,
   });
 
+  const drawRoughArrow = (
+    direction: string,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    stroke: string,
+    sw: number,
+    seedBase: string | number,
+  ) => {
+    let lineIndex = 0;
+    const drawLine = (x1: number, y1: number, x2: number, y2: number) => {
+      push(
+        gen.line(
+          x1,
+          y1,
+          x2,
+          y2,
+          makeOpts(stroke, sw, seedFrom(seedBase, "line", lineIndex++)),
+        ),
+        stroke,
+        sw,
+      );
+    };
+    const drawDirectional = (
+      fromX: number,
+      fromY: number,
+      toX: number,
+      toY: number,
+    ) => {
+      const angle = Math.atan2(toY - fromY, toX - fromX);
+      const length = Math.hypot(toX - fromX, toY - fromY);
+      const head = Math.min(7, Math.max(4, length * 0.28));
+      const shaftEndX = toX - Math.cos(angle) * head;
+      const shaftEndY = toY - Math.sin(angle) * head;
+      drawLine(fromX, fromY, shaftEndX, shaftEndY);
+      const spread = Math.PI / 6;
+      drawLine(
+        toX,
+        toY,
+        toX - Math.cos(angle - spread) * head,
+        toY - Math.sin(angle - spread) * head,
+      );
+      drawLine(
+        toX,
+        toY,
+        toX - Math.cos(angle + spread) * head,
+        toY - Math.sin(angle + spread) * head,
+      );
+    };
+
+    const centerX = x + w / 2;
+    const centerY = y + h / 2;
+    const pad = Math.min(3, w / 5, h / 5);
+    const horizontalFrom = x + pad;
+    const horizontalTo = x + w - pad;
+    const verticalFrom = y + pad;
+    const verticalTo = y + h - pad;
+
+    if (direction === "refresh") {
+      const diameter = Math.max(8, Math.min(w, h) - pad * 2);
+      const start = -Math.PI * 0.8;
+      const stop = Math.PI * 1.15;
+      push(
+        gen.arc(
+          centerX,
+          centerY,
+          diameter,
+          diameter,
+          start,
+          stop,
+          false,
+          makeOpts(stroke, sw, seedFrom(seedBase, "arc")),
+        ),
+        stroke,
+        sw,
+      );
+      drawDirectional(x + w - pad - 5, y + pad + 1, x + w - pad, y + pad + 1);
+      return;
+    }
+
+    if (direction === "down") {
+      drawDirectional(centerX, verticalFrom, centerX, verticalTo);
+      return;
+    }
+    if (direction === "up") {
+      drawDirectional(centerX, verticalTo, centerX, verticalFrom);
+      return;
+    }
+    if (direction === "left") {
+      drawDirectional(horizontalTo, centerY, horizontalFrom, centerY);
+      return;
+    }
+    if (direction === "both") {
+      drawDirectional(horizontalFrom, centerY, horizontalTo, centerY);
+      drawDirectional(horizontalTo, centerY, horizontalFrom, centerY);
+      return;
+    }
+    drawDirectional(horizontalFrom, centerY, horizontalTo, centerY);
+  };
+
   if (opts.drawFrame && hasDrawableRoughBounds(layoutW, layoutH, 2)) {
     const sw = 2;
     push(
@@ -1692,6 +1749,13 @@ function build(
       Math.round(h),
       index++,
     );
+    const arrow = node.classList.contains("diagram-arrow")
+      ? node.getAttribute("data-arrow")
+      : null;
+    if (arrow) {
+      drawRoughArrow(arrow, x, y, w, h, stroke, sw, seedFrom("arrow", seed));
+      return;
+    }
     const o = makeOpts(stroke, sw, seed);
     let drawable: unknown;
     if (kind === "ellipse") {
@@ -1720,11 +1784,6 @@ function build(
   return { paths, w: layoutW, h: layoutH };
 }
 
-/**
- * Renders the rough overlay for a frame. `scopeRef` points at the frame root.
- * When `enabled` is false (skeleton / clean register) it renders nothing and the
- * crisp CSS borders stay visible.
- */
 export function RoughOverlay({
   scopeRef,
   sketch = 52,

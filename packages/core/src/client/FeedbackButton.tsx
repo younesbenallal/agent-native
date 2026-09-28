@@ -1,6 +1,6 @@
 import * as PopoverPrimitive from "@radix-ui/react-popover";
 import * as TooltipPrimitive from "@radix-ui/react-tooltip";
-import { IconMessage2, IconCheck } from "@tabler/icons-react";
+import { IconCheck, IconMessageCircle } from "@tabler/icons-react";
 import {
   useState,
   useEffect,
@@ -53,7 +53,7 @@ const FEEDBACK_COPY: Record<
   }
 > = {
   "en-US": {
-    label: "Feedback",
+    label: "Send feedback",
     placeholder: "What's working, what's broken, or what would you change?",
     submit: "Send feedback",
     submitting: "Sending...",
@@ -62,7 +62,7 @@ const FEEDBACK_COPY: Record<
     invalidUrl: "Invalid feedback URL",
     emptyError: "Please write something first",
     sendError: "Couldn't send feedback",
-    keyboardHint: "{{shortcut}}+Enter to send",
+    keyboardHint: "{{shortcut}} Enter to send",
   },
   "zh-CN": {
     label: "反馈",
@@ -74,7 +74,7 @@ const FEEDBACK_COPY: Record<
     invalidUrl: "反馈 URL 无效",
     emptyError: "请先写点内容",
     sendError: "无法发送反馈",
-    keyboardHint: "{{shortcut}}+Enter 发送",
+    keyboardHint: "{{shortcut}} Enter 发送",
   },
   "zh-TW": {
     label: "意見回饋",
@@ -86,7 +86,7 @@ const FEEDBACK_COPY: Record<
     invalidUrl: "意見回饋 URL 無效",
     emptyError: "請先輸入內容",
     sendError: "無法送出意見回饋",
-    keyboardHint: "{{shortcut}}+Enter 送出",
+    keyboardHint: "{{shortcut}} Enter 送出",
   },
   "es-ES": {
     label: "Comentarios",
@@ -98,7 +98,7 @@ const FEEDBACK_COPY: Record<
     invalidUrl: "URL de comentarios no válida",
     emptyError: "Escribe algo primero",
     sendError: "No se pudieron enviar los comentarios",
-    keyboardHint: "{{shortcut}}+Enter para enviar",
+    keyboardHint: "{{shortcut}} Enter para enviar",
   },
   "fr-FR": {
     label: "Retour",
@@ -110,7 +110,7 @@ const FEEDBACK_COPY: Record<
     invalidUrl: "URL de retour invalide",
     emptyError: "Écrivez quelque chose d'abord",
     sendError: "Impossible d'envoyer le retour",
-    keyboardHint: "{{shortcut}}+Entrée pour envoyer",
+    keyboardHint: "{{shortcut}} Entrée pour envoyer",
   },
   "de-DE": {
     label: "Feedback",
@@ -122,7 +122,7 @@ const FEEDBACK_COPY: Record<
     invalidUrl: "Ungültige Feedback-URL",
     emptyError: "Bitte zuerst etwas schreiben",
     sendError: "Feedback konnte nicht gesendet werden",
-    keyboardHint: "{{shortcut}}+Enter zum Senden",
+    keyboardHint: "{{shortcut}} Enter zum Senden",
   },
   "ja-JP": {
     label: "フィードバック",
@@ -134,7 +134,7 @@ const FEEDBACK_COPY: Record<
     invalidUrl: "フィードバック URL が無効です",
     emptyError: "先に内容を入力してください",
     sendError: "送信できませんでした",
-    keyboardHint: "{{shortcut}}+Enter で送信",
+    keyboardHint: "{{shortcut}} Enter で送信",
   },
   "ko-KR": {
     label: "피드백",
@@ -146,7 +146,7 @@ const FEEDBACK_COPY: Record<
     invalidUrl: "피드백 URL이 올바르지 않습니다",
     emptyError: "먼저 내용을 입력해 주세요",
     sendError: "피드백을 보낼 수 없습니다",
-    keyboardHint: "{{shortcut}}+Enter로 보내기",
+    keyboardHint: "{{shortcut}} Enter로 보내기",
   },
   "pt-BR": {
     label: "Feedback",
@@ -158,7 +158,7 @@ const FEEDBACK_COPY: Record<
     invalidUrl: "URL de feedback inválida",
     emptyError: "Escreva algo primeiro",
     sendError: "Não foi possível enviar o feedback",
-    keyboardHint: "{{shortcut}}+Enter para enviar",
+    keyboardHint: "{{shortcut}} Enter para enviar",
   },
   "hi-IN": {
     label: "फ़ीडबैक",
@@ -170,7 +170,7 @@ const FEEDBACK_COPY: Record<
     invalidUrl: "फ़ीडबैक URL अमान्य है",
     emptyError: "पहले कुछ लिखें",
     sendError: "फ़ीडबैक भेजा नहीं जा सका",
-    keyboardHint: "भेजने के लिए {{shortcut}}+Enter",
+    keyboardHint: "भेजने के लिए {{shortcut}} Enter",
   },
   "ar-SA": {
     label: "ملاحظات",
@@ -182,7 +182,7 @@ const FEEDBACK_COPY: Record<
     invalidUrl: "رابط الملاحظات غير صالح",
     emptyError: "اكتب شيئا أولا",
     sendError: "تعذر إرسال الملاحظات",
-    keyboardHint: "{{shortcut}}+Enter للإرسال",
+    keyboardHint: "{{shortcut}} Enter للإرسال",
   },
 };
 
@@ -227,36 +227,94 @@ async function loadSchema(target: ParsedTarget): Promise<FormSchema> {
   return pending;
 }
 
+export interface SubmitFeedbackFormOptions {
+  value: string;
+  url?: string | null;
+  openedAt?: number;
+  idempotencyKey?: string | null;
+  honeypot?: string;
+  submitterEmail?: string | null;
+  chatSessionId?: string | null;
+  chatStorageKey?: string | null;
+  activeRunId?: string | null;
+}
+
+export async function submitFeedbackForm(
+  options: SubmitFeedbackFormOptions,
+): Promise<"submitted" | "unconfigured"> {
+  const resolvedUrl = resolveFeedbackUrl(options.url);
+  const target = resolvedUrl ? parseTarget(resolvedUrl) : null;
+  if (!target) return "unconfigured";
+
+  const value = options.value.trim();
+  if (!value) throw new Error("Feedback is empty");
+
+  const resolvedSchema = await loadSchema(target);
+  const submitterEmail = isSyntheticAgentNativeAnonymousEmail(
+    options.submitterEmail,
+  )
+    ? null
+    : options.submitterEmail;
+  const feedbackContext = getFeedbackClientContext({
+    chatSessionId: options.chatSessionId,
+    storageKey: options.chatStorageKey,
+    activeRunId: options.activeRunId,
+  });
+  const res = await fetch(
+    `${target.endpoint}/api/submit/${encodeURIComponent(resolvedSchema.formId)}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(options.idempotencyKey
+          ? { "Idempotency-Key": options.idempotencyKey }
+          : {}),
+      },
+      body: JSON.stringify({
+        data: { [resolvedSchema.fieldId]: value },
+        _t: options.openedAt ?? Date.now(),
+        _hp: options.honeypot ?? "",
+        _meta: {
+          ...(submitterEmail ? { submitterEmail } : {}),
+          ...feedbackContext,
+        },
+      }),
+    },
+  );
+  if (!res.ok) {
+    const responseBody = await res.text();
+    let errorMessage: string | undefined;
+    try {
+      const body = JSON.parse(responseBody) as unknown;
+      if (
+        body !== null &&
+        typeof body === "object" &&
+        "error" in body &&
+        typeof body.error === "string"
+      ) {
+        errorMessage = body.error.trim() || undefined;
+      }
+    } catch {
+      throw new Error(`submit failed (${res.status})`);
+    }
+    throw new Error(errorMessage || `submit failed (${res.status})`);
+  }
+  return "submitted";
+}
+
 export interface FeedbackButtonProps {
-  /**
-   * "sidebar" renders a full-width row with icon + label (for app left sidebars).
-   * "icon" renders a small icon-only button (for dense toolbars, e.g. the agent panel header).
-   * "outlined" renders an outlined pill button with icon + label (for top-nav bars, e.g. docs).
-   */
   variant?: "sidebar" | "icon" | "outlined";
   label?: string;
-  /**
-   * Defaults to VITE_AGENT_NATIVE_FEEDBACK_URL. First-party agent-native.com
-   * apps fall back to the Agent Native feedback form; other apps stay hidden.
-   * Pass null to explicitly hide the control.
-   */
   url?: string | null;
   className?: string;
-  /** Which side the popover opens on. Defaults match the variant. */
   side?: "top" | "bottom" | "left" | "right";
   align?: "start" | "center" | "end";
-  /** Placeholder text for the textarea. */
   placeholder?: string;
-  /** Optional text to prefill when the popover opens. */
   initialValue?: string;
-  /** Current chat session/thread id, when the host already knows it. */
   chatSessionId?: string | null;
-  /** Chat localStorage namespace, when the host uses per-app chat storage. */
   chatStorageKey?: string | null;
-  /** Controlled popover open state for hosts that trigger feedback from a menu. */
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
-  /** Optional custom trigger element. */
   trigger?: ReactNode;
 }
 
@@ -299,10 +357,36 @@ function clientHostname(): string | undefined {
 }
 
 function isFirstPartyHostname(hostname: string | null | undefined): boolean {
-  const normalized = hostname?.trim().toLowerCase();
+  const normalized = hostname?.trim().toLowerCase().split(":")[0];
   return (
     normalized === FIRST_PARTY_HOSTNAME ||
-    normalized?.endsWith(`.${FIRST_PARTY_HOSTNAME}`) === true
+    normalized?.endsWith(`.${FIRST_PARTY_HOSTNAME}`) === true ||
+    normalized?.endsWith(".netlify.app") === true ||
+    normalized?.endsWith(".builder.io") === true
+  );
+}
+
+function isLocalDevHostname(hostname: string | null | undefined): boolean {
+  const normalized = hostname?.trim().toLowerCase().split(":")[0];
+  return (
+    normalized === "localhost" ||
+    normalized === "127.0.0.1" ||
+    normalized === "[::1]" ||
+    normalized === "0.0.0.0" ||
+    normalized?.endsWith(".local") === true
+  );
+}
+
+function isLegacyFeedbackPageUrl(
+  value: string,
+  hostname: string | null | undefined,
+): boolean | null {
+  const hasScheme = /^[a-z][a-z\d+.-]*:/i.test(value);
+  const base = hasScheme || !hostname ? undefined : `https://${hostname}`;
+  if (!URL.canParse(value, base)) return null;
+  const parsed = new URL(value, base);
+  return (
+    parsed.pathname === "/feedback" && isFirstPartyHostname(parsed.hostname)
   );
 }
 
@@ -312,9 +396,17 @@ export function resolveFeedbackUrl(
 ): string | null {
   const value =
     url === undefined ? clientEnv()?.VITE_AGENT_NATIVE_FEEDBACK_URL : url;
-  if (typeof value === "string" && value.trim()) return value.trim();
+  if (typeof value === "string" && value.trim()) {
+    const normalized = value.trim();
+    if (isLegacyFeedbackPageUrl(normalized, hostname) === true) {
+      return FIRST_PARTY_FEEDBACK_URL;
+    }
+    return parseTarget(normalized) ? normalized : null;
+  }
   if (url !== undefined) return null;
-  return isFirstPartyHostname(hostname) ? FIRST_PARTY_FEEDBACK_URL : null;
+  return isFirstPartyHostname(hostname) || isLocalDevHostname(hostname)
+    ? FIRST_PARTY_FEEDBACK_URL
+    : null;
 }
 
 export function FeedbackButton(props: FeedbackButtonProps) {
@@ -362,12 +454,10 @@ function FeedbackPopoverButton({
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [schema, setSchema] = useState<FormSchema | null>(null);
   const openedAtRef = useRef<number>(0);
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // Reset transient state and kick off schema load on each open.
   useEffect(() => {
     if (!open) return;
     openedAtRef.current = Date.now();
@@ -376,14 +466,11 @@ function FeedbackPopoverButton({
     setSubmitting(false);
     setSubmitted(false);
     setError(null);
-    setSchema(null);
     if (target) {
-      loadSchema(target)
-        .then((s) => setSchema(s))
-        .catch((err) => {
-          console.error("[FeedbackButton] schema load failed", err);
-          setError(copy.loadError);
-        });
+      loadSchema(target).catch((err) => {
+        console.error("[FeedbackButton] schema load failed", err);
+        setError(copy.loadError);
+      });
     } else {
       setError(copy.invalidUrl);
     }
@@ -409,39 +496,20 @@ function FeedbackPopoverButton({
       setSubmitting(true);
       setError(null);
       try {
-        const resolvedSchema = schema ?? (await loadSchema(target));
-        if (!schema) setSchema(resolvedSchema);
         const submitterEmail = isSyntheticAgentNativeAnonymousEmail(
           session?.email,
         )
           ? null
           : session?.email;
-        const feedbackContext = getFeedbackClientContext({
+        await submitFeedbackForm({
+          url,
+          value,
+          openedAt: openedAtRef.current,
+          honeypot,
+          submitterEmail,
           chatSessionId,
-          storageKey: chatStorageKey,
+          chatStorageKey,
         });
-        const res = await fetch(
-          `${target.endpoint}/api/submit/${encodeURIComponent(resolvedSchema.formId)}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              data: { [resolvedSchema.fieldId]: trimmed },
-              _t: openedAtRef.current,
-              _hp: honeypot,
-              _meta: {
-                ...(submitterEmail ? { submitterEmail } : {}),
-                ...feedbackContext,
-              },
-            }),
-          },
-        );
-        if (!res.ok) {
-          const body = (await res.json().catch(() => ({}))) as {
-            error?: string;
-          };
-          throw new Error(body.error || `submit failed (${res.status})`);
-        }
         setSubmitted(true);
         closeTimerRef.current = setTimeout(() => setOpen(false), 1400);
       } catch (err) {
@@ -451,7 +519,6 @@ function FeedbackPopoverButton({
     },
     [
       target,
-      schema,
       value,
       honeypot,
       submitting,
@@ -481,16 +548,17 @@ function FeedbackPopoverButton({
                 type="button"
                 aria-label={resolvedLabel}
                 className={cn(
-                  "flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-accent/50",
+                  "flex size-9 items-center justify-center rounded-md bg-transparent text-primary hover:bg-accent/60 hover:text-primary",
                   className,
                 )}
               >
-                <IconMessage2 size={14} />
+                <IconMessageCircle className="size-4 shrink-0 text-primary" />
               </button>
             </PopoverPrimitive.Trigger>
           </TooltipPrimitive.Trigger>
           <TooltipPrimitive.Portal>
             <TooltipPrimitive.Content
+              side={side ?? "right"}
               sideOffset={6}
               className="z-[100040] overflow-hidden rounded-md border border-border bg-popover px-2 py-1 text-[11px] text-foreground shadow-md animate-in fade-in-0 zoom-in-95 origin-[var(--radix-tooltip-content-transform-origin)]"
             >
@@ -511,7 +579,7 @@ function FeedbackPopoverButton({
             className,
           )}
         >
-          <IconMessage2 size={14} stroke={1.5} />
+          <IconMessageCircle size={14} stroke={1.5} />
           <span>{resolvedLabel}</span>
         </button>
       </PopoverPrimitive.Trigger>
@@ -522,11 +590,11 @@ function FeedbackPopoverButton({
         <button
           type="button"
           className={cn(
-            "flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground",
+            "flex h-auto w-full items-center justify-start gap-2 rounded bg-transparent px-2 py-1.5 text-xs font-normal text-primary hover:bg-accent/60 hover:text-primary",
             className,
           )}
         >
-          <IconMessage2 className="h-4 w-4" />
+          <IconMessageCircle className="size-4 shrink-0 text-primary" />
           <span>{resolvedLabel}</span>
         </button>
       </PopoverPrimitive.Trigger>
@@ -564,7 +632,8 @@ function FeedbackPopoverButton({
                 value={value}
                 onChange={(e) => setValue(e.target.value)}
                 onKeyDown={(e) => {
-                  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") submit();
+                  if ((e.metaKey || e.ctrlKey) && e.key === "Enter")
+                    void submit();
                 }}
                 placeholder={resolvedPlaceholder}
                 rows={5}
@@ -591,7 +660,7 @@ function FeedbackPopoverButton({
                     copy.keyboardHint.replace(
                       "{{shortcut}}",
                       /Mac|iPhone|iPad/.test(navigator.userAgent)
-                        ? "⌘"
+                        ? "Cmd"
                         : "Ctrl",
                     )}
                 </div>

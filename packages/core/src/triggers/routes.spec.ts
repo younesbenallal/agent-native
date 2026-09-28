@@ -67,6 +67,11 @@ describe("automations route helpers", () => {
 schedule: "0 9 * * 1-5"
 timezone: UTC
 enabled: true
+model: claude-sonnet-4-5
+mcpTools: ["mcp__calendar__list_events"]
+runAs: creator
+deliveryPlatform: email
+deliveryDestination: steve@example.com
 lastRun: 2026-06-18T15:00:00.000Z
 lastStatus: error
 lastError: "Calendar token expired"
@@ -121,6 +126,11 @@ Hidden legacy organization job.`,
       lastError: "Calendar token expired",
       lastRun: "2026-06-18T15:00:00.000Z",
       scheduleDescription: "Every weekday at 9 AM (UTC)",
+      model: "claude-sonnet-4-5",
+      mcpTools: ["mcp__calendar__list_events"],
+      runAs: "creator",
+      deliveryPlatform: "email",
+      deliveryDestination: "steve@example.com",
       canUpdate: true,
     });
     expect(result[0].nextRun).toBeTruthy();
@@ -130,9 +140,10 @@ Hidden legacy organization job.`,
       event: "test.event.fired",
       canUpdate: false,
     });
+    expect(result[1].orgId).toBeUndefined();
   });
 
-  it("lists and updates automations for the active organization only", async () => {
+  it("fails closed for organization automations without an app owner", async () => {
     const organizationOwner = "__organization__:org-1";
     const organizationResource = {
       id: "organization",
@@ -167,25 +178,23 @@ Organization body.`,
     expect(result.map((item) => item.name)).toEqual(["organization"]);
     expect(result[0]).toMatchObject({
       owner: organizationOwner,
-      canUpdate: true,
+      canUpdate: false,
       triggerType: "event",
     });
 
     resourceGetByPathMock.mockResolvedValue(organizationResource);
-    await setAutomationEnabledForOwner(event, owner, {
-      owner: organizationOwner,
-      path: "jobs/organization.md",
-      enabled: false,
-    });
+    await expect(
+      setAutomationEnabledForOwner(event, owner, {
+        owner: organizationOwner,
+        path: "jobs/organization.md",
+        enabled: false,
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
     expect(resourceGetByPathMock).toHaveBeenCalledWith(
       organizationOwner,
       "jobs/organization.md",
     );
-    expect(resourcePutMock).toHaveBeenCalledWith(
-      organizationOwner,
-      "jobs/organization.md",
-      expect.stringContaining("enabled: false"),
-    );
+    expect(resourcePutMock).not.toHaveBeenCalled();
   });
 
   it("toggles a personal automation and refreshes event subscriptions", async () => {
@@ -245,6 +254,9 @@ Run the legacy job.`,
     expect(updatedContent).toContain("enabled: false");
     expect(updatedContent).toContain('model: "claude-sonnet-4-5"');
     expect(updatedContent).not.toContain("triggerType:");
+    expect(
+      updatedContent.indexOf('model: "claude-sonnet-4-5"'),
+    ).toBeGreaterThan(updatedContent.indexOf("enabled: false"));
   });
 
   it("rejects shared automation updates from non-creators who are not org admins", async () => {

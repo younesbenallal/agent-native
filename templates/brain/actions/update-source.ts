@@ -1,4 +1,5 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
+import { getCredentialContext } from "@agent-native/core/server";
 import { assertAccess } from "@agent-native/core/sharing";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
@@ -10,13 +11,17 @@ import {
   serializeSource,
   stableJson,
 } from "../server/lib/brain.js";
-import { assertSourceWorkspaceConnectionAvailable } from "../server/lib/source-credentials.js";
+import {
+  assertSourceCredentialAvailable,
+  assertSourceWorkspaceConnectionAvailable,
+} from "../server/lib/source-credentials.js";
 import { withSourceAnswerPolicy } from "../server/lib/source-policy.js";
 import { normalizeSlackChannelConfig } from "../shared/slack-source-config.js";
 import {
   optionalJsonRecordSchema,
   sourceAnswerPolicySchema,
 } from "./_schemas.js";
+import { assertValidSourceConfig } from "./_source-config.js";
 
 export default defineAction({
   description:
@@ -36,6 +41,9 @@ export default defineAction({
   run: async (args) => {
     const access = await assertAccess("brain-source", args.id, "editor");
     const existing = access.resource;
+    if (args.config !== undefined) {
+      assertValidSourceConfig(existing.provider, args.config);
+    }
     const updates: Record<string, unknown> = { updatedAt: nowIso() };
     if (args.title !== undefined) updates.title = args.title;
     if (args.status !== undefined) updates.status = args.status;
@@ -66,6 +74,11 @@ export default defineAction({
         await assertSourceWorkspaceConnectionAvailable({
           provider: existing.provider,
           workspaceConnectionId,
+        });
+        await assertSourceCredentialAvailable({
+          provider: existing.provider,
+          workspaceConnectionId,
+          ctx: getCredentialContext(),
         });
       } else {
         delete nextConfig.workspaceConnectionId;

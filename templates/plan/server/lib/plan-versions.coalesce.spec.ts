@@ -1,17 +1,13 @@
-/**
- * Unit tests for the burst-coalescing behaviour added to
- * createPlanVersionSnapshot in plan-versions.ts.
- *
- * Tests run against an in-process libsql SQLite database so the real Drizzle
- * query layer is exercised; vi.setSystemTime controls wall-clock timing.
- */
-
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 
-import { createClient, type Client } from "@libsql/client";
-import { drizzle, type LibSQLDatabase } from "drizzle-orm/libsql";
+const { PGlite } = createRequire(
+  new URL("../../../packages/core/package.json", import.meta.url),
+)("@electric-sql/pglite");
+type PGliteClient = Awaited<ReturnType<typeof PGlite.create>>;
+import { drizzle, type PgliteDatabase } from "drizzle-orm/pglite";
 import {
   afterAll,
   afterEach,
@@ -25,12 +21,28 @@ import {
 
 import * as planSchema from "../db/schema.js";
 
-// ---------------------------------------------------------------------------
-// DB wiring — injected via vi.mock so createPlanVersionSnapshot picks it up
-// ---------------------------------------------------------------------------
+type SqlStatement = string | { sql: string; args?: unknown[] };
 
-let client: Client;
-let db: LibSQLDatabase<typeof planSchema>;
+function postgresSql(sql: string): string {
+  let index = 0;
+  return sql.replace(/\?/g, () => "$" + ++index);
+}
+
+async function execute(statement: SqlStatement) {
+  if (typeof statement === "string") {
+    const results = [];
+    for (const sql of statement
+      .split(";")
+      .map((value) => value.trim())
+      .filter(Boolean))
+      results.push(await client.query(postgresSql(sql)));
+    return results[results.length - 1];
+  }
+  return client.query(postgresSql(statement.sql), statement.args ?? []);
+}
+
+let client: PGliteClient;
+let db: PgliteDatabase<typeof planSchema>;
 let dbDir: string;
 
 vi.mock("../db/index.js", () => ({
@@ -38,10 +50,6 @@ vi.mock("../db/index.js", () => ({
   getDb: () => db,
   schema: planSchema,
 }));
-
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
 
 const OWNER = "coalesce-test@example.com";
 const PLAN_ID = "plan_coalesce_test";
@@ -78,7 +86,7 @@ const CREATED_AT = "2026-06-09T10:00:00.000Z";
 
 async function resetTables() {
   // guard:allow-unscoped -- test-only fixture cleanup resets the isolated temp DB.
-  await client.executeMultiple(`
+  await execute(`
     DELETE FROM plan_versions;
     DELETE FROM plan_sections;
     DELETE FROM plans;
@@ -135,16 +143,12 @@ async function countVersionRows(): Promise<number> {
   return rows.length;
 }
 
-// ---------------------------------------------------------------------------
-// DB bootstrap
-// ---------------------------------------------------------------------------
-
 beforeAll(async () => {
   dbDir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-coalesce-"));
-  client = createClient({ url: `file:${path.join(dbDir, "test.db")}` });
+  client = await PGlite.create(dbDir);
   db = drizzle(client, { schema: planSchema });
 
-  await client.executeMultiple(`
+  await execute(`
     CREATE TABLE plans (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
@@ -207,23 +211,23 @@ beforeAll(async () => {
       change_label TEXT,
       created_by TEXT NOT NULL DEFAULT 'agent',
       created_at TEXT NOT NULL,
+      chat_context TEXT,
       summary_status TEXT,
       summary_source TEXT,
       block_count INTEGER,
       section_count INTEGER,
-      has_canvas INTEGER,
-      has_prototype INTEGER,
+      has_canvas BOOLEAN,
+      has_prototype BOOLEAN,
       preview_text TEXT
     );
   `);
 });
 
-afterAll(() => {
-  client?.close();
+afterAll(async () => {
+  await client?.close();
   if (dbDir) fs.rmSync(dbDir, { recursive: true, force: true });
 });
 
-// Use fake timers so we control the clock precisely.
 beforeEach(async () => {
   await resetTables();
   vi.useFakeTimers();
@@ -233,10 +237,6 @@ beforeEach(async () => {
 afterEach(() => {
   vi.useRealTimers();
 });
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 describe("createPlanVersionSnapshot — burst coalescing", () => {
   it("creates a snapshot on first forced call", async () => {
@@ -256,7 +256,6 @@ describe("createPlanVersionSnapshot — burst coalescing", () => {
     const { createPlanVersionSnapshot } = await import("./plan-versions.js");
     await seedPlan();
 
-    // First burst: creates snapshot of pre-edit state
     const first = await createPlanVersionSnapshot(PLAN_ID, {
       force: true,
       label: "Edited markdown block blk_abc",
@@ -264,10 +263,8 @@ describe("createPlanVersionSnapshot — burst coalescing", () => {
     });
     expect(first.created).toBe(true);
 
-    // Simulate plan content changing (the actual edit happened)
     await setPlanContent(UPDATED_CONTENT_1);
 
-    // 30 seconds later — still within the 90 s window
     vi.advanceTimersByTime(30_000);
 
     const second = await createPlanVersionSnapshot(PLAN_ID, {
@@ -287,10 +284,8 @@ describe("createPlanVersionSnapshot — burst coalescing", () => {
     const LABEL = "Edited markdown block blk_abc";
 
     for (let tick = 0; tick < 10; tick++) {
-      // Use markdown (stored verbatim in the snapshot) so each tick produces
-      // a distinct snapshotJson that bypasses the identical-content duplicate guard.
       await setPlanMarkdown(`# Test plan — edit ${tick}`);
-      vi.advanceTimersByTime(5_000); // 5 s between saves
+      vi.advanceTimersByTime(5_000);
       const result = await createPlanVersionSnapshot(PLAN_ID, {
         force: true,
         label: LABEL,
@@ -304,7 +299,6 @@ describe("createPlanVersionSnapshot — burst coalescing", () => {
       }
     }
 
-    // Total elapsed: 50 s → still within 90 s window → exactly 1 row
     expect(await countVersionRows()).toBe(1);
   });
 
@@ -323,7 +317,6 @@ describe("createPlanVersionSnapshot — burst coalescing", () => {
 
     await setPlanMarkdown("# Test plan — edit after first snapshot");
 
-    // Advance past the 90 s coalescing window
     vi.advanceTimersByTime(91_000);
 
     const second = await createPlanVersionSnapshot(PLAN_ID, {
@@ -349,7 +342,6 @@ describe("createPlanVersionSnapshot — burst coalescing", () => {
 
     await setPlanMarkdown("# Test plan — edited blk_abc");
 
-    // Only 5 s later — well within window — but with a different label
     vi.advanceTimersByTime(5_000);
 
     const second = await createPlanVersionSnapshot(PLAN_ID, {
@@ -366,7 +358,6 @@ describe("createPlanVersionSnapshot — burst coalescing", () => {
     const { createPlanVersionSnapshot } = await import("./plan-versions.js");
     await seedPlan();
 
-    // Simulate a prior inline-edit snapshot with the same pre-restore content
     const first = await createPlanVersionSnapshot(PLAN_ID, {
       force: true,
       label: "Before restore",
@@ -376,8 +367,6 @@ describe("createPlanVersionSnapshot — burst coalescing", () => {
 
     await setPlanContent(UPDATED_CONTENT_1);
 
-    // 5 s later — within window — but safety snapshots must preserve the
-    // immediate pre-restore state when content has changed.
     vi.advanceTimersByTime(5_000);
 
     const second = await createPlanVersionSnapshot(PLAN_ID, {
@@ -423,7 +412,6 @@ describe("createPlanVersionSnapshot — burst coalescing", () => {
     });
     expect(first.created).toBe(true);
 
-    // Advance past the coalescing window — but do NOT change the plan content
     vi.advanceTimersByTime(120_000);
 
     const second = await createPlanVersionSnapshot(PLAN_ID, {
@@ -440,7 +428,6 @@ describe("createPlanVersionSnapshot — burst coalescing", () => {
     const { createPlanVersionSnapshot } = await import("./plan-versions.js");
     await seedPlan();
 
-    // First snapshot without force
     const first = await createPlanVersionSnapshot(PLAN_ID, {
       force: false,
       label: "Edited markdown block blk_abc",
@@ -451,7 +438,6 @@ describe("createPlanVersionSnapshot — burst coalescing", () => {
     await setPlanContent(UPDATED_CONTENT_1);
     vi.advanceTimersByTime(30_000);
 
-    // Within 5-min SNAPSHOT_INTERVAL_MS → interval guard fires, not coalesce
     const second = await createPlanVersionSnapshot(PLAN_ID, {
       force: false,
       label: "Edited markdown block blk_abc",

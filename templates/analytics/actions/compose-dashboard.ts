@@ -1,23 +1,21 @@
 import { defineAction, embedApp } from "@agent-native/core";
-import {
-  hasCollabState,
-  applyText,
-  seedFromText,
-} from "@agent-native/core/collab";
+import type { ActionRunContext } from "@agent-native/core/action";
 import {
   getRequestUserEmail,
   getRequestOrgId,
   buildDeepLink,
 } from "@agent-native/core/server";
+import { track } from "@agent-native/core/tracking";
 import { z } from "zod";
 
+import { queueDashboardCollabSync } from "../server/lib/dashboard-collab-sync";
 import { validateFirstPartyDashboardTimeScope } from "../server/lib/dashboard-time-scope";
 import {
   getDashboard,
   upsertDashboard,
   upsertDashboardWithRetry,
 } from "../server/lib/dashboards-store";
-import { validateFirstPartyAnalyticsSql } from "../server/lib/first-party-analytics.js";
+import { validateFirstPartyAnalyticsSqlForScope } from "../server/lib/first-party-analytics.js";
 import {
   buildFirstPartyDashboardFilters,
   buildPanel,
@@ -27,27 +25,6 @@ import {
   usesFirstPartyDashboardFilters,
 } from "../server/lib/first-party-metric-catalog";
 
-/**
- * Push the saved config through the collab layer so open dashboard editors get
- * the change in real time (mirrors update-dashboard).
- */
-async function syncToCollab(
-  dashboardId: string,
-  config: Record<string, unknown>,
-): Promise<void> {
-  const docId = `dash-${dashboardId}`;
-  const configStr = JSON.stringify(config);
-  try {
-    if (await hasCollabState(docId)) {
-      await applyText(docId, configStr, "content", "agent");
-    } else {
-      await seedFromText(docId, configStr);
-    }
-  } catch {
-    // Collab sync is best-effort — the SQL write is the source of truth.
-  }
-}
-
 const WINDOWS = new Set<MetricWindow>(["30d", "90d", "all"]);
 
 function normalizeWindow(raw: unknown): MetricWindow | undefined {
@@ -56,7 +33,6 @@ function normalizeWindow(raw: unknown): MetricWindow | undefined {
   return WINDOWS.has(v) ? v : undefined;
 }
 
-/** One requested metric, normalized to a key plus optional overrides. */
 interface NormalizedRequest {
   metric: string;
   id?: string;
@@ -136,8 +112,8 @@ export default defineAction({
     "Build a large first-party analytics dashboard in ONE fast call: name the metrics you want and the SERVER generates the validated SQL + chart config for every panel. " +
     "Do NOT hand-author large `update-dashboard` configs panel-by-panel — producing/streaming a big multi-panel config inside the ~40s run budget fails and thrashes. " +
     "Each metric expands into a complete first-party panel from the shipped, already-validated metric catalog. Unknown metric keys are skipped and reported (not fatal); each panel's SQL is validated independently (valid panels are saved, invalid ones reported), and the dashboard is assembled and saved in a single atomic store write. " +
-    "If the dashboard already exists and `overwrite` is false (default), the new panels are APPENDED (panels whose id is already present are skipped); with `overwrite: true` the config is replaced. " +
-    "Returns { dashboardId, panelCount, createdMetrics, unknownMetrics, invalidMetrics, urlPath, deepLink, message } — use panelCount as proof-of-done. " +
+    "If the dashboard already exists and `overwrite` is false (default), the new panels are APPENDED (panels whose id is already present are skipped). Set `refreshExisting: true` to atomically replace matching catalog panels in place while preserving unrelated panels. With `overwrite: true` the config is replaced. " +
+    "Returns { dashboardId, panelCount, createdMetrics, refreshedExistingIds, unknownMetrics, invalidMetrics, urlPath, deepLink, message } — use panelCount as proof-of-done. " +
     `Available metric keys: ${METRIC_KEYS.join(", ")}. ` +
     "Each metric accepts an optional per-metric `window` of '30d' | '90d' | 'all' (only affects windowed virality/time metrics). Catalog panels are time-scoped by construction; custom first-party SQL added later must use `{{timeRange}}` or declare `config.timeScope`.",
   schema: z.object({
@@ -167,6 +143,12 @@ export default defineAction({
       .describe(
         "If true, replace the whole dashboard config. If false (default) and the dashboard exists, APPEND the new panels (skipping ids already present).",
       ),
+    refreshExisting: z
+      .boolean()
+      .optional()
+      .describe(
+        "When appending to an existing dashboard, replace panels whose ids match the requested catalog metrics in place, preserving unrelated panels and layout order. Use this to refresh a catalog-backed dashboard without sending SQL through the prompt.",
+      ),
   }),
   mcpApp: {
     compactCatalog: true,
@@ -178,13 +160,11 @@ export default defineAction({
       height: 680,
     }),
   },
-  run: async (args) => {
+  run: async (args, actionContext?: ActionRunContext) => {
     const email = getRequestUserEmail();
     if (!email) throw new Error("no authenticated user");
     const ctx = { email, orgId: getRequestOrgId() || null };
 
-    // The CLI/gateway may hand `metrics` over as a JSON string; the schema
-    // preprocess handles that, but normalize defensively here too.
     const rawMetrics: unknown[] = Array.isArray(args.metrics)
       ? (args.metrics as unknown[])
       : typeof args.metrics === "string"
@@ -212,15 +192,11 @@ export default defineAction({
         window: req.window,
       });
       if (!panel) {
-        // Unknown key — report, never throw.
         if (!unknownMetrics.includes(req.metric)) {
           unknownMetrics.push(req.metric);
         }
         continue;
       }
-      // Per-panel graceful validation: a bad panel is dropped + reported, the
-      // rest of the dashboard still builds. (Catalog SQL is known-good, so this
-      // is a defensive net, e.g. if a future window/override produces bad SQL.)
       try {
         const timeScopeError = validateFirstPartyDashboardTimeScope(
           panel,
@@ -231,7 +207,10 @@ export default defineAction({
           invalidMetrics.push({ metric: req.metric, reason: timeScopeError });
           continue;
         }
-        validateFirstPartyAnalyticsSql(panel.sql);
+        await validateFirstPartyAnalyticsSqlForScope(panel.sql, {
+          userEmail: ctx.email,
+          orgId: ctx.orgId,
+        });
       } catch (e: any) {
         invalidMetrics.push({
           metric: req.metric,
@@ -263,12 +242,9 @@ export default defineAction({
     let finalConfig: Record<string, unknown>;
     let appendedCount = composedPanels.length;
     let skippedExistingIds: string[] = [];
+    let refreshedExistingIds: string[] = [];
 
     if (existing && !args.overwrite) {
-      // Append: preserve existing panels + order, add only new panel ids.
-      // Recomputed on every retry attempt from the freshest existing config —
-      // via upsertDashboardWithRetry — so a panel a concurrent writer just
-      // added is never silently dropped by this merge.
       const saved = await upsertDashboardWithRetry(
         args.dashboardId,
         ctx,
@@ -285,18 +261,36 @@ export default defineAction({
               .map((p) => (typeof p?.id === "string" ? p.id : null))
               .filter((id): id is string => !!id),
           );
+          const composedById = new Map(
+            composedPanels.map((panel) => [panel.id, panel]),
+          );
+          const refreshed = new Set<string>();
+          const mergedExistingPanels = existingPanels.map((panel) => {
+            const id = typeof panel?.id === "string" ? panel.id : "";
+            const replacement = args.refreshExisting
+              ? composedById.get(id)
+              : undefined;
+            if (!replacement) return panel;
+            refreshed.add(id);
+            return replacement;
+          });
           const toAppend: ComposedPanel[] = [];
           const skipped: string[] = [];
+          const appendedIds = new Set<string>();
           for (const panel of composedPanels) {
+            if (refreshed.has(panel.id)) continue;
             if (existingIds.has(panel.id)) {
               skipped.push(panel.id);
               continue;
             }
+            if (appendedIds.has(panel.id)) continue;
             toAppend.push(panel);
+            appendedIds.add(panel.id);
             existingIds.add(panel.id);
           }
           appendedCount = toAppend.length;
-          skippedExistingIds = skipped;
+          skippedExistingIds = Array.from(new Set(skipped));
+          refreshedExistingIds = Array.from(refreshed);
           const merged = withFilters({
             ...existingConfig,
             name:
@@ -304,18 +298,13 @@ export default defineAction({
               existingConfig.name.trim()
                 ? existingConfig.name
                 : dashboardName,
-            panels: [...existingPanels, ...toAppend],
+            panels: [...mergedExistingPanels, ...toAppend],
           });
           return { kind: "sql" as const, body: merged };
         },
       );
       finalConfig = saved.config as Record<string, unknown>;
     } else {
-      // Create or overwrite: a fresh config with exactly the composed panels.
-      // No prior state can be lost here — create has none, and
-      // `overwrite: true` is an explicit full-replace request rather than a
-      // read-modify-write, so it saves unconditionally like update-dashboard's
-      // full-config replace mode.
       finalConfig = withFilters({
         name: dashboardName,
         description:
@@ -329,11 +318,44 @@ export default defineAction({
       ? (finalConfig.panels as unknown[]).length
       : 0;
 
-    await syncToCollab(args.dashboardId, finalConfig);
+    const changed =
+      !existing ||
+      args.overwrite === true ||
+      appendedCount > 0 ||
+      refreshedExistingIds.length > 0;
+
+    if (changed) {
+      queueDashboardCollabSync(args.dashboardId, finalConfig, "agent");
+      track(
+        "dashboard_saved",
+        {
+          app_name: "analytics",
+          template_name: "analytics",
+          output_id: args.dashboardId,
+          output_type: "dashboard",
+          dashboard_id: args.dashboardId,
+          panel_count: panelCount,
+          created_panel_count: createdMetrics.length,
+          refreshed_panel_count: refreshedExistingIds.length,
+        },
+        actionContext,
+      );
+    }
 
     const parts: string[] = [];
     if (existing && !args.overwrite) {
-      parts.push(`Appended ${appendedCount} panel(s) to "${args.dashboardId}"`);
+      if (!changed) {
+        parts.push(`No changes were needed for "${args.dashboardId}"`);
+      } else if (refreshedExistingIds.length > 0) {
+        parts.push(
+          `Refreshed ${refreshedExistingIds.length} existing panel(s)`,
+        );
+      }
+      if (changed) {
+        parts.push(
+          `Appended ${appendedCount} panel(s) to "${args.dashboardId}"`,
+        );
+      }
       if (skippedExistingIds.length > 0) {
         parts.push(`${skippedExistingIds.length} already present`);
       }
@@ -355,11 +377,14 @@ export default defineAction({
     parts.push(`Dashboard now has ${panelCount} panel(s).`);
 
     return {
+      saved: true,
+      changed,
       id: args.dashboardId,
       dashboardId: args.dashboardId,
       name: dashboardName,
       panelCount,
       createdMetrics,
+      refreshedExistingIds,
       unknownMetrics,
       invalidMetrics,
       skippedExistingIds,

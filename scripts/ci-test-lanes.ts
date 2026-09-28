@@ -1,32 +1,14 @@
 #!/usr/bin/env node
-/**
- * Split the full fast-test suite into balanced CI lanes. There is deliberately
- * NO change-based selection here: every workspace test package runs on every
- * PR, so a test can never be silently skipped. This script only decides which
- * lane each package runs in, purely to parallelise wall-clock.
- *
- * @agent-native/core is handled by its own dedicated CI job (isolated so it can
- * run uncapped), so it is excluded here. Every OTHER test package is partitioned
- * across the lanes, and the script asserts the partition covers all of them
- * exactly once — if a new package is added it lands in a lane automatically, and
- * a bug that dropped one would fail this job rather than pass silently.
- *
- * Balance weight is each package's live fast-test file count, read from the tree
- * at run time — no hardcoded table, nothing to maintain.
- *
- * Runs on plain `node --experimental-strip-types` with zero dependencies so CI
- * can invoke it before `pnpm install`.
- */
+import { execFileSync } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const ROOT = process.cwd();
-const CORE = "@agent-native/core"; // isolated in its own CI job
+const CORE = "@agent-native/core";
 const LANES = Math.max(1, Number(process.env.LANES || 5));
 
-// Must track the package globs in pnpm-workspace.yaml. A package under a glob
-// not listed here would be missed, so keep this in sync when workspaces change.
-const PACKAGE_PARENTS = ["packages", "examples", "templates"];
+const PACKAGE_PARENTS = ["packages", "templates"];
 const NESTED_TEMPLATE_DIRS = ["desktop", "chrome-extension"];
 
 const TEST_FILE_RE = /\.(test|spec)\.(c|m)?[jt]sx?$/;
@@ -47,6 +29,10 @@ interface Pkg {
   name: string;
   dir: string;
 }
+
+type PnpmWorkspace = {
+  name?: unknown;
+};
 
 function discoverTestPackages(): Pkg[] {
   const out: Pkg[] = [];
@@ -82,6 +68,87 @@ function discoverTestPackages(): Pkg[] {
   return out;
 }
 
+function pnpmCommand(): string {
+  return process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+}
+
+function readTargetedFilters(): string[] | undefined {
+  const raw = process.env.CI_WORKSPACE_FILTERS;
+  if (raw === undefined) return undefined;
+  if (raw.trim().length === 0) {
+    throw new Error(
+      "CI_WORKSPACE_FILTERS must be a non-empty JSON array of non-empty strings",
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(
+      `CI_WORKSPACE_FILTERS must be valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length === 0 ||
+    parsed.some((filter) => typeof filter !== "string" || filter.length === 0)
+  ) {
+    throw new Error(
+      "CI_WORKSPACE_FILTERS must be a non-empty JSON array of non-empty strings",
+    );
+  }
+
+  return parsed;
+}
+
+function resolveTestPackages(all: Pkg[], filters: string[] | undefined): Pkg[] {
+  if (!filters) return all;
+
+  const args = [
+    "-r",
+    "list",
+    ...filters.flatMap((filter) => ["--filter", filter]),
+    "--depth=-1",
+    "--json",
+  ];
+  const output = execFileSync(pnpmCommand(), args, {
+    encoding: "utf8",
+  });
+
+  let workspaces: unknown;
+  try {
+    workspaces = JSON.parse(output);
+  } catch (error) {
+    throw new Error(
+      `pnpm list returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  if (!Array.isArray(workspaces)) {
+    throw new Error("pnpm list did not return a workspace array");
+  }
+
+  const selectedNames = new Set(
+    workspaces.map((workspace, index) => {
+      const name =
+        workspace && typeof workspace === "object"
+          ? (workspace as PnpmWorkspace).name
+          : undefined;
+      if (typeof name !== "string" || name.length === 0) {
+        throw new Error(
+          `pnpm list returned an invalid workspace entry at index ${index}`,
+        );
+      }
+      return name;
+    }),
+  );
+  const packages = all.filter((pkg) => selectedNames.has(pkg.name));
+
+  return packages;
+}
+
 function countTestFiles(dir: string): number {
   let n = 0;
   const stack = [path.join(ROOT, dir)];
@@ -113,37 +180,105 @@ interface Lane {
   filters: string;
   packages: string[];
   files: number;
+  coreShard: string;
 }
 
-function partition(pkgs: Pkg[], laneCount: number): Lane[] {
-  const weight = new Map<string, number>();
-  for (const p of pkgs) weight.set(p.name, Math.max(1, countTestFiles(p.dir)));
+function splitWeight(total: number, index: number, count: number): number {
+  const remainder = total % count;
+  return Math.floor(total / count) + (index < remainder ? 1 : 0);
+}
 
-  const n = Math.max(1, Math.min(laneCount, pkgs.length));
-  const bins = Array.from({ length: n }, () => ({
-    packages: [] as string[],
-    files: 0,
-  }));
-  // Greedy: heaviest first into the currently-lightest bin.
-  for (const p of [...pkgs].sort(
-    (a, b) => weight.get(b.name)! - weight.get(a.name)!,
-  )) {
-    bins.sort((a, b) => a.files - b.files);
-    bins[0].packages.push(p.name);
-    bins[0].files += weight.get(p.name)!;
+function partition(pkgs: Pkg[], laneCount: number, core?: Pkg): Lane[] {
+  return partitionWeighted(
+    pkgs.map((p) => ({
+      name: p.name,
+      files: Math.max(1, countTestFiles(p.dir)),
+    })),
+    laneCount,
+    core ? Math.max(1, countTestFiles(core.dir)) : null,
+  );
+}
+
+/**
+ * Balance packages across lanes by test file count, with core Vitest-sharded
+ * across them. A package can't be split, so the heaviest packages may each
+ * take a lane of their own while core shards across the rest; the plan with
+ * the smallest largest lane wins. Stacking a core shard on top of Design made
+ * one lane outrun the job timeout while the others finished early.
+ */
+export function partitionWeighted(
+  pkgs: ReadonlyArray<{ name: string; files: number }>,
+  laneCount: number,
+  coreFiles: number | null,
+): Lane[] {
+  const sorted = [...pkgs].sort((a, b) => b.files - a.files);
+  const maxSolo =
+    coreFiles === null ? 0 : Math.min(laneCount - 1, sorted.length);
+  let best: LaneBin[] | null = null;
+  for (let solo = 0; solo <= maxSolo; solo++) {
+    const bins = planBins(sorted, laneCount, coreFiles, solo);
+    if (!best || largestBin(bins) < largestBin(best)) best = bins;
   }
+  return toLanes(best!);
+}
+
+interface LaneBin {
+  packages: string[];
+  files: number;
+  coreShard: string;
+}
+
+function largestBin(bins: LaneBin[]): number {
+  return Math.max(...bins.map((bin) => bin.files));
+}
+
+function planBins(
+  sorted: ReadonlyArray<{ name: string; files: number }>,
+  laneCount: number,
+  coreFiles: number | null,
+  soloCount: number,
+): LaneBin[] {
+  const shared = sorted.slice(soloCount);
+  const n =
+    coreFiles !== null
+      ? laneCount - soloCount
+      : Math.max(1, Math.min(laneCount, shared.length));
+  const sharedBins: LaneBin[] = Array.from({ length: n }, (_, index) => ({
+    packages: [],
+    files: coreFiles !== null ? splitWeight(coreFiles, index, n) : 0,
+    coreShard: coreFiles !== null ? `${index + 1}/${n}` : "",
+  }));
+  for (const p of shared) {
+    sharedBins.sort((a, b) => a.files - b.files);
+    sharedBins[0].packages.push(p.name);
+    sharedBins[0].files += p.files;
+  }
+  return [
+    ...sorted
+      .slice(0, soloCount)
+      .map((p) => ({ packages: [p.name], files: p.files, coreShard: "" })),
+    ...sharedBins,
+  ];
+}
+
+function toLanes(bins: LaneBin[]): Lane[] {
   return bins
-    .filter((b) => b.packages.length > 0)
+    .filter((b) => b.packages.length > 0 || b.coreShard !== "")
     .sort((a, b) => b.files - a.files)
     .map((b, i) => ({
       lane: `lane-${i + 1}`,
       filters: b.packages.map((p) => `--filter ${p}`).join(" "),
       packages: b.packages,
       files: b.files,
+      coreShard: b.coreShard,
     }));
 }
 
-function assertFullCoverage(lanes: Lane[], expected: Pkg[]): void {
+export function assertFullCoverage(
+  lanes: Lane[],
+  expected: ReadonlyArray<{ name: string }>,
+  core?: unknown,
+): void {
   const covered = new Set<string>();
   for (const lane of lanes) {
     for (const name of lane.packages) {
@@ -159,6 +294,22 @@ function assertFullCoverage(lanes: Lane[], expected: Pkg[]): void {
   if (missing.length > 0) {
     throw new Error(`Packages missing from all lanes: ${missing.join(", ")}`);
   }
+
+  if (core) {
+    const shards = lanes.map((lane) => lane.coreShard).filter(Boolean);
+    const shardCount = Number(shards[0]?.split("/")[1] ?? 0);
+    const expectedShards = Array.from(
+      { length: shardCount },
+      (_, index) => `${index + 1}/${shardCount}`,
+    );
+    if (
+      shardCount === 0 ||
+      shards.length !== shardCount ||
+      expectedShards.some((shard) => !shards.includes(shard))
+    ) {
+      throw new Error("Core test shards are missing or duplicated");
+    }
+  }
 }
 
 function emit(key: string, value: string): void {
@@ -168,16 +319,28 @@ function emit(key: string, value: string): void {
 }
 
 function summarize(lanes: Lane[], coreFiles: number): void {
+  const targeted = process.env.CI_WORKSPACE_FILTERS !== undefined;
   const lines = [
-    "## Fast tests — full suite, sharded",
+    `## Fast tests — ${targeted ? "targeted" : "full suite"}, sharded`,
     "",
-    `Every test package runs. \`${CORE}\` runs on its own uncapped lane (${coreFiles} files); the rest are split across ${lanes.length} balanced lanes.`,
+    targeted && lanes.length === 0
+      ? "No affected workspace has a test script; targeted fast tests are skipped."
+      : targeted && coreFiles > 0
+        ? `Every affected test package runs exactly once across ${lanes.length} balanced lanes; ${CORE} is Vitest-sharded.`
+        : targeted
+          ? `Every affected test package runs exactly once across ${lanes.length} balanced lanes.`
+          : `Every test package runs. \`${CORE}\` is split across ${lanes.filter((l) => l.coreShard).length} Vitest shards (${coreFiles} files); the rest share those balanced lanes.`,
     "",
     "| lane | test files | packages |",
     "| --- | ---: | --- |",
-    `| core | ${coreFiles} | ${CORE} |`,
     ...lanes.map(
-      (l) => `| ${l.lane} | ${l.files} | ${l.packages.join(", ")} |`,
+      (l) =>
+        `| ${l.lane} | ${l.files} | ${[
+          l.coreShard ? `${CORE} (${l.coreShard})` : "",
+          ...l.packages,
+        ]
+          .filter(Boolean)
+          .join(", ")} |`,
     ),
   ];
   const md = lines.join("\n");
@@ -188,14 +351,21 @@ function summarize(lanes: Lane[], coreFiles: number): void {
 
 function main(): void {
   const all = discoverTestPackages();
-  const core = all.find((p) => p.name === CORE);
-  const rest = all.filter((p) => p.name !== CORE);
+  const selected = resolveTestPackages(all, readTargetedFilters());
+  const core = selected.find((p) => p.name === CORE);
+  const rest = selected.filter((p) => p.name !== CORE);
 
-  const lanes = partition(rest, LANES);
-  assertFullCoverage(lanes, rest);
+  const lanes = partition(rest, LANES, core);
+  assertFullCoverage(lanes, rest, core);
 
   emit("matrix", JSON.stringify({ include: lanes }));
+  emit("has_tests", String(lanes.length > 0));
   summarize(lanes, core ? countTestFiles(core.dir) : 0);
 }
 
-main();
+if (
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
+  main();
+}

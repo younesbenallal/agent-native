@@ -181,6 +181,27 @@ pnpm action set-default-design-system --id <id>
 Pass `--isDefault false` to clear the current default. Setting a system as the
 default unsets the previous default in the same user and organization scope.
 
+### Deleting a Design System
+
+```bash
+pnpm action delete-design-system --id <id>
+```
+
+Requires admin access or higher — the owner, or anyone holding an `admin`
+share role. That is the same `canManage` flag `list-design-systems` returns
+and the Design Systems page renders its Delete control from. Removes the
+system and its shares, and clears `designSystemId` on every linked design and
+saved template the caller can edit — a design system's admin share does not
+grant write access to every design or template that happens to reference it,
+so ones the caller can't edit keep a dangling reference instead, reported
+back as `designsSkippedForAccess` / `templatesSkippedForAccess` (both
+`get-design-template` and `list-design-templates` already resolve a dangling
+`designSystemId` back to `null` rather than erroring). Those designs keep the
+tokens already baked into their HTML, so a design can still look on-brand
+while no longer linked to a system. If the deleted system was the owner's
+default, another of their design systems is promoted to default so future
+design creation doesn't silently drop to "no design system".
+
 ## Multi-Source Import Flow
 
 The design system setup page collects brand assets from multiple sources. When the user clicks "Continue to generation", a structured message is sent to the agent with all sources. Process each source type with the appropriate action:
@@ -201,10 +222,22 @@ it reports an explicit static SSRF-safe fallback when no browser is available.
 ### Source: GitHub Repository
 
 ```bash
-pnpm action index-design-system-with-builder --githubRepoUrl "https://github.com/acme/ui"
+pnpm action index-design-system-with-builder --githubSources '[{"repoUrl":"https://github.com/acme/ui","ref":"main","include":["src/styles","design.md"]}]'
 ```
 
-Starts Builder design-system indexing for the repository. Builder is the source of truth for the indexed brand kit, generated docs, and usage guidance. If Builder is not connected, stop and ask the user to connect Builder.
+Starts one Builder design-system job with one or more GitHub sources. Each
+source can pin a branch, tag, or commit and include repository-relative files or
+folders. Unscoped public repositories stay native Builder sources so large
+codebases are not truncated; private repos and scoped refs stay server-side and
+use the saved `GITHUB_TOKEN` without exposing it to the browser or Builder.
+Builder is the source of truth for the indexed brand kit, generated docs, and
+usage guidance. If Builder is not connected, stop and ask the user to connect
+Builder.
+
+The legacy `githubRepoUrl` argument remains compatible for one unscoped repo.
+For a saved GitHub-backed system, use `sync-design-system-with-builder --id
+<localDesignSystemId>` to replay the stored repository/ref/scope after upstream
+changes. Do not create a second local copy.
 
 ### Source: Local Code Files
 
@@ -483,6 +516,8 @@ human approval.
 ## Applying Design System to Generated HTML
 
 When generating a design that has a linked design system, replace all default CSS custom properties with the design system tokens.
+
+`get-design` / `view-screen` return `designSystem` as a bounded summary; call `get-design-system` once for the full context before the first screen you author, and use `index-design-tokens` to inspect an existing design's applied tokens.
 
 ### Before (defaults):
 

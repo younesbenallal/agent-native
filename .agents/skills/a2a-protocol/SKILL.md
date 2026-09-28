@@ -28,20 +28,24 @@ fixing it. If A2A delegation is unreliable, fix A2A — file it as a bug in the
 delegation path (timeout handling, retries, typed terminal states), don't
 route around it app by app.
 
-Connecting app A to app B is two independent things, and both must be true:
+Connecting app A to an Agent-Native app B is two independent things, and both
+must be true:
 
 1. **B is registered on A** as a `remote-agents/<id>.json` resource.
 2. **A and B share a secret**, so A's signed JWT verifies on B.
 
 Neither is a code change, and neither is symmetric. Registering B on A does not
-let B call A.
+let B call A. A hosted peer uses provider-specific endpoint and credential
+metadata in place of the shared Agent-Native secret, but it still does not make
+the provider's model or SDK an A2A endpoint.
 
 ## A2A is already mounted
 
 `createAgentChatPlugin` calls `mountA2A` for every app, so a generated app
 already serves:
 
-- `GET /.well-known/agent-card.json` — public discovery, never authenticated
+- `GET /.well-known/agent-card.json` — public discovery, with a larger
+  authenticated capability view for verified sibling callers
 - `POST /_agent-native/a2a` — JSON-RPC, authenticated
 
 Do not add a `mountA2A` server plugin to enable A2A; it is on. Hand-mounting is
@@ -61,19 +65,37 @@ A remote agent is **a row in the resources table, not a file on disk**. Path
   "name": "Analytics",
   "description": "Queries analytics data across providers",
   "url": "https://analytics.example.com",
-  "color": "#6B7280"
+  "color": "#6B7280",
+  "cardUrl": "https://analytics.example.com/.well-known/agent-card.json",
+  "auth": {
+    "type": "bearer",
+    "credentialRef": "ANALYTICS_A2A_TOKEN"
+  }
 }
 ```
 
-`url` is the only required field. `parseRemoteAgentManifest` accepts **only**
-these five keys — there is no `apiKey`, `env`, `skills`, or `token` field, and
-anything else is silently dropped.
+`url` is the only required endpoint field. `cardUrl` is the optional discovery
+URL for providers that do not serve `/.well-known/agent-card.json`. The client
+reads the protocol version from the agent card. Pass `protocolVersion` directly
+to `A2AClient` when a provider's card omits it. The optional `auth` descriptor is
+non-secret connection metadata. Use
+`{ "type": "bearer", "credentialRef": "..." }` for a vault-backed bearer
+credential, or `{ "type": "oauth-client-credentials", "tokenUrl": "...",
+"clientId": "...", "clientSecretRef": "...", "scope": "..." }` when the
+peer issues OAuth client-credentials tokens. `credentialRef` and
+`clientSecretRef` are references, never secret values.
 
-Four ways to create it, all writing the same row:
+Do not add `apiKey`, `env`, `skills`, or `token` values to a manifest. Resolve
+credentials server-side from the workspace connection or vault. A direct
+`A2AClient` call can pass `cardUrl` and `protocolVersion` while a provider
+adapter is being used, but browser code must never receive the credential.
+
+Five ways to create it, all writing the same row:
 
 | Surface | Where |
 | --- | --- |
-| Settings → Manage agent → Connected Agents (A2A) | any app with the settings panel |
+| Settings → Agent → Sub-agents → Connect agent (with the `settings-redesign` flag; owners and admins) | any app with the Settings shell |
+| Settings → Manage agent → Connected Agents (A2A) | any app with the settings panel, flag off |
 | Agent page → Connections | apps mounting `AgentTabsPage` |
 | Dispatch → Agents → Add external agent | workspace dispatch |
 | The agent itself | `resources` tool, `action: "write"`, `--scope shared` |
@@ -138,7 +160,63 @@ request is genuine loopback or `A2A_ALLOW_UNSIGNED_INTERNAL=1`.
 `A2AConfig.apiKeyEnv` still exists for static bearer auth against non-agent-native
 peers, but the framework's own mount never sets it. Do not reach for it when
 debugging a connection between two agent-native apps — the answer there is
-always the shared secret.
+always the shared secret. For a provider that uses OAuth, resolve and refresh
+the access token in a server-side adapter. `A2A_SECRET` is not a substitute for
+the provider's Entra, Google, or other OAuth credential.
+
+## Hosted providers
+
+Foundry, Gemini Enterprise, and other hosted services can be A2A peers only
+when they expose a compatible protocol endpoint. Foundry hosted agents run
+agent code in managed containers and can expose A2A through Agent Service. Keep
+the Agent-Native UI, actions, and PostgreSQL app on its normal host. Foundry
+callers use Microsoft Entra bearer tokens with Foundry Agent Consumer access,
+so configure `cardUrl` and obtain the token through the workspace credential
+provider. Foundry v1.0 is the GA JSON-RPC endpoint; v0.3 is the preview
+endpoint used when no version is selected. Use the v1 card URL
+`.../agents/{agent}/endpoint/protocols/a2a/agentCard/v1.0` when available,
+and pass `protocolVersion` only when the card omits it. Foundry v1 does not
+provide SSE streaming. See the [Foundry hosted agent overview](https://learn.microsoft.com/en-us/azure/foundry/agents/overview)
+and [A2A endpoint guidance](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/enable-agent-to-agent-endpoint).
+
+Gemini Enterprise managed assistants expose a standard A2A JSON-RPC endpoint
+under the assistant resource, such as
+`.../assistants/default_assistant/agents/{id}/a2a`, and can publish the card at
+a custom URL. Use the generic bearer client with that `cardUrl`; the caller's
+Google OAuth bearer needs the `discoveryengine.assist` permission. Custom A2A
+agent registration is Pre-GA, so verify that it is enabled in the target
+project before exposing it in the workspace picker. A model provider or SDK
+without an A2A endpoint still needs a server-side adapter before an
+Agent-Native app can call it.
+
+Anthropic Managed Agents has no inbound A2A endpoint. Use
+`createAnthropicManagedAgentsHandler()` as the `A2AConfig.handler` when the
+Agent-Native app should own the A2A task, workflow state, and approvals while
+Anthropic owns the session, context, and tools. Its configuration is a native
+provider kind on the existing remote-agent resource:
+
+```json
+{
+  "kind": {
+    "provider": "anthropic-managed-agents",
+    "agentId": "agt_01...",
+    "environmentId": "env_01...",
+    "credentialRef": "ANTHROPIC_API_KEY"
+  }
+}
+```
+
+`credentialRef` is a vault reference, resolved in the caller's user and
+organization scope. The adapter calls `POST /v1/sessions`, sends
+`user.message` or `user.tool_confirmation` events to
+`POST /v1/sessions/{id}/events`, and reads
+`GET /v1/sessions/{id}/events/stream` with the
+`managed-agents-2026-04-01` beta header. A `session.status_idle` event whose
+stop reason is `requires_action` becomes A2A `input-required`; each blocking
+tool also emits the normal `approval-request` runtime event. Continue only
+with structured `{ toolUseId, result: "allow" | "deny" }` confirmations in
+the adapter metadata. Register the `anthropic-managed-agents` workspace
+connection provider to reuse existing per-app grants.
 
 Never hardcode either secret in source, docs, prompts, app state, action
 descriptions, client bundles, or examples. Read them from runtime config; never
@@ -146,11 +224,23 @@ log or return them.
 
 ## Advertising what this agent can do
 
-Card `skills` are derived from actions marked `publicAgent`. An app that marks
-none publishes `"skills": []`, but natural-language delegation still works
-because the receiving agent loads its own instructions, skills, data
-dictionary, credentials, and tools. Mark only stable machine contracts that a
-peer may intentionally invoke directly; leave implementation actions internal.
+Card `skills` are derived from actions marked `publicAgent`; do not maintain a
+second capability registry. Anonymous callers see only explicitly public-safe
+reads. Verified sibling callers see two concise kinds of capability:
+
+- Authenticated read-only actions selected by connector policy include their
+  input schemas and may be invoked directly.
+- Authenticated writes marked `publicAgent: { expose: true, readOnly: false,
+  requiresAuth: true }` are advertised without schemas as message-only
+  capabilities. A sibling delegates an objective; the receiving agent chooses
+  and validates its own local actions.
+
+`agentTool: false` and `externalAgents.denyActions` remove an action from both
+authenticated paths. An app that marks no actions still publishes
+`"skills": []`, and natural-language delegation still works because the
+receiver loads its own instructions, skills, data dictionary, credentials, and
+tools. Expose stable user-facing capabilities, not internal implementation
+actions.
 
 ## Calling another agent
 
@@ -203,8 +293,9 @@ const { result } = await invokeAgentAction({
 The receiver still owns schema validation, credentials, access scoping, audit
 attribution, and exposure policy. Direct invocation is available only for
 cataloged, authenticated, explicitly exposed read-only actions that do not
-require approval. Its JWT is audience-bound to the receiving app. Use normal
-message delegation whenever the receiver must interpret the request, choose a
+require approval. Its JWT is audience-bound to the receiving app's exact base
+URL, including a workspace path such as `/content`. Use normal message
+delegation whenever the receiver must interpret the request, choose a
 source, consult its data dictionary, plan, synthesize, join data, or perform a
 multi-step workflow.
 
@@ -224,10 +315,12 @@ change it when the work changes. Dedupe is scoped to the JWT-authenticated
 owner and verified org, and keys are limited to 128 characters.
 
 The caller also forwards bounded correlation metadata (`callerApp`,
-`callerThreadId`, `parentRunId`, `parentTurnId`, and direct-read
-`invocationId`). These fields
-are telemetry hints only. Receivers must continue to derive identity,
-ownership, org scope, access, and approval from the verified request context.
+`selectedReceiverApp`, `callerThreadId`, `parentRunId`, `parentTurnId`, and
+direct-read `invocationId`). `selectedReceiverApp` lets the matching receiver
+prioritize its declared local capabilities before loading cross-app tools; the
+other fields remain telemetry hints. Receivers must continue to derive
+identity, data ownership, org scope, access, and approval from the verified
+request context.
 Delegated model loops emit `$ai_generation` with A2A/MCP lineage, while direct
 reads emit the content-free `$a2a_read_invoke` event; neither event includes
 action arguments or results.
@@ -265,7 +358,7 @@ for await (const update of client.stream({
 
 ### Agent activity in delegated chat
 
-Agent Native peers attach a bounded `data` part with
+Agent-Native peers attach a bounded `data` part with
 `kind: "agent-native/agent-activity"` to in-progress and terminal task status
 messages. It contains the same user-visible reasoning summaries shown in the
 receiving app, tool names and completion states, elapsed time, and progressive

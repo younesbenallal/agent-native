@@ -6,51 +6,62 @@ The first screen is the chat: start by helping the user build, set up, inspect,
 or analyze their form workspace, then navigate into app views when a richer
 editor or table is useful.
 
-Detailed building, publishing, response, storage, and UI rules live in
-`.agents/skills/`.
+## Skills
 
-Before building common workspace or agent UI, read `agent-native-toolkit` to
-inventory existing public kits and installed package seams. Use
-`customizing-agent-native` for the configure → compose → eject → propose seam
-ladder.
+Read the relevant skill before deeper work:
+
+- `form-building` for schema/field creation and edits.
+- `form-publishing` for public forms, submission behavior, and sharing.
+- `form-responses` for response review and analysis.
+
+## Actions
+
+| Action | Purpose |
+| --- | --- |
+| `view-screen` | Re-read the active form, selected field, or response table |
+| `navigate` | Move between home, builder, responses, response-insights, settings |
+| `create-form` | Create a form with fields; status defaults to draft |
+| `update-form` | Change title, settings, or status (publish with `status: "published"`) |
+| `patch-form-fields` | Upsert or reorder individual fields without a full rewrite |
+| `show-response-insight` | Show a theme card |
+| `list-forms` / `get-form` | List forms / read one form's definition |
+| `preview-form` | Inline setup summary with an open-editor link |
+| `response-insights` | Chart, table, or combined response analytics |
+| `list-responses` / `export-responses` | Read or export submissions |
 
 ## Core Rules
 
+- UI feedback: target 100 ms, never exceed 400 ms; acknowledge before network work.
 - Store large file/blob payloads in configured file/blob storage, not SQL: no
   base64, `data:` URLs, images, video/audio, PDFs, ZIPs, screenshots,
   thumbnails, or replay chunks in app tables, `application_state`, `settings`,
   or `resources`; persist URLs, ids, or handles instead.
 - Never hardcode API keys, tokens, webhook URLs, signing secrets, private Builder/internal data, customer data, or credential-looking literals. Use secrets/OAuth/runtime configuration and obvious placeholders in examples.
+- For external integrations, inspect the workspace/provider connection catalog first; reuse its scoped resolver.
 - Use actions for form lifecycle, fields, publishing, responses, navigation,
-  sharing, and database work. Do not bypass ownable access checks.
-- In dev, call actions with `pnpm action <name>`; in production, use native
-  tools. The action schema is authoritative.
+  sharing, and database work. Do not bypass ownable access checks. The action
+  schema is authoritative when a parameter is unclear.
 - Use `view-screen` when the active form, selected field, publish state, or
   response table is unclear.
-- For response analytics, call `response-insights` instead of inventing SQL.
-  Pass `displayMode: "chart"` for chart-only requests, `displayMode: "table"`
-  only when the user asks for a table/rows, and `displayMode: "insights"` for
-  combined dashboard/report requests.
-- For form setup/configuration previews, call `preview-form`. It returns a
-  native inline summary/table and an "Open editor" expansion path.
-- For an anonymous feedback form or survey, create all fields in one
-  `create-form` call with `status: "published"`, verify the persisted form, and
-  return the action's exact public `/f/<slug>` response URL rather than only
-  the private editor link.
-- To email the form owner when someone submits a response, set
-  `settings.emailOnNewResponses: true` through `create-form` or `update-form`.
-  Delivery uses the configured framework email provider (`RESEND_API_KEY` or
-  `SENDGRID_API_KEY`) in the form owner's request context and sends to the form
-  owner's account email. A public submission can succeed even when delivery
-  fails, so check the server logs and provider configuration when debugging.
-- Conditional fields use `conditional: { fieldId, operator, value }`. The
-  `fieldId` must reference an earlier field; supported operators are `equals`,
-  `not_equals`, and `contains`. Hidden fields and their stale values are not
-  persisted or delivered to integrations.
-- Form integrations are outbound webhooks. Slack requires an Incoming Webhook
-  URL, and Google Sheets requires a deployed Google Apps Script `/exec` URL that
-  parses `JSON.parse(e.postData.contents)` and appends the received values.
-  They are separate from the managed Slack/Messaging connection.
+- One request, one form: the open form is context, not a default write target,
+  so a prompt naming a different form is `create-form`, never `update-form`.
+- For response analytics and setup previews, follow `form-responses`
+  (`response-insights` displayMode, `preview-form`); never invent SQL.
+- For product usage, agent-native signup, conversion, app-wide event, or other
+  data-owned-by-sibling questions, use `describe-workspace-apps` when ownership
+  is unclear, then delegate a narrow natural-language question with `call-agent`
+  to the owning app. In workspaces with Analytics, it normally owns first-party
+  signup, conversion, and app-usage metrics. Do not invent SQL or query another
+  app's database.
+- For publishing, `publicUrl`, `slug`, and anonymous-mode rules, follow
+  `form-publishing`; always copy the returned `publicUrl` verbatim.
+- `settings.emailOnNewResponses: true` emails the form owner per response;
+  delivery details follow `form-publishing`.
+- Conditional-field rules (`conditional: { fieldId, operator, value }`) and
+  hidden-field handling follow `form-building`.
+- Form integrations (webhook/Slack/Discord/Google Sheets) follow
+  `form-publishing`; they are separate from the managed Slack/Messaging
+  connection.
 - Form UX should stay focused: clear labels, sensible validation, minimal
   required fields, and progressive disclosure for advanced settings.
 - Public form submission endpoints must be intentionally public; keep management
@@ -59,9 +70,10 @@ ladder.
 
 ## Application State
 
-- `navigation` exposes home chat, builder, published form, responses,
-  response-insights, selected field, and builder tab context
-  (`activeTab`: `edit`, `responses`, `settings`, or `integrations`).
+- `navigation` exposes the `/home` chat, builder, published form, responses,
+  response-insights, and builder tab context (`activeTab`: `edit`,
+  `responses`, `settings`, or `integrations`); `view-screen` reports the
+  selected field as `form.selection`.
 - `navigate` moves the UI between home, forms, builder, responses,
   response-insights, preview, and team/settings-style views. For builder
   sub-tabs, call `navigate` with `view=form`, the form ID, and
@@ -69,8 +81,9 @@ ladder.
 
 ## Chat-First Workflow
 
-- The `/` route is the primary chat surface. Use it to ask clarifying questions,
-  create or edit forms, explain setup, and surface response insights.
+- The `/home` route is the primary chat surface. Use it to ask clarifying
+  questions, create or edit forms, explain setup, and surface response insights.
+  The public `/` route redirects to the shared sign-in/signup page.
 - When the user needs a focused workspace, call `navigate` to open `/forms`,
   `/forms/:id?tab=edit`, `/forms/:id?tab=responses`,
   `/forms/:id?tab=settings`, `/forms/:id?tab=integrations`,
@@ -88,12 +101,7 @@ ladder.
   do not include both unless the user asked for both; iframe/MCP App rendering
   is only a fallback for external hosts.
 
-## Skills
+## Source Changes
 
-Read the relevant skill before deeper work:
-
-- `form-building` for schema/field creation and edits.
-- `form-publishing` for public forms, submission behavior, and sharing.
-- `form-responses` for response review and analysis.
-- `storing-data`, `real-time-sync`, `security`, `actions`, `frontend-design`,
-  and `shadcn-ui` for framework work.
+Before building common workspace or agent UI, read `agent-native-toolkit`; read
+`customizing-agent-native` before adapting shared UI.

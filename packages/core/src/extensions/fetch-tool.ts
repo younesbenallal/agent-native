@@ -16,6 +16,7 @@ import {
   collectSecretValues,
   MAX_EXTENSION_PROXY_RESPONSE_SIZE,
   normalizeExtensionProxyMethod,
+  readResponseBytesWithLimit,
   readResponseTextWithLimit,
   redactSecrets,
   redactString,
@@ -32,6 +33,51 @@ import {
 } from "./web-content.js";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
+const VISION_IMAGE_CONTENT_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+]);
+const CREDENTIAL_NAME_RE =
+  /(?:^|[-_])(access[-_]?token|api[-_]?key|auth(?:orization)?|credential|expires?|key[-_]?pair[-_]?id|key|password|passwd|policy|secret|session|signature|sig|token|jwt|assertion)(?:$|[-_])/i;
+
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+  if (typeof Buffer !== "undefined")
+    return Buffer.from(bytes).toString("base64");
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(
+      ...bytes.subarray(i, Math.min(i + chunkSize, bytes.length)),
+    );
+  }
+  return btoa(binary);
+}
+
+function hasCredentialBearingImageRequest(
+  url: string,
+  headers: Record<string, string>,
+): boolean {
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    return true;
+  }
+  if (parsedUrl.username || parsedUrl.password) return true;
+  if (parsedUrl.hash) return true;
+  if (
+    Object.keys(headers).some((name) =>
+      CREDENTIAL_NAME_RE.test(name.replace(/([a-z])([A-Z])/g, "$1-$2")),
+    )
+  ) {
+    return true;
+  }
+  return [...parsedUrl.searchParams.keys()].some((name) =>
+    CREDENTIAL_NAME_RE.test(name.replace(/([a-z])([A-Z])/g, "$1-$2")),
+  );
+}
 
 /**
  * Headers that mimic a current Chrome on macOS so anti-bot middleware (Cloudflare,
@@ -73,33 +119,19 @@ function applyBrowserDefaults(
 }
 
 export interface FetchToolOptions {
-  /** Resolve ${keys.NAME} references. Injected by the plugin at setup time. */
   resolveKeys?: (text: string) => Promise<{
     resolved: string;
     usedKeys: string[];
     secretValues?: string[];
-    /**
-     * Optional: which scope (user/org/workspace) each used key actually
-     * resolved at. Populated by resolvers like
-     * `resolveKeyReferencesWithRequestScopes` so `validateUrl` can look up
-     * the allowlist at the scope the value came from rather than assuming
-     * user scope. Backwards compatible — callers that omit this (or a
-     * resolver that doesn't report it) are unaffected.
-     */
     resolvedKeys?: ResolvedKeyReference[];
   }>;
-  /** Validate URL against per-key allowlists. */
   validateUrl?: (
     url: string,
     usedKeys: string[],
-    /** Accumulated `resolvedKeys` from every `resolveKeys` call this request made, when the resolver reported them. */
     resolvedKeys?: ResolvedKeyReference[],
   ) => Promise<boolean>;
 }
 
-/**
- * Create the fetch tool entry for the agent tool registry.
- */
 export function createFetchToolEntry(
   opts: FetchToolOptions = {},
 ): Record<string, ActionEntry> {
@@ -142,7 +174,7 @@ export function createFetchToolEntry(
             responseMode: {
               type: "string",
               description:
-                "How to return the response. Default: auto (HTML pages become clean markdown; JSON/text stays raw). Use raw for exact bytes, markdown/text for extracted readable content, links for just links, metadata for page metadata, or matches with search.",
+                "How to return the response. Default: auto (HTML pages become clean markdown; JSON/text stays raw; successful public image responses are attached as vision context). Use raw for exact bytes, markdown/text for extracted readable content, links for just links, metadata for page metadata, or matches with search.",
               enum: [
                 "auto",
                 "raw",
@@ -227,7 +259,6 @@ export function createFetchToolEntry(
             ? Math.min(requestedMaxChars, 200_000)
             : 32_000;
 
-        // Resolve key references
         let resolvedUrl = rawUrl;
         let resolvedHeaders = rawHeaders;
         let resolvedBody = rawBody;
@@ -265,12 +296,10 @@ export function createFetchToolEntry(
           ? allResolvedKeys
           : undefined;
 
-        // Block SSRF targets regardless of key usage
         if (await isBlockedExtensionUrlWithDns(resolvedUrl)) {
           return `Requests to private/internal addresses are not allowed: "${rawUrl}".`;
         }
 
-        // Validate URL against per-key allowlists
         if (opts.validateUrl && allUsedKeys.length > 0) {
           try {
             const allowed = await opts.validateUrl(
@@ -286,12 +315,6 @@ export function createFetchToolEntry(
           }
         }
 
-        // Parse headers, then merge in browser-like defaults for any header the
-        // caller didn't already specify. Real-browser headers (User-Agent,
-        // Accept, Sec-Fetch-*) are what gets you past Cloudflare / PerimeterX /
-        // generic UA-sniffing middleware on sites the user pastes in chat;
-        // explicit caller headers always win so API calls keep their auth
-        // headers untouched.
         let headers: Record<string, string>;
         try {
           headers = sanitizeOutboundHeaders(JSON.parse(resolvedHeaders));
@@ -300,7 +323,6 @@ export function createFetchToolEntry(
         }
         headers = applyBrowserDefaults(headers);
 
-        // Make the request
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -349,15 +371,57 @@ export function createFetchToolEntry(
             }`;
           }
 
-          // Check if caller wants to save to workspace file (before truncation).
+          const contentType =
+            response.headers.get("content-type")?.split(";")[0].trim() ??
+            "text/plain";
+
           const saveToFilePath =
             typeof (args as Record<string, unknown>).saveToFile === "string"
               ? ((args as Record<string, unknown>).saveToFile as string).trim()
               : "";
+          const hasCredentials =
+            allUsedKeys.length > 0 ||
+            hasCredentialBearingImageRequest(resolvedUrl, headers);
+          if (
+            !saveToFilePath &&
+            method === "GET" &&
+            response.ok &&
+            VISION_IMAGE_CONTENT_TYPES.has(contentType.toLowerCase()) &&
+            resolvedUrl.startsWith("https://") &&
+            !hasCredentials
+          ) {
+            const imageBody = await readResponseBytesWithLimit(
+              response,
+              MAX_EXTENSION_PROXY_RESPONSE_SIZE,
+            );
+            if (imageBody.truncated) {
+              return `HTTP ${response.status} ${response.statusText}\n\nContent-Type: ${contentType}\n\nImage response too large to attach (${imageBody.size} bytes, max ${MAX_EXTENSION_PROXY_RESPONSE_SIZE}).`;
+            }
+            console.log(
+              "[fetch-tool] " +
+                method +
+                " image → " +
+                response.status +
+                " (" +
+                elapsed +
+                "ms, vision image)",
+            );
+            return {
+              status: response.status,
+              statusText: response.statusText,
+              contentType,
+              url: resolvedUrl,
+              _agentImages: [
+                {
+                  data: uint8ArrayToBase64(imageBody.bytes),
+                  mediaType: contentType.toLowerCase(),
+                },
+              ],
+            };
+          }
 
           let body: string;
           try {
-            // When saving to file allow larger reads (20MB), otherwise cap at proxy limit.
             const readLimit = saveToFilePath
               ? 20 * 1024 * 1024
               : MAX_EXTENSION_PROXY_RESPONSE_SIZE;
@@ -367,9 +431,6 @@ export function createFetchToolEntry(
             body = "(could not read response body)";
           }
           body = redactString(body, secretValues);
-          const contentType =
-            response.headers.get("content-type")?.split(";")[0].trim() ??
-            "text/plain";
           let displayBody: string;
           let processedMode = "raw";
           try {
@@ -392,16 +453,18 @@ export function createFetchToolEntry(
             return `web-request post-processing error: ${err?.message ?? String(err)}`;
           }
 
-          // Audit log
           console.log(
             `[fetch-tool] ${method} ${rawUrl} → ${response.status} (${elapsed}ms, keys: ${allUsedKeys.join(",") || "none"})`,
           );
 
-          // saveToFile: write full body to workspace and return compact summary.
           if (saveToFilePath) {
             try {
-              const { writeWorkspaceFile, SAVE_TO_FILE_MAX_BYTES } =
-                await import("../workspace-files/store.js");
+              const {
+                writeWorkspaceFile,
+                SAVE_TO_FILE_MAX_BYTES,
+                isScratchWorkspacePath,
+                toWorkspaceFileCard,
+              } = await import("../workspace-files/store.js");
               const { getRequestOrgId, getRequestUserEmail } =
                 await import("../server/request-context.js");
               const orgId = getRequestOrgId();
@@ -413,7 +476,13 @@ export function createFetchToolEntry(
                   : null;
               if (!scope)
                 throw new Error("No authenticated context for saveToFile");
-              await writeWorkspaceFile(
+              const scratchPath = isScratchWorkspacePath(saveToFilePath);
+              if (!response.ok && !scratchPath) {
+                throw new Error(
+                  `Refusing to save a failed response to durable workspace file "${saveToFilePath}" (status ${response.status}). Use a scratch/... path for diagnostics.`,
+                );
+              }
+              const meta = await writeWorkspaceFile(
                 scope,
                 saveToFilePath,
                 body,
@@ -433,6 +502,7 @@ export function createFetchToolEntry(
                 responseMode: processedMode,
                 preview:
                   preview.length < displayBody.length ? `${preview}…` : preview,
+                ...(scratchPath ? {} : { file: toWorkspaceFileCard(meta) }),
               });
             } catch (saveErr: any) {
               return `saveToFile error: ${saveErr?.message ?? String(saveErr)}\n\nHTTP ${response.status} ${response.statusText}\n\n${body.slice(0, maxChars)}`;

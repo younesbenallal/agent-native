@@ -34,6 +34,7 @@ const messages = {
     agentDescription:
       "エージェントのモデル、API キー、自動化、音声などを管理します。",
     openAgentSettings: "エージェントを管理",
+    editorGroupTitle: "エディター",
     editorTitle: "VS Code 拡張機能",
     editorDescription:
       "別のブラウザータブではなく、VS Code のサイドパネルでプランを開いてレビューします。",
@@ -386,9 +387,18 @@ const messages = {
         "デフォルトでは非公開です。人を招待したり、組織と共有したり、リンクを知っている人全員がレビューできるように「公開」を設定したりできます。",
       peopleAccess: "{{noun}} アクセス権を持つ人",
       generalAccess: "一般的な {{noun}} アクセス",
+      commenterRoleLabel: "コメント投稿者",
+      commenterRoleDescription: "閲覧してコメントを追加できます",
       shareAria: "{{noun}}をシェアする",
       share: "{{noun}}をシェアする",
       shareThis: "この {{noun}} を共有する",
+      teammateSuggestion: {
+        message: "チームを Plan に招待しましょう。",
+        invite: "チームを招待",
+        enableDomain: "@{{domain}} の全員に参加を許可",
+        enableFailed:
+          "ドメイン参加を有効にできませんでした。もう一度お試しください。",
+      },
       hostedCopy:
         "このローカル {{noun}} には、共有用にホストされたコピーがあります。ホストされた {{noun}} を開いてアクセスを管理します。",
       publishDescription:
@@ -646,6 +656,7 @@ const messages = {
       createAccount: "创建账户",
       signIn: "登录",
       haveAccount: "我已有账户",
+      storageStatusUnavailable: "ファイルストレージを確認できませんでした。",
       retry: "重试",
       sendFeedback: "フィードバックを送信",
       feedbackPlaceholder:

@@ -1,9 +1,11 @@
+import { createApp } from "h3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   ensurePersonalDefaults: vi.fn(async () => undefined),
   resourceGetByPath: vi.fn(),
   resourceList: vi.fn(),
+  resourceListAllOwners: vi.fn(async () => []),
   resourceListAccessible: vi.fn(),
   resourceGet: vi.fn(),
   resourcePut: vi.fn(async () => undefined),
@@ -14,9 +16,13 @@ const mocks = vi.hoisted(() => ({
     skills: {},
   })),
   generateSkillsPromptBlock: vi.fn(() => ""),
+  getSession: vi.fn(),
 }));
 
-// Mirror the real `getRuntimeSkills`: drop `scope: dev` skills, keep the rest.
+const routeHarness = vi.hoisted(() => ({
+  initPromises: [] as Promise<void>[],
+}));
+
 function runtimeSkillsFromBundle(bundle: { skills?: Record<string, any> }) {
   return Object.values(bundle.skills ?? {}).filter(
     (skill: any) => skill?.meta?.scope !== "dev",
@@ -32,10 +38,18 @@ vi.mock("../resources/store.js", () => ({
       : null,
   sharedResourceOwner: (orgId?: string | null) =>
     orgId ? `__organization__:${encodeURIComponent(orgId)}` : "__shared__",
+  workspaceResourceOwner: (orgId?: string | null) =>
+    orgId
+      ? `__workspace__:__organization__:${encodeURIComponent(orgId)}`
+      : "__workspace__",
+  isWorkspaceResourceOwner: (owner: string) =>
+    owner === "__workspace__" || owner.startsWith("__workspace__:"),
   ensurePersonalDefaults: (...args: any[]) =>
     mocks.ensurePersonalDefaults(...args),
   resourceGetByPath: (...args: any[]) => mocks.resourceGetByPath(...args),
   resourceList: (...args: any[]) => mocks.resourceList(...args),
+  resourceListAllOwners: (...args: any[]) =>
+    mocks.resourceListAllOwners(...args),
   resourceListAccessible: (...args: any[]) =>
     mocks.resourceListAccessible(...args),
   resourceGet: (...args: any[]) => mocks.resourceGet(...args),
@@ -53,11 +67,34 @@ vi.mock("./agents-bundle.js", () => ({
   getRuntimeSkills: (bundle: any) => runtimeSkillsFromBundle(bundle),
 }));
 
-import { loadResourcesForPrompt } from "./agent-chat-plugin.js";
+vi.mock("./framework-request-handler.js", () => ({
+  awaitBootstrap: () => Promise.resolve(),
+  getH3App: (nitroApp: { h3App: ReturnType<typeof createApp> }) =>
+    nitroApp.h3App,
+  markDefaultPluginProvided: vi.fn(),
+  trackPluginInit: (_nitroApp: unknown, initPromise: Promise<void>) => {
+    routeHarness.initPromises.push(initPromise);
+  },
+}));
+
+vi.mock("./auth.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./auth.js")>()),
+  getSession: (...args: any[]) => mocks.getSession(...args),
+}));
+
+import {
+  createAgentChatPlugin,
+  loadResourcesForPrompt,
+} from "./agent-chat-plugin.js";
 import {
   promptResourceManifestSections,
   registerPromptContextProvider,
 } from "./agent-chat/prompt-resources.js";
+import {
+  getRequestContext,
+  getRequestOrgId,
+  runWithRequestContext,
+} from "./request-context.js";
 
 const resourcesById = new Map([
   [
@@ -167,6 +204,8 @@ function meta(id: string) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  routeHarness.initPromises.length = 0;
+  mocks.getSession.mockResolvedValue(null);
   mocks.loadAgentsBundle.mockResolvedValue({
     workspaceAgentsMd: "",
     agentsMd: "",
@@ -252,6 +291,298 @@ beforeEach(() => {
   mocks.resourceGet.mockImplementation(async (id) => resourcesById.get(id));
 });
 
+async function mountResourceRoutes(options?: {
+  resolveOrgId?: (
+    event: unknown,
+  ) => string | null | undefined | Promise<string | null | undefined>;
+}) {
+  const h3App = createApp();
+  createAgentChatPlugin({
+    actions: () => ({}),
+    a2aAgentDelegation: false,
+    frameworkTools: "minimal",
+    leanPrompt: true,
+    mcp: { enabled: false },
+    ...options,
+  })({
+    h3App,
+    hooks: { hook: vi.fn() },
+  });
+  const initPromise = routeHarness.initPromises.at(-1);
+  if (!initPromise) throw new Error("Agent chat routes did not initialize");
+  await initPromise;
+  return h3App;
+}
+
+async function fetchWithRequestContext(
+  h3App: ReturnType<typeof createApp>,
+  path: string,
+  context: { userEmail?: string; orgId?: string; orgScope?: "personal" },
+) {
+  return runWithRequestContext(context, () =>
+    h3App.fetch(new Request(`http://example.test${path}`)),
+  );
+}
+
+describe("agent chat resource route organization scopes", () => {
+  it("inherits the active request organization when no resolver is configured", async () => {
+    const h3App = await mountResourceRoutes();
+    expect(mocks.resourceListAllOwners).toHaveBeenCalledWith("jobs/");
+    const resourceList = mocks.resourceList.getMockImplementation()!;
+    const resourceListContexts: Array<{
+      orgId: string | undefined;
+      orgScope: "personal" | undefined;
+    }> = [];
+    mocks.resourceList.mockImplementation(async (...args) => {
+      resourceListContexts.push({
+        orgId: getRequestOrgId(),
+        orgScope: getRequestContext()?.orgScope,
+      });
+      return resourceList(...args);
+    });
+
+    await fetchWithRequestContext(h3App, "/_agent-native/agent-chat/files", {
+      userEmail: "user@example.test",
+      orgId: "org-active",
+    });
+    expect(mocks.resourceList).toHaveBeenCalledWith("__shared__", undefined, {
+      orgId: "org-active",
+    });
+    expect(mocks.resourceList).toHaveBeenCalledWith(
+      "__workspace__",
+      undefined,
+      { orgId: "org-active" },
+    );
+
+    mocks.resourceList.mockClear();
+    await fetchWithRequestContext(h3App, "/_agent-native/agent-chat/skills", {
+      userEmail: "user@example.test",
+      orgId: "org-active",
+    });
+    expect(mocks.resourceList).toHaveBeenCalledWith("__shared__", "skills/", {
+      orgId: "org-active",
+    });
+    expect(mocks.resourceList).toHaveBeenCalledWith(
+      "__workspace__",
+      "skills/",
+      { orgId: "org-active" },
+    );
+
+    mocks.resourceList.mockClear();
+    resourceListContexts.length = 0;
+    const mentions = await fetchWithRequestContext(
+      h3App,
+      "/_agent-native/agent-chat/mentions",
+      { userEmail: "user@example.test", orgId: "org-active" },
+    );
+    await mentions.text();
+    expect(mocks.resourceList).toHaveBeenCalledWith("__shared__", undefined, {
+      orgId: "org-active",
+    });
+    expect(mocks.resourceList).toHaveBeenCalledWith(
+      "__workspace__",
+      undefined,
+      { orgId: "org-active" },
+    );
+    expect(resourceListContexts).toContainEqual({
+      orgId: "org-active",
+      orgScope: undefined,
+    });
+  });
+
+  it("inherits the active request organization when a resolver returns undefined", async () => {
+    const h3App = await mountResourceRoutes({ resolveOrgId: () => undefined });
+    const resourceList = mocks.resourceList.getMockImplementation()!;
+    const resourceListContexts: Array<{
+      orgId: string | undefined;
+      orgScope: "personal" | undefined;
+    }> = [];
+    mocks.resourceList.mockImplementation(async (...args) => {
+      resourceListContexts.push({
+        orgId: getRequestOrgId(),
+        orgScope: getRequestContext()?.orgScope,
+      });
+      return resourceList(...args);
+    });
+
+    const mentions = await fetchWithRequestContext(
+      h3App,
+      "/_agent-native/agent-chat/mentions",
+      { userEmail: "user@example.test", orgId: "org-active" },
+    );
+    await mentions.text();
+
+    expect(mocks.resourceList).toHaveBeenCalledWith(
+      "__workspace__",
+      undefined,
+      { orgId: "org-active" },
+    );
+    expect(resourceListContexts).toContainEqual({
+      orgId: "org-active",
+      orgScope: undefined,
+    });
+  });
+
+  it("passes an explicit organization resolver scope to no-owner skill reads", async () => {
+    const h3App = await mountResourceRoutes({
+      resolveOrgId: () => "org-resolved",
+    });
+
+    await fetchWithRequestContext(h3App, "/_agent-native/agent-chat/skills", {
+      userEmail: "user@example.test",
+      orgId: "org-active",
+    });
+
+    expect(mocks.resourceList).toHaveBeenCalledWith("__shared__", "skills/", {
+      orgId: "org-resolved",
+    });
+    expect(mocks.resourceList).toHaveBeenCalledWith(
+      "__workspace__",
+      "skills/",
+      { orgId: "org-resolved" },
+    );
+    expect(mocks.resourceGet).toHaveBeenCalledWith("skills_company_voice", {
+      userEmail: undefined,
+      orgId: "org-resolved",
+    });
+  });
+
+  it.each([
+    ["/_agent-native/agent-chat/files", undefined],
+    ["/_agent-native/agent-chat/skills", "skills/"],
+    ["/_agent-native/agent-chat/mentions", undefined],
+  ])(
+    "uses the resolver organization instead of the ambient organization for shared %s reads",
+    async (path, prefix) => {
+      const h3App = await mountResourceRoutes({
+        resolveOrgId: () => "org-resolved",
+      });
+
+      const response = await fetchWithRequestContext(h3App, path, {
+        userEmail: "user@example.test",
+        orgId: "org-ambient",
+      });
+      if (path.endsWith("/mentions")) await response.text();
+
+      expect(mocks.resourceList).toHaveBeenCalledWith("__shared__", prefix, {
+        orgId: "org-resolved",
+      });
+    },
+  );
+
+  it.each([
+    ["/_agent-native/agent-chat/files", undefined],
+    ["/_agent-native/agent-chat/skills", "skills/"],
+    ["/_agent-native/agent-chat/mentions", undefined],
+  ])(
+    "preserves an explicit personal resolver scope for no-owner shared %s reads",
+    async (path, prefix) => {
+      const h3App = await mountResourceRoutes({ resolveOrgId: () => null });
+      const resourceList = mocks.resourceList.getMockImplementation()!;
+      const resourceListContexts: Array<{
+        orgId: string | undefined;
+        orgScope: "personal" | undefined;
+      }> = [];
+      mocks.resourceList.mockImplementation(async (...args) => {
+        resourceListContexts.push({
+          orgId: getRequestOrgId(),
+          orgScope: getRequestContext()?.orgScope,
+        });
+        return resourceList(...args);
+      });
+
+      const response = await fetchWithRequestContext(h3App, path, {
+        userEmail: "user@example.test",
+        orgId: "org-ambient",
+      });
+      if (path.endsWith("/mentions")) await response.text();
+
+      expect(mocks.resourceList).toHaveBeenCalledWith("__shared__", prefix, {
+        orgId: null,
+      });
+      if (path.endsWith("/mentions")) {
+        expect(resourceListContexts).toContainEqual({
+          orgId: undefined,
+          orgScope: "personal",
+        });
+      }
+    },
+  );
+
+  it("preserves an explicit personal resolver scope for owned skills and mentions", async () => {
+    mocks.getSession.mockResolvedValue({ email: "user@example.test" });
+    const h3App = await mountResourceRoutes({ resolveOrgId: () => null });
+
+    await fetchWithRequestContext(h3App, "/_agent-native/agent-chat/skills", {
+      userEmail: "user@example.test",
+      orgId: "org-active",
+    });
+    expect(mocks.resourceListAccessible).toHaveBeenCalledWith(
+      "user@example.test",
+      "skills/",
+      { userEmail: "user@example.test", orgId: null },
+    );
+    expect(mocks.resourceGet).toHaveBeenCalledWith("skills_company_voice", {
+      userEmail: "user@example.test",
+      orgId: null,
+    });
+
+    mocks.resourceListAccessible.mockClear();
+    const resourceListAccessible =
+      mocks.resourceListAccessible.getMockImplementation()!;
+    const resourceListAccessibleContexts: Array<{
+      orgId: string | undefined;
+      orgScope: "personal" | undefined;
+    }> = [];
+    mocks.resourceListAccessible.mockImplementation(async (...args) => {
+      resourceListAccessibleContexts.push({
+        orgId: getRequestOrgId(),
+        orgScope: getRequestContext()?.orgScope,
+      });
+      return resourceListAccessible(...args);
+    });
+    const mentions = await fetchWithRequestContext(
+      h3App,
+      "/_agent-native/agent-chat/mentions",
+      { userEmail: "user@example.test", orgId: "org-active" },
+    );
+    await mentions.text();
+    expect(mocks.resourceListAccessible).toHaveBeenCalledWith(
+      "user@example.test",
+      undefined,
+      { userEmail: "user@example.test", orgId: null },
+    );
+    expect(resourceListAccessibleContexts).toContainEqual({
+      orgId: undefined,
+      orgScope: "personal",
+    });
+  });
+
+  it.each([
+    "/_agent-native/agent-chat/files",
+    "/_agent-native/agent-chat/skills",
+    "/_agent-native/agent-chat/mentions",
+  ])(
+    "does not turn an organization resolver failure into a personal lookup for %s",
+    async (path) => {
+      const h3App = await mountResourceRoutes({
+        resolveOrgId: () => {
+          throw new Error("organization lookup failed");
+        },
+      });
+
+      const response = await fetchWithRequestContext(h3App, path, {
+        userEmail: "user@example.test",
+        orgId: "org-active",
+      });
+      expect(response.status).toBe(500);
+      expect(mocks.resourceList).not.toHaveBeenCalled();
+      expect(mocks.resourceListAccessible).not.toHaveBeenCalled();
+      expect(mocks.resourceGet).not.toHaveBeenCalled();
+    },
+  );
+});
+
 describe("promptResourceManifestSections", () => {
   it("accounts for runtime resource notes, budget notes, and available apps", () => {
     const sections = promptResourceManifestSections(`
@@ -305,6 +636,22 @@ describe("promptResourceManifestSections", () => {
 });
 
 describe("loadResourcesForPrompt", () => {
+  it("uses runtime-scoped instructions and excludes development instructions", async () => {
+    mocks.loadAgentsBundle.mockResolvedValueOnce({
+      workspaceAgentsMd: "",
+      agentsMd: "# Legacy instructions",
+      runtimeAgentsMd: "# Runtime instructions",
+      developmentAgentsMd: "# Development instructions",
+      skills: {},
+    });
+
+    const prompt = await loadResourcesForPrompt("user@example.test");
+
+    expect(prompt).toContain("# Runtime instructions");
+    expect(prompt).not.toContain("# Development instructions");
+    expect(prompt).not.toContain("# Legacy instructions");
+  });
+
   it("loads bounded package context providers into every prompt path", async () => {
     const unregister = registerPromptContextProvider({
       id: "creative-context-test",
@@ -346,6 +693,24 @@ describe("loadResourcesForPrompt", () => {
     }
   });
 
+  it("surfaces failures from prompt providers that fail closed", async () => {
+    const unregister = registerPromptContextProvider({
+      id: "creative-context-required-test",
+      failOnError: true,
+      load: async () => {
+        throw new Error("Labs settings unavailable");
+      },
+    });
+
+    try {
+      await expect(
+        loadResourcesForPrompt("user@example.test", false, "slides"),
+      ).rejects.toThrow("Labs settings unavailable");
+    } finally {
+      unregister();
+    }
+  });
+
   it("assembles the same inherited workspace context for every app without sync writes", async () => {
     const analyticsPrompt = await loadResourcesForPrompt(
       "user@example.test",
@@ -366,17 +731,25 @@ describe("loadResourcesForPrompt", () => {
     expect(mocks.resourceGetByPath).toHaveBeenCalledWith(
       "__workspace__",
       "AGENTS.md",
+      { orgId: null },
     );
     expect(mocks.resourceList).toHaveBeenCalledWith(
       "__workspace__",
       "instructions/",
+      { orgId: null },
     );
     expect(mocks.resourceListAccessible).toHaveBeenCalledWith(
       "user@example.test",
       "skills/",
       { orgId: null },
     );
-    expect(mocks.resourceList).toHaveBeenCalledWith("__workspace__");
+    expect(mocks.resourceList).toHaveBeenCalledWith(
+      "__workspace__",
+      undefined,
+      {
+        orgId: null,
+      },
+    );
 
     expect(analyticsPrompt).toContain(
       '<resource name="instructions/guardrails.md" scope="workspace-instruction"',
@@ -399,6 +772,95 @@ describe("loadResourcesForPrompt", () => {
     );
     expect(analyticsPrompt).not.toContain("Workspace voice default.");
     expect(analyticsPrompt).not.toContain("Organization voice override.");
+  });
+
+  it("loads only the active organization's workspace defaults", async () => {
+    const ownerA = "__workspace__:__organization__:org-a";
+    const ownerB = "__workspace__:__organization__:org-b";
+    const orgResources = new Map(
+      [
+        {
+          id: "org_a_agents",
+          owner: ownerA,
+          path: "AGENTS.md",
+          content: "# Org A Workspace Instructions",
+        },
+        {
+          id: "org_a_guardrails",
+          owner: ownerA,
+          path: "instructions/guardrails.md",
+          content: "# Org A Guardrails",
+        },
+        {
+          id: "org_a_company",
+          owner: ownerA,
+          path: "context/company.md",
+          content: "---\ntitle: Acme\ndescription: Org A company.\n---\n",
+        },
+        {
+          id: "org_b_agents",
+          owner: ownerB,
+          path: "AGENTS.md",
+          content: "# Org B Workspace Instructions",
+        },
+        {
+          id: "org_b_guardrails",
+          owner: ownerB,
+          path: "instructions/guardrails.md",
+          content: "# Org B Guardrails",
+        },
+        {
+          id: "org_b_company",
+          owner: ownerB,
+          path: "context/company.md",
+          content: "---\ntitle: Globex\ndescription: Org B company.\n---\n",
+        },
+      ].map((resource) => [
+        resource.id,
+        { ...resource, mimeType: "text/markdown" },
+      ]),
+    );
+    const byOwner = (owner: string, prefix?: string) =>
+      [...orgResources.values()].filter(
+        (resource) =>
+          resource.owner === owner &&
+          (!prefix || resource.path.startsWith(prefix)),
+      );
+    mocks.resourceGetByPath.mockImplementation(
+      async (owner, path) =>
+        byOwner(owner).find((resource) => resource.path === path) ?? null,
+    );
+    mocks.resourceList.mockImplementation(async (owner, prefix) =>
+      byOwner(owner, prefix).map(({ content, ...meta }) => meta),
+    );
+    mocks.resourceListAccessible.mockResolvedValue([]);
+    mocks.resourceGet.mockImplementation(async (id) => orgResources.get(id));
+
+    const prompt = await loadResourcesForPrompt(
+      "user@example.test",
+      false,
+      "analytics",
+      "org-a",
+    );
+
+    expect(mocks.resourceGetByPath).toHaveBeenCalledWith(ownerA, "AGENTS.md", {
+      orgId: "org-a",
+    });
+    expect(mocks.resourceGetByPath).not.toHaveBeenCalledWith(
+      ownerB,
+      "AGENTS.md",
+      expect.anything(),
+    );
+    expect(mocks.resourceGetByPath).not.toHaveBeenCalledWith(
+      "__workspace__",
+      "AGENTS.md",
+      expect.anything(),
+    );
+    expect(prompt).toContain("# Org A Workspace Instructions");
+    expect(prompt).toContain("# Org A Guardrails");
+    expect(prompt).toContain("`context/company.md` - Acme: Org A company.");
+    expect(prompt).not.toContain("Org B");
+    expect(prompt).not.toContain("Globex");
   });
 
   it("loads inherited workspace instructions and indexes workspace reference resources", async () => {
@@ -472,8 +934,9 @@ describe("loadResourcesForPrompt", () => {
     expect(prompt).toContain("<skills-summary>");
     expect(prompt).toContain("Prefer concise updates.");
     expect(prompt).toContain(
-      'Read with `docs-search --slug "skill-deep-review"` before starting a task it applies to.',
+      'Read with `docs-search --slug "skill-deep-review"` before starting a task it applies to; reuse that page for subsequent steps in this turn.',
     );
+    expect(prompt).toContain("do not repeat an equivalent docs-search lookup");
     expect(prompt).toContain("Do not use MCP resource reads for these skills.");
     expect(prompt).not.toContain("Use `docs-search` to read a skill");
   });
@@ -488,6 +951,47 @@ describe("loadResourcesForPrompt", () => {
     expect(prompt).not.toContain("Protect customer data.");
     expect(prompt).not.toContain("Narrow workspace guardrails.");
     expect(prompt).not.toContain("Prefer concise local overrides.");
+  });
+
+  it("keeps a saved personal AGENTS.md instruction in compact startup context", async () => {
+    mocks.loadAgentsBundle.mockResolvedValueOnce({
+      workspaceAgentsMd: "",
+      agentsMd: "",
+      skills: {},
+    });
+    mocks.resourceGetByPath.mockImplementation(async (owner, path) => {
+      if (path === "AGENTS.md") {
+        return {
+          content:
+            owner === "user@example.test"
+              ? "# Saved personal rule\n\nAlways preserve the user's requested output format."
+              : `# ${owner} rule\n\n${"context ".repeat(2_000)}`,
+        };
+      }
+      return null;
+    });
+
+    const prompt = await loadResourcesForPrompt("user@example.test", true);
+
+    expect(prompt).toContain(
+      "Always preserve the user's requested output format.",
+    );
+    expect(prompt).toContain("# Saved personal rule");
+  });
+
+  it("fails loudly when a durable AGENTS.md resource cannot be read", async () => {
+    mocks.resourceGetByPath.mockImplementation(async (owner, path) => {
+      if (owner === "user@example.test" && path === "AGENTS.md") {
+        throw new Error("resource backend unavailable");
+      }
+      return null;
+    });
+
+    await expect(
+      loadResourcesForPrompt("user@example.test", true),
+    ).rejects.toThrow(
+      "Unable to read durable AGENTS.md instructions for personal (user@example.test)",
+    );
   });
 
   it("keeps aggregate compact startup resources within a fixed budget", async () => {
@@ -527,8 +1031,6 @@ describe("loadResourcesForPrompt", () => {
   });
 
   it("keeps cross-app discovery and names what it dropped when compact context overflows", async () => {
-    // 30 peers with real descriptions is a ~14,000-character block: large
-    // enough that the old greedy fitter had no room left for it.
     mocks.discoverAgents.mockResolvedValueOnce(
       Array.from({ length: 30 }, (_, index) => ({
         id: index === 0 ? "analytics" : `app-${index}`,
@@ -653,7 +1155,6 @@ describe("loadResourcesForPrompt", () => {
     expect(prompt).toContain('<resource name="LEARNINGS.md" scope="shared"');
     expect(prompt).toContain("truncated after 30,000 characters");
     expect(prompt).toContain('Use the `resources` tool with `action: "read"`');
-    // The full oversized content must not have been inlined verbatim.
     expect(prompt.length).toBeLessThan(hugeLearnings.length);
   });
 

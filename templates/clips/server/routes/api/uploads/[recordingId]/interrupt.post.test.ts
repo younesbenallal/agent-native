@@ -124,7 +124,7 @@ describe("/api/uploads/:recordingId/interrupt route", () => {
       expect.objectContaining({
         status: "failed",
         failureReason:
-          "Upload was interrupted. The local recording is safe; retry from the Clips desktop app.",
+          "Upload was interrupted. The local recording is safe; retry from the Clips desktop app. Last error: TypeError: Load failed",
       }),
     ]);
     expect(mockCompareAndSetAppState).toHaveBeenCalledWith(
@@ -136,6 +136,61 @@ describe("/api/uploads/:recordingId/interrupt route", () => {
         bytesReceived: 7_864_320,
         interruptionDetail: "TypeError: Load failed",
       }),
+    );
+  });
+
+  it("redacts HTML response bodies while preserving the failure code", async () => {
+    mockBody.value = {
+      detail:
+        "Upload failed: <!DOCTYPE html><html>private proxy content</html>",
+      failureCode: "chunk_html_error",
+      failureStage: "chunk_upload",
+      httpStatus: 502,
+    };
+
+    await handler({} as any);
+
+    expect(mockUpdateSets).toEqual([
+      expect.objectContaining({
+        status: "failed",
+        failureCode: "chunk_html_error",
+        failureReason:
+          "Upload was interrupted. The local recording is safe; retry from the Clips desktop app. Last error: Upload returned an HTML error response.",
+      }),
+    ]);
+    expect(mockCompareAndSetAppState).toHaveBeenCalledWith(
+      "recording-upload-rec-1",
+      expect.any(Object),
+      expect.objectContaining({
+        interruptionDetail: "Upload returned an HTML error response.",
+      }),
+    );
+    expect(JSON.stringify(mockUpdateSets)).not.toContain(
+      "private proxy content",
+    );
+    expect(JSON.stringify(mockCompareAndSetAppState.mock.calls)).not.toContain(
+      "private proxy content",
+    );
+  });
+
+  it("redacts an HTML body even when the caller omits classification", async () => {
+    mockBody.value = {
+      detail:
+        "Upload failed: <!DOCTYPE html><html>private proxy content</html>",
+    };
+
+    await handler({} as any);
+
+    expect(mockUpdateSets).toEqual([
+      expect.objectContaining({
+        failureCode: "chunk_html_error",
+        failureReason: expect.stringContaining(
+          "Last error: Upload returned an HTML error response.",
+        ),
+      }),
+    ]);
+    expect(JSON.stringify(mockUpdateSets)).not.toContain(
+      "private proxy content",
     );
   });
 

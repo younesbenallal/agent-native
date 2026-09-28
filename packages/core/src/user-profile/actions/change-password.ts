@@ -1,15 +1,26 @@
 import { z } from "zod";
 
 import { defineAction } from "../../action.js";
-import { getBetterAuth } from "../../server/better-auth-instance.js";
+import {
+  getBetterAuth,
+  withBetterAuthActionSession,
+} from "../../server/better-auth-instance.js";
+import {
+  PASSWORD_MAX_LENGTH,
+  PASSWORD_MIN_LENGTH,
+} from "../../shared/password-policy.js";
 
-const passwordSchema = z.string().min(8).max(128);
+const currentPasswordSchema = z.string().min(1).max(PASSWORD_MAX_LENGTH);
+const newPasswordSchema = z
+  .string()
+  .min(PASSWORD_MIN_LENGTH)
+  .max(PASSWORD_MAX_LENGTH);
 
 export default defineAction({
   description: "Change the password for the signed-in user's account.",
   schema: z.object({
-    currentPassword: passwordSchema,
-    newPassword: passwordSchema,
+    currentPassword: currentPasswordSchema,
+    newPassword: newPasswordSchema,
   }),
   agentTool: false,
   toolCallable: false,
@@ -22,16 +33,21 @@ export default defineAction({
     }
 
     const auth = await getBetterAuth();
-    return (
-      auth.api as unknown as {
-        changePassword: (options: {
-          body: { currentPassword: string; newPassword: string };
-          headers: Headers;
-        }) => Promise<{ status: boolean }>;
-      }
-    ).changePassword({
-      body: { currentPassword, newPassword },
-      headers: ctx.requestHeaders,
-    });
+    return withBetterAuthActionSession(
+      ctx.userEmail,
+      ctx.requestHeaders,
+      async (headers) =>
+        (
+          auth.api as unknown as {
+            changePassword: (options: {
+              body: { currentPassword: string; newPassword: string };
+              headers: Headers;
+            }) => Promise<{ status: boolean }>;
+          }
+        ).changePassword({
+          body: { currentPassword, newPassword },
+          headers,
+        }),
+    );
   },
 });

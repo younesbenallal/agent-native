@@ -1,11 +1,3 @@
-/**
- * Serve a recording thumbnail from the same origin as the public player.
- *
- * Thumbnail providers may return expiring or hotlink-protected URLs. Public
- * share pages already proxy video through `/api/video/:recordingId`; using the
- * same contract here keeps embeds and crawler previews reliable.
- */
-
 import {
   createSsrfSafeDispatcher,
   isBlockedExtensionUrlWithDns,
@@ -32,6 +24,11 @@ import {
 } from "h3";
 
 import { getDb, schema } from "../../../db/index.js";
+import {
+  isHeldForRedaction,
+  REDACTION_HOLD_MESSAGE,
+} from "../../../lib/pending-redactions.js";
+import { isRecordingExpiredForViewer } from "../../../lib/recording-page-access.js";
 import { getOrganizationRoleForEmail } from "../../../lib/recordings.js";
 import { verifySharePassword } from "../../../lib/share-password.js";
 
@@ -50,6 +47,7 @@ const SAFE_RASTER_IMAGE_TYPES = new Set([
 
 type ThumbnailRecording = {
   id: string;
+  editsJson?: string | null;
   thumbnailUrl?: string | null;
   animatedThumbnailUrl?: string | null;
   expiresAt?: string | null;
@@ -207,6 +205,7 @@ async function loadRecording(recordingId: string, event: H3Event) {
     const [row] = await getDb()
       .select({
         id: schema.recordings.id,
+        editsJson: schema.recordings.editsJson,
         thumbnailUrl: schema.recordings.thumbnailUrl,
         animatedThumbnailUrl: schema.recordings.animatedThumbnailUrl,
         expiresAt: schema.recordings.expiresAt,
@@ -258,12 +257,19 @@ export default defineEventHandler(async (event: H3Event) => {
       }
 
       const { recording } = loaded;
-      if (recording.expiresAt) {
-        const expires = new Date(recording.expiresAt).getTime();
-        if (Number.isFinite(expires) && expires < Date.now()) {
-          setResponseStatus(event, 410);
-          return { error: "Recording has expired" };
-        }
+      if (
+        isRecordingExpiredForViewer({
+          expiresAt: recording.expiresAt,
+          viewerIsOwner: loaded.role === "owner",
+        })
+      ) {
+        setResponseStatus(event, 410);
+        return { error: "Recording has expired" };
+      }
+
+      if (isHeldForRedaction(recording.editsJson, loaded.role)) {
+        setResponseStatus(event, 409);
+        return { error: REDACTION_HOLD_MESSAGE };
       }
 
       const query = getQuery(event) as {

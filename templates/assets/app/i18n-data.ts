@@ -1,4 +1,4 @@
-import { type LocaleCode } from "@agent-native/core/client/i18n";
+import { type BuiltinLocaleCode as LocaleCode } from "@agent-native/core/client/i18n";
 import { creativeContextMessagesByLocale } from "@agent-native/creative-context/messages";
 
 import zhTW from "./i18n/zh-TW";
@@ -606,6 +606,7 @@ const enUS = {
     brand: "Assets",
     create: "Create",
     library: "Library",
+    templates: "Templates",
     brandKits: "Brand Kits",
     auditLog: "Audit log",
     settings: "Settings",
@@ -636,8 +637,12 @@ const enUS = {
     setupReady: "ready",
     builderDescriptionReady: "Connected for managed generation.",
     builderDescriptionManaged:
-      "Managed image generation and storage, no provider keys.",
-    builderDescriptionDisabled: "Disabled for this deployment.",
+      "Connect Builder for managed image generation and storage. Video generation is available when enabled for your space.",
+    builderDescriptionDisabled:
+      "Image generation is disabled here; Builder video may still be available.",
+    builderLookupFailed:
+      "Couldn’t check Builder access. Retry to refresh the connection status.",
+    statusUnavailable: "Status unavailable",
     optional: "Optional",
     reconnect: "Reconnect",
     generation: "Generation",
@@ -645,7 +650,7 @@ const enUS = {
     generationNeedsSetup: "Needs setup",
     manualGenerationKeys: "Manual generation keys",
     manualGenerationDescription:
-      "Add Gemini for video generation, or OpenAI/Gemini as image fallbacks.",
+      "Add Gemini for manual video generation, or OpenAI/Gemini as image fallbacks.",
     storage: "Storage",
     storageReady:
       "Originals, thumbnails, videos, and exports have a durable home.",
@@ -667,13 +672,21 @@ const enUS = {
     saveKey: "Save key",
     saving: "Saving",
     noManualOptions: "No manual setup options are available for this item.",
-    builderManaged: "Builder is handling managed image generation.",
+    builderManaged:
+      "Builder manages image generation. Video generation is available when enabled for your space.",
     providerConfigured: "{{providers}} configured.",
     addGeminiOrOpenAI: "Add Gemini or OpenAI before generating new assets.",
     addBuilderGeminiOrOpenAI:
       "Add Builder, Gemini, or OpenAI before generating new assets.",
     enterValueFirst: "Enter a value first.",
     saveFailed: "Save failed",
+    builderConnectedTo: "Connected to {{orgName}}.",
+    manage: "Manage",
+    addKeys: "Add keys",
+    setUp: "Set up",
+    emailGroup: "Email",
+    setupLoadFailed: "Couldn’t load setup status.",
+    notificationsLoadFailed: "Couldn’t load this setting.",
   },
   chat: {
     emptyState: "Describe the asset you want to make",
@@ -715,9 +728,46 @@ const enUS = {
     brandKits: "Brand Kits - Assets",
     library: "Library - Assets",
     generationPreset: "Generation preset - Assets",
+    templates: "Templates - Assets",
     extension: "Extension - Assets",
     extensions: "Extensions - Assets",
     team: "Team - Assets",
+  },
+  templates: {
+    all: "All templates",
+    globalOnly: "Global only",
+    search: "Search templates",
+    new: "New template",
+    name: "Name",
+    category: "Category",
+    aspectRatio: "Aspect ratio",
+    promptTemplate: "Prompt template",
+    textPolicy: "Text policy",
+    brandKit: "Brand kit",
+    global: "Global",
+    globalNoBrandKit: "Global (no brand kit)",
+    includeLogo: "Composite canonical logo",
+    associateToPin: "Associate this template with a brand kit to pin images.",
+    edit: "Edit",
+    duplicate: "Duplicate",
+    duplicateIntoBrandKit: "Duplicate into brand kit…",
+    delete: "Delete",
+    deleteTitle: "Delete template?",
+    deleteDescription: "Existing runs keep their captured prompt and settings.",
+    noTemplates: "No templates yet.",
+    noMatches: "No templates match these filters.",
+    clearFilters: "Clear filters",
+    unavailableTitle: "Template unavailable",
+    unavailableDescription:
+      "This template may have been deleted, or you may no longer have access.",
+    created: "Template created.",
+    createFailed: "Could not create template.",
+    updated: "Template saved.",
+    updateFailed: "Could not save template.",
+    deleted: "Template deleted.",
+    deleteFailed: "Could not delete template.",
+    deleteInUse: "This template is used by an existing generation.",
+    back: "Back to templates",
   },
   team: {
     title: "Team",
@@ -844,10 +894,11 @@ const enUS = {
     checking: "Checking",
     checkingUpload: "Checking upload",
     clearAll: "Clear all",
+    clearAllWithCount: "Clear all candidates ({{count}})",
     clearCandidates: "Clear candidates",
     clearCandidatesTitle: "Clear {{count}} candidates?",
     clearCandidatesDescription:
-      "Clears the live stage and deletes unsaved draft candidates.",
+      "Clears the live stage and deletes every unsaved draft candidate. Saved library assets stay untouched.",
     clearGeneratedCandidatesTitle: "Clear generated candidates?",
     clearGeneratedCandidatesDescription:
       "This removes every unsaved candidate from the thread and deletes the generated asset rows behind them. Saved library assets are not touched.",
@@ -972,6 +1023,9 @@ const enUS = {
     recentDrafts: "Recent Drafts",
     viewAllDrafts: "View all drafts",
     draftAsset: "Draft asset",
+    draftsOnly: "Drafts only",
+    draftsOnlyHint:
+      "You can generate drafts in this kit. Ask an editor to save them into it.",
     noReusableAssets:
       "No reusable assets yet. Select a kit to upload references or generate assets.",
     noNewAssetsUploaded: "No new assets were uploaded.",
@@ -986,6 +1040,7 @@ const enUS = {
     open: "Open",
     openAssets: "Open Assets",
     openChat: "Open chat",
+    hideDetails: "Hide details",
     openDetails: "Open details",
     preparing: "Preparing...",
     previousImage: "Previous image",
@@ -1071,7 +1126,6 @@ type PartialMessages = {
   };
 };
 
-// TODO(l10n): translate after QA.
 const referenceBoardL10nTodo = {
   addReference: "Add reference",
   referenceBoard: "Reference board",
@@ -3654,6 +3708,7 @@ function mergeMessages(overrides: PartialMessages): Messages {
       },
     },
     routeTitles: { ...enUS.routeTitles, ...overrides.routeTitles },
+    templates: { ...enUS.templates, ...overrides.templates },
     team: { ...enUS.team, ...overrides.team },
     assetDetail: { ...enUS.assetDetail, ...overrides.assetDetail },
     assetPicker: { ...enUS.assetPicker, ...overrides.assetPicker },
@@ -3692,6 +3747,9 @@ export const messagesByLocale = {
       recentDrafts: "最近草稿",
       viewAllDrafts: "查看所有草稿",
       draftAsset: "草稿资产",
+      draftsOnly: "仅草稿",
+      draftsOnlyHint:
+        "您可以在此套件中生成草稿。请让编辑者将它们保存到套件中。",
       addAssets: "添加资产",
       addAssetsDescription:
         "上传源素材或生成候选项，然后只将应指导未来生成的资产标记为参考。",
@@ -3728,7 +3786,9 @@ export const messagesByLocale = {
       checkingUpload: "正在检查上传",
       clear: "清除",
       clearAll: "全部清除",
+      clearAllWithCount: "清除所有候选项（{{count}}）",
       clearCandidates: "清除候选项",
+      hideDetails: "隐藏详情",
       clearCandidatesDescription: "清除实时阶段并删除未保存的草稿候选项。",
       clearCandidatesTitle: "清除 {{count}} 个候选项？",
       clearGeneratedCandidatesDescription:
@@ -3909,6 +3969,7 @@ export const messagesByLocale = {
     navigation: {
       create: "创建",
       library: "资料库",
+      templates: "模板",
       brandKits: "品牌套件",
       auditLog: "审计日志",
       settings: "设置",
@@ -3937,22 +3998,36 @@ export const messagesByLocale = {
         "在生成新资产之前添加 Builder、Gemini 或 OpenAI。",
       addGeminiOrOpenAI: "在生成新资产之前添加Gemini或OpenAI。",
       brandKits: "品牌套件",
-      builderDescriptionDisabled: "对此部署禁用。",
-      builderDescriptionManaged: "托管图像生成和存储，无需提供商密钥。",
+      builderDescriptionDisabled:
+        "此处已停用图像生成；Builder 视频生成功能仍可能可用。",
+      builderLookupFailed: "无法检查 Builder 访问权限。重试以刷新连接状态。",
+      statusUnavailable: "状态不可用",
+      builderDescriptionManaged:
+        "连接 Builder 即可使用托管图像生成和存储。若你的空间已启用视频生成功能，也可使用该功能。",
       builderDescriptionReady: "连接管理一代。",
-      builderManaged: "Builder 正在处理托管映像生成。",
+      builderManaged:
+        "Builder 管理图像生成。若你的空间已启用视频生成功能，即可使用。",
       chooseProvider: "选择提供商",
       enterValueFirst: "首先输入一个值。",
       generationNeedsSetup: "需要设置",
       manualGenerationDescription:
-        "添加 Gemini 用于视频生成，或 OpenAI/Gemini 作为图像后备。",
+        "添加 Gemini 作为手动视频生成选项，或 OpenAI/Gemini 作为图像后备选项。",
       manualGenerationKeys: "手动生成密钥",
-      manualKeys: "手动按键",
+      manualKeys: "手动密钥",
       noManualOptions: "该项目没有可用的手动设置选项。",
       objectStorageDescription:
         "使用 S3、R2、Spaces、Tigris、MinIO 或其他兼容的提供商。",
       objectStorage: "对象存储",
       saveFailed: "保存失败",
+      builderConnectedTo: "已连接到 {{orgName}}。",
+      generation: "生成",
+      storage: "存储",
+      manage: "管理",
+      addKeys: "添加密钥",
+      setUp: "设置",
+      emailGroup: "电子邮件",
+      setupLoadFailed: "无法加载设置状态。",
+      notificationsLoadFailed: "无法加载此设置。",
       saveKey: "保存密钥",
       saveSettings: "保存设置",
       setupDescription: "两个要素：生成和持久存储。",
@@ -4031,11 +4106,47 @@ export const messagesByLocale = {
     },
     routeTitles: {
       library: "资料库 - Assets",
+      templates: "模板 - Assets",
       brandKits: "品牌套件 - Assets",
       generationPreset: "生成预设 - Assets",
       extension: "扩展 - Assets",
       extensions: "扩展 - Assets",
       team: "团队 - Assets",
+    },
+    templates: {
+      all: "所有模板",
+      globalOnly: "仅全局",
+      search: "搜索模板",
+      new: "新建模板",
+      name: "名称",
+      category: "类别",
+      aspectRatio: "宽高比",
+      promptTemplate: "提示词模板",
+      textPolicy: "文本策略",
+      brandKit: "品牌套件",
+      global: "全局",
+      globalNoBrandKit: "全局（无品牌套件）",
+      includeLogo: "合成标准徽标",
+      associateToPin: "将此模板关联到品牌套件以固定图片。",
+      edit: "编辑",
+      duplicate: "复制",
+      duplicateIntoBrandKit: "复制到品牌套件…",
+      delete: "删除",
+      deleteTitle: "删除模板？",
+      deleteDescription: "现有运行会保留已捕获的提示词和设置。",
+      noTemplates: "尚无模板。",
+      noMatches: "没有模板与这些筛选条件匹配。",
+      clearFilters: "清除筛选条件",
+      unavailableTitle: "模板不可用",
+      unavailableDescription: "此模板可能已被删除，或者您可能已失去访问权限。",
+      created: "模板已创建。",
+      createFailed: "无法创建模板。",
+      updated: "模板已保存。",
+      updateFailed: "无法保存模板。",
+      deleted: "模板已删除。",
+      deleteFailed: "无法删除模板。",
+      deleteInUse: "此模板已用于现有生成，无法删除。",
+      back: "返回模板",
     },
     team: {
       title: "团队",
@@ -4527,6 +4638,9 @@ export const messagesByLocale = {
       recentDrafts: "Borradores recientes",
       viewAllDrafts: "Ver todos los borradores",
       draftAsset: "Borrador",
+      draftsOnly: "Solo borradores",
+      draftsOnlyHint:
+        "Puedes generar borradores en este kit. Pide a un editor que los guarde en él.",
       addAssets: "Agregar activos",
       addAssetsDescription:
         "Cargue material fuente o genere candidatos, luego marque solo los activos que deberían guiar a las generaciones futuras como referencias.",
@@ -4552,7 +4666,9 @@ export const messagesByLocale = {
       checkingImageLibraries: "Comprobando bibliotecas de imágenes...",
       checkingUpload: "Comprobando carga",
       clearAll: "Borrar todo",
+      clearAllWithCount: "Borrar todos los candidatos ({{count}})",
       clearCandidates: "Limpiar candidatos",
+      hideDetails: "Ocultar detalles",
       clearCandidatesDescription:
         "Limpia la etapa en vivo y elimina los candidatos de borrador no guardados.",
       clearGeneratedCandidatesDescription:
@@ -4711,6 +4827,7 @@ export const messagesByLocale = {
     navigation: {
       create: "Crear",
       library: "Biblioteca",
+      templates: "Plantillas",
       brandKits: "Kits de marca",
       auditLog: "Registro de auditoría",
       settings: "Ajustes",
@@ -4742,25 +4859,38 @@ export const messagesByLocale = {
       addGeminiOrOpenAI:
         "Agregue Gemini o OpenAI antes de generar nuevos activos.",
       brandKits: "Kits de marca",
-      builderDescriptionDisabled: "Deshabilitado para esta implementación.",
+      builderDescriptionDisabled:
+        "La generación de imágenes está desactivada aquí; la generación de vídeo de Builder puede seguir disponible.",
+      builderLookupFailed:
+        "No se pudo comprobar el acceso a Builder. Vuelve a intentarlo para actualizar el estado de la conexión.",
+      statusUnavailable: "Estado no disponible",
       builderDescriptionManaged:
-        "Generación y almacenamiento de imágenes gestionados, sin claves de proveedor.",
+        "Conecta Builder para usar la generación y el almacenamiento de imágenes gestionados. La generación de vídeo está disponible si se habilita para tu espacio.",
       builderDescriptionReady: "Conectado para generación gestionada.",
       builderManaged:
-        "Builder se encarga de la generación de imágenes administradas.",
+        "Builder gestiona la generación de imágenes. La generación de vídeo está disponible si se habilita para tu espacio.",
       chooseProvider: "Elige un proveedor",
       enterValueFirst: "Introduzca un valor primero.",
       generationNeedsSetup: "Necesita configuración",
       manualGenerationDescription:
-        "Agregue Gemini para generación de video o OpenAI/Gemini como respaldo de imágenes.",
+        "Agregue Gemini para la generación manual de vídeo u OpenAI/Gemini como alternativas para imágenes.",
       manualGenerationKeys: "Claves de generación manual",
-      manualKeys: "llaves manuales",
+      manualKeys: "Claves manuales",
       noManualOptions:
         "No hay opciones de configuración manual disponibles para este artículo.",
       objectStorageDescription:
         "Utilice S3, R2, Spaces, Tigris, MinIO u otro proveedor compatible.",
       objectStorage: "Almacenamiento de objetos",
       saveFailed: "Error al guardar",
+      builderConnectedTo: "Conectado a {{orgName}}.",
+      generation: "Generación",
+      storage: "Almacenamiento",
+      manage: "Gestionar",
+      addKeys: "Añadir claves",
+      setUp: "Configurar",
+      emailGroup: "Correo electrónico",
+      setupLoadFailed: "No se pudo cargar el estado de la configuración.",
+      notificationsLoadFailed: "No se pudo cargar este ajuste.",
       saveKey: "Guardar clave",
       saveSettings: "Guardar configuración",
       setupDescription:
@@ -4904,11 +5034,50 @@ export const messagesByLocale = {
     },
     routeTitles: {
       library: "Biblioteca - Assets",
+      templates: "Plantillas - Assets",
       generationPreset: "Preajuste de generación - Assets",
       brandKits: "Kits de marca - Assets",
       extension: "Extensión - Assets",
       extensions: "Extensiones - Assets",
       team: "Equipo - Assets",
+    },
+    templates: {
+      all: "Todas las plantillas",
+      globalOnly: "Solo globales",
+      search: "Buscar plantillas",
+      new: "Nueva plantilla",
+      name: "Nombre",
+      category: "Categoría",
+      aspectRatio: "Relación de aspecto",
+      promptTemplate: "Plantilla de prompt",
+      textPolicy: "Política de texto",
+      brandKit: "Kit de marca",
+      global: "Global",
+      globalNoBrandKit: "Global (sin kit de marca)",
+      includeLogo: "Componer el logotipo canónico",
+      associateToPin:
+        "Asocia esta plantilla a un kit de marca para fijar imágenes.",
+      edit: "Editar",
+      duplicate: "Duplicar",
+      duplicateIntoBrandKit: "Duplicar en el kit de marca…",
+      delete: "Eliminar",
+      deleteTitle: "¿Eliminar plantilla?",
+      deleteDescription:
+        "Las ejecuciones existentes conservan el prompt y la configuración capturados.",
+      noTemplates: "Aún no hay plantillas.",
+      noMatches: "Ninguna plantilla coincide con estos filtros.",
+      clearFilters: "Borrar filtros",
+      unavailableTitle: "Plantilla no disponible",
+      unavailableDescription:
+        "Es posible que esta plantilla se haya eliminado o que ya no tengas acceso a ella.",
+      created: "Plantilla creada.",
+      createFailed: "No se pudo crear la plantilla.",
+      updated: "Plantilla guardada.",
+      updateFailed: "No se pudo guardar la plantilla.",
+      deleted: "Plantilla eliminada.",
+      deleteFailed: "No se pudo eliminar la plantilla.",
+      deleteInUse: "Esta plantilla se usa en una generación existente.",
+      back: "Volver a plantillas",
     },
     team: {
       title: "Equipo",
@@ -5001,6 +5170,9 @@ export const messagesByLocale = {
       recentDrafts: "Brouillons récents",
       viewAllDrafts: "Voir tous les brouillons",
       draftAsset: "Brouillon",
+      draftsOnly: "Brouillons uniquement",
+      draftsOnlyHint:
+        "Vous pouvez générer des brouillons dans ce kit. Demandez à un éditeur de les y enregistrer.",
       addAssets: "Ajouter des éléments",
       addAssetsDescription:
         "Téléchargez le matériel source ou générez des candidats, puis marquez uniquement les atouts qui devraient guider les générations futures comme références.",
@@ -5026,7 +5198,9 @@ export const messagesByLocale = {
       checkingImageLibraries: "Vérification des bibliothèques d'images...",
       checkingUpload: "Vérification du téléchargement",
       clearAll: "Tout effacer",
+      clearAllWithCount: "Effacer tous les candidats ({{count}})",
       clearCandidates: "Effacer les candidats",
+      hideDetails: "Masquer les détails",
       clearCandidatesDescription:
         "Efface l'étape en direct et supprime les candidats de brouillon non enregistrés.",
       clearGeneratedCandidatesDescription:
@@ -5178,6 +5352,7 @@ export const messagesByLocale = {
     navigation: {
       create: "Créer",
       library: "Bibliothèque",
+      templates: "Modèles",
       brandKits: "Kits de marque",
       auditLog: "Journal d'audit",
       settings: "Paramètres",
@@ -5209,16 +5384,21 @@ export const messagesByLocale = {
       addGeminiOrOpenAI:
         "Ajoutez Gemini ou OpenAI avant de générer de nouveaux actifs.",
       brandKits: "Kits de marque",
-      builderDescriptionDisabled: "Désactivé pour ce déploiement.",
+      builderDescriptionDisabled:
+        "La génération d’images est désactivée ici ; la génération vidéo de Builder peut rester disponible.",
+      builderLookupFailed:
+        "Impossible de vérifier l’accès à Builder. Réessayez pour actualiser l’état de la connexion.",
+      statusUnavailable: "État indisponible",
       builderDescriptionManaged:
-        "Génération et stockage d'images gérés, pas de clés de fournisseur.",
+        "Connectez Builder pour gérer la génération et le stockage d’images. La génération vidéo est disponible si elle est activée pour votre espace.",
       builderDescriptionReady: "Connecté pour une génération gérée.",
-      builderManaged: "Builder gère la génération d'images gérées.",
+      builderManaged:
+        "Builder gère la génération d’images. La génération vidéo est disponible si elle est activée pour votre espace.",
       chooseProvider: "Choisissez un fournisseur",
       enterValueFirst: "Entrez d'abord une valeur.",
       generationNeedsSetup: "Nécessite une configuration",
       manualGenerationDescription:
-        "Ajoutez Gemini pour la génération vidéo, ou OpenAI/Gemini comme images de secours.",
+        "Ajoutez Gemini pour la génération vidéo manuelle, ou OpenAI/Gemini comme solutions de secours pour les images.",
       manualGenerationKeys: "Clés de génération manuelle",
       manualKeys: "Clés manuelles",
       noManualOptions:
@@ -5227,6 +5407,15 @@ export const messagesByLocale = {
         "Utilisez S3, R2, Spaces, Tigris, MinIO ou un autre fournisseur compatible.",
       objectStorage: "Stockage d'objets",
       saveFailed: "Échec de l'enregistrement",
+      builderConnectedTo: "Connecté à {{orgName}}.",
+      generation: "Génération",
+      storage: "Stockage",
+      manage: "Gérer",
+      addKeys: "Ajouter des clés",
+      setUp: "Configurer",
+      emailGroup: "E-mail",
+      setupLoadFailed: "Impossible de charger l’état de la configuration.",
+      notificationsLoadFailed: "Impossible de charger ce paramètre.",
       saveKey: "Enregistrer la clé",
       saveSettings: "Enregistrer les paramètres",
       setupDescription:
@@ -5356,11 +5545,50 @@ export const messagesByLocale = {
     },
     routeTitles: {
       library: "Bibliothèque - Assets",
+      templates: "Modèles - Assets",
       generationPreset: "Préréglage de génération - Assets",
       brandKits: "Kits de marque - Assets",
       extension: "Module d’extension - Assets",
       extensions: "Modules d’extension - Assets",
       team: "Équipe - Assets",
+    },
+    templates: {
+      all: "Tous les modèles",
+      globalOnly: "Globaux uniquement",
+      search: "Rechercher des modèles",
+      new: "Nouveau modèle",
+      name: "Nom",
+      category: "Catégorie",
+      aspectRatio: "Format",
+      promptTemplate: "Modèle de prompt",
+      textPolicy: "Politique de texte",
+      brandKit: "Kit de marque",
+      global: "Global",
+      globalNoBrandKit: "Global (sans kit de marque)",
+      includeLogo: "Composer le logo canonique",
+      associateToPin:
+        "Associez ce modèle à un kit de marque pour épingler des images.",
+      edit: "Modifier",
+      duplicate: "Dupliquer",
+      duplicateIntoBrandKit: "Dupliquer dans un kit de marque…",
+      delete: "Supprimer",
+      deleteTitle: "Supprimer le modèle ?",
+      deleteDescription:
+        "Les exécutions existantes conservent leur prompt et leurs paramètres capturés.",
+      noTemplates: "Aucun modèle pour le moment.",
+      noMatches: "Aucun modèle ne correspond à ces filtres.",
+      clearFilters: "Effacer les filtres",
+      unavailableTitle: "Modèle indisponible",
+      unavailableDescription:
+        "Ce modèle a peut-être été supprimé ou vous n’y avez peut-être plus accès.",
+      created: "Modèle créé.",
+      createFailed: "Impossible de créer le modèle.",
+      updated: "Modèle enregistré.",
+      updateFailed: "Impossible d’enregistrer le modèle.",
+      deleted: "Modèle supprimé.",
+      deleteFailed: "Impossible de supprimer le modèle.",
+      deleteInUse: "Ce modèle est utilisé par une génération existante.",
+      back: "Retour aux modèles",
     },
     team: {
       title: "Équipe",
@@ -5453,6 +5681,9 @@ export const messagesByLocale = {
       recentDrafts: "Letzte Entwürfe",
       viewAllDrafts: "Alle Entwürfe anzeigen",
       draftAsset: "Entwurf",
+      draftsOnly: "Nur Entwürfe",
+      draftsOnlyHint:
+        "Sie können in diesem Kit Entwürfe generieren. Bitten Sie einen Bearbeiter, sie im Kit zu speichern.",
       addAssets: "Assets hinzufügen",
       addAssetsDescription:
         "Laden Sie Quellmaterial hoch oder generieren Sie Kandidaten und markieren Sie dann nur die Assets, die künftigen Generationen als Referenz dienen sollen.",
@@ -5479,7 +5710,9 @@ export const messagesByLocale = {
       checkingImageLibraries: "Bildbibliotheken werden geprüft...",
       checkingUpload: "Upload wird überprüft",
       clearAll: "Alles löschen",
+      clearAllWithCount: "Alle Kandidaten löschen ({{count}})",
       clearCandidates: "Kandidaten löschen",
+      hideDetails: "Details ausblenden",
       clearCandidatesDescription:
         "Löscht die Live-Phase und entfernt nicht gespeicherte Entwurfskandidaten.",
       clearGeneratedCandidatesDescription:
@@ -5634,6 +5867,7 @@ export const messagesByLocale = {
     navigation: {
       create: "Erstellen",
       library: "Bibliothek",
+      templates: "Vorlagen",
       brandKits: "Marken-Kits",
       auditLog: "Audit-Log",
       settings: "Einstellungen",
@@ -5665,8 +5899,12 @@ export const messagesByLocale = {
       setupReady: "bereit",
       builderDescriptionReady: "Für verwaltete Generierung verbunden.",
       builderDescriptionManaged:
-        "Verwaltete Bildgenerierung und Speicher, keine Provider-Schlüssel.",
-      builderDescriptionDisabled: "Für diese Bereitstellung deaktiviert.",
+        "Verbinde Builder für verwaltete Bildgenerierung und Speicherung. Videogenerierung ist verfügbar, wenn sie für deinen Space aktiviert ist.",
+      builderDescriptionDisabled:
+        "Die Bildgenerierung ist hier deaktiviert; die Videogenerierung mit Builder kann weiterhin verfügbar sein.",
+      builderLookupFailed:
+        "Der Builder-Zugriff konnte nicht geprüft werden. Versuche es erneut, um den Verbindungsstatus zu aktualisieren.",
+      statusUnavailable: "Status nicht verfügbar",
       optional: "Optional",
       reconnect: "Neu verbinden",
       generation: "Generierung",
@@ -5674,7 +5912,7 @@ export const messagesByLocale = {
       generationNeedsSetup: "Einrichtung erforderlich",
       manualGenerationKeys: "Manuelle Generierungsschlüssel",
       manualGenerationDescription:
-        "Füge Gemini für Videogenerierung oder OpenAI/Gemini als Bild-Fallbacks hinzu.",
+        "Füge Gemini für die manuelle Videogenerierung oder OpenAI/Gemini als Bild-Fallbacks hinzu.",
       storage: "Speicher",
       storageReady:
         "Originale, Miniaturen, Videos und Exporte haben einen dauerhaften Speicherort.",
@@ -5687,7 +5925,8 @@ export const messagesByLocale = {
       connecting: "Verbindung wird hergestellt",
       noManualOptions:
         "Für dieses Element sind keine manuellen Einrichtungsoptionen verfügbar.",
-      builderManaged: "Builder verwaltet die Bildgenerierung.",
+      builderManaged:
+        "Builder verwaltet die Bildgenerierung. Videogenerierung ist verfügbar, wenn sie für deinen Space aktiviert ist.",
       providerConfigured: "{{providers}} konfiguriert.",
 
       addBuilderGeminiOrOpenAI:
@@ -5699,6 +5938,13 @@ export const messagesByLocale = {
       enterValueFirst: "Geben Sie zunächst einen Wert ein.",
       manualKeys: "Manuelle Schlüssel",
       saveFailed: "Speichern fehlgeschlagen",
+      builderConnectedTo: "Verbunden mit {{orgName}}.",
+      manage: "Verwalten",
+      addKeys: "Schlüssel hinzufügen",
+      setUp: "Einrichten",
+      emailGroup: "E-Mail",
+      setupLoadFailed: "Der Einrichtungsstatus konnte nicht geladen werden.",
+      notificationsLoadFailed: "Diese Einstellung konnte nicht geladen werden.",
       saveKey: "Schlüssel speichern",
       saveSettings: "Einstellungen speichern",
     },
@@ -5736,11 +5982,51 @@ export const messagesByLocale = {
     },
     routeTitles: {
       library: "Bibliothek - Assets",
+      templates: "Vorlagen - Assets",
       generationPreset: "Generationsvoreinstellung - Assets",
       brandKits: "Marken-Kits - Assets",
       extension: "Erweiterung - Assets",
       extensions: "Erweiterungen - Assets",
       team: "Teamseite - Assets",
+    },
+    templates: {
+      all: "Alle Vorlagen",
+      globalOnly: "Nur globale",
+      search: "Vorlagen durchsuchen",
+      new: "Neue Vorlage",
+      name: "Name",
+      category: "Kategorie",
+      aspectRatio: "Seitenverhältnis",
+      promptTemplate: "Prompt-Vorlage",
+      textPolicy: "Textrichtlinie",
+      brandKit: "Brand-Kit",
+      global: "Global",
+      globalNoBrandKit: "Global (ohne Brand-Kit)",
+      includeLogo: "Kanonisches Logo einbinden",
+      associateToPin:
+        "Verknüpfen Sie diese Vorlage mit einem Brand-Kit, um Bilder anzuheften.",
+      edit: "Bearbeiten",
+      duplicate: "Duplizieren",
+      duplicateIntoBrandKit: "In Brand-Kit duplizieren…",
+      delete: "Löschen",
+      deleteTitle: "Vorlage löschen?",
+      deleteDescription:
+        "Bestehende Ausführungen behalten ihren erfassten Prompt und ihre Einstellungen.",
+      noTemplates: "Noch keine Vorlagen.",
+      noMatches: "Keine Vorlagen entsprechen diesen Filtern.",
+      clearFilters: "Filter zurücksetzen",
+      unavailableTitle: "Vorlage nicht verfügbar",
+      unavailableDescription:
+        "Diese Vorlage wurde möglicherweise gelöscht oder Sie haben keinen Zugriff mehr darauf.",
+      created: "Vorlage erstellt.",
+      createFailed: "Vorlage konnte nicht erstellt werden.",
+      updated: "Vorlage gespeichert.",
+      updateFailed: "Vorlage konnte nicht gespeichert werden.",
+      deleted: "Vorlage gelöscht.",
+      deleteFailed: "Vorlage konnte nicht gelöscht werden.",
+      deleteInUse:
+        "Diese Vorlage wird von einer vorhandenen Generierung verwendet.",
+      back: "Zurück zu Vorlagen",
     },
     team: {
       title: "Team",
@@ -5812,6 +6098,9 @@ export const messagesByLocale = {
       recentDrafts: "最近の下書き",
       viewAllDrafts: "すべての下書きを表示",
       draftAsset: "下書きアセット",
+      draftsOnly: "下書きのみ",
+      draftsOnlyHint:
+        "このキットで下書きを生成できます。キットに保存するには編集者に依頼してください。",
       addAssets: "アセットの追加",
       addAssetsDescription:
         "ソース素材をアップロードするか候補を生成し、将来の世代を導く必要がある資産のみを参照としてマークします。",
@@ -5837,7 +6126,9 @@ export const messagesByLocale = {
       checkingImageLibraries: "画像ライブラリを確認中...",
       checkingUpload: "アップロードを確認しています",
       clearAll: "すべてクリア",
+      clearAllWithCount: "候補をすべてクリア（{{count}}）",
       clearCandidates: "候補をクリアする",
+      hideDetails: "詳細を非表示",
       clearCandidatesDescription:
         "ライブ ステージをクリアし、保存されていないドラフト候補を削除します。",
       clearGeneratedCandidatesDescription:
@@ -5986,6 +6277,7 @@ export const messagesByLocale = {
     navigation: {
       create: "作成",
       library: "ライブラリ",
+      templates: "テンプレート",
       brandKits: "ブランドキット",
       auditLog: "監査ログ",
       settings: "設定",
@@ -6016,8 +6308,12 @@ export const messagesByLocale = {
       setupReady: "準備完了",
       builderDescriptionReady: "管理された生成に接続済みです。",
       builderDescriptionManaged:
-        "管理された画像生成とストレージ。プロバイダーキーは不要です。",
-      builderDescriptionDisabled: "このデプロイでは無効です。",
+        "Builder に接続すると、画像生成と保存を管理できます。動画生成はスペースで有効な場合に利用できます。",
+      builderDescriptionDisabled:
+        "ここでは画像生成が無効です。Builder の動画生成は引き続き利用できる場合があります。",
+      builderLookupFailed:
+        "Builder のアクセス権を確認できませんでした。再試行して接続状態を更新してください。",
+      statusUnavailable: "状態を確認できません",
       optional: "任意",
       reconnect: "再接続",
       generation: "生成",
@@ -6025,7 +6321,7 @@ export const messagesByLocale = {
       generationNeedsSetup: "設定が必要です",
       manualGenerationKeys: "手動生成キー",
       manualGenerationDescription:
-        "動画生成には Gemini を、画像のフォールバックには OpenAI/Gemini を追加します。",
+        "手動で動画を生成する場合は Gemini、画像の代替には OpenAI/Gemini を追加します。",
       storage: "ストレージ",
       storageReady:
         "オリジナル、サムネイル、動画、エクスポートの保存先が確保されています。",
@@ -6037,7 +6333,8 @@ export const messagesByLocale = {
       available: "利用可能",
       connecting: "接続中",
       noManualOptions: "この項目で利用できる手動設定オプションはありません。",
-      builderManaged: "Builder が管理された画像生成を処理しています。",
+      builderManaged:
+        "Builder が画像生成を管理します。動画生成はスペースで有効な場合に利用できます。",
       providerConfigured: "{{providers}} が設定済みです。",
 
       addBuilderGeminiOrOpenAI:
@@ -6049,6 +6346,13 @@ export const messagesByLocale = {
       enterValueFirst: "先に値を入力してください。",
       manualKeys: "手動キー",
       saveFailed: "保存に失敗しました",
+      builderConnectedTo: "{{orgName}} に接続済みです。",
+      manage: "管理",
+      addKeys: "キーを追加",
+      setUp: "設定",
+      emailGroup: "メール",
+      setupLoadFailed: "設定状況を読み込めませんでした。",
+      notificationsLoadFailed: "この設定を読み込めませんでした。",
       saveKey: "キーを保存",
       saveSettings: "設定を保存する",
     },
@@ -6085,11 +6389,50 @@ export const messagesByLocale = {
     },
     routeTitles: {
       library: "ライブラリ - Assets",
+      templates: "テンプレート - Assets",
       generationPreset: "生成プリセット - Assets",
       brandKits: "ブランドキット - Assets",
       extension: "拡張機能 - Assets",
       extensions: "拡張機能 - Assets",
       team: "チーム - Assets",
+    },
+    templates: {
+      all: "すべてのテンプレート",
+      globalOnly: "グローバルのみ",
+      search: "テンプレートを検索",
+      new: "新しいテンプレート",
+      name: "名前",
+      category: "カテゴリ",
+      aspectRatio: "アスペクト比",
+      promptTemplate: "プロンプトテンプレート",
+      textPolicy: "テキストポリシー",
+      brandKit: "ブランドキット",
+      global: "グローバル",
+      globalNoBrandKit: "グローバル（ブランドキットなし）",
+      includeLogo: "標準ロゴを合成",
+      associateToPin:
+        "画像をピン留めするには、このテンプレートをブランドキットに関連付けてください。",
+      edit: "編集",
+      duplicate: "複製",
+      duplicateIntoBrandKit: "ブランドキットに複製…",
+      delete: "削除",
+      deleteTitle: "テンプレートを削除しますか？",
+      deleteDescription:
+        "既存の実行には、取得済みのプロンプトと設定が保持されます。",
+      noTemplates: "テンプレートはまだありません。",
+      noMatches: "これらのフィルターに一致するテンプレートはありません。",
+      clearFilters: "フィルターをクリア",
+      unavailableTitle: "テンプレートを利用できません",
+      unavailableDescription:
+        "このテンプレートは削除されたか、アクセス権がなくなった可能性があります。",
+      created: "テンプレートを作成しました。",
+      createFailed: "テンプレートを作成できませんでした。",
+      updated: "テンプレートを保存しました。",
+      updateFailed: "テンプレートを保存できませんでした。",
+      deleted: "テンプレートを削除しました。",
+      deleteFailed: "テンプレートを削除できませんでした。",
+      deleteInUse: "このテンプレートは既存の生成で使用されています。",
+      back: "テンプレートに戻る",
     },
     team: {
       title: "チーム",
@@ -6161,6 +6504,9 @@ export const messagesByLocale = {
       recentDrafts: "최근 초안",
       viewAllDrafts: "모든 초안 보기",
       draftAsset: "초안 자산",
+      draftsOnly: "초안만 가능",
+      draftsOnlyHint:
+        "이 키트에서 초안을 생성할 수 있습니다. 키트에 저장하려면 편집자에게 요청하세요.",
       addAssets: "자산 추가",
       addAssetsDescription:
         "원본 자료를 업로드하거나 후보를 생성한 후, 미래 세대를 이끌어야 할 자산만 참고 자료로 표시하세요.",
@@ -6186,7 +6532,9 @@ export const messagesByLocale = {
       checkingImageLibraries: "이미지 라이브러리 확인 중...",
       checkingUpload: "업로드 확인 중",
       clearAll: "모두 지우기",
+      clearAllWithCount: "후보 모두 지우기({{count}})",
       clearCandidates: "후보 제거",
+      hideDetails: "세부정보 숨기기",
       clearCandidatesDescription:
         "라이브 단계를 지우고 저장되지 않은 초안 후보를 삭제합니다.",
       clearGeneratedCandidatesDescription:
@@ -6334,6 +6682,7 @@ export const messagesByLocale = {
     navigation: {
       create: "생성",
       library: "라이브러리",
+      templates: "템플릿",
       brandKits: "브랜드 키트",
       auditLog: "감사 로그",
       settings: "설정",
@@ -6364,8 +6713,12 @@ export const messagesByLocale = {
       setupReady: "준비됨",
       builderDescriptionReady: "관리형 생성에 연결되었습니다.",
       builderDescriptionManaged:
-        "관리형 이미지 생성 및 저장소, 제공자 키가 필요 없습니다.",
-      builderDescriptionDisabled: "이 배포에서는 비활성화되었습니다.",
+        "이미지 생성 및 저장을 관리하려면 Builder를 연결하세요. 동영상 생성은 워크스페이스에서 사용 설정된 경우 이용할 수 있습니다.",
+      builderDescriptionDisabled:
+        "여기서는 이미지 생성이 비활성화되어 있습니다. Builder 동영상 생성은 계속 사용할 수 있을 수 있습니다.",
+      builderLookupFailed:
+        "Builder 액세스를 확인할 수 없습니다. 다시 시도하여 연결 상태를 새로고침하세요.",
+      statusUnavailable: "상태를 확인할 수 없음",
       optional: "선택 사항",
       reconnect: "다시 연결",
       generation: "생성",
@@ -6373,7 +6726,7 @@ export const messagesByLocale = {
       generationNeedsSetup: "설정 필요",
       manualGenerationKeys: "수동 생성 키",
       manualGenerationDescription:
-        "비디오 생성에는 Gemini를, 이미지 대체 모델에는 OpenAI/Gemini를 추가하세요.",
+        "수동 동영상 생성에는 Gemini를, 이미지 대체에는 OpenAI/Gemini를 추가하세요.",
       storage: "저장소",
       storageReady:
         "원본, 썸네일, 비디오, 내보내기에 사용할 영구 저장소가 있습니다.",
@@ -6385,7 +6738,8 @@ export const messagesByLocale = {
       available: "사용 가능",
       connecting: "연결 중",
       noManualOptions: "이 항목에 사용할 수 있는 수동 설정 옵션이 없습니다.",
-      builderManaged: "Builder가 관리형 이미지 생성을 처리합니다.",
+      builderManaged:
+        "Builder가 이미지 생성을 관리합니다. 동영상 생성은 워크스페이스에서 사용 설정된 경우 이용할 수 있습니다.",
       providerConfigured: "{{providers}} 설정됨.",
 
       addBuilderGeminiOrOpenAI:
@@ -6397,6 +6751,13 @@ export const messagesByLocale = {
       enterValueFirst: "먼저 값을 입력하세요.",
       manualKeys: "수동 키",
       saveFailed: "저장 실패",
+      builderConnectedTo: "{{orgName}}에 연결되었습니다.",
+      manage: "관리",
+      addKeys: "키 추가",
+      setUp: "설정",
+      emailGroup: "이메일",
+      setupLoadFailed: "설정 상태를 불러오지 못했습니다.",
+      notificationsLoadFailed: "이 설정을 불러오지 못했습니다.",
       saveKey: "키 저장",
       saveSettings: "설정 저장",
     },
@@ -6433,11 +6794,49 @@ export const messagesByLocale = {
     },
     routeTitles: {
       library: "라이브러리 - Assets",
+      templates: "템플릿 - Assets",
       generationPreset: "생성 사전 설정 - Assets",
       brandKits: "브랜드 키트 - Assets",
       extension: "확장 - Assets",
       extensions: "확장 - Assets",
       team: "팀 - Assets",
+    },
+    templates: {
+      all: "모든 템플릿",
+      globalOnly: "전역만",
+      search: "템플릿 검색",
+      new: "새 템플릿",
+      name: "이름",
+      category: "카테고리",
+      aspectRatio: "가로세로 비율",
+      promptTemplate: "프롬프트 템플릿",
+      textPolicy: "텍스트 정책",
+      brandKit: "브랜드 키트",
+      global: "전역",
+      globalNoBrandKit: "전역(브랜드 키트 없음)",
+      includeLogo: "기준 로고 합성",
+      associateToPin:
+        "이미지를 고정하려면 이 템플릿을 브랜드 키트와 연결하세요.",
+      edit: "편집",
+      duplicate: "복제",
+      duplicateIntoBrandKit: "브랜드 키트에 복제…",
+      delete: "삭제",
+      deleteTitle: "템플릿을 삭제할까요?",
+      deleteDescription: "기존 실행에는 캡처된 프롬프트와 설정이 유지됩니다.",
+      noTemplates: "아직 템플릿이 없습니다.",
+      noMatches: "이 필터와 일치하는 템플릿이 없습니다.",
+      clearFilters: "필터 지우기",
+      unavailableTitle: "템플릿을 사용할 수 없음",
+      unavailableDescription:
+        "이 템플릿이 삭제되었거나 더 이상 접근할 수 없을 수 있습니다.",
+      created: "템플릿을 만들었습니다.",
+      createFailed: "템플릿을 만들 수 없습니다.",
+      updated: "템플릿을 저장했습니다.",
+      updateFailed: "템플릿을 저장할 수 없습니다.",
+      deleted: "템플릿을 삭제했습니다.",
+      deleteFailed: "템플릿을 삭제할 수 없습니다.",
+      deleteInUse: "이 템플릿은 기존 생성에서 사용 중입니다.",
+      back: "템플릿으로 돌아가기",
     },
     team: {
       title: "팀",
@@ -6509,6 +6908,9 @@ export const messagesByLocale = {
       recentDrafts: "Rascunhos recentes",
       viewAllDrafts: "Ver todos os rascunhos",
       draftAsset: "Rascunho",
+      draftsOnly: "Somente rascunhos",
+      draftsOnlyHint:
+        "Você pode gerar rascunhos neste kit. Peça a um editor para salvá-los nele.",
       addAssets: "Adicionar recursos",
       addAssetsDescription:
         "Carregue o material de origem ou gere candidatos e marque apenas os ativos que devem orientar as gerações futuras como referências.",
@@ -6534,7 +6936,9 @@ export const messagesByLocale = {
       checkingImageLibraries: "Verificando bibliotecas de imagens...",
       checkingUpload: "Verificando upload",
       clearAll: "Limpar tudo",
+      clearAllWithCount: "Limpar todos os candidatos ({{count}})",
       clearCandidates: "Limpar candidatos",
+      hideDetails: "Ocultar detalhes",
       clearCandidatesDescription:
         "Limpa o estágio ao vivo e exclui candidatos de rascunho não salvos.",
       clearGeneratedCandidatesDescription:
@@ -6684,6 +7088,7 @@ export const messagesByLocale = {
     navigation: {
       create: "Criar",
       library: "Biblioteca",
+      templates: "Modelos",
       brandKits: "Kits de marca",
       auditLog: "Log de auditoria",
       settings: "Configurações",
@@ -6715,17 +7120,21 @@ export const messagesByLocale = {
       addGeminiOrOpenAI:
         "Adicione Gemini ou OpenAI antes de gerar novos ativos.",
       brandKits: "Kits de marca",
-      builderDescriptionDisabled: "Desativado para esta implantação.",
+      builderDescriptionDisabled:
+        "A geração de imagens está desativada aqui; a geração de vídeo do Builder ainda pode estar disponível.",
+      builderLookupFailed:
+        "Não foi possível verificar o acesso ao Builder. Tente novamente para atualizar o estado da conexão.",
+      statusUnavailable: "Status indisponível",
       builderDescriptionManaged:
-        "Geração e armazenamento de imagens gerenciados, sem chaves de provedor.",
+        "Conecte o Builder para gerenciar a geração e o armazenamento de imagens. A geração de vídeo fica disponível quando ativada para seu espaço.",
       builderDescriptionReady: "Conectado para geração gerenciada.",
       builderManaged:
-        "Builder está lidando com a geração de imagens gerenciadas.",
+        "O Builder gerencia a geração de imagens. A geração de vídeo fica disponível quando ativada para seu espaço.",
       chooseProvider: "Escolha um provedor",
       enterValueFirst: "Insira um valor primeiro.",
       generationNeedsSetup: "Precisa de configuração",
       manualGenerationDescription:
-        "Adicione Gemini para geração de vídeo ou OpenAI/Gemini como substitutos de imagem.",
+        "Adicione Gemini para geração manual de vídeo ou OpenAI/Gemini como alternativas para imagens.",
       manualGenerationKeys: "Chaves de geração manual",
       manualKeys: "Chaves manuais",
       noManualOptions:
@@ -6734,6 +7143,15 @@ export const messagesByLocale = {
         "Use S3, R2, Spaces, Tigris, MinIO ou outro provedor compatível.",
       objectStorage: "Armazenamento de objetos",
       saveFailed: "Falha ao salvar",
+      builderConnectedTo: "Conectado a {{orgName}}.",
+      generation: "Geração",
+      storage: "Armazenamento",
+      manage: "Gerenciar",
+      addKeys: "Adicionar chaves",
+      setUp: "Configurar",
+      emailGroup: "E-mail",
+      setupLoadFailed: "Não foi possível carregar o status da configuração.",
+      notificationsLoadFailed: "Não foi possível carregar esta configuração.",
       saveKey: "Salvar chave",
       saveSettings: "Salvar configurações",
       setupDescription: "Dois fundamentos: geração e armazenamento durável.",
@@ -6863,11 +7281,50 @@ export const messagesByLocale = {
     },
     routeTitles: {
       library: "Biblioteca - Assets",
+      templates: "Modelos - Assets",
       generationPreset: "Predefinição de geração - Assets",
       brandKits: "Kits de marca - Assets",
       extension: "Extensão - Assets",
       extensions: "Extensões - Assets",
       team: "Equipe - Assets",
+    },
+    templates: {
+      all: "Todos os modelos",
+      globalOnly: "Somente globais",
+      search: "Pesquisar modelos",
+      new: "Novo modelo",
+      name: "Nome",
+      category: "Categoria",
+      aspectRatio: "Proporção",
+      promptTemplate: "Modelo de prompt",
+      textPolicy: "Política de texto",
+      brandKit: "Kit da marca",
+      global: "Global",
+      globalNoBrandKit: "Global (sem kit da marca)",
+      includeLogo: "Compor logotipo canônico",
+      associateToPin:
+        "Associe este modelo a um kit da marca para fixar imagens.",
+      edit: "Editar",
+      duplicate: "Duplicar",
+      duplicateIntoBrandKit: "Duplicar para o kit da marca…",
+      delete: "Excluir",
+      deleteTitle: "Excluir modelo?",
+      deleteDescription:
+        "As execuções existentes mantêm o prompt e as configurações capturados.",
+      noTemplates: "Ainda não há modelos.",
+      noMatches: "Nenhum modelo corresponde a estes filtros.",
+      clearFilters: "Limpar filtros",
+      unavailableTitle: "Modelo indisponível",
+      unavailableDescription:
+        "Este modelo pode ter sido excluído ou você talvez não tenha mais acesso.",
+      created: "Modelo criado.",
+      createFailed: "Não foi possível criar o modelo.",
+      updated: "Modelo salvo.",
+      updateFailed: "Não foi possível salvar o modelo.",
+      deleted: "Modelo excluído.",
+      deleteFailed: "Não foi possível excluir o modelo.",
+      deleteInUse: "Este modelo é usado por uma geração existente.",
+      back: "Voltar aos modelos",
     },
     team: {
       title: "Equipe",
@@ -6960,6 +7417,9 @@ export const messagesByLocale = {
       recentDrafts: "हाल के ड्राफ़्ट",
       viewAllDrafts: "सभी ड्राफ़्ट देखें",
       draftAsset: "ड्राफ़्ट एसेट",
+      draftsOnly: "केवल ड्राफ़्ट",
+      draftsOnlyHint:
+        "आप इस किट में ड्राफ़्ट बना सकते हैं। उन्हें किट में सहेजने के लिए किसी एडिटर से कहें।",
       addAssets: "संपत्तियां जोड़ें",
       addAssetsDescription:
         "स्रोत सामग्री अपलोड करें या उम्मीदवार तैयार करें, फिर केवल उन संपत्तियों को चिह्नित करें जो भविष्य की पीढ़ियों को संदर्भ के रूप में मार्गदर्शन करें।",
@@ -6985,7 +7445,9 @@ export const messagesByLocale = {
       checkingImageLibraries: "Image libraries जांची जा रही हैं...",
       checkingUpload: "अपलोड की जाँच की जा रही है",
       clearAll: "सभी साफ करें",
+      clearAllWithCount: "सभी उम्मीदवार साफ करें ({{count}})",
       clearCandidates: "उम्मीदवारों को साफ करें",
+      hideDetails: "विवरण छिपाएं",
       clearCandidatesDescription:
         "लाइव चरण को साफ करता है और अ सहेजे गए ड्राफ्ट उम्मीदवारों को हटाता है।",
       clearGeneratedCandidatesDescription:
@@ -7133,6 +7595,7 @@ export const messagesByLocale = {
     navigation: {
       create: "बनाएं",
       library: "लाइब्रेरी",
+      templates: "टेम्प्लेट",
       brandKits: "ब्रांड किट",
       auditLog: "ऑडिट लॉग",
       settings: "सेटिंग्स",
@@ -7162,8 +7625,12 @@ export const messagesByLocale = {
       setupReady: "तैयार",
       builderDescriptionReady: "Managed generation के लिए connected.",
       builderDescriptionManaged:
-        "Managed image generation और storage, provider keys के बिना.",
-      builderDescriptionDisabled: "इस deployment के लिए disabled.",
+        "प्रबंधित इमेज जनरेशन और स्टोरेज के लिए Builder कनेक्ट करें। वीडियो जनरेशन आपके स्पेस में सक्षम होने पर उपलब्ध है।",
+      builderDescriptionDisabled:
+        "यहां छवि निर्माण बंद है; Builder वीडियो निर्माण फिर भी उपलब्ध हो सकता है।",
+      builderLookupFailed:
+        "Builder की पहुंच जांची नहीं जा सकी। कनेक्शन की स्थिति अपडेट करने के लिए फिर से प्रयास करें।",
+      statusUnavailable: "स्थिति उपलब्ध नहीं",
       optional: "वैकल्पिक",
       reconnect: "फिर से कनेक्ट करें",
       generation: "जनरेशन",
@@ -7171,7 +7638,7 @@ export const messagesByLocale = {
       generationNeedsSetup: "Setup जरूरी",
       manualGenerationKeys: "मैनुअल generation keys",
       manualGenerationDescription:
-        "वीडियो generation के लिए Gemini जोड़ें, या image fallbacks के लिए OpenAI/Gemini.",
+        "मैन्युअल वीडियो जनरेशन के लिए Gemini जोड़ें, या इमेज फ़ॉलबैक के लिए OpenAI/Gemini जोड़ें।",
       storage: "स्टोरेज",
       storageReady:
         "Originals, thumbnails, videos और exports के लिए durable home मौजूद है.",
@@ -7183,7 +7650,8 @@ export const messagesByLocale = {
       available: "उपलब्ध",
       connecting: "कनेक्ट हो रहा है",
       noManualOptions: "इस item के लिए कोई manual setup options उपलब्ध नहीं हैं.",
-      builderManaged: "Builder managed image generation संभाल रहा है.",
+      builderManaged:
+        "Builder इमेज जनरेशन संभालता है। वीडियो जनरेशन आपके स्पेस में सक्षम होने पर उपलब्ध है।",
       providerConfigured: "{{providers}} configured.",
 
       addBuilderGeminiOrOpenAI:
@@ -7192,8 +7660,15 @@ export const messagesByLocale = {
       brandKits: "ब्रांड किट",
       chooseProvider: "एक प्रदाता चुनें",
       enterValueFirst: "पहले एक मान दर्ज करें.",
-      manualKeys: "मैनुअल चाबियाँ",
+      manualKeys: "मैनुअल कुंजियाँ",
       saveFailed: "सहेजना विफल",
+      builderConnectedTo: "{{orgName}} से कनेक्ट है।",
+      manage: "प्रबंधित करें",
+      addKeys: "कुंजियाँ जोड़ें",
+      setUp: "सेट अप करें",
+      emailGroup: "ईमेल",
+      setupLoadFailed: "सेटअप की स्थिति लोड नहीं हो सकी।",
+      notificationsLoadFailed: "यह सेटिंग लोड नहीं हो सकी।",
       saveKey: "कुंजी सहेजें",
       saveSettings: "सेटिंग्स सेव करें",
     },
@@ -7230,11 +7705,48 @@ export const messagesByLocale = {
     },
     routeTitles: {
       library: "लाइब्रेरी - Assets",
+      templates: "टेम्प्लेट - Assets",
       generationPreset: "जनरेशन प्रीसेट - Assets",
       brandKits: "ब्रांड किट - Assets",
       extension: "एक्सटेंशन - Assets",
       extensions: "एक्सटेंशन - Assets",
       team: "टीम - Assets",
+    },
+    templates: {
+      all: "सभी टेम्प्लेट",
+      globalOnly: "केवल ग्लोबल",
+      search: "टेम्प्लेट खोजें",
+      new: "नया टेम्प्लेट",
+      name: "नाम",
+      category: "श्रेणी",
+      aspectRatio: "आस्पेक्ट रेशियो",
+      promptTemplate: "प्रॉम्प्ट टेम्प्लेट",
+      textPolicy: "टेक्स्ट नीति",
+      brandKit: "ब्रांड किट",
+      global: "ग्लोबल",
+      globalNoBrandKit: "ग्लोबल (कोई ब्रांड किट नहीं)",
+      includeLogo: "कैनॉनिकल लोगो कंपोज़िट करें",
+      associateToPin: "चित्रों को पिन करने के लिए इस टेम्प्लेट को किसी ब्रांड किट से जोड़ें।",
+      edit: "संपादित करें",
+      duplicate: "डुप्लिकेट",
+      duplicateIntoBrandKit: "ब्रांड किट में डुप्लिकेट करें…",
+      delete: "हटाएं",
+      deleteTitle: "टेम्प्लेट हटाएं?",
+      deleteDescription: "मौजूदा रन अपने कैप्चर किए गए प्रॉम्प्ट और सेटिंग बनाए रखते हैं।",
+      noTemplates: "अभी कोई टेम्प्लेट नहीं है।",
+      noMatches: "इन फ़िल्टर से कोई टेम्प्लेट मेल नहीं खाता।",
+      clearFilters: "फ़िल्टर साफ़ करें",
+      unavailableTitle: "टेम्प्लेट उपलब्ध नहीं है",
+      unavailableDescription:
+        "यह टेम्प्लेट हटाया जा चुका हो सकता है या अब आपके पास इसकी पहुंच नहीं है।",
+      created: "टेम्प्लेट बनाया गया।",
+      createFailed: "टेम्प्लेट नहीं बनाया जा सका।",
+      updated: "टेम्प्लेट सहेजा गया।",
+      updateFailed: "टेम्प्लेट सहेजा नहीं जा सका।",
+      deleted: "टेम्प्लेट हटाया गया।",
+      deleteFailed: "टेम्प्लेट हटाया नहीं जा सका।",
+      deleteInUse: "यह टेम्प्लेट किसी मौजूदा जनरेशन में उपयोग हो रहा है।",
+      back: "टेम्प्लेट पर वापस जाएं",
     },
     team: {
       title: "टीम",
@@ -7306,6 +7818,9 @@ export const messagesByLocale = {
       recentDrafts: "المسودات الأخيرة",
       viewAllDrafts: "عرض جميع المسودات",
       draftAsset: "مسودة",
+      draftsOnly: "المسودات فقط",
+      draftsOnlyHint:
+        "يمكنك إنشاء مسودات في هذه المجموعة. اطلب من محرِّر حفظها فيها.",
       addAssets: "أضف الأصول",
       addAssetsDescription:
         "قم بتحميل المواد المصدرية أو قم بإنشاء مرشحين، ثم حدد فقط الأصول التي يجب أن توجه الأجيال القادمة كمراجع.",
@@ -7331,7 +7846,9 @@ export const messagesByLocale = {
       checkingImageLibraries: "جارٍ فحص مكتبات الصور...",
       checkingUpload: "التحقق من التحميل",
       clearAll: "مسح الكل",
+      clearAllWithCount: "مسح كل المرشحين ({{count}})",
       clearCandidates: "امسح المرشحين",
+      hideDetails: "إخفاء التفاصيل",
       clearCandidatesDescription:
         "مسح مرحلة المرشح وحذف المرشحين الذين تم إنشاؤهم غير المحفوظة. أصول المكتبة المحفوظة تبقى دون تغيير.",
       clearGeneratedCandidatesDescription:
@@ -7481,6 +7998,7 @@ export const messagesByLocale = {
     navigation: {
       create: "إنشاء",
       library: "المكتبة",
+      templates: "القوالب",
       brandKits: "مجموعات العلامة",
       auditLog: "سجل التدقيق",
       settings: "الإعدادات",
@@ -7510,16 +8028,21 @@ export const messagesByLocale = {
         "قم بإضافة Builder، أو Gemini، أو OpenAI قبل إنشاء أصول جديدة.",
       addGeminiOrOpenAI: "أضف Gemini أو OpenAI قبل إنشاء أصول جديدة.",
       brandKits: "مجموعات العلامة التجارية",
-      builderDescriptionDisabled: "معطل لهذا النشر.",
+      builderDescriptionDisabled:
+        "إنشاء الصور معطّل هنا؛ قد يظل إنشاء الفيديو عبر Builder متاحًا.",
+      builderLookupFailed:
+        "تعذّر التحقق من الوصول إلى Builder. أعد المحاولة لتحديث حالة الاتصال.",
+      statusUnavailable: "الحالة غير متاحة",
       builderDescriptionManaged:
-        "إدارة إنشاء الصور وتخزينها، بدون مفاتيح الموفر.",
+        "اربط Builder لإدارة إنشاء الصور وتخزينها. يتوفر إنشاء الفيديو عند تفعيله لمساحتك.",
       builderDescriptionReady: "متصل للجيل المدار.",
-      builderManaged: "يتعامل Builder مع إنشاء الصور المُدارة.",
+      builderManaged:
+        "يدير Builder إنشاء الصور. يتوفر إنشاء الفيديو عند تفعيله لمساحتك.",
       chooseProvider: "اختر مزودًا",
       enterValueFirst: "أدخل قيمة أولاً.",
       generationNeedsSetup: "يحتاج إلى إعداد",
       manualGenerationDescription:
-        "أضف Gemini لإنشاء الفيديو، أو OpenAI/Gemini كصور احتياطية.",
+        "أضف Gemini لإنشاء الفيديو يدويًا، أو OpenAI/Gemini كخيارات احتياطية للصور.",
       manualGenerationKeys: "مفاتيح الجيل اليدوي",
       manualKeys: "مفاتيح يدوية",
       noManualOptions: "لا تتوفر خيارات الإعداد اليدوي لهذا العنصر.",
@@ -7527,6 +8050,15 @@ export const messagesByLocale = {
         "استخدم S3، أو R2، أو Spaces، أو Tigris، أو MinIO، أو أي موفر آخر متوافق.",
       objectStorage: "تخزين الكائنات",
       saveFailed: "فشل الحفظ",
+      builderConnectedTo: "متصل بـ {{orgName}}.",
+      generation: "الإنشاء",
+      storage: "التخزين",
+      manage: "إدارة",
+      addKeys: "إضافة مفاتيح",
+      setUp: "إعداد",
+      emailGroup: "البريد الإلكتروني",
+      setupLoadFailed: "تعذّر تحميل حالة الإعداد.",
+      notificationsLoadFailed: "تعذّر تحميل هذا الإعداد.",
       saveKey: "حفظ المفتاح",
       saveSettings: "حفظ الإعدادات",
       setupDescription: "أساسيان: التوليد والتخزين الدائم.",
@@ -7663,11 +8195,49 @@ export const messagesByLocale = {
     },
     routeTitles: {
       library: "المكتبة - Assets",
+      templates: "القوالب - Assets",
       generationPreset: "إعداد التوليد المسبق - Assets",
       brandKits: "مجموعات العلامة - Assets",
       extension: "إضافة - Assets",
       extensions: "الإضافات - Assets",
       team: "الفريق - Assets",
+    },
+    templates: {
+      all: "كل القوالب",
+      globalOnly: "العالمية فقط",
+      search: "البحث في القوالب",
+      new: "قالب جديد",
+      name: "الاسم",
+      category: "الفئة",
+      aspectRatio: "نسبة العرض إلى الارتفاع",
+      promptTemplate: "قالب المطالبة",
+      textPolicy: "سياسة النص",
+      brandKit: "مجموعة العلامة التجارية",
+      global: "عالمي",
+      globalNoBrandKit: "عالمي (من دون مجموعة علامة تجارية)",
+      includeLogo: "دمج الشعار الأساسي",
+      associateToPin: "اربط هذا القالب بمجموعة علامة تجارية لتثبيت الصور.",
+      edit: "تعديل",
+      duplicate: "تكرار",
+      duplicateIntoBrandKit: "تكرار إلى مجموعة علامة تجارية…",
+      delete: "حذف",
+      deleteTitle: "حذف القالب؟",
+      deleteDescription:
+        "تحتفظ عمليات التشغيل الحالية بالمطالبة والإعدادات التي تم التقاطها.",
+      noTemplates: "لا توجد قوالب بعد.",
+      noMatches: "لا توجد قوالب تطابق عوامل التصفية هذه.",
+      clearFilters: "مسح عوامل التصفية",
+      unavailableTitle: "القالب غير متاح",
+      unavailableDescription:
+        "ربما حُذف هذا القالب، أو لم تعد تملك صلاحية الوصول إليه.",
+      created: "تم إنشاء القالب.",
+      createFailed: "تعذر إنشاء القالب.",
+      updated: "تم حفظ القالب.",
+      updateFailed: "تعذر حفظ القالب.",
+      deleted: "تم حذف القالب.",
+      deleteFailed: "تعذر حذف القالب.",
+      deleteInUse: "هذا القالب مستخدم في عملية إنشاء حالية.",
+      back: "العودة إلى القوالب",
     },
     team: {
       title: "الفريق",

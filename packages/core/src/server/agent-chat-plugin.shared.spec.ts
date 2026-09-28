@@ -7,8 +7,116 @@ import {
   finalizeClaimedAgentChatProcessRunFailure,
   handleSharedThreadRequest,
   isNetlifyRecurringJobsRuntime,
+  resolveRecurringJobsBuildMarker,
+  resolveAgentCheckpointPaths,
+  scheduledTriggerAvailability,
   shouldDisableRecurringJobsRuntime,
 } from "./agent-chat-plugin.js";
+
+describe("agent checkpoint path provenance", () => {
+  const contentSha256 = "a".repeat(64);
+
+  it("keeps reported file-tool paths and fails closed on unreported changes", () => {
+    const events = [
+      {
+        event: {
+          type: "tool_done" as const,
+          tool: "edit",
+          input: { path: "src/agent.ts" },
+          result: "ok",
+          fileMutation: { path: "src/agent.ts", contentSha256 },
+        },
+      },
+    ];
+
+    expect(
+      resolveAgentCheckpointPaths("/workspace", ["src/agent.ts"], events),
+    ).toEqual(new Map([["src/agent.ts", contentSha256]]));
+    expect(
+      resolveAgentCheckpointPaths(
+        "/workspace",
+        ["src/agent.ts", "developer.txt"],
+        events,
+      ),
+    ).toEqual(new Map());
+    expect(
+      resolveAgentCheckpointPaths(
+        "/workspace",
+        ["outside.txt"],
+        [
+          {
+            event: {
+              type: "tool_done",
+              tool: "write",
+              input: { path: "../outside.txt" },
+              result: "ok",
+              fileMutation: { path: "../outside.txt", contentSha256 },
+            },
+          },
+        ],
+      ),
+    ).toEqual(new Map());
+  });
+
+  it("normalizes Windows-style tool paths", () => {
+    expect(
+      resolveAgentCheckpointPaths(
+        "/workspace",
+        ["src/agent.ts"],
+        [
+          {
+            event: {
+              type: "tool_done",
+              tool: "write",
+              input: { path: "src\\agent.ts" },
+              result: "ok",
+              fileMutation: { path: "src/agent.ts", contentSha256 },
+            },
+          },
+        ],
+      ),
+    ).toEqual(new Map([["src/agent.ts", contentSha256]]));
+  });
+
+  it("ignores paths reported by read-only tools", () => {
+    expect(
+      resolveAgentCheckpointPaths(
+        "/workspace",
+        ["src/agent.ts"],
+        [
+          {
+            event: {
+              type: "tool_done",
+              tool: "read-file",
+              input: { path: "src/agent.ts" },
+              result: "contents",
+              fileMutation: { path: "src/agent.ts", contentSha256 },
+            },
+          },
+        ],
+      ),
+    ).toEqual(new Map());
+  });
+
+  it("ignores writes without exact content identity", () => {
+    expect(
+      resolveAgentCheckpointPaths(
+        "/workspace",
+        ["src/agent.ts"],
+        [
+          {
+            event: {
+              type: "tool_done",
+              tool: "write",
+              input: { path: "src/agent.ts" },
+              result: "ok",
+            },
+          },
+        ],
+      ),
+    ).toEqual(new Map());
+  });
+});
 
 function createSharedThreadEvent(
   path: string,
@@ -16,6 +124,8 @@ function createSharedThreadEvent(
 ) {
   const headers = new Headers();
   if (options.accept) headers.set("accept", options.accept);
+  headers.set("host", "share.example.test");
+  headers.set("x-forwarded-proto", "https");
   return {
     path,
     req: {
@@ -146,6 +256,34 @@ describe("recurring jobs runtime startup", () => {
     ).toBe(false);
   });
 
+  it("disables every in-process recurring sweep in serverless runtimes", () => {
+    expect(
+      shouldDisableRecurringJobsRuntime({
+        NODE_ENV: "production",
+        NETLIFY: "true",
+      }),
+    ).toBe(true);
+    expect(
+      shouldDisableRecurringJobsRuntime({
+        NODE_ENV: "production",
+        AWS_LAMBDA_FUNCTION_NAME: "analytics-handler",
+      }),
+    ).toBe(true);
+    expect(
+      shouldDisableRecurringJobsRuntime({
+        NODE_ENV: "production",
+        CF_PAGES: "1",
+      }),
+    ).toBe(true);
+    expect(
+      shouldDisableRecurringJobsRuntime({
+        NODE_ENV: "production",
+        NETLIFY: "true",
+        NETLIFY_LOCAL: "true",
+      }),
+    ).toBe(false);
+  });
+
   it("supports an explicit local opt-in for scheduler development", () => {
     expect(
       shouldDisableRecurringJobsRuntime({
@@ -163,6 +301,158 @@ describe("recurring jobs runtime startup", () => {
         AGENT_NATIVE_ENABLE_LOCAL_RECURRING_JOBS: "1",
       }),
     ).toBe(true);
+  });
+});
+
+describe("scheduled trigger availability", () => {
+  it("reports hosted Netlify as working despite the in-process timer being off", () => {
+    expect(
+      shouldDisableRecurringJobsRuntime({
+        NODE_ENV: "production",
+        NETLIFY: "true",
+        SITE_ID: "site-1",
+      }),
+    ).toBe(true);
+    expect(
+      scheduledTriggerAvailability({
+        NODE_ENV: "production",
+        NETLIFY: "true",
+        SITE_ID: "site-1",
+      }),
+    ).toEqual({ available: true, driver: "netlify-scheduled-function" });
+  });
+
+  it("reports the build kill switch as unavailable even on Netlify", () => {
+    expect(
+      scheduledTriggerAvailability({
+        NODE_ENV: "production",
+        NETLIFY: "true",
+        SITE_ID: "site-1",
+        AGENT_NATIVE_DISABLE_RECURRING_JOBS: "true",
+      }),
+    ).toEqual({ available: false, reason: "disabled-by-env" });
+  });
+
+  it("reports serverless hosts with no emitted trigger as unavailable", () => {
+    expect(
+      scheduledTriggerAvailability({
+        NODE_ENV: "production",
+        VERCEL: "1",
+      }),
+    ).toEqual({ available: false, reason: "no-platform-scheduler" });
+    expect(
+      scheduledTriggerAvailability({
+        NODE_ENV: "production",
+        AWS_LAMBDA_FUNCTION_NAME: "analytics-handler",
+      }),
+    ).toEqual({ available: false, reason: "no-platform-scheduler" });
+  });
+
+  it("distinguishes a dev machine from a broken deploy", () => {
+    expect(scheduledTriggerAvailability({ NODE_ENV: "development" })).toEqual({
+      available: false,
+      reason: "local-development",
+    });
+    expect(
+      scheduledTriggerAvailability({
+        NODE_ENV: "development",
+        AGENT_NATIVE_ENABLE_LOCAL_RECURRING_JOBS: "1",
+      }),
+    ).toEqual({ available: true, driver: "in-process" });
+  });
+
+  it("reports a long-lived hosted node server as driven in-process", () => {
+    expect(
+      scheduledTriggerAvailability({
+        NODE_ENV: "production",
+        APP_URL: "https://design.agent-native.com",
+      }),
+    ).toEqual({ available: true, driver: "in-process" });
+  });
+
+  it("trusts the build marker over runtime-only Netlify markers", () => {
+    expect(
+      scheduledTriggerAvailability({
+        NODE_ENV: "production",
+        NETLIFY: "true",
+        SITE_ID: "site-1",
+        AGENT_NATIVE_BUILD_RECURRING_JOBS: "disabled",
+      }),
+    ).toEqual({ available: false, reason: "disabled-by-env" });
+  });
+
+  it("confirms the emitted Netlify trigger from the build marker", () => {
+    expect(
+      scheduledTriggerAvailability({
+        NODE_ENV: "production",
+        NETLIFY: "true",
+        SITE_ID: "site-1",
+        AGENT_NATIVE_BUILD_RECURRING_JOBS: "enabled",
+      }),
+    ).toEqual({ available: true, driver: "netlify-scheduled-function" });
+  });
+
+  // The mirror image, and the reason the Netlify branch reads the build scope
+  // ALONE: the emitted scheduled function fires on the platform's clock and
+  // never consults the deployed env, so a runtime-only kill switch does not stop
+  // it. Reporting "won't run" there would be a false alarm about work that runs.
+  it("does not let a runtime-only switch deny a trigger the build emitted", () => {
+    expect(
+      scheduledTriggerAvailability({
+        NODE_ENV: "production",
+        NETLIFY: "true",
+        SITE_ID: "site-1",
+        AGENT_NATIVE_BUILD_RECURRING_JOBS: "enabled",
+        AGENT_NATIVE_DISABLE_RECURRING_JOBS: "true",
+      }),
+    ).toEqual({ available: true, driver: "netlify-scheduled-function" });
+  });
+
+  it("keeps the runtime env authoritative for the in-process driver", () => {
+    expect(
+      scheduledTriggerAvailability({
+        NODE_ENV: "production",
+        APP_URL: "https://design.agent-native.com",
+        AGENT_NATIVE_BUILD_RECURRING_JOBS: "disabled",
+      }),
+    ).toEqual({ available: true, driver: "in-process" });
+    expect(
+      scheduledTriggerAvailability({
+        NODE_ENV: "production",
+        APP_URL: "https://design.agent-native.com",
+        AGENT_NATIVE_BUILD_RECURRING_JOBS: "enabled",
+        AGENT_NATIVE_DISABLE_RECURRING_JOBS: "true",
+      }),
+    ).toEqual({ available: false, reason: "disabled-by-env" });
+  });
+
+  it("ignores a marker value it does not recognize", () => {
+    expect(
+      scheduledTriggerAvailability({
+        NODE_ENV: "production",
+        NETLIFY: "true",
+        SITE_ID: "site-1",
+        AGENT_NATIVE_BUILD_RECURRING_JOBS: "",
+      }),
+    ).toEqual({ available: true, driver: "netlify-scheduled-function" });
+  });
+});
+
+describe("recurring jobs build marker", () => {
+  it("mirrors the build kill switch the emit gate reads", () => {
+    expect(resolveRecurringJobsBuildMarker({})).toBe("enabled");
+    expect(
+      resolveRecurringJobsBuildMarker({
+        AGENT_NATIVE_DISABLE_RECURRING_JOBS: "false",
+      }),
+    ).toBe("enabled");
+    for (const value of ["1", "true", "TRUE", "yes", "on", " true "]) {
+      expect(
+        resolveRecurringJobsBuildMarker({
+          AGENT_NATIVE_DISABLE_RECURRING_JOBS: value,
+        }),
+      ).toBe("disabled");
+    }
   });
 });
 
@@ -237,6 +527,26 @@ describe("agent chat process-run failure finalization", () => {
     expect(d.updateRunStatusIfRunning).not.toHaveBeenCalled();
     expect(d.ensureTerminalRunEvent).not.toHaveBeenCalled();
   });
+
+  it("leaves the run untouched when the claim read fails transiently", async () => {
+    const d = deps("background-processing");
+    d.readBackgroundRunClaim.mockRejectedValueOnce(
+      new Error("database connection reset"),
+    );
+
+    await expect(
+      finalizeClaimedAgentChatProcessRunFailure(
+        "run-claim-read-failed",
+        new Error("payload read failed"),
+        d,
+      ),
+    ).resolves.toBe(false);
+
+    expect(d.setRunError).not.toHaveBeenCalled();
+    expect(d.setRunTerminalReason).not.toHaveBeenCalled();
+    expect(d.updateRunStatusIfRunning).not.toHaveBeenCalled();
+    expect(d.ensureTerminalRunEvent).not.toHaveBeenCalled();
+  });
 });
 
 describe("shared thread route", () => {
@@ -291,6 +601,29 @@ describe("shared thread route", () => {
     expect(event.res.headers.get("x-robots-tag")).toBe("noindex, nofollow");
     expect(result).toContain("<!doctype html>");
     expect(result).toContain("Read-only shared agent session");
+    const head = result.slice(
+      result.indexOf("<head>"),
+      result.indexOf("</head>"),
+    );
+    expect(head).toContain(
+      '<meta name="description" content="Two messages" />',
+    );
+    expect(head).toContain(
+      '<meta property="og:title" content="Deploy recap" />',
+    );
+    expect(head).toContain(
+      '<meta property="og:description" content="Two messages" />',
+    );
+    expect(head).toContain(
+      '<meta name="twitter:title" content="Deploy recap" />',
+    );
+    expect(head).toContain(
+      '<meta name="twitter:card" content="summary_large_image" />',
+    );
+    expect(head).toContain(
+      '<meta property="og:image" content="https://share.example.test/_agent-native/og-image.png?',
+    );
+    expect(head).not.toContain("Done &amp; shipped");
     expect(result).toContain("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;");
     expect(result).toContain("Done &amp; shipped");
     expect(result).not.toContain("<script>alert");

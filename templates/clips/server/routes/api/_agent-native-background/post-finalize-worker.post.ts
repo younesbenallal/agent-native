@@ -20,6 +20,11 @@ import { runLoomImportJob } from "../../../../actions/lib/loom-import-job.js";
 import requestTranscript from "../../../../actions/request-transcript.js";
 import { getDb, schema } from "../../../db/index.js";
 import {
+  ensureRecordingThumbnail,
+  isRetryableRecordingThumbnailStatus,
+  markThumbnailFailed,
+} from "../../../lib/ensure-recording-thumbnail.js";
+import {
   dispatchPostFinalizeJob,
   POST_FINALIZE_JOB_TOKEN_KIND,
   postFinalizeJobResourceId,
@@ -30,6 +35,7 @@ const bodySchema = z.object({
   kind: z.enum([
     "media-ready",
     "seekable",
+    "thumbnail",
     "transcript",
     "brain-export",
     "loom-import",
@@ -37,10 +43,33 @@ const bodySchema = z.object({
   token: z.string().min(1),
   delayMs: z.number().int().min(0).max(30_000).optional(),
   retryAttempt: z.number().int().min(1).max(10).optional(),
+  uploadAttemptId: z.string().min(1).max(128).nullable().optional(),
+  uploadGenerationId: z.string().min(1).max(128).nullable().optional(),
   regenerate: z.boolean().optional(),
 });
 
 const LOOM_IMPORT_LEASE_MS = 30 * 60 * 1000;
+const MAX_THUMBNAIL_RETRIES = 5;
+
+function thumbnailRetryDelayMs(retryAttempt: number): number {
+  return Math.min(30_000, 5_000 * 2 ** Math.max(0, retryAttempt));
+}
+
+async function scheduleThumbnailRetry(
+  recordingId: string,
+  retryAttempt: number | undefined,
+): Promise<number | null> {
+  const nextRetryAttempt = (retryAttempt ?? 0) + 1;
+  if (nextRetryAttempt > MAX_THUMBNAIL_RETRIES) return null;
+  await dispatchPostFinalizeJob({
+    recordingId,
+    kind: "thumbnail",
+    delayMs: thumbnailRetryDelayMs(retryAttempt ?? 0),
+    retryAttempt: nextRetryAttempt,
+    requireAccepted: true,
+  });
+  return nextRetryAttempt;
+}
 
 export default defineEventHandler(async (event: H3Event) => {
   const parsed = bodySchema.safeParse(await readBody(event).catch(() => null));
@@ -49,8 +78,16 @@ export default defineEventHandler(async (event: H3Event) => {
     return { ok: false, error: "Invalid post-finalize job" };
   }
 
-  const { recordingId, kind, token, delayMs, retryAttempt, regenerate } =
-    parsed.data;
+  const {
+    recordingId,
+    kind,
+    token,
+    delayMs,
+    retryAttempt,
+    uploadAttemptId,
+    uploadGenerationId,
+    regenerate,
+  } = parsed.data;
   console.log("[post-finalize-worker] received job", { recordingId, kind });
   const verified = verifyScopedAgentAccessToken(token, {
     resourceKind: POST_FINALIZE_JOB_TOKEN_KIND,
@@ -72,6 +109,7 @@ export default defineEventHandler(async (event: H3Event) => {
       ownerEmail: schema.recordings.ownerEmail,
       orgId: schema.recordings.orgId,
       status: schema.recordings.status,
+      uploadAttemptId: schema.recordings.uploadAttemptId,
       uploadGenerationId: schema.recordings.uploadGenerationId,
     })
     .from(schema.recordings)
@@ -80,6 +118,33 @@ export default defineEventHandler(async (event: H3Event) => {
   if (!recording) {
     setResponseStatus(event, 404);
     return { ok: false, error: "Recording not found" };
+  }
+  if (
+    kind === "media-ready" &&
+    (uploadAttemptId === undefined || uploadGenerationId === undefined)
+  ) {
+    return {
+      ok: true,
+      recordingId,
+      kind,
+      skipped: true,
+      reason: "upload-identity-missing",
+    };
+  }
+  const expectedAttemptId = uploadAttemptId ?? null;
+  const expectedGenerationId = uploadGenerationId ?? null;
+  if (
+    kind === "media-ready" &&
+    ((recording.uploadAttemptId ?? null) !== expectedAttemptId ||
+      (recording.uploadGenerationId ?? null) !== expectedGenerationId)
+  ) {
+    return {
+      ok: true,
+      recordingId,
+      kind,
+      skipped: true,
+      reason: "upload-identity-changed",
+    };
   }
   const requiredStatus =
     kind === "media-ready" || kind === "loom-import" ? "processing" : "ready";
@@ -105,8 +170,14 @@ export default defineEventHandler(async (event: H3Event) => {
           recordingId,
           kind,
           retryAttempt,
+          ...(kind === "media-ready"
+            ? {
+                uploadAttemptId: expectedAttemptId,
+                uploadGenerationId: expectedGenerationId,
+              }
+            : {}),
           regenerate,
-          requireAccepted: kind === "media-ready",
+          requireAccepted: kind === "media-ready" || kind === "thumbnail",
         });
         return {
           ok: true,
@@ -123,13 +194,80 @@ export default defineEventHandler(async (event: H3Event) => {
         });
         return { ok: true, kind, result };
       }
+      if (kind === "thumbnail") {
+        try {
+          const result = await ensureRecordingThumbnail({
+            recordingId,
+            ownerEmail: recording.ownerEmail,
+          });
+          if (isRetryableRecordingThumbnailStatus(result.status)) {
+            const nextRetryAttempt = await scheduleThumbnailRetry(
+              recordingId,
+              retryAttempt,
+            );
+            if (nextRetryAttempt !== null) {
+              return {
+                ok: true,
+                kind,
+                result,
+                retryScheduled: true,
+                retryAttempt: nextRetryAttempt,
+              };
+            }
+            console.warn("[post-finalize-worker] thumbnail retries exhausted", {
+              recordingId,
+              status: result.status,
+              retryAttempt,
+            });
+            await markThumbnailFailed(recordingId, result.status);
+            return {
+              ok: true,
+              kind,
+              result,
+              retryExhausted: true,
+            };
+          }
+          return { ok: true, kind, result };
+        } catch (error) {
+          const nextRetryAttempt = await scheduleThumbnailRetry(
+            recordingId,
+            retryAttempt,
+          );
+          if (nextRetryAttempt !== null) {
+            return {
+              ok: true,
+              kind,
+              retryScheduled: true,
+              retryAttempt: nextRetryAttempt,
+              error: error instanceof Error ? error.message : String(error),
+            };
+          }
+          console.warn(
+            "[post-finalize-worker] thumbnail retries exhausted after error",
+            {
+              recordingId,
+              retryAttempt,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          );
+          await markThumbnailFailed(
+            recordingId,
+            error instanceof Error ? error.message : String(error),
+          );
+          return {
+            ok: true,
+            kind,
+            retryExhausted: true,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }
       if (kind === "media-ready") {
         const result = await finalizeRecording.run({
           id: recordingId,
           mediaVerificationRetryAttempt: retryAttempt ?? 1,
-          ...(recording.uploadGenerationId
-            ? { uploadGenerationId: recording.uploadGenerationId }
-            : {}),
+          uploadAttemptId: expectedAttemptId,
+          uploadGenerationId: expectedGenerationId,
         });
         return { ok: true, kind, result };
       }

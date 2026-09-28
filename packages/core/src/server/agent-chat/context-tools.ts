@@ -7,19 +7,8 @@ import {
   dataWidgetResultSchema,
 } from "../../data-widgets/index.js";
 import { getRequestRunContext } from "../request-context.js";
+import { createOpenSettingsPageTool } from "./open-settings-page-tool.js";
 
-// ---------------------------------------------------------------------------
-// Framework-owned "context" action entries: get-framework-context,
-// refresh-screen, the URL/ask-question tools, and the native data-widget
-// renderer. These are generic, template-agnostic tools registered into every
-// app's tool surface.
-// ---------------------------------------------------------------------------
-
-/**
- * Verbose framework sections returned by the `get-framework-context` tool.
- * Keyed by topic so the agent can request specific sections.
- * Not template-specific — lives outside buildFrameworkPrompts().
- */
 export const FRAMEWORK_CONTEXT_SECTIONS: Record<string, string> = {
   embeds: `### Inline Embeds
 
@@ -152,11 +141,16 @@ Prefer \`web-request\` for simple API calls and static pages. Use browser automa
 
 The \`call-agent\` tool sends a message to a DIFFERENT, separately-deployed app's agent (A2A protocol). It is **not** for calling actions within the current app.
 
-Use a natural-language \`message\` by default. The receiving app owns interpretation and runs with its own instructions, skills, connected sources, data dictionary, and tools. Do not choose its provider, schema, query, joins, or SQL for it. A direct \`action\` + \`input\` call is only for an exact bounded read whose complete contract is already known; it is never a workaround for unreliable delegation.
+Use a natural-language \`message\` by default. The receiving app owns interpretation and runs with its own instructions, skills, connected sources, data dictionary, and tools. Do not choose its provider, schema, query, joins, or SQL for it. A direct \`action\` + \`input\` call is only for an exact bounded read whose complete contract is already known; it is never for a create, update, delete, send, save, publish, or other side effect, and it is never a workaround for unreliable delegation.
 
 **NEVER use \`call-agent\` to:**
 - Call your own app by name
 - Perform tasks you can accomplish with your own registered tools
+
+Written todo lists, checklists, summaries, action-item lists, and prose plans
+belong in the current chat. Do not route those ordinary outputs to Plan. Call
+Plan only when the user explicitly asks for a visual or structured
+Agent-Native Plan, a Plan artifact, or the Plans app.
 
 **ONLY use \`call-agent\` when:**
 - The user explicitly asks you to communicate with a different app
@@ -168,6 +162,7 @@ If \`call-agent\` says a downstream agent accepted the subtask and will post its
   memory: `### Structured Memory
 
 Your memory index (\`memory/MEMORY.md\`) is loaded at the start of every conversation.
+Personal memory instructions in \`memory/INSTRUCTIONS.md\` are also loaded automatically; follow them when deciding what to save or leave out.
 
 **Tools:**
 - \`save-memory\` — Create or update a memory (name, type, description, content)
@@ -240,26 +235,10 @@ export function createFrameworkContextEntry(): Record<string, ActionEntry> {
   };
 }
 
-/**
- * Creates the `refresh-screen` tool. Writes a bump to `application_state`
- * under a well-known key; the client's `useDbSync` watches for this and
- * invalidates react-query caches so the on-screen UI re-fetches its data
- * without a full page reload.
- *
- * This is the standard way for the agent to say "the data on the screen
- * just changed, please refresh it" — e.g. after editing a dashboard config,
- * updating a form schema, or mutating a row that the current view renders.
- */
 export function createRefreshScreenEntry(): Record<string, ActionEntry> {
   return {
     "refresh-screen": {
-      // Writes __screen_refresh__ to application_state, which emits its own
-      // distinct `screen-refresh` poll event. Don't double-emit a generic
-      // `action` event on top of that.
       readOnly: true,
-      // Refetching volatile on-screen state is the entire point of this
-      // tool — an identical repeat call (even with the same scope) is a
-      // legitimate re-refresh, not a redundant read to skip.
       dedupe: false,
       tool: {
         description:
@@ -290,7 +269,6 @@ export function createRefreshScreenEntry(): Record<string, ActionEntry> {
   };
 }
 
-/** Well-known application-state key used by the refresh-screen tool. */
 const SCREEN_REFRESH_KEY = "__screen_refresh__";
 const SAFE_BROWSER_TAB_ID_RE = /^[A-Za-z0-9_-]{1,96}$/;
 
@@ -303,21 +281,9 @@ export function appStateKeyForBrowserTab(
   return SAFE_BROWSER_TAB_ID_RE.test(trimmed) ? `${key}:${trimmed}` : key;
 }
 
-/**
- * Creates the `set-search-params` / `set-url-path` tools. Writes a one-shot
- * URL command to application_state; the client's URLSync component applies
- * it via react-router (no full page reload) and then deletes the command.
- *
- * This is how the agent edits URL state — filter query params, route
- * changes, hash — without needing a per-template navigate action. The
- * current URL is visible to the agent via the auto-injected `<current-url>`
- * block, which includes parsed search params.
- */
 export function createUrlTools(): Record<string, ActionEntry> {
   return {
     "set-search-params": {
-      // Writes __set_url__ to application_state, which the app-state watcher
-      // already surfaces as a poll event. No need to double-emit.
       readOnly: true,
       tool: {
         description:
@@ -369,8 +335,6 @@ export function createUrlTools(): Record<string, ActionEntry> {
       },
     },
     "set-url-path": {
-      // Same as set-search-params — writes application_state, already emits
-      // via the app-state watcher.
       readOnly: true,
       tool: {
         description:
@@ -427,10 +391,12 @@ export function createUrlTools(): Record<string, ActionEntry> {
         return `set-url-path: ${pathname}`;
       },
     },
+    "open-settings-page": createOpenSettingsPageTool(),
     "ask-question": {
+      endsTurn: true,
       tool: {
         description:
-          "Ask the user a multiple-choice clarifying question and render it inline in the chat. Use this ONLY when you are genuinely blocked on a decision you cannot resolve from context and a wrong guess would be costly — an ambiguous metric, date range, or grain; a real fork in approach. Present 2-5 concrete options and mark the most likely one recommended. Do NOT use it for confirmations, for things the user already specified, or to dodge easy work you could just do. Ask at most once per turn. Calling this yields the turn: stop and wait for the user's answer.",
+          "Ask the user a multiple-choice clarifying question and render it inline in the chat. Use this ONLY when you are genuinely blocked on a decision you cannot resolve from context and a wrong guess would be costly — an ambiguous metric, date range, or grain; a real fork in approach. Present 2-5 concrete options and mark the most likely one recommended. Do NOT use it for confirmations, for things the user already specified, or to dodge easy work you could just do. Calling this ends the turn: one question per turn, and any other tool call you emit alongside it will not run.",
         parameters: {
           type: "object",
           properties: {
@@ -452,7 +418,7 @@ export function createUrlTools(): Record<string, ActionEntry> {
             allowFreeText: {
               type: "string",
               description:
-                'Whether the user may also type a free-text "Other" answer. "true" (default) or "false".',
+                'Whether the user may also type a free-text "Other" answer. Keep this "true" (the default) for preferences and clarifying questions. Use "false" only when the underlying workflow can accept one of the enumerated values and cannot handle a custom answer.',
               enum: ["true", "false"],
             },
             allowMultiple: {
@@ -467,7 +433,7 @@ export function createUrlTools(): Record<string, ActionEntry> {
       },
       run: async (args) => {
         const question = String(args?.question ?? "").trim();
-        if (!question) return "Error: 'question' is required.";
+        if (!question) throw new Error("'question' is required.");
         const header = String(args?.header ?? "").trim();
         const allowMultiple = String(args?.allowMultiple ?? "") === "true";
         const allowFreeText = String(args?.allowFreeText ?? "true") !== "false";
@@ -476,10 +442,14 @@ export function createUrlTools(): Record<string, ActionEntry> {
         try {
           parsedOptions = JSON.parse(String(args?.options ?? "[]"));
         } catch {
-          return "Error: 'options' must be a JSON array of { label, value?, description?, recommended? }.";
+          throw new Error(
+            "'options' must be a JSON array of { label, value?, description?, recommended? }.",
+          );
         }
         if (!Array.isArray(parsedOptions) || parsedOptions.length === 0) {
-          return "Error: 'options' must be a non-empty JSON array of { label, value?, description?, recommended? }.";
+          throw new Error(
+            "'options' must be a non-empty JSON array of { label, value?, description?, recommended? }.",
+          );
         }
 
         type AskOption = {
@@ -515,15 +485,18 @@ export function createUrlTools(): Record<string, ActionEntry> {
           })
           .filter((opt): opt is AskOption => opt !== null);
         if (options.length === 0) {
-          return "Error: 'options' must contain at least one option with a label.";
+          throw new Error(
+            "'options' must contain at least one option with a label.",
+          );
         }
 
-        // Shape must match the GuidedQuestionFlow renderer in
-        // client/guided-questions.tsx: a `text-options` question whose options
-        // carry `value`, with `multiSelect` for multi-pick and `allowOther` for
-        // free text. The renderer otherwise injects "Explore"/"Decide" options,
-        // which would be noise for a focused clarifying question, so disable them.
+        const askingRunCtx = getRequestRunContext();
+        const askingThreadId =
+          askingRunCtx?.threadId && askingRunCtx.threadId !== askingRunCtx.runId
+            ? askingRunCtx.threadId
+            : undefined;
         const payload = {
+          ...(askingThreadId ? { threadId: askingThreadId } : {}),
           questions: [
             {
               id: "q1",
@@ -549,7 +522,7 @@ export function createUrlTools(): Record<string, ActionEntry> {
           ),
           payload,
         );
-        return "Asked the user a clarifying question and rendered it in the chat. Stop here and wait for their answer — do not proceed or assume an answer.";
+        return "Asked the user a clarifying question and rendered it in the chat. This turn is over — their answer arrives as a new message.";
       },
     },
   };

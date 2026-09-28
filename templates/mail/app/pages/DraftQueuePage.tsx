@@ -159,7 +159,7 @@ function QueueDraftDialog({
                 {t("mail.draftQueue.reviewer")}
               </label>
               <Select value={ownerEmail} onValueChange={setOwnerEmail}>
-                <SelectTrigger className="h-9">
+                <SelectTrigger>
                   <SelectValue
                     placeholder={t("mail.draftQueue.chooseMember")}
                   />
@@ -668,8 +668,8 @@ export function DraftQueuePage() {
     if (navCommand.queuedDraftId) {
       setSelectedId(navCommand.queuedDraftId);
     }
-    navigate(target);
-    navState.clearCommand();
+    void navigate(target);
+    void navState.clearCommand();
   }, [navCommand, navigate]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const currentUser = members.currentUser;
@@ -745,7 +745,7 @@ export function DraftQueuePage() {
               selectedId={selectedId}
               onSelect={(id) => {
                 setSelectedId(id);
-                navigate(`/draft-queue/${encodeURIComponent(id)}`);
+                void navigate(`/draft-queue/${encodeURIComponent(id)}`);
               }}
               isLoading={queue.isLoading}
             />

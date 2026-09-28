@@ -1,3 +1,4 @@
+import { notify } from "@agent-native/core/notifications";
 import type { AutomationAction } from "@shared/types.js";
 
 import {
@@ -6,18 +7,20 @@ import {
   gmailListLabels,
   gmailCreateLabel,
 } from "./google-api.js";
+import { syncInboxLabelDelta } from "./inbox-store-sync.js";
+import { findThreadIdsByMessageIds } from "./inbox-store.js";
 
 export interface ActionContext {
   accessToken: string;
   messageId: string;
   ownerEmail: string;
   accountEmail: string;
-  labelCache: Map<string, string>; // lowercase name → Gmail label ID
+  labelCache: Map<string, string>;
+  from?: string;
+  subject?: string;
+  snippet?: string;
 }
 
-/**
- * Build a label name→id cache from the user's Gmail labels.
- */
 export async function buildLabelCache(
   accessToken: string,
 ): Promise<Map<string, string>> {
@@ -35,29 +38,25 @@ export async function buildLabelCache(
   return cache;
 }
 
-/**
- * Resolve a label name to a Gmail label ID, creating the label if needed.
- */
-async function resolveLabelId(
+export async function ensureGmailLabel(
+  accessToken: string,
   labelName: string,
-  ctx: ActionContext,
+  labelCache: Map<string, string>,
 ): Promise<string> {
   const key = labelName.toLowerCase();
-  const existing = ctx.labelCache.get(key);
+  const existing = labelCache.get(key);
   if (existing) return existing;
 
-  // Create the label
   try {
-    const created = await gmailCreateLabel(ctx.accessToken, labelName);
+    const created = await gmailCreateLabel(accessToken, labelName);
     if (created.id) {
-      ctx.labelCache.set(key, created.id);
+      labelCache.set(key, created.id);
       return created.id;
     }
   } catch (err: any) {
-    // Label might already exist (race condition) — try to find it
-    const refreshed = await buildLabelCache(ctx.accessToken);
-    for (const [k, v] of refreshed) ctx.labelCache.set(k, v);
-    const retryId = ctx.labelCache.get(key);
+    const refreshed = await buildLabelCache(accessToken);
+    for (const [k, v] of refreshed) labelCache.set(k, v);
+    const retryId = labelCache.get(key);
     if (retryId) return retryId;
     throw err;
   }
@@ -65,36 +64,121 @@ async function resolveLabelId(
   throw new Error(`Failed to create or find label "${labelName}"`);
 }
 
-/**
- * Execute a single automation action against a Gmail message.
- */
+async function mirrorStoreDelta(
+  ctx: ActionContext,
+  delta: {
+    add?: string[];
+    remove?: string[];
+    providerHistoryId?: string;
+  },
+): Promise<void> {
+  const threadId = (
+    await findThreadIdsByMessageIds(ctx.ownerEmail, ctx.accountEmail, [
+      ctx.messageId,
+    ])
+  ).get(ctx.messageId);
+  if (!threadId) return;
+  await syncInboxLabelDelta(ctx.ownerEmail, ctx.accountEmail, [threadId], {
+    ...delta,
+    scope: "message",
+    messageIds: [ctx.messageId],
+  });
+}
+
 export async function executeAction(
   action: AutomationAction,
   ctx: ActionContext,
 ): Promise<{ success: boolean; error?: string }> {
   try {
     switch (action.type) {
-      case "label": {
-        const labelId = await resolveLabelId(action.labelName, ctx);
-        await gmailModifyMessage(ctx.accessToken, ctx.messageId, [labelId]);
+      case "notify": {
+        const notification = await notify(
+          {
+            severity: "info",
+            channels: ["inbox"],
+            title: ctx.subject?.trim() || ctx.from?.trim() || ctx.accountEmail,
+            body: [ctx.from?.trim(), ctx.snippet?.trim()]
+              .filter(Boolean)
+              .join(" · "),
+            metadata: {
+              accountEmail: ctx.accountEmail,
+              messageId: ctx.messageId,
+            },
+          },
+          { owner: ctx.ownerEmail },
+        );
+        if (!notification) {
+          throw new Error("Mail notification was not persisted.");
+        }
         return { success: true };
       }
-      case "archive":
-        await gmailModifyMessage(ctx.accessToken, ctx.messageId, undefined, [
-          "INBOX",
-        ]);
+      case "label": {
+        const labelId = await ensureGmailLabel(
+          ctx.accessToken,
+          action.labelName,
+          ctx.labelCache,
+        );
+        const updated = (await gmailModifyMessage(
+          ctx.accessToken,
+          ctx.messageId,
+          [labelId],
+        )) as { historyId?: string } | undefined;
+        await mirrorStoreDelta(ctx, {
+          add: [labelId],
+          providerHistoryId: updated?.historyId,
+        });
         return { success: true };
-      case "mark_read":
-        await gmailModifyMessage(ctx.accessToken, ctx.messageId, undefined, [
-          "UNREAD",
-        ]);
+      }
+      case "archive": {
+        const updated = (await gmailModifyMessage(
+          ctx.accessToken,
+          ctx.messageId,
+          undefined,
+          ["INBOX"],
+        )) as { historyId?: string } | undefined;
+        await mirrorStoreDelta(ctx, {
+          remove: ["INBOX"],
+          providerHistoryId: updated?.historyId,
+        });
         return { success: true };
-      case "star":
-        await gmailModifyMessage(ctx.accessToken, ctx.messageId, ["STARRED"]);
+      }
+      case "mark_read": {
+        const updated = (await gmailModifyMessage(
+          ctx.accessToken,
+          ctx.messageId,
+          undefined,
+          ["UNREAD"],
+        )) as { historyId?: string } | undefined;
+        await mirrorStoreDelta(ctx, {
+          remove: ["UNREAD"],
+          providerHistoryId: updated?.historyId,
+        });
         return { success: true };
-      case "trash":
-        await gmailTrashMessage(ctx.accessToken, ctx.messageId);
+      }
+      case "star": {
+        const updated = (await gmailModifyMessage(
+          ctx.accessToken,
+          ctx.messageId,
+          ["STARRED"],
+        )) as { historyId?: string } | undefined;
+        await mirrorStoreDelta(ctx, {
+          add: ["STARRED"],
+          providerHistoryId: updated?.historyId,
+        });
         return { success: true };
+      }
+      case "trash": {
+        const updated = (await gmailTrashMessage(
+          ctx.accessToken,
+          ctx.messageId,
+        )) as { historyId?: string } | undefined;
+        await mirrorStoreDelta(ctx, {
+          add: ["TRASH"],
+          remove: ["INBOX"],
+          providerHistoryId: updated?.historyId,
+        });
+        return { success: true };
+      }
       default:
         return {
           success: false,
@@ -106,25 +190,28 @@ export async function executeAction(
   }
 }
 
-/**
- * Execute all actions for a matched rule against a message.
- */
 export async function executeActions(
   actions: AutomationAction[],
   ctx: ActionContext,
-): Promise<{ successes: number; failures: number }> {
+): Promise<{
+  successes: number;
+  failures: number;
+  failedActions: AutomationAction[];
+}> {
   let successes = 0;
   let failures = 0;
+  const failedActions: AutomationAction[] = [];
   for (const action of actions) {
     const result = await executeAction(action, ctx);
     if (result.success) successes++;
     else {
       failures++;
+      failedActions.push(action);
       console.error(
         `[automation-actions] Action ${action.type} failed for ${ctx.messageId}:`,
         result.error,
       );
     }
   }
-  return { successes, failures };
+  return { successes, failures, failedActions };
 }

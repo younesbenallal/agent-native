@@ -1,6 +1,7 @@
 import {
   buildCodeLayerProjection,
   type CodeLayerNode,
+  type CodeLayerSource,
 } from "@shared/code-layer";
 
 import type { ElementInfo } from "@/components/design/types";
@@ -8,13 +9,6 @@ import type { ElementInfo } from "@/components/design/types";
 import { resolveCodeLayerNodeFromElementInfo } from "./code-layer-state";
 import { describeFlowContainer, type FlowContainerInfo } from "./nudge-intent";
 
-/**
- * Figma parity — paste goes INSIDE a selected frame and AFTER a selected
- * object. Treating every selection as an object is the difference between
- * "paste into this card" and "paste a second card beside it".
- */
-
-/** Elements that render their own content and can never host a pasted layer. */
 const REPLACED_TAGS = new Set([
   "area",
   "audio",
@@ -39,8 +33,6 @@ const REPLACED_TAGS = new Set([
   "wbr",
 ]);
 
-/** Elements a designer reads as a text object rather than a frame, even when
- * markup nests inline children inside them. */
 const TEXT_LEAF_TAGS = new Set([
   "a",
   "b",
@@ -120,14 +112,70 @@ function pasteTargetFromCodeLayerNode(
 
 export function resolvePastePlacementForSelection(args: {
   content: string;
+  source?: CodeLayerSource;
   selectedElement: ElementInfo | null | undefined;
 }): PastePlacementDecision | null {
   if (!args.content || !args.selectedElement) return null;
-  const projection = buildCodeLayerProjection(args.content);
+  const projection = buildCodeLayerProjection(args.content, {
+    ...(args.source ? { source: args.source } : {}),
+  });
   const node = resolveCodeLayerNodeFromElementInfo(
     projection,
     args.selectedElement,
   );
   if (!node) return null;
   return resolvePastePlacement(pasteTargetFromCodeLayerNode(node));
+}
+
+export interface PasteSourceAnchor {
+  fileId: string;
+  parentSelectors: string[] | null;
+}
+
+export function resolvePasteSourceAnchor(args: {
+  entries: ReadonlyArray<{ rootNodeId?: string; sourceFileId: string }>;
+  getContent: (fileId: string) => string | undefined;
+}): PasteSourceAnchor | null {
+  const first = args.entries[0];
+  if (!first) return null;
+  if (args.entries.some((entry) => entry.sourceFileId !== first.sourceFileId)) {
+    return null;
+  }
+  const content = args.getContent(first.sourceFileId);
+  if (!content) return null;
+  const projection = buildCodeLayerProjection(content, {
+    source: { kind: "design-file", fileId: first.sourceFileId },
+  });
+  const unresolved: PasteSourceAnchor = {
+    fileId: first.sourceFileId,
+    parentSelectors: null,
+  };
+  const parentIds = args.entries.map((entry) => {
+    const node = entry.rootNodeId
+      ? projection.nodes.find(
+          (candidate) =>
+            candidate.dataAttributes["data-agent-native-node-id"] ===
+              entry.rootNodeId || candidate.id === entry.rootNodeId,
+        )
+      : undefined;
+    return node?.parentId ?? null;
+  });
+  const [sharedParentId] = parentIds;
+  if (!sharedParentId || parentIds.some((id) => id !== sharedParentId)) {
+    return unresolved;
+  }
+  const parent = projection.nodes.find(
+    (candidate) => candidate.id === sharedParentId,
+  );
+  if (!parent) return unresolved;
+  const parentNodeId = parent.dataAttributes["data-agent-native-node-id"];
+  const parentSelectors = [
+    parentNodeId
+      ? `[data-agent-native-node-id="${parentNodeId.replace(/["\\]/g, "\\$&")}"]`
+      : null,
+    parent.selector,
+    ...parent.selectors,
+  ].filter((selector): selector is string => Boolean(selector));
+  if (parentSelectors.length === 0) return unresolved;
+  return { fileId: first.sourceFileId, parentSelectors };
 }

@@ -5,7 +5,7 @@ description: "Bessere Auth-Integration mit E-Mail/Passwort, sozialen Anbietern, 
 
 # Authentifizierung
 
-Agent-native Apps verwenden [Better Auth](https://better-auth.com) für die Authentifizierung mit einem Account-First-Design. Benutzer erstellen beim ersten Besuch ein Konto und erhalten vom ersten Tag an eine echte Identität.
+Agent-Native Apps verwenden [Better Auth](https://better-auth.com) für die Authentifizierung mit einem Account-First-Design. Benutzer erstellen beim ersten Besuch ein Konto und erhalten vom ersten Tag an eine echte Identität.
 
 ## Übersicht {#overview}
 
@@ -102,6 +102,14 @@ Ein paar Flags optimieren dies; Ausführliche Informationen finden Sie in der Ta
 
 </Callout>
 
+## Anmeldung in der lokalen Entwicklung {#local-development-sign-in}
+
+Auf einem Entwicklungsserver mit Loopback-Adresse zeigt die gemeinsame Anmeldeseite zuerst **Continue as local dev** an. Sie erstellt das echte Better Auth-Entwicklerkonto und die Sitzung oder verwendet sie erneut. Dadurch wird derselbe authentifizierte Ablauf wie an anderen Stellen verwendet.
+
+Wählen Sie **Show full sign in options**, um die normalen Optionen für Registrierung, Passwort, Magic Link und soziale Anbieter anzuzeigen. Wenn die lokale Sitzung nicht erstellt werden kann, zeigt die Seite diese Optionen automatisch an, damit Sie mit der normalen Authentifizierung fortfahren können.
+
+Diese Funktion ist nur verfügbar, wenn der Browser in der Entwicklung oder im Test über `localhost`, `127.0.0.0/8` oder `::1` verbunden ist. Sie ist für Bereitstellungsvorschauen und gehostete Produktion deaktiviert. Sie ist keine Umgehung der Authentifizierung. Setzen Sie `AGENT_NATIVE_DISABLE_AUTO_DEV_ACCOUNT=1`, um sie zu deaktivieren und in der lokalen Entwicklung die normale Anmeldeseite anzuzeigen.
+
 ## Bessere Authentifizierung (Standard) {#better-auth}
 
 Standardmäßig unterstützt Better Auth die Authentifizierung. Es bietet:
@@ -155,8 +163,29 @@ AUTH_SKIP_EMAIL_VERIFICATION=1
 
 Wenn dieses Flag gesetzt ist, ist für die E-Mail-/Passwort-Anmeldung keine E-Mail erforderlich
 Bestätigung und die Anmeldebestätigungs-E-Mail wird nicht gesendet. Verwenden Sie es nur zur Qualitätssicherung
-oder Vorschauumgebungen und benennen Sie Testkonten mit einer `+qa`-Adresse
-(`name+qa@example.com`), damit sie leicht zu identifizieren sind.
+oder Vorschauumgebungen und benennen Sie Testkonten mit einer `+autoz`-Adresse
+(`name+autoz@example.com`), damit sie leicht zu identifizieren sind.
+
+## Richtlinie zur E-Mail-Überprüfung {#email-verification-policy}
+
+`AUTH_SKIP_EMAIL_VERIFICATION` ist eine lokale und QA-Bequemlichkeit — eine
+gehostete Bereitstellung ignoriert sie. Um die Richtlinie für jede Umgebung
+festzulegen, einschließlich der Produktion, deklarieren Sie sie in der
+Konfiguration:
+
+```ts
+defineAppConfig({ auth: { requireEmailVerification: false } });
+```
+
+Der Bereitstellungsalias lautet `AUTH_REQUIRE_EMAIL_VERIFICATION=0`. Ein
+deklarierter Wert übertrifft sowohl `AUTH_SKIP_EMAIL_VERIFICATION` als auch die
+Standardeinstellung der jeweiligen Umgebung.
+
+`false` akzeptiert eine nicht überprüfte Adresse als Anmeldeinformation — jeder
+kann jede E-Mail-Adresse beanspruchen — verwenden Sie es also nur dort, wo die
+Anmeldung bereits anderweitig eingeschränkt ist. `true` deaktiviert auf einer
+Bereitstellung ohne E-Mail-Anbieter stattdessen die Passwortanmeldung, da die
+Überprüfung nie zugestellt werden könnte.
 
 ## Soziale Anbieter {#social-providers}
 
@@ -405,7 +434,7 @@ function SignInCta() {
 
 Normale App-Seiten verwenden für alle Besucher dieselbe unpersönliche, öffentlich cachebare SSR-Shell. `AppProviders` prüft die Sitzung im Client und leitet anonyme Besucher auf privaten Pfaden wie `/dashboard` zu `/sign-in?return=%2Fdashboard` weiter, bevor private App-UI gerendert wird. Nach der Anmeldung kehren sie zu `/dashboard` zurück. Verwenden Sie `isPublicPath` für öffentliche/SEO-Routen oder `sessionBypass` für Oberflächen mit einem anderen begrenzten Authentifizierungsmechanismus, etwa einem MCP-Embed-Token.
 
-Wie lange diese Shell zwischengespeichert wird, ist eine bereitstellungsweite Einstellung – siehe [SSR-Caching](/docs/deployment#ssr-caching) für `AGENT_NATIVE_SSR_CACHE`. Das Verkürzen oder Deaktivieren des Caches ändert nur die Dauer; SSR rendert weiterhin den anonymen Zweig mit entfernten Cookies.
+Wie lange diese Shell zwischengespeichert wird, ist eine bereitstellungsweite Einstellung – siehe [SSR-Caching](/docs/ssr-caching) für `AGENT_NATIVE_SSR_CACHE`. Das Verkürzen oder Deaktivieren des Caches ändert nur die Dauer; SSR rendert weiterhin den anonymen Zweig mit entfernten Cookies.
 
 ### Hinter den Kulissen: Google OAuth
 
@@ -430,6 +459,7 @@ Die Standardroute `/_agent-native/google/auth-url` führt dies automatisch aus �
 | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `BETTER_AUTH_SECRET`                    | Signaturschlüssel für Better Auth (automatisch generiert, wenn nicht festgelegt)                                                                                                                                             |
 | `AUTH_SKIP_EMAIL_VERIFICATION`          | In QA-/Vorschauumgebungen auf `1` setzen, damit E-Mail-/Passwort-Anmeldungen ohne Überprüfung durchgeführt werden können. Lokale Entwicklung/Test überspringt standardmäßig                                                  |
+| `AUTH_REQUIRE_EMAIL_VERIFICATION`       | Auf `0` oder `1` setzen, um die Überprüfungsrichtlinie für die Passwortanmeldung in jeder Umgebung festzulegen, einschließlich der Produktion; übertrifft `AUTH_SKIP_EMAIL_VERIFICATION`                                     |
 | `AUTH_DISABLED`                         | Auf `true` oder `1` einstellen, um Anmeldung/Registrierung zu überspringen; Alle Anfragen werden von einem gemeinsamen Benutzer ausgeführt (nur lokale Entwicklung/Vorschau – nicht für die Produktion mit echten Benutzern) |
 | `AGENT_NATIVE_DISABLE_AUTO_DEV_ACCOUNT` | Auf `1` einstellen, um die automatische Anmeldung von Localhost in einer neuen Entwicklungsdatenbank zu deaktivieren                                                                                                         |
 | `AUTH_MODE`                             | `local` löst nur die CLI/Agent-Identität auf (unter der der Entwicklerbenutzer `pnpm action` ausgeführt wird); niemals eine Browser-Anmeldeumgehung                                                                          |
@@ -446,3 +476,12 @@ Die Standardroute `/_agent-native/google/auth-url` führt dies automatisch aus �
 | `ACCESS_TOKEN`                          | Statischer Bearer-Fallback für MCP/connect-Clients; keine Browser-Authentifizierung                                                                                                                                          |
 | `ACCESS_TOKENS`                         | Durch Kommas getrennte statische Bearer-Fallbacks für MCP/connect-Clients; keine Browser-Authentifizierung                                                                                                                   |
 | `A2A_SECRET`                            | Gemeinsames Geheimnis für die JWT-signierte A2A-Cross-App-Identitätsüberprüfung und, falls vorhanden, MCP OAuth-Zugriffstoken-Signierung                                                                                     |
+
+Das standardmäßig deaktivierte Dispatch-Flag `desktop.workspace-sso` steuert nur die Verfügbarkeit; Authentifizierung, Signatur-, Nonce-, Origin-, Callback-, Sitzungs- und Widerrufsprüfungen bleiben immer verpflichtend. Ist das Flag aus oder nicht lesbar, verändert Desktop weder App-Anmeldung noch Abmeldung oder Einstellungen.
+Die Canary-Kennung im User-Agent ist nur ein Verfügbarkeitshinweis und keine Remote-Attestierung; Authentifizierung und Autorisierung vertrauen ihr nicht.
+Kanonische gehostete Apps erkennen Anfragen der paketierten Desktop SSO Canary ohne eine Identity-Hub-Umgebungsvariable pro App. Normale Browser verwenden die übliche Anmeldung pro App. Selbst gehostete Apps benötigen `AGENT_NATIVE_IDENTITY_HUB_URL` nur für den verbleibenden expliziten Desktop- oder serverseitigen Föderationspfad. Stabile Desktop-Builds initialisieren den Broker erst nach einer separat genehmigten späteren Veröffentlichung.
+Die Canary-Version fängt anonyme App-Anmeldungen nicht ab. Benutzer müssen die Workspace-Anmeldung in den Desktop-Einstellungen für die aktive registrierte App ausdrücklich auswählen; die normale App-Anmeldung bleibt der Standardpfad.
+
+## Verwaltete Bereitstellung und Einladungen
+
+Für eine verwaltete Bereitstellung setzen Sie `AUTH_SIGNUP=invited`, `ORG_CREATION=closed` und `AUTO_CREATE_DEFAULT_ORG=0`. Der [Leitfaden für verwaltete Bereitstellungen](/docs/administered-deployments) beschreibt Bootstrap-Admins, Einladungen und erlaubte E-Mail-Domains. Mitgliedschaftseinladungen und Domain-Beitritt sind getrennte Regeln.

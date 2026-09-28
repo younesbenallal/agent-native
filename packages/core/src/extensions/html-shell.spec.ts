@@ -27,6 +27,9 @@ describe("buildExtensionHtml", () => {
     expect(EXTENSION_IFRAME_CSP).not.toContain("frame-ancestors *");
     expect(EXTENSION_FRAME_ANCESTORS).toContain("https://*.agent-native.com");
     expect(EXTENSION_FRAME_ANCESTORS).toContain(
+      "https://agent-workspace.builder.io",
+    );
+    expect(EXTENSION_FRAME_ANCESTORS).toContain(
       "https://*.claudemcpcontent.com",
     );
     expect(EXTENSION_FRAME_ANCESTORS).toContain(
@@ -72,6 +75,17 @@ describe("buildExtensionHtml", () => {
     expect(html).toContain("_appendActionQuery(path, params)");
   });
 
+  it("hides x-cloak content until Alpine boots", () => {
+    const html = buildExtensionHtml(
+      '<div x-cloak class="fixed inset-0">Alerts</div>',
+      ":root{}",
+      false,
+      "extension-1",
+    );
+
+    expect(html).toContain("[x-cloak] { display: none !important; }");
+  });
+
   it("routes extension navigate calls through the app-state command endpoint", () => {
     const html = buildExtensionHtml("<div/>", ":root{}", false, "extension-1");
 
@@ -101,6 +115,8 @@ describe("buildExtensionHtml", () => {
 
     expect(html).toContain("function sendToChat(message, options)");
     expect(html).toContain("type: 'agent-native-send-to-chat'");
+    expect(html).toContain("submit: options.submit === true");
+    expect(html).not.toContain("submit: options.submit !== false");
     expect(html).toContain("sendToChat: sendToChat");
     expect(html).toContain("send: sendToChat");
     expect(html).toContain("window.sendToAgentChat = sendToChat");
@@ -128,6 +144,52 @@ describe("buildExtensionHtml", () => {
       "new URLSearchParams(location.search).get('slot') || window.parent !== window",
     );
     expect(html).toContain("agent-native-extension-resize");
+    expect(html).not.toContain("min-height: 100vh");
+    expect(html).toContain("var bodyRect = body.getBoundingClientRect()");
+    expect(html).toContain("bodyRect.height - paddingBottom");
+    expect(html).toContain("body.querySelectorAll('*')");
+    expect(html).toContain("style.overflowY");
+    expect(html).toContain("auto|scroll|overlay|hidden|clip");
+    expect(html).toContain("style.position === 'fixed'");
+    expect(html).toContain("style.position === 'absolute'");
+    expect(html).toContain("requestAnimationFrame");
+    expect(html).toContain("_positionObservationScheduled");
+    expect(html).toContain("_schedulePositionObservation");
+    expect(html).toContain("_positionMonitorActive");
+    expect(html).toContain("_activeCssMotionCount");
+    expect(html).toContain("_animationProbeTimer");
+    expect(html).toContain("document.getAnimations()");
+    expect(html).toContain("_positionedElements.forEach");
+    expect(html).toContain("_motionElements.forEach");
+    expect(html).toContain("_watchAnimationCompletion");
+    expect(html).toContain("Element.prototype.animate");
+    expect(html).toContain("document.addEventListener('animationend'");
+    expect(html).toContain("document.addEventListener('transitionend'");
+    expect(html).not.toContain(
+      "document.addEventListener('animationiteration'",
+    );
+    expect(html).toContain("_positionMonitorFramesRemaining");
+    expect(html).toContain("document.addEventListener('transitionstart'");
+    expect(html).toContain("new MutationObserver");
+    expect(html).not.toContain("document.createTreeWalker(body, 4");
+    expect(html).not.toContain("range.getClientRects()");
+    const reportStart = html.indexOf("var _reportHeight = function()");
+    const reportEnd = html.indexOf(
+      "window.addEventListener('scroll', _scheduleResizeWork",
+      reportStart,
+    );
+    expect(reportStart).toBeGreaterThanOrEqual(0);
+    expect(reportEnd).toBeGreaterThan(reportStart);
+    expect(html.slice(reportStart, reportEnd)).toContain(
+      "_measurePositionedContent",
+    );
+    expect(html.slice(reportStart, reportEnd)).not.toContain(
+      "querySelectorAll('*')",
+    );
+    expect(html.slice(reportStart, reportEnd)).not.toContain(
+      "document.createTreeWalker(body, 4)",
+    );
+    expect(html).not.toContain("body.scrollHeight");
   });
 
   it("serializes authenticated extension binding metadata", () => {
@@ -146,15 +208,12 @@ describe("buildExtensionHtml", () => {
 
   it("pins CDN scripts to exact versions with SRI integrity hashes", () => {
     const html = buildExtensionHtml("<div/>", ":root{}", false, "t");
-    // Tailwind: pinned to a patch version + SRI.
     expect(html).toMatch(
       /<script[^>]*src="https:\/\/cdn\.jsdelivr\.net\/npm\/@tailwindcss\/browser@\d+\.\d+\.\d+"[^>]*integrity="sha384-[A-Za-z0-9+/=]+"/,
     );
-    // Alpine: pinned to a patch version + SRI.
     expect(html).toMatch(
       /<script[^>]*src="https:\/\/cdn\.jsdelivr\.net\/npm\/alpinejs@\d+\.\d+\.\d+\/dist\/cdn\.min\.js"[^>]*integrity="sha384-[A-Za-z0-9+/=]+"/,
     );
-    // Refuse the old unpinned-major form.
     expect(html).not.toContain('@tailwindcss/browser@4"');
     expect(html).not.toContain("alpinejs@3/dist/cdn.min.js");
     expect(html).toContain("@rrweb/record@2.1.0/umd/record.min.js");
@@ -214,6 +273,22 @@ describe("extension iframe sandbox attribute (CI guard)", () => {
       for (const sandbox of sandboxMatches) {
         expect(sandbox).not.toContain("allow-same-origin");
       }
+    });
+  }
+});
+
+describe("extension chat submission policy (CI guard)", () => {
+  const HOST_SUBMISSION_GUARDS = [
+    ["ExtensionViewer.tsx", "submit: message.submit === true"],
+    ["EmbeddedExtension.tsx", "submit: (message as any).submit === true"],
+    ["InlineExtensionFrame.tsx", "submit: (message as any).submit === true"],
+  ] as const;
+
+  for (const [file, guard] of HOST_SUBMISSION_GUARDS) {
+    it(`${file} requires explicit submission opt-in`, () => {
+      const text = readFileSync(join(CLIENT_DIR, file), "utf8");
+      expect(text).toContain(guard);
+      expect(text).not.toContain(guard.replace("=== true", "!== false"));
     });
   }
 });

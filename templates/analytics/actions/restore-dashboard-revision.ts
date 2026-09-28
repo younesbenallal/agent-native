@@ -1,15 +1,11 @@
-import { defineAction } from "@agent-native/core";
-import {
-  applyText,
-  hasCollabState,
-  seedFromText,
-} from "@agent-native/core/collab";
+import { defineAction } from "@agent-native/core/action";
 import {
   getRequestOrgId,
   getRequestUserEmail,
 } from "@agent-native/core/server";
 import { z } from "zod";
 
+import { queueDashboardCollabSync } from "../server/lib/dashboard-collab-sync";
 import { restoreDashboardRevision } from "../server/lib/dashboards-store";
 
 function resolveScope() {
@@ -17,25 +13,6 @@ function resolveScope() {
   const email = getRequestUserEmail();
   if (!email) throw new Error("no authenticated user");
   return { orgId, email };
-}
-
-async function syncToCollab(
-  dashboardId: string,
-  config: Record<string, unknown>,
-  requestSource?: string,
-): Promise<void> {
-  const docId = `dash-${dashboardId}`;
-  const configStr = JSON.stringify(config);
-  try {
-    const exists = await hasCollabState(docId);
-    if (exists) {
-      await applyText(docId, configStr, "content", requestSource);
-    } else {
-      await seedFromText(docId, configStr);
-    }
-  } catch {
-    // SQL is the source of truth; open editors also refetch on the dashboards signal.
-  }
 }
 
 export default defineAction({
@@ -58,12 +35,15 @@ export default defineAction({
       args.expectedUpdatedAt,
     );
     if (!restored) {
-      throw new Error(
-        `Dashboard revision "${args.revisionId}" was not found for dashboard "${args.dashboardId}".`,
+      throw Object.assign(
+        new Error(
+          `Dashboard revision "${args.revisionId}" was not found for dashboard "${args.dashboardId}".`,
+        ),
+        { statusCode: 404 },
       );
     }
     const { dashboard, snapshotRevisionId } = restored;
-    await syncToCollab(
+    queueDashboardCollabSync(
       dashboard.id,
       dashboard.config,
       actionContext?.caller === "frontend" ? undefined : "agent",

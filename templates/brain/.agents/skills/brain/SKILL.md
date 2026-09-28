@@ -8,11 +8,12 @@ description: Work with the Brain institutional-memory template, including import
 Use Brain actions rather than raw SQL.
 
 1. Call `get-brain-settings` before answering, searching broadly, or distilling when current settings are not already in context. Apply the returned guidance for assistant name, company name, tone, source policy, citation requirements, publish tier, redaction, and distillation instructions.
-2. Import raw material with `import-capture` (generic) or `import-transcript`
-   (meeting-shaped: participants, `sourceUrl`, tags). Both default
-   `enqueueDistillation: true`, immediately create or reuse a queue item, and
-   auto-create a `manual` source when `sourceId` is omitted — don't call
-   `create-source` first just to import one ad hoc capture.
+2. Import raw material with `import-capture` (generic), `import-transcript`
+   (meeting-shaped: participants, `sourceUrl`, tags), or
+   `import-markdown-files` for a bounded Markdown folder/batch. These default
+   `enqueueDistillation: true`, immediately create or reuse queue items, and
+   auto-create a private `manual` source when `sourceId` is omitted — don't
+   call `create-source` first just to import one ad hoc item.
 3. Call `enqueue-distillation` when an existing capture needs an explicit
    queue/retry handoff. Re-running it for a capture that's already
    queued/processing refreshes the handoff instructions instead of creating a
@@ -56,10 +57,24 @@ that boundary.
   quarantine records. Push-only `generic` and `clips` material is retained only
   in the encrypted, short-TTL private quarantine store; expiry becomes a
   suppression receipt.
-- If no approved privacy classifier is configured, deterministic-only mode
-  allows clearly clean, company-relevant material and quarantines uncertainty.
-  Treat the health/setup warning as a requirement to configure the classifier
-  before broad ingestion.
+- After the deterministic screen, the verdict comes from the classifier named
+  by the `privacyClassifier` setting: `jev` (default), `model`, or
+  `deterministic`. Jev scores each category as a probability; anything over the
+  block bar is quarantined and named, and anything in the uncertain middle is
+  quarantined without naming a category. Jev decides the verdict only — it
+  cannot rewrite a document, so safe content always comes from the
+  deterministic line screen or the configured sanitizer.
+- Each step degrades into the next, so a Jev outage falls through to the
+  approved model and then to deterministic screening. When a configured
+  classifier fails, uncertain captures stay quarantined rather than being
+  released.
+- If no classifier is reachable, deterministic-only mode allows clearly clean,
+  company-relevant material and quarantines uncertainty. Treat the health/setup
+  warning as a requirement to configure a classifier before broad ingestion.
+- `BRAIN_SENSITIVITY_POLICY_VERSION` stamps new decisions; it does not
+  retroactively re-screen. Captures decided under an older policy keep their
+  verdict and stay indexed until `resanitize-captures` re-runs them, so treat a
+  classifier or policy change as needing a deliberate backfill.
 
 Administrators may review a disposition but may not declassify HR-blocked
 evidence. A broader statement must be a newly reviewed, non-identifying memory
@@ -174,17 +189,20 @@ AGENTS.md carries a one-line action index; these are the fuller purposes.
 | Action | Purpose |
 | --- | --- |
 | `get-brain-settings` | Identity, tone, `sourcePolicy`, citation, and distillation settings — read first. |
+| `update-brain-settings` | Partial patch of any Brain setting; each field saves on its own, like the Settings rows. |
+| `navigate` (`view: "settings"`) | `settingsSection` opens a Brain › General tab: `general`, `identity`, `behavior`, `publishing`, `safety`, or `privacy`. |
 | `search-everything` | Broad search across knowledge + captures + sources, plus `federatedCoverage`. |
 | `search-knowledge` | SQL text search over distilled knowledge only. |
 | `ask-brain` | Cited-answer endpoint: reviewed knowledge, capped raw-capture fallback, citations, `federatedCoverage`. |
 | `get-knowledge` / `list-knowledge` | Read one or list distilled knowledge records. |
 | `get-capture` / `list-captures` | Read one or list raw captures (redacted by default; `includeRawContent` for exact quotes). |
-| `import-capture` / `import-transcript` | Ingest a generic capture or meeting transcript, auto-create a `manual` source when needed, and queue distillation by default. |
+| `import-capture` / `import-transcript` / `import-markdown-files` | Ingest generic material or a bounded Markdown batch, auto-create a private `manual` source when needed, and queue distillation by default. |
 | `enqueue-distillation` / `mark-capture-distilled` | Queue a capture for distillation; close out the queue row when done. |
 | `write-knowledge` | Write/update durable knowledge; may return a pending proposal — see Publish Tiers above. |
 | `review-proposal` / `approve-proposal` / `reject-proposal` / `list-proposals` / `update-proposal` | Human-review workflow for gated writes. |
 | `set-knowledge-canonical` | Mirror/unmirror approved knowledge into `context/company-brain/...` workspace resources. |
 | `create-source` / `update-source` / `delete-source` / `list-sources` / `get-source` | Source lifecycle across the six providers. |
+| `set-resource-visibility` / `share-resource` | Set source visibility or grant explicit source access. |
 | `sync-source` / `sync-due-sources` | Run one connector now, or sweep all due sources. |
 | `get-brain-health` | Setup/source health, sync freshness, queue and proposal counts, next steps. |
 | `list-connection-providers` | Per-provider workspace-connection readiness and credential health. |

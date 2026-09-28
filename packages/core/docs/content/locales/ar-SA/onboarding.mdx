@@ -99,7 +99,7 @@ description: "قائمة التحقق من الإعداد للتهيئة الت�
   Builder لبوابة مُدارة بنقرة واحدة، أو افتح مفتاح الموفر الثانوي
   منتقي ولصق مفتاح LLM الخاص بك.
 - **قاعدة البيانات** (اختياري) — قم بتعيين `DATABASE_URL` عندما تريد استخدام محدد
-  سلسلة اتصال قاعدة البيانات SQL.
+  سلسلة اتصال PostgreSQL.
 - **المصادقة** (اختياري) — تعمل حسابات البريد الإلكتروني/كلمة المرور المضمنة بواسطة
   افتراضي. قم بإضافة OAuth أو تسجيل الدخول برمز الوصول فقط عندما تريد هذه المسارات.
 - **تسليم البريد الإلكتروني** (اختياري) — مفيد قبل النشر لإعادة تعيين كلمة المرور،
@@ -199,6 +199,10 @@ Drives the sidebar checklist — returns each step's id, title, methods, require
 
 ```ts
 import { listWorkspaceConnectionProviderCatalogForApp } from "@agent-native/core/workspace-connections";
+import {
+  getRequestOrgId,
+  getRequestUserEmail,
+} from "@agent-native/core/server";
 
 // Inside registerOnboardingStep:
 isComplete: async () => {
@@ -217,8 +221,15 @@ isComplete: async () => {
     return true;
   }
 
-  // Fall back to local environment variable check
-  return !!process.env.GMAIL_REFRESH_TOKEN;
+  // If there is no reusable connection, check the caller-scoped credential
+  // store - never a deployment environment variable.
+  const { resolveCredential } = await import("@agent-native/core/credentials");
+  return Boolean(
+    await resolveCredential("GMAIL_REFRESH_TOKEN", {
+      userEmail: getRequestUserEmail(),
+      orgId: getRequestOrgId(),
+    }),
+  );
 };
 ```
 
@@ -232,6 +243,7 @@ isComplete: async () => {
 | `form`             | `{ fields, writeScope? }`                             | اجمع env vars (المفاتيح، الأسرار، URLs)          |
 | `builder-cli-auth` | `{ scope: "llm" \| "browser" \| "image-generation" }` | Connect Builder (unlocks shared infra)           |
 | `agent-task`       | `{ prompt }`                                          | أرسل مطالبة إلى دردشة الوكيل للتعامل معها        |
+| `file-storage`     | -                                                     | اعرض نموذج التخزين المشترك المتوافق مع S3        |
 
 تشير علامة `primary: true` إلى الطريقة باعتبارها CTA الكبيرة لخطوتها.
 استخدم `badge: "soon"` بالإضافة إلى `disabled: true` عندما يكون مسار الإعداد مرئيًا
@@ -239,12 +251,12 @@ isComplete: async () => {
 
 ### الخطوات المضمنة
 
-| المعرف     | مطلوب | الوصف                                                      |
-| ---------- | ----- | ---------------------------------------------------------- |
-| `llm`      | نعم   | اتصال Builder أو مفتاح LLM للموفر                          |
-| `database` | لا    | قاعدة البيانات الافتراضية أو أي SQL `DATABASE_URL`         |
-| `auth`     | لا    | حسابات مدمجة، OAuth اختياري أو رمز وصول                    |
-| `email`    | لا    | إعادة إرسال أو SendGrid للبريد الإلكتروني الخاص بالمعاملات |
+| المعرف     | مطلوب | الوصف                                                          |
+| ---------- | ----- | -------------------------------------------------------------- |
+| `llm`      | نعم   | اتصال Builder أو مفتاح LLM للموفر                              |
+| `database` | لا    | عنوان PostgreSQL مستضاف أو اتركه فارغًا لاستخدام PGlite المحلي |
+| `auth`     | لا    | حسابات مدمجة، OAuth اختياري أو رمز وصول                        |
+| `email`    | لا    | إعادة إرسال أو SendGrid للبريد الإلكتروني الخاص بالمعاملات     |
 
 يمكن تجاوز أي من هذه العناصر عن طريق إعادة التسجيل بنفس `id` بعد
 التحميل الافتراضي.

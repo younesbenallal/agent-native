@@ -4,6 +4,7 @@ export interface TrackingEvent {
   timestamp?: string;
   userId?: string;
   anonymousId?: string;
+  sessionId?: string;
 }
 
 export interface TrackingProvider {

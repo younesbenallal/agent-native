@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   buildMcpOAuthStartUrl,
@@ -10,15 +10,62 @@ import {
   getMcpIntegrationApiFallback,
   getDefaultMcpIntegrations,
   isCustomMcpIntegrationEnabled,
+  isMcpIntegrationUrl,
   isMcpIntegrationCatalogAvailable,
   isMcpConnectionFailureText,
+  isMcpConnectionSuggestionText,
   mcpIntegrationAuthLabel,
   mergeDefaultMcpIntegrations,
+  navigateToMcpOAuthStart,
   resolveMcpIntegrationScope,
+  shouldOfferMcpIntegrationOrganizationScope,
   shouldOfferMcpOrganizationScope,
+  supportsMcpIntegrationOrganizationScope,
 } from "./mcp-integration-catalog.js";
 
 describe("MCP integration catalog", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+  });
+
+  it("opens OAuth setup without replacing the current app", () => {
+    const popup = {
+      opener: {},
+    } as unknown as Window;
+    const open = vi.fn(() => popup);
+    vi.stubGlobal("window", {
+      open,
+      location: {
+        href: "https://content.example.test/settings",
+        pathname: "/settings",
+      },
+    });
+
+    expect(
+      navigateToMcpOAuthStart("/_agent-native/mcp/servers/oauth/start"),
+    ).toBe(true);
+
+    expect(open).toHaveBeenCalledWith(
+      "https://content.example.test/_agent-native/mcp/servers/oauth/start",
+      "_blank",
+      "width=640,height=760",
+    );
+    expect(popup.opener).toBeNull();
+
+    open.mockReturnValueOnce(null);
+    expect(
+      navigateToMcpOAuthStart("/_agent-native/mcp/servers/oauth/start"),
+    ).toBe(false);
+
+    open.mockImplementationOnce(() => {
+      throw new Error("blocked");
+    });
+    expect(
+      navigateToMcpOAuthStart("/_agent-native/mcp/servers/oauth/start"),
+    ).toBe(false);
+  });
+
   it("includes direct-connect defaults that do not need headers", () => {
     const context7 = DEFAULT_MCP_INTEGRATIONS.find(
       (integration) => integration.id === "context7",
@@ -31,6 +78,37 @@ describe("MCP integration catalog", () => {
     expect(context7?.authMode).toBe("none");
     expect(semgrep?.url).toBe("https://mcp.semgrep.ai/mcp");
     expect(semgrep?.authMode).toBe("none");
+  });
+
+  it("opts only verified shared-capable integrations into organization scope", () => {
+    const context7 = DEFAULT_MCP_INTEGRATIONS.find(
+      (integration) => integration.id === "context7",
+    )!;
+    const exa = DEFAULT_MCP_INTEGRATIONS.find(
+      (integration) => integration.id === "exa",
+    )!;
+    const gong = DEFAULT_MCP_INTEGRATIONS.find(
+      (integration) => integration.id === "gong",
+    )!;
+    const hubspot = DEFAULT_MCP_INTEGRATIONS.find(
+      (integration) => integration.id === "hubspot",
+    )!;
+
+    expect(context7.supportsOrganizationScope).toBe(true);
+    expect(exa.supportsOrganizationScope).toBe(true);
+    expect(gong.supportsOrganizationScope).toBe(true);
+    expect(hubspot.supportsOrganizationScope).not.toBe(true);
+    expect(supportsMcpIntegrationOrganizationScope(context7)).toBe(true);
+    expect(supportsMcpIntegrationOrganizationScope(hubspot)).toBe(false);
+    expect(
+      shouldOfferMcpIntegrationOrganizationScope(context7, true, true),
+    ).toBe(true);
+    expect(
+      shouldOfferMcpIntegrationOrganizationScope(context7, true, false),
+    ).toBe(false);
+    expect(
+      shouldOfferMcpIntegrationOrganizationScope(hubspot, true, true),
+    ).toBe(false);
   });
 
   it("replaces one remote MCP preset without dropping the rest", () => {
@@ -95,6 +173,46 @@ describe("MCP integration catalog", () => {
     });
   });
 
+  it("catalogs Sigma with its organization-specific OAuth endpoint", () => {
+    const sigma = DEFAULT_MCP_INTEGRATIONS.find(
+      (integration) => integration.id === "sigma",
+    );
+
+    expect(sigma).toMatchObject({
+      url: "",
+      authMode: "oauth",
+      connectionMode: "oauth",
+      availability: "ready",
+      verification: "preflight-only",
+      docsUrl: "https://help.sigmacomputing.com/docs/use-sigma-mcp-server",
+      setupNoteKey: "mcpIntegrations.catalog.sigma.setupNote",
+    });
+    expect(sigma?.supportsOrganizationScope).not.toBe(true);
+    expect(filterMcpIntegrations("sigma").map((item) => item.id)).toEqual([
+      "sigma",
+    ]);
+    expect(findMcpIntegrationForText("Connect Sigma")?.id).toBe("sigma");
+    expect(findMcpIntegrationForText("Connect Sigma dashboard")?.id).toBe(
+      "sigma",
+    );
+    expect(findMcpIntegrationForText("Show me Sigma dashboards")?.id).toBe(
+      "sigma",
+    );
+    expect(findMcpIntegrationForText("Analyze my Sigma dashboard")?.id).toBe(
+      "sigma",
+    );
+    expect(findMcpIntegrationForText("Explore Sigma workbooks")?.id).toBe(
+      "sigma",
+    );
+    expect(
+      findMcpIntegrationForText("Find the sigma of this distribution"),
+    ).toBe(null);
+    expect(
+      isMcpIntegrationUrl(sigma!, "https://acme.sigmacomputing.com/mcp"),
+    ).toBe(true);
+    expect(isMcpIntegrationUrl(sigma!, "https://example.com/mcp")).toBe(false);
+  });
+
   it("records logo and provider-gating metadata for remote directory entries", () => {
     const context7 = DEFAULT_MCP_INTEGRATIONS.find(
       (integration) => integration.id === "context7",
@@ -143,15 +261,16 @@ describe("MCP integration catalog", () => {
     });
     expect(getMcpIntegrationApiFallback(figma, "analytics")).toBeNull();
     expect(getMcpIntegrationApiFallback(figma, null)).toBeNull();
-    expect(DEFAULT_MCP_INTEGRATIONS).toHaveLength(27);
+    expect(DEFAULT_MCP_INTEGRATIONS).toHaveLength(36);
     expect(
       new Set(DEFAULT_MCP_INTEGRATIONS.map((integration) => integration.id))
         .size,
-    ).toBe(27);
+    ).toBe(36);
     for (const integration of DEFAULT_MCP_INTEGRATIONS) {
       expect(integration.logoUrl).toMatch(
-        /^data:image\/(?:png|svg\+xml|x-icon|vnd\.microsoft\.icon);base64,/,
+        /^data:image\/(?:png|svg\+xml|x-icon|vnd\.microsoft\.icon)(?:;base64,|,)/,
       );
+      expect(integration.logoUrl).not.toContain("%3Ctext");
       expect(["verified", "preflight-only", "restricted"]).toContain(
         integration.verification,
       );
@@ -159,7 +278,19 @@ describe("MCP integration catalog", () => {
     expect(
       DEFAULT_MCP_INTEGRATIONS.find((item) => item.id === "github"),
     ).toMatchObject({
+      url: "https://api.githubcopilot.com/mcp/",
+      authMode: "headers",
+      connectionMode: "headers",
+      availability: "ready",
+      verification: "preflight-only",
+      headerPlaceholder: "Authorization: Bearer <github-token>",
+    });
+    expect(
+      DEFAULT_MCP_INTEGRATIONS.find((item) => item.id === "hubspot"),
+    ).toMatchObject({
+      authMode: "oauth",
       availability: "provider-setup",
+      managedOAuth: true,
       verification: "restricted",
     });
     expect(
@@ -208,6 +339,28 @@ describe("MCP integration catalog", () => {
     });
   });
 
+  it("includes first-party remote MCPs represented in the organization vault", () => {
+    const expected = [
+      ["amplitude", "https://mcp.amplitude.com/mcp", "ready"],
+      ["apollo", "https://mcp.apollo.io/mcp", "ready"],
+      ["common-room", "https://mcp.commonroom.io/mcp", "ready"],
+      ["exa", "https://mcp.exa.ai/mcp", "ready"],
+      ["gong", "https://mcp.gong.io/mcp", "provider-setup"],
+      ["grafana", "https://mcp.grafana.com/mcp", "beta"],
+      ["pylon", "https://mcp.usepylon.com/", "provider-setup"],
+      ["builder-cms", "https://mcp.builder.io/mcp/publish", "ready"],
+    ] as const;
+
+    for (const [id, url, availability] of expected) {
+      expect(
+        DEFAULT_MCP_INTEGRATIONS.find((item) => item.id === id),
+      ).toMatchObject({
+        url,
+        availability,
+      });
+    }
+  });
+
   it("matches MCP tool names to their preset for brand icons", () => {
     expect(findMcpIntegrationForToolName("mcp__slack__search")?.id).toBe(
       "slack",
@@ -222,7 +375,6 @@ describe("MCP integration catalog", () => {
     expect(findMcpIntegrationForToolName("mcp__chrome-devtools__click")).toBe(
       null,
     );
-    // The tool half of the name must never drive the icon.
     expect(
       findMcpIntegrationForToolName("mcp__zapier__send_slack_message")?.id,
     ).toBe("zapier");
@@ -261,7 +413,7 @@ describe("MCP integration catalog", () => {
     expect(findMcpIntegrationForText("Pull my meeting recordings")).toBeNull();
     expect(
       findMcpIntegrationForText("Find call transcripts from Gong"),
-    ).toBeNull();
+    ).toMatchObject({ id: "gong" });
     expect(
       findMcpIntegrationForText(
         "Make the action items and decisions larger on this slide",
@@ -277,15 +429,62 @@ describe("MCP integration catalog", () => {
       true,
     );
     expect(isMcpConnectionFailureText("I can read it now")).toBe(false);
+    expect(
+      findMcpIntegrationForText(
+        "Add a text box and connect it to the shape below",
+      ),
+    ).toBeNull();
+    expect(
+      findMcpIntegrationForText("Let's create a bounding box for this design"),
+    ).toBeNull();
+    expect(
+      findMcpIntegrationForText("Connect Box.com to import my files")?.id,
+    ).toBe("box");
+    expect(
+      findMcpIntegrationForText("Connect my Box folders to this workspace")?.id,
+    ).toBe("box");
+    expect(
+      findMcpIntegrationForText("Connect a Box file to this workspace")?.id,
+    ).toBe("box");
+  });
+
+  it("recognizes agent-authored setup requests without matching positive status text", () => {
+    expect(isMcpConnectionSuggestionText("Please connect HubSpot")).toBe(true);
+    expect(
+      isMcpConnectionSuggestionText(
+        "I need you to authorize HubSpot before I can pull the deals.",
+      ),
+    ).toBe(true);
+    expect(isMcpConnectionSuggestionText("Can you connect HubSpot?")).toBe(
+      true,
+    );
+    expect(isMcpConnectionSuggestionText("HubSpot access is required")).toBe(
+      true,
+    );
+    expect(isMcpConnectionSuggestionText("HubSpot requires access")).toBe(true);
+    expect(
+      isMcpConnectionSuggestionText(
+        "HubSpot needs to be connected before I can search your leads.",
+      ),
+    ).toBe(true);
+    expect(
+      isMcpConnectionSuggestionText(
+        "The Dispatch connection requires authentication.",
+      ),
+    ).toBe(true);
+    expect(
+      isMcpConnectionSuggestionText("I don't have access to HubSpot yet."),
+    ).toBe(true);
+    expect(isMcpConnectionSuggestionText("HubSpot is connected")).toBe(false);
   });
 
   it("matches exact display brands and branded aliases only", () => {
     for (const integration of DEFAULT_MCP_INTEGRATIONS) {
+      const term = integration.promptAliases?.[0] ?? integration.name;
       expect(
-        findMcpIntegrationForText(
-          `Connect ${integration.name} to this workspace`,
-          [integration],
-        )?.id,
+        findMcpIntegrationForText(`Connect ${term} to this workspace`, [
+          integration,
+        ])?.id,
       ).toBe(integration.id);
     }
 
@@ -318,6 +517,36 @@ describe("MCP integration catalog", () => {
     expect(mcpIntegrationAuthLabel("oauth")).toBe("OAuth");
   });
 
+  it("refuses to build a personal OAuth start for an org-only server", () => {
+    const params = new URL(
+      buildMcpOAuthStartUrl({
+        name: "Builder.io",
+        url: "https://mcp.builder.io/mcp/publish",
+        description: "Search Builder Publish content",
+        scope: "user",
+        returnUrl: "/settings/integrations",
+      }),
+      "https://example.com",
+    ).searchParams;
+
+    expect(params.get("scope")).toBe("org");
+  });
+
+  it("leaves the requested scope alone for every other server", () => {
+    const params = new URL(
+      buildMcpOAuthStartUrl({
+        name: "Linear",
+        url: "https://mcp.linear.app/sse",
+        description: "Read and write issues",
+        scope: "user",
+        returnUrl: "/settings/integrations",
+      }),
+      "https://example.com",
+    ).searchParams;
+
+    expect(params.get("scope")).toBe("user");
+  });
+
   it("builds an encoded OAuth start URL", () => {
     const url = buildMcpOAuthStartUrl({
       name: "Linear & Issues",
@@ -340,10 +569,27 @@ describe("MCP integration catalog", () => {
     expect(params.get("return")).toBe("/settings/integrations");
   });
 
+  it("builds the OAuth start URL under a configured app mount", () => {
+    vi.stubEnv("VITE_APP_BASE_PATH", "/content");
+
+    const url = buildMcpOAuthStartUrl({
+      name: "Linear",
+      url: "https://mcp.linear.app/sse",
+      description: "Read and write issues",
+      scope: "user",
+      returnUrl: "/content/settings/integrations",
+    });
+
+    expect(new URL(url, "https://example.com").pathname).toBe(
+      "/content/_agent-native/mcp/servers/oauth/start",
+    );
+  });
+
   it("falls back to personal scope when organization access is unavailable", () => {
     expect(resolveMcpIntegrationScope("org", false, true)).toBe("user");
     expect(resolveMcpIntegrationScope("org", true, false)).toBe("user");
     expect(resolveMcpIntegrationScope("org", true, true)).toBe("org");
+    expect(resolveMcpIntegrationScope("org", true, true, false)).toBe("user");
     expect(resolveMcpIntegrationScope("user", true, true)).toBe("user");
   });
 

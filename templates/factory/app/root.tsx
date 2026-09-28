@@ -21,6 +21,7 @@ import {
   Outlet,
   Scripts,
   ScrollRestoration,
+  useLocation,
   useNavigate,
 } from "react-router";
 import type { LinksFunction } from "react-router";
@@ -69,7 +70,6 @@ export function Layout({ children }: { children: React.ReactNode }) {
           suppressHydrationWarning
           dangerouslySetInnerHTML={{ __html: LOCALE_INIT_SCRIPT }}
         />
-        <link rel="manifest" href={appPath("/manifest.json")} />
         {/* guard:allow-raw-color - theme-color metadata requires a concrete browser-chrome color. */}
         <meta name="theme-color" content="#18181B" />
         <meta name="mobile-web-app-capable" content="yes" />
@@ -121,6 +121,7 @@ function AppContent() {
   const [cmdkOpen, setCmdkOpen] = useState(false);
   const navigate = useNavigate();
   const t = useT();
+  const location = useLocation();
   useCommandMenuShortcut(useCallback(() => setCmdkOpen(true), []));
   return (
     <>
@@ -128,14 +129,22 @@ function AppContent() {
         open={cmdkOpen}
         onOpenChange={setCmdkOpen}
         changelog={changelog}
-        changelogKey="chat"
+        changelogKey="factory"
+        chatStorageKey="chat"
       >
         <CommandMenu.Group heading={t("root.commandActions")}>
-          <CommandMenu.Item onSelect={() => {}}>
-            {t("root.commandSearch")}
-          </CommandMenu.Item>
+          {location.pathname.startsWith("/factory") ? (
+            <CommandMenu.Item onSelect={() => navigate("/new-factory")}>
+              {t("factoryRoute.newFactory")}
+            </CommandMenu.Item>
+          ) : null}
+          {location.pathname === "/new-factory" ? (
+            <CommandMenu.Item onSelect={() => navigate("/factory")}>
+              {t("factoryRoute.backToFactories")}
+            </CommandMenu.Item>
+          ) : null}
           <CommandMenu.Item
-            onSelect={() => navigate("/agent")}
+            onSelect={() => navigate("/settings/agent")}
             keywords={[
               "agent",
               "context",
@@ -164,7 +173,11 @@ export default function Root() {
   const [queryClient] = useState(() => createAgentNativeQueryClient());
   return (
     <AppToolkitProvider>
-      <AppProviders queryClient={queryClient} i18n={{ catalog: i18nCatalog }}>
+      <AppProviders
+        queryClient={queryClient}
+        skeletonLayout="list"
+        i18n={{ catalog: i18nCatalog }}
+      >
         <DbSyncSetup />
         <AppContent />
       </AppProviders>

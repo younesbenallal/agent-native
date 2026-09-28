@@ -7,8 +7,12 @@ import {
   isSsrCacheEnabled,
   parseSsrCacheSetting,
   resolveSsrCacheHeaders,
+  resolveSsrCacheKeyHeaders,
   SSR_CACHE_ENV_VAR,
+  SSR_HTML_CONTENT_TYPE,
+  SSR_QUERY_CACHE_KEY_HEADER,
   ssrCacheHeadersForPolicy,
+  withSsrHtmlContentType,
 } from "./cache-control.js";
 
 function envWith(value: string | undefined) {
@@ -142,7 +146,7 @@ describe("ssrCacheHeadersForPolicy", () => {
       "cdn-cache-control":
         "public, max-age=30, stale-while-revalidate=30, stale-if-error=3600",
       "netlify-cdn-cache-control":
-        "public, max-age=30, stale-while-revalidate=30, stale-if-error=3600",
+        "public, durable, s-maxage=30, stale-while-revalidate=30, stale-if-error=3600",
     });
   });
 });
@@ -191,6 +195,39 @@ describe("resolveSsrCacheHeaders", () => {
   });
 });
 
+describe("resolveSsrCacheKeyHeaders", () => {
+  it("narrows query variation on Netlify", () => {
+    expect(resolveSsrCacheKeyHeaders({ NETLIFY: "true" })).toEqual({
+      "netlify-vary": "query=_routes|index",
+    });
+    expect(resolveSsrCacheKeyHeaders({ SITE_ID: "site-test" })).toEqual({
+      "netlify-vary": "query=_routes|index",
+    });
+  });
+
+  it("does not emit a Netlify header outside Netlify", () => {
+    expect(resolveSsrCacheKeyHeaders({})).toEqual({});
+    expect(
+      resolveSsrCacheKeyHeaders({ NETLIFY: "true", NETLIFY_LOCAL: "true" }),
+    ).toEqual({});
+  });
+});
+
+describe("withSsrHtmlContentType", () => {
+  it("marks query-preserving redirects for full cache-key variation", () => {
+    const response = new Response(null, {
+      status: 302,
+      headers: { location: "/library?from=home" },
+    });
+
+    expect(withSsrHtmlContentType(response, { varyByQuery: true })).toBe(
+      response,
+    );
+    expect(response.headers.get("content-type")).toBe(SSR_HTML_CONTENT_TYPE);
+    expect(response.headers.get(SSR_QUERY_CACHE_KEY_HEADER)).toBe("query");
+  });
+});
+
 describe("isSsrCacheEnabled", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -212,5 +249,18 @@ describe("isSsrCacheEnabled", () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
 
     expect(isSsrCacheEnabled(envWith("banana"))).toBe(true);
+  });
+});
+describe("withSsrHtmlContentType", () => {
+  it("marks an existing redirect as HTML without changing its contract", () => {
+    const response = new Response(null, {
+      status: 302,
+      headers: { location: "/library?from=home" },
+    });
+
+    expect(withSsrHtmlContentType(response)).toBe(response);
+    expect(response.status).toBe(302);
+    expect(response.headers.get("location")).toBe("/library?from=home");
+    expect(response.headers.get("content-type")).toBe(SSR_HTML_CONTENT_TYPE);
   });
 });

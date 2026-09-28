@@ -1,9 +1,3 @@
-// Integration tests for the record page actions against a real libsql (SQLite)
-// database with the app's own migrations applied. The two things they have to
-// prove — that a superseded bitemporal row is never read as the current value,
-// and that two entries of one record in one list both survive — are exactly
-// what a mocked query builder would let through.
-
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const TEST_DB_PATH = join(
   tmpdir(),
-  `crm-record-page-test-${process.pid}-${Date.now()}.sqlite`,
+  `crm-record-page-test-${process.pid}-${Date.now()}.pglite`,
 );
 
 const OWNER = "owner@example.test";
@@ -148,7 +142,7 @@ async function setValue(
 }
 
 beforeAll(async () => {
-  process.env.DATABASE_URL = `file:${TEST_DB_PATH}`;
+  process.env.DATABASE_URL = `pglite:${TEST_DB_PATH}`;
   const dbModule = await import("../server/db/index.js");
   getDb = dbModule.getDb;
   schema = dbModule.schema;
@@ -182,9 +176,7 @@ beforeAll(async () => {
 }, 60_000);
 
 afterAll(() => {
-  for (const suffix of ["", "-shm", "-wal"]) {
-    rmSync(`${TEST_DB_PATH}${suffix}`, { force: true });
-  }
+  rmSync(TEST_DB_PATH, { force: true, recursive: true });
 });
 
 describe("get-crm-record-page", () => {
@@ -220,8 +212,6 @@ describe("get-crm-record-page", () => {
   it("has no upstream link for a native record", async () => {
     const recordId = await createRecord("Native Co");
     const page = await asOwner(() => getRecordPage.run({ recordId }, ownerCtx));
-    // Absent and unavailable are different states; a native record has no
-    // upstream record at all, so neither field is populated.
     expect(page.recordUrl).toBeNull();
     expect(page.recordUrlUnavailableReason).toBeNull();
   });
@@ -321,7 +311,6 @@ describe("list-crm-record-field-history", () => {
       listFieldHistory.run({ recordId, apiSlug: "last_seen" }, ownerCtx),
     );
     expect(history.historyTracked).toBe(false);
-    // Updated in place: one row, holding the newest value.
     expect(history.changes).toHaveLength(1);
     expect(history.changes[0].value).toBe("b");
   });

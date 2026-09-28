@@ -2,9 +2,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const testState = vi.hoisted(() => ({
   resolveAccess: vi.fn(),
+  assertAccess: vi.fn(),
   nanoidValues: ["copied-design", "copied-file"],
   insertedDesign: null as Record<string, unknown> | null,
   insertedFiles: [] as Array<Record<string, unknown>>,
+  updatedDesign: null as Record<string, unknown> | null,
+  targetDesignFiles: [] as Array<Record<string, unknown>>,
+  targetDesignRows: [] as Array<Record<string, unknown>>,
   transactionCount: 0,
 }));
 
@@ -15,11 +19,14 @@ vi.mock("@agent-native/core/server/request-context", () => ({
 
 vi.mock("@agent-native/core/sharing", () => ({
   resolveAccess: (...args: unknown[]) => testState.resolveAccess(...args),
+  assertAccess: (...args: unknown[]) => testState.assertAccess(...args),
 }));
 
 vi.mock("drizzle-orm", async (importOriginal) => ({
   ...(await importOriginal<typeof import("drizzle-orm")>()),
   eq: (column: unknown, value: unknown) => ({ column, value }),
+  ne: (column: unknown, value: unknown) => ({ column, value, op: "ne" }),
+  and: (...parts: unknown[]) => ({ parts }),
 }));
 
 vi.mock("nanoid", () => ({
@@ -28,7 +35,7 @@ vi.mock("nanoid", () => ({
 
 vi.mock("../server/db/index.js", () => {
   const schema = {
-    designs: { table: "designs" },
+    designs: { table: "designs", data: "designs.data" },
     designFiles: { table: "designFiles" },
     designTemplateFiles: {
       table: "designTemplateFiles",
@@ -45,24 +52,48 @@ vi.mock("../server/db/index.js", () => {
       filename: "index.html",
       fileType: "html",
       content:
-        '<main style="width:1080px;height:1080px"><div data-agent-native-locked="true">Brand</div><p>Editable</p></main>',
+        '<link href="https://fonts.googleapis.com/css2?family=Sora:wght@700" rel="stylesheet">' +
+        '<main style="width:1080px;height:1080px;font-family:Sora,sans-serif"><div data-agent-native-locked="true">Brand</div><p>Editable</p></main>',
     },
   ];
+  const select = () => ({
+    from: (table: { table: string }) => ({
+      where: () => {
+        const rows =
+          table.table === "designFiles"
+            ? testState.targetDesignFiles
+            : table.table === "designs"
+              ? testState.targetDesignRows
+              : templateFiles;
+        const result = Promise.resolve(rows) as Promise<unknown[]> & {
+          limit: (n: number) => Promise<unknown[]>;
+        };
+        result.limit = async () => rows;
+        return result;
+      },
+    }),
+  });
   return {
     schema,
     getDb: () => ({
-      select: () => ({
-        from: () => ({ where: async () => templateFiles }),
-      }),
+      select,
       transaction: async (
         run: (tx: {
+          select: typeof select;
           insert: (table: { table: string }) => {
             values: (values: unknown) => Promise<void>;
           };
+          update: (table: { table: string }) => {
+            set: (values: unknown) => {
+              where: (condition: unknown) => Promise<void>;
+            };
+          };
+          execute: (query: unknown) => Promise<{ rows: unknown[] }>;
         }) => Promise<void>,
       ) => {
         testState.transactionCount += 1;
         await run({
+          select,
           insert: (table) => ({
             values: async (values) => {
               if (table.table === "designs") {
@@ -74,12 +105,21 @@ vi.mock("../server/db/index.js", () => {
               }
             },
           }),
+          update: () => ({
+            set: (values) => ({
+              where: async () => {
+                testState.updatedDesign = values as Record<string, unknown>;
+              },
+            }),
+          }),
+          execute: async () => ({ rows: [] }),
         });
       },
     }),
   };
 });
 
+import { designTemplateRetryKey } from "../shared/design-template-retry.js";
 import action from "./create-design-from-template.js";
 
 describe("create-design-from-template", () => {
@@ -88,7 +128,11 @@ describe("create-design-from-template", () => {
     testState.nanoidValues = ["copied-design", "copied-file"];
     testState.insertedDesign = null;
     testState.insertedFiles = [];
+    testState.updatedDesign = null;
+    testState.targetDesignFiles = [];
+    testState.targetDesignRows = [];
     testState.transactionCount = 0;
+    testState.assertAccess.mockResolvedValue(undefined);
     testState.resolveAccess.mockImplementation(
       async (type: string, id: string) => {
         if (type === "design-template" && id === "saved-template") {
@@ -156,6 +200,16 @@ describe("create-design-from-template", () => {
       appliedDesignSystemId: "override-system",
       designSystemOverridden: true,
     });
+    expect(data.templateSource.files).toEqual([
+      {
+        designFileId: "copied-file",
+        templateFileId: "template-file",
+        filename: "index.html",
+        width: 1080,
+        height: 1080,
+      },
+    ]);
+    expect(data.templateSource.fonts).toEqual(["Sora"]);
     expect(testState.insertedFiles[0]?.content).toContain(
       'data-agent-native-locked="true"',
     );
@@ -177,6 +231,74 @@ describe("create-design-from-template", () => {
     expect(result.nextRequiredAction).toContain("Do not call generate-design");
   });
 
+  it("fills the design the caller already created instead of making a second one", async () => {
+    const result = await action.run({
+      templateId: "saved-template",
+      targetDesignId: "existing-design",
+    } as never);
+
+    expect(testState.assertAccess).toHaveBeenCalledWith(
+      "design",
+      "existing-design",
+      "editor",
+    );
+    expect(testState.insertedDesign).toBeNull();
+    expect(testState.updatedDesign).toMatchObject({
+      title: "Saved campaign",
+      designSystemId: "linked-system",
+    });
+    expect(result.id).toBe("existing-design");
+    expect(
+      testState.insertedFiles.every(
+        (file) => file.designId === "existing-design",
+      ),
+    ).toBe(true);
+  });
+
+  it("treats a design holding only the board row as empty", async () => {
+    testState.targetDesignFiles = [];
+
+    const result = await action.run({
+      templateId: "saved-template",
+      targetDesignId: "existing-design",
+    } as never);
+
+    expect(result.id).toBe("existing-design");
+    expect(testState.insertedFiles.length).toBe(1);
+  });
+
+  it("keeps the target's own editor state instead of replacing its data blob", async () => {
+    testState.targetDesignRows = [
+      { data: JSON.stringify({ boardFileId: "board-1", keepMe: true }) },
+    ];
+
+    await action.run({
+      templateId: "saved-template",
+      targetDesignId: "existing-design",
+    } as never);
+
+    const written = JSON.parse(
+      String(testState.updatedDesign?.data ?? "{}"),
+    ) as Record<string, unknown>;
+    expect(written.boardFileId).toBe("board-1");
+    expect(written.keepMe).toBe(true);
+    expect(written.templateSource).toBeTruthy();
+  });
+
+  it("refuses to overwrite a target that already has screens", async () => {
+    testState.targetDesignFiles = [{ id: "existing-file" }];
+
+    await expect(
+      action.run({
+        templateId: "saved-template",
+        targetDesignId: "existing-design",
+      } as never),
+    ).rejects.toThrow(/only fill an empty design/i);
+
+    expect(testState.transactionCount).toBe(1);
+    expect(testState.updatedDesign).toBeNull();
+  });
+
   it("rejects an inaccessible explicit override before inserting anything", async () => {
     await expect(
       action.run({
@@ -187,5 +309,27 @@ describe("create-design-from-template", () => {
 
     expect(testState.transactionCount).toBe(0);
     expect(testState.insertedDesign).toBeNull();
+  });
+
+  it("preserves stable retries without requiring callers to build the fingerprint", async () => {
+    const first = await action.run({
+      templateId: "saved-template",
+      newId: "retry-id",
+    });
+    expect(first.id).toBe("retry-id");
+
+    await expect(
+      action.run({
+        templateId: "saved-template",
+        newId: "retry-id",
+        retryKey: "wrong-key",
+      }),
+    ).rejects.toThrow(/cannot be reused/i);
+
+    const retryKey = designTemplateRetryKey({
+      templateId: "saved-template",
+      title: "Saved campaign",
+    });
+    expect(retryKey.length).toBeLessThanOrEqual(128);
   });
 });

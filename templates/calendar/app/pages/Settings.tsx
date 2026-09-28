@@ -1,7 +1,7 @@
 import { ChangelogSettingsCard } from "@agent-native/core/client/changelog";
+import { useFeatureFlagState } from "@agent-native/core/client/feature-flags";
 import { callAction } from "@agent-native/core/client/hooks";
 import { LanguagePicker, useT } from "@agent-native/core/client/i18n";
-import { TeamPage } from "@agent-native/core/client/org";
 import {
   AccountSettingsCard,
   SettingsGroup,
@@ -14,8 +14,12 @@ import {
   AppearancePicker,
   type AppearancePresetId,
 } from "@agent-native/core/client/ui";
+import { SETTINGS_REDESIGN_FLAG } from "@agent-native/core/feature-flags/registry";
+import type { CalendarWeekStart } from "@shared/calendar-week";
+import { isCalendarWeekStart } from "@shared/calendar-week";
 import {
   IconBrandZoom,
+  IconCalendarCheck,
   IconExternalLink,
   IconLink,
   IconUnlink,
@@ -38,51 +42,42 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
-import {
-  useGoogleAuthStatus,
-  useGoogleAuthUrl,
-  useGoogleDesktopAuth,
-  useDisconnectGoogle,
-} from "@/hooks/use-google-auth";
 import { useSettings, useUpdateSettings } from "@/hooks/use-settings";
-import {
-  useConnectZoom,
-  useDisconnectZoom,
-  useZoomStatus,
-} from "@/hooks/use-zoom-auth";
-import { shouldOfferGoogleOAuthSetup } from "@/lib/google-oauth-setup";
 
 import changelog from "../../CHANGELOG.md?raw";
+import { CalendarEventRules } from "./settings/CalendarEventRules";
+import {
+  AVAILABILITY_SETTINGS_PATH,
+  useCalendarSettingsRedesign,
+  useDesktopNotificationPermission,
+} from "./settings/CalendarSettingsRedesign";
+import { useCalendarConnections } from "./settings/use-calendar-connections";
 
 export default function Settings() {
   const t = useT();
   const agentSettingsTabs = useAgentSettingsTabs();
+  const redesign = useFeatureFlagState(SETTINGS_REDESIGN_FLAG.key).enabled;
   const { data: settings } = useSettings();
   const updateSettings = useUpdateSettings();
-  const googleStatus = useGoogleAuthStatus();
-  const disconnectGoogle = useDisconnectGoogle();
-  const {
-    isDesktopGoogleAuth,
-    isGoogleDesktopAuthPending,
-    startDesktopGoogleAuth,
-  } = useGoogleDesktopAuth({
-    onError: (issue) =>
-      toast.error(issue.message || issue.error || t("settings.googleFailed")),
-    onSuccess: () => window.location.reload(),
-  });
-  const zoomStatus = useZoomStatus();
-  const connectZoom = useConnectZoom();
-  const disconnectZoom = useDisconnectZoom();
-  const [wantAuthUrl, setWantAuthUrl] = useState(false);
-  const authUrl = useGoogleAuthUrl(wantAuthUrl);
-  const canOfferGoogleOAuthSetup = shouldOfferGoogleOAuthSetup();
+  const connections = useCalendarConnections();
+  const { googleStatus, zoomStatus, canOfferGoogleOAuthSetup } = connections;
+  const notificationPermission = useDesktopNotificationPermission();
+  const redesigned = useCalendarSettingsRedesign(notificationPermission);
 
   const [timezone, setTimezone] = useState("");
   const [bookingTitle, setBookingTitle] = useState("");
   const [bookingDescription, setBookingDescription] = useState("");
   const [defaultDuration, setDefaultDuration] = useState(30);
+  const [weekStart, setWeekStart] = useState<CalendarWeekStart>("sunday");
 
   useEffect(() => {
     if (settings) {
@@ -90,6 +85,9 @@ export default function Settings() {
       setBookingTitle(settings.bookingPageTitle);
       setBookingDescription(settings.bookingPageDescription);
       setDefaultDuration(settings.defaultEventDuration);
+      setWeekStart(
+        isCalendarWeekStart(settings.weekStart) ? settings.weekStart : "sunday",
+      );
     }
   }, [settings]);
 
@@ -100,66 +98,13 @@ export default function Settings() {
         bookingPageTitle: bookingTitle,
         bookingPageDescription: bookingDescription,
         defaultEventDuration: defaultDuration,
+        weekStart,
       },
       {
         onSuccess: () => toast.success(t("settings.saved")),
         onError: () => toast.error(t("settings.saveFailed")),
       },
     );
-  }
-
-  function handleConnect() {
-    if (isDesktopGoogleAuth) {
-      startDesktopGoogleAuth({
-        previousAccountCount: googleStatus.data?.accounts?.length ?? 0,
-      });
-      return;
-    }
-    setWantAuthUrl(true);
-  }
-
-  useEffect(() => {
-    if (!wantAuthUrl || !authUrl.data?.url) return;
-    setWantAuthUrl(false);
-    window.open(authUrl.data.url, "_blank");
-  }, [wantAuthUrl, authUrl.data]);
-
-  useEffect(() => {
-    if (authUrl.error) {
-      toast.error(authUrl.error.message);
-      setWantAuthUrl(false);
-    }
-  }, [authUrl.error]);
-
-  async function handleDisconnect() {
-    const accounts = googleStatus.data?.accounts ?? [];
-    try {
-      for (const account of accounts) {
-        await disconnectGoogle.mutateAsync(account.email);
-      }
-      toast.success(t("settings.googleDisconnected"));
-    } catch {
-      toast.error(t("settings.disconnectFailed"));
-    }
-  }
-
-  function handleConnectZoom() {
-    connectZoom.mutate(undefined, {
-      onSuccess: () => toast(t("settings.zoomOpened")),
-      onError: (error) =>
-        toast.error(
-          error instanceof Error
-            ? error.message
-            : t("settings.zoomConnectFailed"),
-        ),
-    });
-  }
-
-  function handleDisconnectZoom() {
-    disconnectZoom.mutate(undefined, {
-      onSuccess: () => toast.success(t("settings.zoomDisconnected")),
-      onError: () => toast.error(t("settings.zoomDisconnectFailed")),
-    });
   }
 
   const generalSearchEntries = useMemo<SettingsSearchEntry[]>(
@@ -185,8 +130,15 @@ export default function Settings() {
       {
         id: "calendar-general",
         label: t("settings.general"),
-        keywords: "timezone booking duration defaults general",
+        keywords:
+          "timezone week start sunday monday booking duration defaults general",
         hash: "general-settings",
+      },
+      {
+        id: "calendar-availability",
+        label: t("bookingLinks.availability"),
+        keywords: "availability available hours booking schedule working hours",
+        hash: "availability",
       },
       {
         id: "calendar-appearance",
@@ -194,17 +146,58 @@ export default function Settings() {
         keywords: "appearance theme color mode dark light",
         hash: "appearance",
       },
+      {
+        id: "calendar-notifications",
+        label: t("settings.desktopNotifications"),
+        keywords: "desktop system notifications meeting reminders permission",
+        hash: "notifications",
+      },
     ],
     [t],
   );
+  // The redesigned shell shows the rules as the Rules app area instead.
+  const settingsTabs = redesign
+    ? agentSettingsTabs
+    : [
+        ...agentSettingsTabs,
+        {
+          id: "event-rules",
+          label: t("settings.eventRules"),
+          icon: IconCalendarCheck,
+          keywords: "jev invitation rules accept decline hide",
+          content: (
+            <Card
+              id="event-rules"
+              className="mx-auto w-full max-w-2xl scroll-mt-16"
+            >
+              <CardHeader>
+                <CardTitle>{t("settings.eventRules")}</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <CalendarEventRules />
+              </CardContent>
+            </Card>
+          ),
+        },
+      ];
 
   return (
     <SettingsTabsPage
       account={<AccountSettingsCard />}
       generalLabel={t("settings.general")}
-      teamLabel={t("navigation.team")}
-      extraTabs={agentSettingsTabs}
-      generalSearchEntries={generalSearchEntries}
+      extraTabs={settingsTabs}
+      generalSearchEntries={
+        redesign ? redesigned.generalSearchEntries : generalSearchEntries
+      }
+      generalGroups={redesigned.generalGroups}
+      // Today's tabs would show app areas and notifications as extra tabs, so
+      // they are passed only to the redesigned shell.
+      appAreas={redesign ? redesigned.appAreas : undefined}
+      notifications={redesign ? redesigned.notifications : undefined}
+      notificationsSearchEntries={
+        redesign ? redesigned.notificationsSearchEntries : undefined
+      }
+      whatsNewMarkdown={changelog}
       general={
         <div className="mx-auto max-w-2xl space-y-6 pb-12">
           <p className="text-sm text-muted-foreground">
@@ -229,8 +222,6 @@ export default function Settings() {
             >
               <AppearancePicker
                 onChange={(preset: AppearancePresetId) => {
-                  // Persist server-side so the choice survives reload and syncs
-                  // across devices; the local UI has already updated optimistically.
                   callAction(
                     "change-appearance" as any,
                     { preset } as any,
@@ -240,74 +231,125 @@ export default function Settings() {
                 }}
               />
             </SettingsRow>
+            {notificationPermission.permission !== null ? (
+              <SettingsRow
+                id="notifications"
+                label={t("settings.desktopNotifications")}
+                description={t("settings.desktopNotificationsDescription")}
+                control={
+                  notificationPermission.permission === "granted" ? (
+                    <span className="text-sm text-muted-foreground">
+                      {t("settings.desktopNotificationsEnabled")}
+                    </span>
+                  ) : (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void notificationPermission.request()}
+                      disabled={notificationPermission.pending}
+                    >
+                      {t("settings.enableDesktopNotifications")}
+                    </Button>
+                  )
+                }
+              />
+            ) : null}
+            <SettingsRow
+              id="availability"
+              label={t("bookingLinks.availability")}
+              description={t("bookingLinks.availabilityDescription")}
+              control={
+                <Button variant="outline" size="sm" asChild>
+                  <Link to={AVAILABILITY_SETTINGS_PATH}>
+                    {t("bookingLinks.availability")}
+                  </Link>
+                </Button>
+              }
+            />
           </SettingsGroup>
 
           {/* Google Calendar Connection */}
-          <Card id="google-calendar" className="scroll-mt-16">
-            <CardHeader>
-              <CardTitle className="text-lg">
-                {t("settings.googleCalendar")}
-              </CardTitle>
-              <CardDescription>
-                {t("settings.googleDescription")}
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  {googleStatus.data?.connected ? (
-                    <>
-                      <IconCircleCheck className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
-                      <div>
-                        <p className="text-sm font-medium">
-                          {t("common.connected")}
-                        </p>
-                        {googleStatus.data.accounts?.length > 0 && (
-                          <p className="text-xs text-muted-foreground">
-                            {googleStatus.data.accounts
-                              .map((a) => a.email)
-                              .join(", ")}
+          {(googleStatus.isError ||
+            googleStatus.data?.connected ||
+            googleStatus.data?.configured === true ||
+            canOfferGoogleOAuthSetup) && (
+            <Card id="google-calendar" className="scroll-mt-16">
+              <CardHeader>
+                <CardTitle className="text-lg">
+                  {t("settings.googleCalendar")}
+                </CardTitle>
+                <CardDescription>
+                  {t("settings.googleDescription")}
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    {googleStatus.data?.connected ? (
+                      <>
+                        <IconCircleCheck className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
+                        <div>
+                          <p className="text-sm font-medium">
+                            {t("common.connected")}
                           </p>
-                        )}
-                      </div>
-                    </>
-                  ) : (
-                    <>
-                      <IconCircleX className="h-5 w-5 text-muted-foreground" />
-                      <p className="text-sm text-muted-foreground">
-                        {t("common.notConnected")}
-                      </p>
-                    </>
-                  )}
-                </div>
+                          {googleStatus.data.accounts?.length > 0 && (
+                            <p className="text-xs text-muted-foreground">
+                              {googleStatus.data.accounts
+                                .map((a) => a.email)
+                                .join(", ")}
+                            </p>
+                          )}
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <IconCircleX className="h-5 w-5 text-muted-foreground" />
+                        <p className="text-sm text-muted-foreground">
+                          {t("common.notConnected")}
+                        </p>
+                      </>
+                    )}
+                  </div>
 
-                {googleStatus.data?.connected ? (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleDisconnect}
-                    disabled={disconnectGoogle.isPending}
-                  >
-                    <IconUnlink className="me-1.5 h-3.5 w-3.5" />
-                    {t("common.disconnect")}
-                  </Button>
-                ) : (
-                  <Button
-                    size="sm"
-                    onClick={handleConnect}
-                    disabled={
-                      authUrl.isLoading ||
-                      authUrl.isFetching ||
-                      isGoogleDesktopAuthPending
-                    }
-                  >
-                    <IconExternalLink className="me-1.5 h-3.5 w-3.5" />
-                    {t("common.connect")}
-                  </Button>
-                )}
-              </div>
-            </CardContent>
-          </Card>
+                  {googleStatus.isError ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void googleStatus.refetch()}
+                      disabled={googleStatus.isFetching}
+                    >
+                      {t("common.retry")}
+                    </Button>
+                  ) : googleStatus.data?.connected &&
+                    googleStatus.data.accounts.some(
+                      (account) => !account.shared,
+                    ) ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() =>
+                        void connections.disconnectGoogleAccounts()
+                      }
+                      disabled={connections.isGoogleDisconnectPending}
+                    >
+                      <IconUnlink className="me-1.5 h-3.5 w-3.5" />
+                      {t("common.disconnect")}
+                    </Button>
+                  ) : googleStatus.data?.configured === true ||
+                    canOfferGoogleOAuthSetup ? (
+                    <Button
+                      size="sm"
+                      onClick={connections.connectGoogle}
+                      disabled={connections.isGoogleDesktopAuthPending}
+                    >
+                      <IconExternalLink className="me-1.5 h-3.5 w-3.5" />
+                      {t("common.connect")}
+                    </Button>
+                  ) : null}
+                </div>
+              </CardContent>
+            </Card>
+          )}
 
           <Card id="zoom" className="scroll-mt-16">
             <CardHeader>
@@ -356,8 +398,8 @@ export default function Settings() {
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={handleDisconnectZoom}
-                    disabled={disconnectZoom.isPending}
+                    onClick={connections.disconnectZoomAccount}
+                    disabled={connections.isZoomDisconnectPending}
                   >
                     <IconUnlink className="me-1.5 h-3.5 w-3.5" />
                     {t("common.disconnect")}
@@ -365,9 +407,9 @@ export default function Settings() {
                 ) : (
                   <Button
                     size="sm"
-                    onClick={handleConnectZoom}
+                    onClick={connections.connectZoomAccount}
                     disabled={
-                      connectZoom.isPending ||
+                      connections.isZoomConnectPending ||
                       zoomStatus.data?.configured === false
                     }
                   >
@@ -410,6 +452,30 @@ export default function Settings() {
               <div className="space-y-2">
                 <Label htmlFor="timezone">{t("settings.timezone")}</Label>
                 <TimezoneCombobox value={timezone} onChange={setTimezone} />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="week-start">
+                  {t("settings.weekStartLabel")}
+                </Label>
+                <Select
+                  value={weekStart}
+                  onValueChange={(value) => {
+                    if (isCalendarWeekStart(value)) setWeekStart(value);
+                  }}
+                >
+                  <SelectTrigger id="week-start" className="w-full sm:w-56">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="sunday">
+                      {t("settings.weekStartSunday")}
+                    </SelectItem>
+                    <SelectItem value="monday">
+                      {t("settings.weekStartMonday")}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
 
               <div className="space-y-2">
@@ -478,14 +544,6 @@ export default function Settings() {
               </div>
             </CardContent>
           </Card>
-        </div>
-      }
-      team={
-        <div className="mx-auto w-full max-w-3xl">
-          <TeamPage
-            showTitle={false}
-            createOrgDescription="Set up a team to share calendars and booking links with your colleagues."
-          />
         </div>
       }
       whatsNew={

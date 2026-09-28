@@ -29,15 +29,12 @@ const mockDb = vi.hoisted(() => ({
   })),
 }));
 const mockWriteAppState = vi.hoisted(() => vi.fn());
-const mockGetSetting = vi.hoisted(() => vi.fn());
-const mockGetUserSetting = vi.hoisted(() => vi.fn());
 const mockFetchLoomTranscript = vi.hoisted(() => vi.fn());
 const mockExportToBrainRun = vi.hoisted(() => vi.fn());
-const mockCleanupTranscriptRun = vi.hoisted(() => vi.fn());
 const mockRegenerateTitleRun = vi.hoisted(() => vi.fn());
 const mockRegenerateSummaryRun = vi.hoisted(() => vi.fn());
 const mockQueueTitleRegenerationRequest = vi.hoisted(() => vi.fn());
-const mockResolveHasBuilderPrivateKey = vi.hoisted(() => vi.fn());
+const mockResolveHasBuilderGatewayCredential = vi.hoisted(() => vi.fn());
 const mockTranscribeWithBuilder = vi.hoisted(() => vi.fn());
 const mockSsrfSafeFetch = vi.hoisted(() => vi.fn());
 const mockPrepareAudioOnlyTranscriptionMedia = vi.hoisted(() => vi.fn());
@@ -45,6 +42,8 @@ const mockAssertAccess = vi.hoisted(() => vi.fn());
 const mockDispatchPostFinalizeJob = vi.hoisted(() =>
   vi.fn(async () => undefined),
 );
+const mockFinalizeEndedMeetingsForRecording = vi.hoisted(() => vi.fn());
+const mockTrack = vi.hoisted(() => vi.fn());
 
 vi.mock("@agent-native/core", () => ({
   defineAction: (options: unknown) => options,
@@ -55,11 +54,6 @@ vi.mock("@agent-native/core/application-state", () => ({
   writeAppState: (...args: unknown[]) => mockWriteAppState(...args),
 }));
 
-vi.mock("@agent-native/core/settings", () => ({
-  getSetting: (...args: unknown[]) => mockGetSetting(...args),
-  getUserSetting: (...args: unknown[]) => mockGetUserSetting(...args),
-}));
-
 vi.mock("@agent-native/core/credentials", () => ({
   resolveCredential: vi.fn(),
 }));
@@ -68,14 +62,9 @@ vi.mock("@agent-native/core/extensions/url-safety", () => ({
   ssrfSafeFetch: (...args: unknown[]) => mockSsrfSafeFetch(...args),
 }));
 
-vi.mock("@agent-native/core/server/request-context", () => ({
-  getRequestUserEmail: vi.fn(() => "owner@example.com"),
-  getCredentialContext: vi.fn(() => null),
-}));
-
 vi.mock("@agent-native/core/server", () => ({
-  resolveHasBuilderPrivateKey: (...args: unknown[]) =>
-    mockResolveHasBuilderPrivateKey(...args),
+  resolveHasBuilderGatewayCredential: (...args: unknown[]) =>
+    mockResolveHasBuilderGatewayCredential(...args),
 }));
 
 vi.mock("@agent-native/core/transcription/builder", () => ({
@@ -85,6 +74,10 @@ vi.mock("@agent-native/core/transcription/builder", () => ({
 
 vi.mock("@agent-native/core/sharing", () => ({
   assertAccess: (...args: unknown[]) => mockAssertAccess(...args),
+}));
+
+vi.mock("@agent-native/core/tracking", () => ({
+  track: (...args: unknown[]) => mockTrack(...args),
 }));
 
 vi.mock("drizzle-orm", () => ({
@@ -148,14 +141,6 @@ vi.mock("./export-to-brain.js", () => ({
   default: { run: (...args: unknown[]) => mockExportToBrainRun(...args) },
 }));
 
-vi.mock("./cleanup-transcript.js", () => ({
-  default: { run: (...args: unknown[]) => mockCleanupTranscriptRun(...args) },
-}));
-
-vi.mock("./lib/agents-md-context.js", () => ({
-  loadAgentsMdContext: vi.fn(async () => ""),
-}));
-
 vi.mock("./lib/audio-only-transcription.js", () => ({
   AudioOnlyExtractionError: class AudioOnlyExtractionError extends Error {},
   assertAudioHasAudibleSignal: vi.fn(),
@@ -168,6 +153,11 @@ vi.mock("./lib/audio-only-transcription.js", () => ({
 vi.mock("./lib/loom-transcript.js", () => ({
   fetchLoomTranscript: (...args: unknown[]) => mockFetchLoomTranscript(...args),
   loomTranscriptUnavailableMessage: () => "Loom transcript unavailable.",
+}));
+
+vi.mock("./lib/finalize-ended-meetings.js", () => ({
+  finalizeEndedMeetingsForRecording: (...args: unknown[]) =>
+    mockFinalizeEndedMeetingsForRecording(...args),
 }));
 
 import { PENDING_TRANSCRIPT_HEARTBEAT_MS } from "../shared/transcript-status";
@@ -196,9 +186,108 @@ describe("resolveCleanupSegmentsJson", () => {
   ]);
 
   it("keeps measured timings rather than re-synthesizing them", () => {
-    expect(
+    const cleaned = JSON.parse(
       resolveCleanupSegmentsJson(measured, "Hello there. Second cue.", 120_000),
-    ).toBe(measured);
+    );
+    expect(cleaned).toEqual([
+      { startMs: 0, endMs: 1_200, text: "Hello there." },
+      { startMs: 1_200, endMs: 2_400, text: "Second cue." },
+    ]);
+  });
+
+  it("rewrites sequence-preserving cleanup while retaining attribution", () => {
+    const attributed = JSON.stringify([
+      {
+        startMs: 0,
+        endMs: 900,
+        text: "old mic words",
+        source: "mic",
+        speaker: "Me",
+      },
+      {
+        startMs: 900,
+        endMs: 1_800,
+        text: "old system words",
+        source: "system",
+        speaker: "Them",
+      },
+    ]);
+    const cleaned = JSON.parse(
+      resolveCleanupSegmentsJson(
+        attributed,
+        "Old mic words. Old system words.",
+        120_000,
+      ),
+    );
+
+    expect(cleaned).toEqual([
+      {
+        startMs: 0,
+        endMs: 900,
+        text: "Old mic words.",
+        source: "mic",
+        speaker: "Me",
+      },
+      {
+        startMs: 900,
+        endMs: 1_800,
+        text: "Old system words.",
+        source: "system",
+        speaker: "Them",
+      },
+    ]);
+  });
+
+  it("keeps the original when cleanup cannot preserve speaker boundaries", () => {
+    const attributed = JSON.stringify([
+      {
+        startMs: 0,
+        endMs: 900,
+        text: "old mic words",
+        source: "mic",
+        speaker: "Me",
+      },
+      {
+        startMs: 900,
+        endMs: 1_800,
+        text: "old system words",
+        source: "system",
+        speaker: "Them",
+      },
+    ]);
+
+    expect(
+      resolveCleanupSegmentsJson(
+        attributed,
+        "Cleaned transcript text",
+        120_000,
+      ),
+    ).toBeNull();
+  });
+
+  it("applies shorter cleanup output to unattributed measured cues", () => {
+    const measured = JSON.stringify([
+      { startMs: 0, endMs: 900, text: "filler one" },
+      { startMs: 900, endMs: 1_800, text: "filler two" },
+      { startMs: 1_800, endMs: 2_700, text: "keep this" },
+    ]);
+    const cleaned = JSON.parse(
+      resolveCleanupSegmentsJson(measured, "keep this", 120_000),
+    );
+
+    expect(cleaned.map((segment: { text: string }) => segment.text)).toEqual([
+      "keep",
+      "this",
+    ]);
+    expect(
+      cleaned.map((segment: { startMs: number; endMs: number }) => [
+        segment.startMs,
+        segment.endMs,
+      ]),
+    ).toEqual([
+      [900, 1_800],
+      [1_800, 2_700],
+    ]);
   });
 
   it("synthesizes cues only when no measured timings exist", () => {
@@ -212,8 +301,6 @@ describe("resolveCleanupSegmentsJson", () => {
   });
 
   it("does not stretch a sparse transcript across the whole recording", () => {
-    // A 31-word transcript of a 2-minute clip used to be re-timed into cues
-    // ~4.3s apart, which looked like minute-long gaps of dropped speech.
     const sparse = JSON.stringify([
       { startMs: 0, endMs: 900, text: "I'm in the Builder desktop app," },
       { startMs: 900, endMs: 1_800, text: "and I zipped a PNG file and" },
@@ -222,6 +309,33 @@ describe("resolveCleanupSegmentsJson", () => {
       resolveCleanupSegmentsJson(sparse, "cleaned up text here", 135_000),
     );
     expect(kept[kept.length - 1].endMs).toBe(1_800);
+    expect(kept.map((segment: { text: string }) => segment.text)).toEqual([
+      "cleaned up",
+      "text here",
+    ]);
+  });
+
+  it("does not rewrite no-space speaker cues without a safe alignment", () => {
+    const measured = JSON.stringify([
+      {
+        startMs: 0,
+        endMs: 900,
+        text: "古い字幕",
+        source: "system",
+        speaker: "Them",
+      },
+      {
+        startMs: 900,
+        endMs: 1_800,
+        text: "を確認",
+        source: "mic",
+        speaker: "Me",
+      },
+    ]);
+    const cleanedText = "新しい日本語の字幕です";
+    expect(
+      resolveCleanupSegmentsJson(measured, cleanedText, 120_000),
+    ).toBeNull();
   });
 });
 
@@ -277,7 +391,7 @@ describe("Builder model fallback", () => {
   const options = {
     audioBytes: new Uint8Array([1, 2, 3]),
     mimeType: "audio/webm",
-    diarize: false,
+    diarize: true,
   };
 
   beforeEach(() => {
@@ -322,7 +436,7 @@ describe("requestTranscript regeneration", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockSelectRows.queue = [];
-    mockResolveHasBuilderPrivateKey.mockResolvedValue(true);
+    mockResolveHasBuilderGatewayCredential.mockResolvedValue(true);
     mockAssertAccess.mockResolvedValue({ role: "editor" });
     mockSsrfSafeFetch.mockResolvedValue(
       new Response(new Blob(["recording"], { type: "video/webm" })),
@@ -342,9 +456,6 @@ describe("requestTranscript regeneration", () => {
   });
 
   it("completes transcript-backed title and summary handoff before returning", async () => {
-    mockGetUserSetting.mockResolvedValue({
-      transcriptCleanupEnabled: false,
-    });
     mockRegenerateTitleRun.mockResolvedValue({
       updated: true,
       summaryQueued: true,
@@ -392,6 +503,78 @@ describe("requestTranscript regeneration", () => {
       titleQueued: true,
       summaryQueued: true,
     });
+  });
+
+  it("does not run automatic transcript cleanup", async () => {
+    mockSelectRows.queue = [
+      [
+        {
+          status: "ready",
+          fullText: "Saved transcript.",
+          segmentsJson: existingSegments,
+          updatedAt: "2026-07-09T00:00:00.000Z",
+          language: "en",
+          retryCount: 0,
+        },
+      ],
+      [
+        {
+          title: "Human title",
+          titleSource: "manual",
+          description: "Saved",
+          durationMs: 1200,
+        },
+      ],
+    ];
+
+    const result = await requestTranscript.run({ recordingId: "rec_native" });
+
+    expect(result).toMatchObject({
+      recordingId: "rec_native",
+      status: "ready",
+      cleanupQueued: false,
+    });
+    expect(mockTrack).not.toHaveBeenCalled();
+  });
+
+  it("tracks terminal cloud transcription failure without user content", async () => {
+    mockTranscribeWithBuilder.mockRejectedValue(new Error("private detail"));
+    mockSelectRows.queue = [
+      [{ status: "failed", retryCount: 0 }],
+      [],
+      [
+        {
+          videoUrl: "https://cdn.example.com/recording.webm",
+          videoFormat: "webm",
+          hasAudio: true,
+          durationMs: 1200,
+          title: "Private title",
+        },
+      ],
+      [],
+    ];
+
+    const result = await requestTranscript.run({ recordingId: "rec_failed" });
+
+    expect(result).toMatchObject({
+      recordingId: "rec_failed",
+      status: "failed",
+    });
+    expect(mockTrack).toHaveBeenCalledWith(
+      "recording_transcription_failed",
+      {
+        failure_code: "CLOUD_FAILED",
+        stage: "transcription",
+        retryable: false,
+        output_id: "rec_failed",
+        output_type: "clip",
+      },
+      { userId: "owner@example.com" },
+    );
+    expect(JSON.stringify(mockTrack.mock.calls)).not.toContain(
+      "private detail",
+    );
+    expect(JSON.stringify(mockTrack.mock.calls)).not.toContain("Private title");
   });
 
   it("replaces a ready transcript when regeneration is explicitly requested", async () => {
@@ -560,6 +743,7 @@ describe("requestTranscript regeneration", () => {
       preserved: true,
     });
     expect(mockUpdateSet).not.toHaveBeenCalled();
+    expect(mockTrack).not.toHaveBeenCalled();
   });
 
   it("falls back to Builder when native transcription is unavailable", async () => {
@@ -571,6 +755,7 @@ describe("requestTranscript regeneration", () => {
           startMs: 0,
           endMs: 1200,
           text: "Recovered from the spoken recording.",
+          speakerLabel: "Speaker 1",
         },
       ],
     });
@@ -616,7 +801,26 @@ describe("requestTranscript regeneration", () => {
         status: "ready",
         fullText: "Recovered from the spoken recording.",
         failureReason: null,
+        segmentsJson: JSON.stringify([
+          {
+            startMs: 0,
+            endMs: 1200,
+            text: "Recovered from the spoken recording.",
+            speaker: "Speaker 1",
+          },
+        ]),
       }),
+    );
+    expect(mockTranscribeWithBuilder).toHaveBeenCalledWith(
+      expect.objectContaining({ diarize: true }),
+    );
+    expect(mockTrack).toHaveBeenCalledWith(
+      "recording_completed",
+      expect.objectContaining({
+        recording_attempt_id: "rec_empty",
+        output_id: "rec_empty",
+      }),
+      expect.anything(),
     );
   });
 
@@ -696,16 +900,10 @@ describe("importLoomTranscriptForRecording", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockSelectRows.queue = [];
-    mockGetSetting.mockResolvedValue({ transcriptCleanupEnabled: true });
-    mockGetUserSetting.mockResolvedValue({ transcriptCleanupEnabled: false });
     mockFetchLoomTranscript.mockRejectedValue(
       new Error("temporary Loom error"),
     );
     mockExportToBrainRun.mockResolvedValue({ status: "skipped" });
-    mockCleanupTranscriptRun.mockResolvedValue({
-      cleanedText: "Saved transcript.",
-      provider: "test",
-    });
   });
 
   it("preserves an existing ready transcript when Loom refresh fails", async () => {
@@ -749,14 +947,6 @@ describe("importLoomTranscriptForRecording", () => {
       shareUrl: "https://www.loom.com/share/abcDEF_123456",
       durationMs: 1200,
     });
-    await vi.waitFor(() =>
-      expect(mockGetUserSetting).toHaveBeenCalledWith(
-        "owner@example.com",
-        "clips-user-prefs",
-      ),
-    );
-    expect(mockGetSetting).not.toHaveBeenCalled();
-    expect(mockCleanupTranscriptRun).not.toHaveBeenCalled();
     expect(mockInsertValues).not.toHaveBeenCalled();
     expect(mockUpdateSet).not.toHaveBeenCalled();
   });

@@ -1,9 +1,14 @@
 import { useT } from "@agent-native/core/client/i18n";
 import {
+  FONT_FAMILY_OPTIONS,
+  VisualFontFamilyPicker,
   VisualColorPicker,
   VisualControlRow,
   VisualScrubInput,
   VisualSegmentedControl,
+  displayFontFamilyName,
+  resolveFontFamilySelectValue,
+  sortFontFamilyOptions,
 } from "@agent-native/toolkit/design-tweaks";
 import type { DesignSystemData } from "@shared/api";
 import {
@@ -12,15 +17,23 @@ import {
   IconAlignLeft,
   IconAlignRight,
   IconAngle,
+  IconArrowsLeftRight,
+  IconArrowsUpDown,
   IconArrowAutofitHeight,
   IconArrowAutofitWidth,
+  IconBoxMultiple,
   IconBorderRadius,
   IconBorderStyle,
-  IconBoxPadding,
   IconDots,
   IconGridDots,
   IconItalic,
+  IconMessageCircle,
+  IconLayoutAlignBottom,
+  IconLayoutAlignCenter,
   IconLayoutAlignLeft,
+  IconLayoutAlignMiddle,
+  IconLayoutAlignRight,
+  IconLayoutAlignTop,
   IconLetterCase,
   IconList,
   IconListNumbers,
@@ -28,7 +41,11 @@ import {
   IconSpacingVertical,
   IconStackBack,
   IconStackFront,
+  IconUnlink,
+  IconBolt,
   IconUnderline,
+  IconZoomIn,
+  IconZoomOut,
 } from "@tabler/icons-react";
 import type { ReactNode } from "react";
 
@@ -52,6 +69,11 @@ import {
 import { cn, shortcutLabel } from "@/lib/utils";
 
 import type { SlideListKind } from "./list-editing";
+import type {
+  SlideObjectAlignment,
+  SlideObjectDistribution,
+  SlideObjectZOrderTarget,
+} from "./slide-object-interactions";
 import {
   backgroundCssValue,
   formatValue,
@@ -120,51 +142,97 @@ function alignIcon(textAlign: string) {
   return IconAlignLeft;
 }
 
-/**
- * Horizontal counterpart to the style dock: the same snapshot and patch
- * callback, presented as a row above the canvas so the slide keeps full width.
- * Controls past the first few live in grouped popovers — a flat row overflows
- * once the agent sidebar and slide rail take their share of the width.
- */
 export function SlideContextToolbar({
   snapshot,
   background,
   designSystem,
   className,
   leading,
+  animationsOpen = false,
+  hasSelectedElement = Boolean(snapshot),
+  onOpenAnimations,
+  canComment = false,
+  onComment,
   onChange,
   onBackgroundChange,
   onArrange,
+  onGroup,
+  onUngroup,
   onToggleList,
+  objectSelectionCount = 0,
+  canGroup = false,
+  canUngroup = false,
+  onAlignObjects,
+  onDistributeObjects,
+  zoomControls,
 }: {
   snapshot: SlideStyleSnapshot | null;
   background: string | undefined;
   designSystem?: DesignSystemData;
   className?: string;
-  /** Selection-independent actions pinned to the head of the row. */
   leading?: ReactNode;
+  hasSelectedElement?: boolean;
+  animationsOpen?: boolean;
+  onOpenAnimations?: () => void;
+  canComment?: boolean;
+  onComment?: () => void;
   onChange: (patch: SlideStylePatch) => void;
   onBackgroundChange: (background: string) => void;
-  onArrange?: (target: "front" | "back") => void;
+  onArrange?: (target: SlideObjectZOrderTarget) => void;
+  onGroup?: () => void;
+  onUngroup?: () => void;
   onToggleList?: (kind: SlideListKind) => void;
+  objectSelectionCount?: number;
+  canGroup?: boolean;
+  canUngroup?: boolean;
+  onAlignObjects?: (alignment: SlideObjectAlignment) => void;
+  onDistributeObjects?: (distribution: SlideObjectDistribution) => void;
+  zoomControls?: {
+    value: number;
+    onZoomOut: () => void;
+    onZoomIn: () => void;
+    canZoomOut: boolean;
+    canZoomIn: boolean;
+  };
 }) {
   const t = useT();
   const documentColors = tokenPalette(designSystem, t).map(
     (option) => option.value,
   );
+  const baseFontFamilyOptions = sortFontFamilyOptions(
+    FONT_FAMILY_OPTIONS.map((option) => ({
+      value: option.value,
+      label:
+        option.label ??
+        (option.key
+          ? t(`styleInspector.fontFamilies.${option.key}`)
+          : displayFontFamilyName(option.value)),
+    })),
+  );
   const inlineEditSurfaceProps = {
     "data-slide-inline-edit-surface": "true",
   };
   const mixedTextStyles = snapshot?.mixedTextStyles ?? [];
-  // A mixed selection has no single state to reflect, so the toggle reads as
-  // off and one click makes the whole selection consistent.
+  const fontFamilyIsMixed = mixedTextStyles.includes("fontFamily");
+  const fontFamily = snapshot
+    ? resolveFontFamilySelectValue(snapshot.fontFamily)
+    : "sans-serif";
+  const fontFamilyOptions = sortFontFamilyOptions(
+    !snapshot ||
+      fontFamilyIsMixed ||
+      baseFontFamilyOptions.some((option) => option.value === fontFamily)
+      ? baseFontFamilyOptions
+      : [
+          {
+            value: fontFamily,
+            label: displayFontFamilyName(snapshot.fontFamily || fontFamily),
+          },
+          ...baseFontFamilyOptions,
+        ],
+  );
   const isItalic =
     !mixedTextStyles.includes("fontStyle") &&
     (snapshot?.fontStyle ?? "").startsWith("italic");
-  // A mixed selection has no single size, so the scrub input reports a step as
-  // a relative delta rather than a value. Writing that delta as an absolute
-  // size would set the whole selection to a few pixels; step from the block's
-  // own size instead, which also makes the selection consistent in one click.
   const sizeFor = (value: number, meta?: { relativeDelta?: number }) => {
     const delta = meta?.relativeDelta;
     if (typeof delta !== "number") return value;
@@ -173,9 +241,6 @@ export function SlideContextToolbar({
   const decorationMixed = mixedTextStyles.includes("textDecoration");
   const isUnderline =
     !decorationMixed && (snapshot?.textDecoration ?? "").includes("underline");
-  // Text can carry more than one decoration, and the agent writes
-  // line-through even though no control exposes it. Editing the underline
-  // token in place keeps the rest; writing a bare "none" would erase them.
   const underlinePatch = () => {
     if (decorationMixed) return "underline";
     const tokens = (snapshot?.textDecoration ?? "")
@@ -186,14 +251,14 @@ export function SlideContextToolbar({
       : [...tokens, "underline"];
     return next.length > 0 ? next.join(" ") : "none";
   };
-  // Null means the slide uses a background this picker cannot represent (named
-  // utility, gradient); surface that as Mixed rather than guessing a hex.
   const slideBackground = backgroundCssValue(background);
+  const hasMultiObjectSelection = objectSelectionCount >= 2;
+  const canDistributeObjects = objectSelectionCount >= 3;
 
   return (
     <div
       className={cn(
-        "slide-context-toolbar flex h-10 shrink-0 items-center gap-1 overflow-x-auto whitespace-nowrap border-b border-border/70 bg-muted/60 px-2 sm:px-3",
+        "slide-context-toolbar flex h-10 shrink-0 items-center gap-1 overflow-x-auto whitespace-nowrap bg-transparent px-2 sm:px-3",
         className,
       )}
       data-slide-context-toolbar="true"
@@ -206,21 +271,214 @@ export function SlideContextToolbar({
           <div className={TOOLBAR_DIVIDER} />
         </>
       )}
+      {hasSelectedElement && onOpenAnimations && (
+        <>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className={cn(
+                  MENU_BUTTON_CLASS,
+                  animationsOpen && TOGGLE_ACTIVE_CLASS,
+                )}
+                aria-label={t("animations.title")}
+                aria-pressed={animationsOpen}
+                onClick={onOpenAnimations}
+              >
+                <IconBolt className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{t("animations.title")}</TooltipContent>
+          </Tooltip>
+          <div className={TOOLBAR_DIVIDER} />
+        </>
+      )}
+      {hasSelectedElement && canComment && onComment && (
+        <>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className={MENU_BUTTON_CLASS}
+                aria-label={t("comments.addComment")}
+                onClick={onComment}
+              >
+                <IconMessageCircle className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{t("comments.addComment")}</TooltipContent>
+          </Tooltip>
+          <div className={TOOLBAR_DIVIDER} />
+        </>
+      )}
+      {(canGroup || canUngroup) && (
+        <>
+          {canGroup && onGroup && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className={MENU_BUTTON_CLASS}
+                  aria-label={t("styleInspector.group")}
+                  onClick={onGroup}
+                >
+                  <IconBoxMultiple className="size-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{t("styleInspector.group")}</TooltipContent>
+            </Tooltip>
+          )}
+          {canUngroup && onUngroup && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className={MENU_BUTTON_CLASS}
+                  aria-label={t("styleInspector.ungroup")}
+                  onClick={onUngroup}
+                >
+                  <IconUnlink className="size-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{t("styleInspector.ungroup")}</TooltipContent>
+            </Tooltip>
+          )}
+          <div className={TOOLBAR_DIVIDER} />
+        </>
+      )}
+      {hasMultiObjectSelection && (
+        <>
+          <DropdownMenu>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className={MENU_BUTTON_CLASS}
+                    aria-label={t("styleInspector.align")}
+                  >
+                    <IconLayoutAlignLeft className="size-3.5" />
+                  </Button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent>{t("styleInspector.align")}</TooltipContent>
+            </Tooltip>
+            <DropdownMenuContent
+              align="start"
+              className="w-44"
+              {...inlineEditSurfaceProps}
+            >
+              <DropdownMenuItem onSelect={() => onAlignObjects?.("left")}>
+                <IconLayoutAlignLeft className="size-4" />
+                {t("styleInspector.left")}
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => onAlignObjects?.("center")}>
+                <IconLayoutAlignCenter className="size-4" />
+                {t("styleInspector.center")}
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => onAlignObjects?.("right")}>
+                <IconLayoutAlignRight className="size-4" />
+                {t("styleInspector.right")}
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => onAlignObjects?.("top")}>
+                <IconLayoutAlignTop className="size-4" />
+                {t("styleInspector.top")}
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => onAlignObjects?.("middle")}>
+                <IconLayoutAlignMiddle className="size-4" />
+                {t("styleInspector.middle")}
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => onAlignObjects?.("bottom")}>
+                <IconLayoutAlignBottom className="size-4" />
+                {t("styleInspector.bottom")}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          <DropdownMenu>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className={MENU_BUTTON_CLASS}
+                    aria-label={t("styleInspector.distribute")}
+                  >
+                    <IconArrowsLeftRight className="size-3.5" />
+                  </Button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent>
+                {`${t("styleInspector.distribute")} (${objectSelectionCount})`}
+              </TooltipContent>
+            </Tooltip>
+            <DropdownMenuContent
+              align="start"
+              className="w-52"
+              {...inlineEditSurfaceProps}
+            >
+              <DropdownMenuItem
+                disabled={!canDistributeObjects}
+                onSelect={() => onDistributeObjects?.("horizontal")}
+              >
+                <IconArrowsLeftRight className="size-4" />
+                {t("styleInspector.horizontal")}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                disabled={!canDistributeObjects}
+                onSelect={() => onDistributeObjects?.("vertical")}
+              >
+                <IconArrowsUpDown className="size-4" />
+                {t("styleInspector.vertical")}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <div className={TOOLBAR_DIVIDER} />
+        </>
+      )}
       {!snapshot ? (
-        <VisualColorPicker
-          label={t("styleInspector.slideBackground")}
-          value={slideBackground ?? ""}
-          mixed={slideBackground === null}
-          mixedLabel={t("styleInspector.mixed")}
-          documentColors={documentColors}
-          variant="swatch"
-          contentProps={inlineEditSurfaceProps}
-          onChange={onBackgroundChange}
-        />
+        hasMultiObjectSelection ? null : (
+          <VisualColorPicker
+            label={t("styleInspector.slideBackground")}
+            value={slideBackground ?? ""}
+            mixed={slideBackground === null}
+            mixedLabel={t("styleInspector.mixed")}
+            documentColors={documentColors}
+            variant="swatch"
+            contentProps={inlineEditSurfaceProps}
+            onChange={onBackgroundChange}
+          />
+        )
       ) : (
         <>
           {snapshot.isText ? (
             <>
+              <VisualFontFamilyPicker
+                label={t("styleInspector.fontFamily")}
+                value={fontFamily}
+                options={fontFamilyOptions}
+                mixed={fontFamilyIsMixed}
+                mixedLabel={t("styleInspector.mixed")}
+                className={cn(
+                  VALUE_MENU_CLASS,
+                  "w-32 border-0 bg-transparent px-1.5 shadow-none focus:ring-0 focus:ring-offset-0",
+                )}
+                contentProps={inlineEditSurfaceProps}
+                onChange={(value) => onChange({ fontFamily: value })}
+              />
+              <div className={TOOLBAR_DIVIDER} />
               <VisualScrubInput
                 label={t("styleInspector.size")}
                 icon={IconLetterCase}
@@ -262,7 +520,11 @@ export function SlideContextToolbar({
                   </TooltipTrigger>
                   <TooltipContent>{t("styleInspector.weight")}</TooltipContent>
                 </Tooltip>
-                <DropdownMenuContent align="start" className="w-36">
+                <DropdownMenuContent
+                  align="start"
+                  className="w-36"
+                  {...inlineEditSurfaceProps}
+                >
                   {fontWeightOptions(t).map((option) => (
                     <DropdownMenuItem
                       key={option.value}
@@ -357,7 +619,11 @@ export function SlideContextToolbar({
                   </TooltipTrigger>
                   <TooltipContent>{t("styleInspector.align")}</TooltipContent>
                 </Tooltip>
-                <DropdownMenuContent align="start" className="w-36">
+                <DropdownMenuContent
+                  align="start"
+                  className="w-36"
+                  {...inlineEditSurfaceProps}
+                >
                   {textAlignOptions(t).map((option) => (
                     <DropdownMenuItem
                       key={option.value}
@@ -557,7 +823,7 @@ export function SlideContextToolbar({
             </Popover>
           )}
 
-          {snapshot.isAbsolute && onArrange && (
+          {(snapshot.isAbsolute || objectSelectionCount >= 2) && onArrange && (
             <>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -583,6 +849,23 @@ export function SlideContextToolbar({
                     variant="ghost"
                     size="icon"
                     className={MENU_BUTTON_CLASS}
+                    onClick={() => onArrange("backward")}
+                    aria-label={t("styleInspector.sendBackward")}
+                  >
+                    <IconStackBack className="size-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {t("styleInspector.sendBackward")}
+                </TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className={MENU_BUTTON_CLASS}
                     onClick={() => onArrange("front")}
                     aria-label={t("styleInspector.bringToFront")}
                   >
@@ -591,6 +874,23 @@ export function SlideContextToolbar({
                 </TooltipTrigger>
                 <TooltipContent>
                   {t("styleInspector.bringToFront")}
+                </TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className={MENU_BUTTON_CLASS}
+                    onClick={() => onArrange("forward")}
+                    aria-label={t("styleInspector.bringForward")}
+                  >
+                    <IconStackFront className="size-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {t("styleInspector.bringForward")}
                 </TooltipContent>
               </Tooltip>
             </>
@@ -797,6 +1097,46 @@ export function SlideContextToolbar({
               )}
             </PopoverContent>
           </Popover>
+        </>
+      )}
+      {zoomControls && (
+        <>
+          <div className={cn(TOOLBAR_DIVIDER, "ml-auto")} />
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className={MENU_BUTTON_CLASS}
+                onClick={zoomControls.onZoomOut}
+                disabled={!zoomControls.canZoomOut}
+                aria-label={t("raw.zoomOut")}
+              >
+                <IconZoomOut className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{t("raw.zoomOut")}</TooltipContent>
+          </Tooltip>
+          <span className="w-11 shrink-0 text-center text-xs tabular-nums text-muted-foreground">
+            {zoomControls.value}%
+          </span>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className={MENU_BUTTON_CLASS}
+                onClick={zoomControls.onZoomIn}
+                disabled={!zoomControls.canZoomIn}
+                aria-label={t("raw.zoomIn")}
+              >
+                <IconZoomIn className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{t("raw.zoomIn")}</TooltipContent>
+          </Tooltip>
         </>
       )}
     </div>

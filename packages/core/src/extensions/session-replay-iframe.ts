@@ -10,11 +10,6 @@ export const RRWEB_RECORD_IFRAME_CDN_URL =
 export const RRWEB_RECORD_IFRAME_SRI =
   "sha384-MrD66HBNSykaP2N95+6hQCFlF5oH2tvL3TD/zyvHNkP/sAFWZx98DX9MEDy8MdVT";
 
-/**
- * Installs the cooperative side of rrweb's cross-origin iframe protocol.
- * Nothing is fetched or recorded until a trusted first-party parent asks the
- * frame to start. rrweb then forwards its events directly to that parent.
- */
 export function buildSessionReplayIframeBootstrap(): string {
   const probeType = JSON.stringify(SESSION_REPLAY_IFRAME_PROBE);
   const startType = JSON.stringify(SESSION_REPLAY_IFRAME_START);
@@ -117,13 +112,23 @@ export function buildSessionReplayIframeBootstrap(): string {
   </script>`;
 }
 
+function maskUnparsedRegions(html: string): string {
+  const regions =
+    /<!--[\s\S]*?-->|<(script|style|title|textarea|xmp|noembed|noframes|iframe)\b[^>]*>[\s\S]*?<\/\1\s*>/gi;
+  const plaintext = /<plaintext\b[^>]*>[\s\S]*$/i;
+  return html
+    .replace(regions, (region) => " ".repeat(region.length))
+    .replace(plaintext, (region) => " ".repeat(region.length));
+}
+
 export function injectSessionReplayIframeBootstrap(html: string): string {
   const bootstrap = buildSessionReplayIframeBootstrap();
-  const headClose = html.search(/<\/head\s*>/i);
+  const markup = maskUnparsedRegions(html);
+  const headClose = markup.search(/<\/head\s*>/i);
   if (headClose >= 0) {
     return `${html.slice(0, headClose)}${bootstrap}${html.slice(headClose)}`;
   }
-  const bodyOpen = html.search(/<body(?:\s[^>]*)?>/i);
+  const bodyOpen = markup.search(/<body(?:\s[^>]*)?>/i);
   if (bodyOpen >= 0) {
     return `${html.slice(0, bodyOpen)}${bootstrap}${html.slice(bodyOpen)}`;
   }

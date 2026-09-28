@@ -1,6 +1,6 @@
 {
   "name": "@agent-native/toolkit",
-  "version": "0.13.2",
+  "version": "0.22.3",
   "description": "Reusable app-building UI and helpers for Agent-Native apps.",
   "homepage": "https://github.com/BuilderIO/agent-native#readme",
   "bugs": {
@@ -47,6 +47,14 @@
       "import": "./dist/app-shell/*.js",
       "default": "./dist/app-shell/*.js"
     },
+    "./app-shell/prompt-home.css": "./dist/app-shell/prompt-home.css",
+    "./agentkit": {
+      "types": "./dist/agentkit.d.ts",
+      "browser": "./dist/agentkit.js",
+      "development": "./dist/agentkit.js",
+      "import": "./dist/agentkit.js",
+      "default": "./dist/agentkit.js"
+    },
     "./collab-ui": {
       "types": "./dist/collab-ui/index.d.ts",
       "browser": "./dist/collab-ui/index.js",
@@ -74,6 +82,20 @@
       "development": "./dist/dashboard/*.js",
       "import": "./dist/dashboard/*.js",
       "default": "./dist/dashboard/*.js"
+    },
+    "./data-grid": {
+      "types": "./dist/data-grid/index.d.ts",
+      "browser": "./dist/data-grid/index.js",
+      "development": "./dist/data-grid/index.js",
+      "import": "./dist/data-grid/index.js",
+      "default": "./dist/data-grid/index.js"
+    },
+    "./data-grid/*": {
+      "types": "./dist/data-grid/*.d.ts",
+      "browser": "./dist/data-grid/*.js",
+      "development": "./dist/data-grid/*.js",
+      "import": "./dist/data-grid/*.js",
+      "default": "./dist/data-grid/*.js"
     },
     "./chat-history": {
       "types": "./dist/chat-history/index.d.ts",
@@ -116,6 +138,13 @@
       "development": "./dist/canvas-interactions/*.js",
       "import": "./dist/canvas-interactions/*.js",
       "default": "./dist/canvas-interactions/*.js"
+    },
+    "./clipboard": {
+      "types": "./dist/clipboard.d.ts",
+      "browser": "./dist/clipboard.js",
+      "development": "./dist/clipboard.js",
+      "import": "./dist/clipboard.js",
+      "default": "./dist/clipboard.js"
     },
     "./composer": {
       "types": "./dist/composer/index.d.ts",
@@ -194,6 +223,14 @@
       "import": "./dist/hooks/index.js",
       "default": "./dist/hooks/index.js"
     },
+    "./icons": {
+      "types": "./dist/icons/index.d.ts",
+      "browser": "./dist/icons/index.js",
+      "node": "./dist/icons/server.js",
+      "development": "./dist/icons/index.js",
+      "import": "./dist/icons/index.js",
+      "default": "./dist/icons/index.js"
+    },
     "./hooks/*": {
       "types": "./dist/hooks/*.d.ts",
       "browser": "./dist/hooks/*.js",
@@ -257,6 +294,20 @@
       "import": "./dist/utils.js",
       "default": "./dist/utils.js"
     },
+    "./streaming-text-smoothing": {
+      "types": "./dist/streaming-text-smoothing.d.ts",
+      "browser": "./dist/streaming-text-smoothing.js",
+      "development": "./dist/streaming-text-smoothing.js",
+      "import": "./dist/streaming-text-smoothing.js",
+      "default": "./dist/streaming-text-smoothing.js"
+    },
+    "./markdown-block-split": {
+      "types": "./dist/markdown-block-split.d.ts",
+      "browser": "./dist/markdown-block-split.js",
+      "development": "./dist/markdown-block-split.js",
+      "import": "./dist/markdown-block-split.js",
+      "default": "./dist/markdown-block-split.js"
+    },
     "./agent-native.eject.json": "./agent-native.eject.json",
     "./migration-manifest.json": "./migration-manifest.json",
     "./styles.css": "./dist/styles.css",
@@ -271,10 +322,12 @@
     "build": "tsc && node scripts/finalize-build.mjs",
     "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit",
-    "test": "vitest --run --passWithNoTests"
+    "test": "vitest --run --dir src --passWithNoTests"
   },
   "dependencies": {
     "@assistant-ui/react": "catalog:",
+    "@assistant-ui/store": "catalog:",
+    "@assistant-ui/tap": "catalog:",
     "@radix-ui/react-accordion": "^1.2.15",
     "@radix-ui/react-alert-dialog": "^1.1.18",
     "@radix-ui/react-aspect-ratio": "^1.1.11",
@@ -302,11 +355,13 @@
     "@radix-ui/react-toggle": "^1.1.13",
     "@radix-ui/react-toggle-group": "^1.1.14",
     "@radix-ui/react-tooltip": "catalog:",
-    "@tabler/icons-react": "^3.41.1",
+    "@tabler/icons-react": "3.44.0",
     "@tiptap/core": "catalog:",
+    "@tiptap/extension-bubble-menu": "catalog:",
     "@tiptap/extension-code-block-lowlight": "catalog:",
     "@tiptap/extension-collaboration": "catalog:",
     "@tiptap/extension-collaboration-caret": "catalog:",
+    "@tiptap/extension-floating-menu": "catalog:",
     "@tiptap/extension-image": "catalog:",
     "@tiptap/extension-link": "catalog:",
     "@tiptap/extension-placeholder": "catalog:",
@@ -326,6 +381,7 @@
     "culori": "^4.0.2",
     "date-fns": "^4.4.0",
     "embla-carousel-react": "^8.6.0",
+    "emojibase-data": "17.0.0",
     "highlight.js": "catalog:",
     "input-otp": "^1.4.2",
     "lowlight": "catalog:",

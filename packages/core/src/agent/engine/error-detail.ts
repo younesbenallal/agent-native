@@ -1,23 +1,26 @@
-/**
- * Compose an error's message with its `cause` chain.
- *
- * Provider SDKs collapse the real failure into a generic wrapper message —
- * the Anthropic SDK reports every transport failure as exactly
- * "Connection error." and undici reports "fetch failed" — and keep the actual
- * reason (ECONNRESET, UND_ERR_SOCKET, TLS failure, request too large) only on
- * `.cause`. Recording `err.message` alone makes every one of them
- * indistinguishable after the fact, which is how a whole class of production
- * failures becomes undiagnosable.
- */
+import { parseRetryAfterMs } from "../../shared/retry-after.js";
+
 const DEFAULT_MAX_CAUSE_LINKS = 4;
 const MAX_CAUSE_LINK_CHARS = 200;
+
+function stringifyUnknown(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  try {
+    return JSON.stringify(value) ?? "";
+  } catch {
+    return Object.prototype.toString.call(value);
+  }
+}
 
 export function describeErrorWithCauses(
   err: unknown,
   maxLinks: number = DEFAULT_MAX_CAUSE_LINKS,
 ): string {
   const head =
-    err instanceof Error ? err.message : String(err ?? "Unknown error");
+    err instanceof Error
+      ? err.message
+      : stringifyUnknown(err) || "Unknown error";
   const links: string[] = [];
   const seen = new Set<unknown>([err]);
   let cause: unknown = (err as { cause?: unknown } | null)?.cause;
@@ -25,7 +28,8 @@ export function describeErrorWithCauses(
     if (seen.has(cause)) break;
     seen.add(cause);
     const code = (cause as { code?: unknown }).code;
-    const message = cause instanceof Error ? cause.message : String(cause);
+    const message =
+      cause instanceof Error ? cause.message : stringifyUnknown(cause);
     const text = (typeof code === "string" ? `${code} ${message}` : message)
       .trim()
       .slice(0, MAX_CAUSE_LINK_CHARS);
@@ -35,26 +39,6 @@ export function describeErrorWithCauses(
   return links.length > 0 ? `${head} (cause: ${links.join(" <- ")})` : head;
 }
 
-/**
- * The single provider-transport-failure classifier. Every layer that decides
- * "is this a network blip?" — engine error codes, run-level retry, Sentry
- * suppression — must call THIS, on `describeErrorWithCauses(err)` rather than
- * on a bare `err.message`.
- *
- * Four divergent copies of this predicate existed, and they disagreed on
- * exactly the string production actually throws. The AI SDK's `RetryError`
- * reports `"Failed after 2 attempts. Last error: Cannot connect to API: …"`,
- * so a copy anchored with `startsWith` scored it as unclassified while a copy
- * using `includes` scored it as retryable. The result was a split brain: the
- * agent loop retried the turn, but the run persisted `error_code = 'unknown'`,
- * which the client does not list as auto-recoverable — so a transient TLS
- * reset ended the user's chat with a dead error instead of resuming. That one
- * mismatch accounted for ~150 failed production runs in a week.
- *
- * Substring matching is deliberate: the real message is always a provider SDK
- * wrapper around the transport error, never bare, and the wrapper prefix
- * differs per SDK and per version.
- */
 export function isProviderConnectionErrorMessage(message: string): boolean {
   const normalized = message.toLowerCase();
   return (
@@ -63,39 +47,110 @@ export function isProviderConnectionErrorMessage(message: string): boolean {
   );
 }
 
-/** `isProviderConnectionErrorMessage` over an error's full cause chain. */
 export function isProviderConnectionError(err: unknown): boolean {
   return isProviderConnectionErrorMessage(describeErrorWithCauses(err));
 }
 
-/** Classification fields an AI SDK provider failure carries. */
+export function isContextOverflowMessage(message: string): boolean {
+  const msg = message.toLowerCase();
+  return (
+    msg.includes("context_length_exceeded") ||
+    msg.includes("input_too_long") ||
+    msg.includes("too many tokens") ||
+    msg.includes("prompt is too long") ||
+    msg.includes("reduce the length") ||
+    msg.includes("input token count exceeds") ||
+    msg.includes("request too large")
+  );
+}
+
+export const BUILDER_GATEWAY_INTERNAL_ERROR_CODE =
+  "builder_gateway_internal_error";
+
+export const PROVIDER_TRANSIENT_REJECTION_ERROR_CODE =
+  "provider_transient_rejection";
+
+export const PROVIDER_RATE_LIMITED_ERROR_CODE = "provider_rate_limited";
+
+export function isCreditsLimitErrorCode(errorCode?: string): boolean {
+  const code = errorCode?.trim().toLowerCase();
+  return code === "http_402" || code?.startsWith("credits-limit") === true;
+}
+
+export function isBareProviderRejectionMessage(message: string): boolean {
+  const trimmed = message.trim();
+  return (
+    trimmed === "" ||
+    /^forbidden$/i.test(trimmed) ||
+    /^403 status code(?: \(no body\))?$/i.test(trimmed) ||
+    /^builder gateway returned 403$/i.test(trimmed)
+  );
+}
+
+const BUILDER_GATEWAY_ERROR_ID_PATTERN = /\berror id:\s*([0-9a-f]+)\b/i;
+const BUILDER_GATEWAY_ERROR_ID_MIN_CHARS = 8;
+const BUILDER_GATEWAY_ERROR_PREFIX_PATTERN =
+  /^sorry,\s+(?:we ran into an issue processing your request|this was caused by an internal error)\b/i;
+
+export function isBuilderGatewayInternalErrorMessage(message: string): boolean {
+  const match = BUILDER_GATEWAY_ERROR_ID_PATTERN.exec(message);
+  return (
+    BUILDER_GATEWAY_ERROR_PREFIX_PATTERN.test(message) &&
+    match !== null &&
+    match[1].length >= BUILDER_GATEWAY_ERROR_ID_MIN_CHARS
+  );
+}
+
+export function canonicalizeBuilderGatewayErrorCode(
+  code: string | undefined,
+  message: string,
+): string | undefined {
+  return (code === undefined || code === "provider_internal_error") &&
+    isBuilderGatewayInternalErrorMessage(message)
+    ? BUILDER_GATEWAY_INTERNAL_ERROR_CODE
+    : code;
+}
+
+export function isContextOverflowCode(code: string | undefined): boolean {
+  const normalized = (code ?? "").toLowerCase();
+  return (
+    normalized.includes("context_length") ||
+    normalized.includes("input_too_long")
+  );
+}
+
 export interface ProviderErrorClassification {
   errorCode?: string;
   statusCode?: number;
   providerRetryable?: boolean;
+  retryAfterMs?: number;
 }
 
-/**
- * Classify a provider error from the AI SDK, whichever way it surfaced.
- *
- * `streamText` does not throw for a failed provider request — it emits an
- * `error` part on `fullStream` — so there are two arrival paths, and only the
- * thrown one used to be classified. The stream-part path discarded
- * `statusCode`, `errorCode`, and `isRetryable` entirely, which is why every
- * provider HTTP failure on an ai-sdk engine landed as `unknown`: a 429 was only
- * retried if its prose happened to contain "rate_limit", and a
- * 100%-reproducible config 400 was indistinguishable from any other unclassified
- * failure, so it had no signature to alert on. Both call sites go through here.
- *
- * `timedOut` is the caller's own first-event deadline, which only the streaming
- * path can know.
- */
+const MAX_RETRY_AFTER_MS = 60_000;
+
+export function extractRetryAfterMs(err: unknown): number | undefined {
+  const wrapped = err as { lastError?: unknown; cause?: unknown } | null;
+  for (const source of [err, wrapped?.lastError, wrapped?.cause]) {
+    const headers = (source as { responseHeaders?: unknown } | null)
+      ?.responseHeaders;
+    if (!headers || typeof headers !== "object") continue;
+    const ms = parseRetryAfterMs(headers as Record<string, string>);
+    if (ms !== null) {
+      if (ms > MAX_RETRY_AFTER_MS) {
+        console.warn(
+          `[classifyProviderError] Retry-After ${ms}ms exceeds cap; using ${MAX_RETRY_AFTER_MS}ms`,
+        );
+      }
+      return Math.min(ms, MAX_RETRY_AFTER_MS);
+    }
+  }
+  return undefined;
+}
+
 export function classifyProviderError(
   err: unknown,
   timedOut = false,
 ): ProviderErrorClassification {
-  // The AI SDK wraps exhausted retries in RetryError and keeps the final
-  // APICallError on `lastError`.
   const wrapped = err as { lastError?: unknown } | null;
   const providerError = (
     wrapped?.lastError instanceof Error ? wrapped.lastError : err
@@ -110,10 +165,6 @@ export function classifyProviderError(
       ? providerError.statusCode
       : undefined;
 
-  // Classify on the cause chain of the ORIGINAL error, not the unwrapped one:
-  // when RetryError does not expose `lastError` as an Error the unwrap falls
-  // back to the wrapper, whose message ("Failed after 2 attempts. Last error:
-  // …") only *embeds* the transport failure. Matching the wrapper is the point.
   const described = describeErrorWithCauses(err);
   const isConnectionError =
     !timedOut &&
@@ -122,31 +173,49 @@ export function classifyProviderError(
       isProviderConnectionErrorMessage(
         typeof providerError?.message === "string"
           ? providerError.message
-          : String(providerError),
+          : stringifyUnknown(providerError),
+      ));
+
+  const isBareRejection =
+    statusCode === 403 &&
+    providerError?.isRetryable !== false &&
+    (isBareProviderRejectionMessage(described) ||
+      isBareProviderRejectionMessage(
+        typeof providerError?.message === "string"
+          ? providerError.message
+          : stringifyUnknown(providerError),
       ));
 
   const providerRetryable =
     typeof providerError?.isRetryable === "boolean"
       ? providerError.isRetryable
-      : isConnectionError || timedOut
+      : isConnectionError || isBareRejection || timedOut
         ? true
         : undefined;
+
+  const retryAfterMs = extractRetryAfterMs(err);
 
   return {
     // Tag every known status as `http_<status>` (not just 401) so a rate limit
     // surfaces as `http_429`: the structured statusCode drives turn-level
-    // retries, but run-level continuation keys off the errorCode.
+    // retries, but run-level continuation keys off the errorCode. A bare 403
+    // is the one status that gets a different code instead of `http_403`,
+    // because that code is the client's credential-rejected signal.
     ...(statusCode !== undefined
-      ? { errorCode: `http_${statusCode}`, statusCode }
+      ? isBareRejection
+        ? {
+            errorCode: PROVIDER_TRANSIENT_REJECTION_ERROR_CODE,
+            statusCode,
+          }
+        : { errorCode: `http_${statusCode}`, statusCode }
       : isConnectionError || timedOut
         ? { errorCode: "provider_network_error" }
-        : // Nothing structured — fall back to reading the message, so a
-          // stream-part 529/timeout is not silently unclassified.
-          (() => {
+        : (() => {
             const code = classifyTerminalErrorCode(described);
             return code ? { errorCode: code } : {};
           })()),
     ...(providerRetryable !== undefined ? { providerRetryable } : {}),
+    ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
   };
 }
 
@@ -171,7 +240,6 @@ export function classifyTerminalErrorCode(
   if (!message) return undefined;
   const msg = message.toLowerCase();
   if (isProviderConnectionErrorMessage(msg)) return "provider_network_error";
-  // Word-bounded: request ids and hashes routinely contain a bare "529".
   if (msg.includes("overloaded") || /\b529\b/.test(msg)) {
     return "overloaded_error";
   }
@@ -188,16 +256,6 @@ export function classifyTerminalErrorCode(
   if (msg.includes("stream ended without a stop event")) {
     return "builder_gateway_network_error";
   }
-  // Deterministic below this line — named so they stop landing in `unknown`,
-  // never retried. Both were measured against the 13 prod app DBs over
-  // 2026-07-24..31: 27 turns/week and 14 turns/week respectively, each with
-  // exactly 1.00 runs/turn, i.e. the chat died on the first attempt showing
-  // the raw provider sentence.
-  //
-  // The request side already avoids emitting reasoning_effort alongside tools
-  // (see ai-sdk-engine.ts). This classifies the failure for the paths that
-  // still reach the provider — another gateway, a stale deploy — so it reads
-  // as a configuration problem rather than a mystery.
   if (
     msg.includes("reasoning_effort are not supported") ||
     msg.includes("reasoning_effort to 'none'") ||
@@ -215,6 +273,9 @@ export function classifyTerminalErrorCode(
     )
   ) {
     return "provider_network_error";
+  }
+  if (isBuilderGatewayInternalErrorMessage(message)) {
+    return BUILDER_GATEWAY_INTERNAL_ERROR_CODE;
   }
   return undefined;
 }

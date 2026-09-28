@@ -9,6 +9,7 @@ import {
   appendFinalTranscript,
   recordingTranscriptionLanguage,
   isMicEcho,
+  resetTranscriptionTimeline,
   restartTranscriptionEngine,
   startTranscriptionEngine,
   transcriptFullText,
@@ -16,7 +17,6 @@ import {
   type TranscriptLine,
 } from "./transcription-engine";
 
-/** A final-transcript event carrying one segment of `text`. */
 function said(
   source: "mic" | "system",
   text: string,
@@ -61,8 +61,6 @@ describe("transcript echo suppression", () => {
   it("retracts a mic echo once the system copy of it arrives", () => {
     const lines: TranscriptLine[] = [];
 
-    // The mic finalizes first, so without retraction the remote speaker's
-    // words would stay attributed to the user.
     appendFinalTranscript(
       said("mic", "Send the pull request button", 1_100),
       lines,
@@ -85,7 +83,6 @@ describe("transcript echo suppression", () => {
       said("system", "So I think we should ship the redesign on Friday", 4_000),
       lines,
     );
-    // Whisper transcribes speaker bleed badly: words drop out and change.
     expect(
       appendFinalTranscript(
         said("mic", "So I think we should ship a redesign Friday", 4_300),
@@ -196,9 +193,6 @@ describe("transcript echo suppression", () => {
     ).toBe(true);
   });
 
-  // Echo repeats a whole utterance. A brief interjection whose words all
-  // happen to appear, in order, somewhere in a long remote passage is the user
-  // talking, and silently deleting that is far worse than keeping echo.
   it.each([
     ["Sorry, go ahead", "Right, go ahead and start whenever you are ready"],
     ["Yeah, I think so", "I don't think so, we should just ship it"],
@@ -216,9 +210,6 @@ describe("transcript echo suppression", () => {
     expect(lines).toHaveLength(2);
   });
 
-  // Captured off a real speaker-mode call. Whisper hears the bleed well enough
-  // to keep the sentence structure but mangles the nouns and the digits, which
-  // is why both exact and set-based matching let it through.
   it("matches a real mangled echo of a long utterance", () => {
     const lines: TranscriptLine[] = [];
 
@@ -285,6 +276,90 @@ describe("transcript echo suppression", () => {
         lines,
       ),
     ).toBe(false);
+  });
+});
+
+describe("transcriptSegments", () => {
+  it("keeps a source-tagged fallback segment for a line with no verbatim timings", () => {
+    const lines: TranscriptLine[] = [
+      { source: "mic", startMs: 1_000, text: "Hello there", segments: [] },
+    ];
+
+    const segments = transcriptSegments(lines);
+    expect(segments).toHaveLength(1);
+    expect(segments[0].source).toBe("mic");
+    expect(segments[0].text).toBe("Hello there");
+  });
+
+  it("gives untimed lines monotonic, non-overlapping timings", () => {
+    const lines: TranscriptLine[] = [
+      {
+        source: "mic",
+        startMs: null,
+        text: "Hello there friend",
+        segments: [],
+      },
+      { source: "mic", startMs: null, text: "How are you doing", segments: [] },
+      { source: "mic", startMs: null, text: "Good to hear it", segments: [] },
+    ];
+
+    const segments = transcriptSegments(lines);
+    expect(segments).toHaveLength(3);
+    segments.forEach((segment, index) => {
+      expect(segment.endMs).toBeGreaterThan(segment.startMs);
+      if (index > 0) {
+        expect(segment.startMs).toBeGreaterThanOrEqual(
+          segments[index - 1].endMs,
+        );
+      }
+    });
+  });
+
+  it("does not let a stale line timestamp move a segment backwards", () => {
+    const lines: TranscriptLine[] = [
+      {
+        source: "system",
+        startMs: 5_000,
+        text: "First",
+        segments: [
+          { startMs: 5_000, endMs: 8_000, text: "First", source: "system" },
+        ],
+      },
+      {
+        source: "mic",
+        startMs: 1_000,
+        text: "Stale earlier stamp",
+        segments: [],
+      },
+    ];
+
+    const segments = transcriptSegments(lines);
+    expect(segments[1].startMs).toBeGreaterThanOrEqual(segments[0].endMs);
+  });
+
+  it("preserves per-line source across a mix of timed and untimed lines", () => {
+    const lines: TranscriptLine[] = [
+      {
+        source: "system",
+        startMs: 0,
+        text: "Let's get started",
+        segments: [
+          {
+            startMs: 0,
+            endMs: 2_000,
+            text: "Let's get started",
+            source: "system",
+          },
+        ],
+      },
+      { source: "mic", startMs: 2_000, text: "Sounds good", segments: [] },
+    ];
+
+    const segments = transcriptSegments(lines);
+    expect(segments.map((segment) => segment.source)).toEqual([
+      "system",
+      "mic",
+    ]);
   });
 });
 
@@ -372,6 +447,15 @@ describe("meeting microphone capture", () => {
     });
   });
 
+  it("rebases a resumed Whisper session to the recording timeline", async () => {
+    await resetTranscriptionTimeline("whisper", 12_345.4);
+
+    expect(invokeMock).toHaveBeenCalledWith(
+      "audio_transcription_reset_timeline",
+      { offsetMs: 12_345 },
+    );
+  });
+
   it("falls back to native speech when the local Whisper capture cannot start", async () => {
     invokeMock
       .mockRejectedValueOnce(new Error("local meeting capture unavailable"))
@@ -383,7 +467,7 @@ describe("meeting microphone capture", () => {
 
     expect(engine).toBe("macos-native");
     expect(invokeMock).toHaveBeenNthCalledWith(2, "native_speech_start", {
-      locale: "en-US",
+      locale: navigator.language || "en-US",
       micDeviceId: "mic-1",
       micDeviceLabel: "Built-in Microphone",
       owner: "meeting",
@@ -453,7 +537,7 @@ describe("meeting microphone capture", () => {
       "Your selected microphone is no longer available. Clips tried your Mac's default microphone, but notes still could not start. Choose an available microphone in Clips settings, then try again.",
     );
     expect(invokeMock).toHaveBeenNthCalledWith(3, "native_speech_start", {
-      locale: "en-US",
+      locale: navigator.language || "en-US",
       micDeviceId: null,
       micDeviceLabel: null,
       owner: "meeting",

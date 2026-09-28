@@ -1,17 +1,6 @@
-/**
- * Durable links between a verified provider identity and an Agent Native user.
- * Provider credentials and raw provider payloads never belong in this table.
- */
-
 import { randomUUID } from "node:crypto";
 
-import {
-  getDbExec,
-  intType,
-  isPostgres,
-  isUniqueViolation,
-  retryOnDdlRace,
-} from "../db/client.js";
+import { getDbExec, isUniqueViolation, retryOnDdlRace } from "../db/client.js";
 import { ensureIndexExists, ensureTableExists } from "../db/ddl-guard.js";
 
 const TABLE = "integration_identity_links";
@@ -29,7 +18,7 @@ export interface IntegrationIdentityLink {
 }
 
 function createSql(): string {
-  const integer = intType();
+  const integer = "BIGINT";
   return `CREATE TABLE IF NOT EXISTS ${TABLE} (
     id TEXT PRIMARY KEY,
     platform TEXT NOT NULL,
@@ -55,11 +44,11 @@ const INDEXES = [
   ],
 ] as const;
 
-async function ensureTable(): Promise<void> {
+export async function ensureTable(): Promise<void> {
   if (!_initPromise) {
     _initPromise = (async () => {
       const client = getDbExec();
-      if (isPostgres()) {
+      {
         await ensureTableExists(TABLE, createSql());
         for (const [name, sql] of INDEXES) {
           await ensureIndexExists(name, sql);
@@ -130,7 +119,6 @@ function matchesVerifiedLink(
   return row.userEmail === input.userEmail && row.orgId === input.orgId;
 }
 
-/** Persist a verified mapping and fail closed if it changes identity later. */
 export async function upsertVerifiedIntegrationIdentity(input: {
   platform: string;
   tenantId: string;
@@ -152,7 +140,7 @@ export async function upsertVerifiedIntegrationIdentity(input: {
   if (existing) {
     if (!matchesVerifiedLink(existing, { userEmail, orgId })) {
       throw new Error(
-        "This provider identity is already linked to a different Agent Native account.",
+        "This provider identity is already linked to a different Agent-Native account.",
       );
     }
     const updatedAt = Date.now();
@@ -191,7 +179,7 @@ export async function upsertVerifiedIntegrationIdentity(input: {
     );
     if (!raced || !matchesVerifiedLink(raced, { userEmail, orgId })) {
       throw new Error(
-        "This provider identity is already linked to a different Agent Native account.",
+        "This provider identity is already linked to a different Agent-Native account.",
       );
     }
     return raced;

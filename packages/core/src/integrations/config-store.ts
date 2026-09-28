@@ -1,31 +1,25 @@
-import { getDbExec, isPostgres, intType } from "../db/client.js";
+import { getDbExec } from "../db/client.js";
 import { ensureTableExists } from "../db/ddl-guard.js";
 
 let _initPromise: Promise<void> | undefined;
 
-async function ensureTable(): Promise<void> {
+export async function ensureTable(): Promise<void> {
   if (!_initPromise) {
     _initPromise = (async () => {
-      const client = getDbExec();
       const createSql = `CREATE TABLE IF NOT EXISTS integration_configs (
   platform TEXT NOT NULL,
   config_key TEXT NOT NULL,
   config_data TEXT NOT NULL,
   owner TEXT,
-  updated_at ${intType()} NOT NULL,
+  updated_at BIGINT NOT NULL,
   PRIMARY KEY (platform, config_key)
 )`;
 
-      if (isPostgres()) {
-        // PG guard: probe via information_schema, only issue DDL if missing, bounded lock_timeout
+      {
         await ensureTableExists("integration_configs", createSql);
         return;
       }
-
-      // SQLite (local dev): keep existing behavior
-      await client.execute(createSql);
     })().catch((err) => {
-      // Don't cache the rejection — let the next caller retry a fresh init.
       _initPromise = undefined;
       throw err;
     });
@@ -33,11 +27,6 @@ async function ensureTable(): Promise<void> {
   return _initPromise;
 }
 
-/**
- * Bumped on every in-process config write. Pollers that back off while their
- * integration is disabled watch this so enabling one takes effect on the next
- * tick instead of at the end of their backoff window.
- */
 let _configWriteEpoch = 0;
 
 export function integrationConfigWriteEpoch(): number {
@@ -52,9 +41,6 @@ export interface IntegrationConfig {
   updatedAt: number;
 }
 
-/**
- * Get the config for a platform integration.
- */
 export async function getIntegrationConfig(
   platform: string,
   configKey = "default",
@@ -76,9 +62,6 @@ export async function getIntegrationConfig(
   };
 }
 
-/**
- * Save or update a platform integration config.
- */
 export async function saveIntegrationConfig(
   platform: string,
   configData: Record<string, unknown>,
@@ -88,9 +71,7 @@ export async function saveIntegrationConfig(
   await ensureTable();
   const client = getDbExec();
   await client.execute({
-    sql: isPostgres()
-      ? `INSERT INTO integration_configs (platform, config_key, config_data, owner, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (platform, config_key) DO UPDATE SET config_data=EXCLUDED.config_data, owner=EXCLUDED.owner, updated_at=EXCLUDED.updated_at`
-      : `INSERT OR REPLACE INTO integration_configs (platform, config_key, config_data, owner, updated_at) VALUES (?, ?, ?, ?, ?)`,
+    sql: `INSERT INTO integration_configs (platform, config_key, config_data, owner, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (platform, config_key) DO UPDATE SET config_data=EXCLUDED.config_data, owner=EXCLUDED.owner, updated_at=EXCLUDED.updated_at`,
     args: [
       platform,
       configKey,
@@ -102,9 +83,37 @@ export async function saveIntegrationConfig(
   _configWriteEpoch += 1;
 }
 
-/**
- * Delete a platform integration config.
- */
+export async function saveIntegrationConfigIfUnchanged(
+  platform: string,
+  configData: Record<string, unknown>,
+  configKey: string,
+  expected: IntegrationConfig | null,
+  owner?: string,
+): Promise<boolean> {
+  await ensureTable();
+  const client = getDbExec();
+  const nextRaw = JSON.stringify(configData);
+  const result = expected
+    ? await client.execute({
+        sql: `UPDATE integration_configs SET config_data = ?, updated_at = updated_at + 1 WHERE platform = ? AND config_key = ? AND config_data = ? AND updated_at = ?`,
+        args: [
+          nextRaw,
+          platform,
+          configKey,
+          JSON.stringify(expected.configData),
+          expected.updatedAt,
+        ],
+      })
+    : await client.execute({
+        sql: `INSERT INTO integration_configs (platform, config_key, config_data, owner, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (platform, config_key) DO NOTHING`,
+        args: [platform, configKey, nextRaw, owner ?? null, Date.now()],
+      });
+
+  if (result.rowsAffected === 0) return false;
+  _configWriteEpoch += 1;
+  return true;
+}
+
 export async function deleteIntegrationConfig(
   platform: string,
   configKey = "default",
@@ -118,9 +127,6 @@ export async function deleteIntegrationConfig(
   _configWriteEpoch += 1;
 }
 
-/**
- * List all configs for a platform.
- */
 export async function listIntegrationConfigs(
   platform?: string,
 ): Promise<IntegrationConfig[]> {

@@ -34,6 +34,7 @@ const messages = {
     agentDescription:
       "Gérez le modèle de l’agent, les clés API, les automatisations, la voix et les autres contrôles.",
     openAgentSettings: "Gérer l’agent",
+    editorGroupTitle: "Éditeur",
     editorTitle: "Extension VS Code",
     editorDescription:
       "Ouvrez et examinez les plans dans un panneau latéral de VS Code plutôt que dans un onglet de navigateur séparé.",
@@ -486,6 +487,8 @@ const messages = {
       requestAccess: "Demander l'accès",
       requestAccessTitle: "Demander l'accès à ce plan",
       requestSent: "Demande envoyée",
+      storageStatusUnavailable:
+        "Impossible de vérifier le stockage de fichiers.",
       retry: "Réessayer",
       sendFeedback: "Envoyer un retour",
       feedbackPlaceholder:
@@ -721,6 +724,8 @@ const messages = {
       finishAccount:
         "Terminez la création de votre compte, puis revenez et nous générerons le lien.",
       generalAccess: "Accès général à {{noun}}",
+      commenterRoleLabel: "Commentateur",
+      commenterRoleDescription: "Peut consulter et ajouter des commentaires",
       hostedCopy:
         "Cet {{noun}} local dispose d'une copie hébergée pour le partage. Ouvrez l'{{noun}} hébergé pour gérer l'accès.",
       linkCopied: "Lien partageable copié",
@@ -732,6 +737,12 @@ const messages = {
       share: "Partager {{noun}}",
       shareAria: "Partager {{noun}}",
       shareThis: "Partager ceci {{noun}}",
+      teammateSuggestion: {
+        message: "Invitez votre équipe dans Plan.",
+        invite: "Inviter l’équipe",
+        enableDomain: "Autoriser toute personne de @{{domain}} à rejoindre",
+        enableFailed: "Impossible d’activer l’accès par domaine. Réessayez.",
+      },
       signedInRetry: "Je suis connecté - réessayez",
       updateLink: "Lien de mise à jour",
       updating: "Mise à jour",

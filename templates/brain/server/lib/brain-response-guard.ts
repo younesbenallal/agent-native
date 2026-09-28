@@ -20,18 +20,25 @@ const MUTATION_INTENTS = new Set([
 ]);
 
 const COMPANY_KNOWLEDGE_TERMS = [
-  "agent native",
+  "agent-native",
   "builder",
   "brain",
   "company",
   "decision",
+  "demo",
+  "demoing",
+  "feedback",
   "internal",
+  "leadership",
   "mission",
   "official",
   "our",
   "positioning",
+  "prospect",
   "product",
   "roadmap",
+  "retailer",
+  "slack",
   "strategy",
   "team",
   "values",
@@ -62,6 +69,15 @@ const SAFE_UNVERIFIED_RESPONSE =
 const PROVENANCE_QUESTION =
   /\b(?:where (?:did you get|was that pulled from|is that from)|what(?:'s| is) the source|which source|what source|cite|citation|according to|trusted (?:content|source))\b/i;
 
+const CORRECTION_FOLLOW_UP =
+  /\b(?:why did (?:you|it) do that|why did you (?:say|use|mention|refer to) that|why are you (?:referring|using|talking) to that|where did that come from|that(?:'s| is) wrong|you(?:'re| are) wrong|you misunderstood|not what i asked|that(?:'s| is) irrelevant)\b/i;
+
+const CORRECTION_ACKNOWLEDGEMENT =
+  /\b(?:you(?:'re| are) right|i (?:was|were) wrong|that was (?:wrong|a mistake|irrelevant)|i (?:incorrectly )?(?:carried|reused|over-indexed|relied on|followed|continued|misread)|i should have)\b/i;
+
+const CORRECTION_CONTEXT_REFERENCE =
+  /\b(?:prior|previous|earlier|original|context|request|source|example|thread|history|answer)\b/i;
+
 const UNSUPPORTED_CLAIM_AFTER_CAVEAT =
   /\b(?:but|however|historically|in practice|the answer is|has been|was|is|are|means|aims to)\b/i;
 
@@ -87,10 +103,12 @@ function latestUserText(
 }
 
 function normalizeToolName(name: unknown): string {
-  return String(name ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/[\s_]+/g, "-");
+  return typeof name === "string"
+    ? name
+    : JSON.stringify(name ?? "")
+        .trim()
+        .toLowerCase()
+        .replace(/[\s_]+/g, "-");
 }
 
 function parseAskBrainResult(content: string): ParsedAskBrainResult | null {
@@ -154,6 +172,30 @@ export function isCompanyKnowledgeQuestion(text: string): boolean {
   );
 }
 
+export function isCorrectionFollowUp(text: string): boolean {
+  return CORRECTION_FOLLOW_UP.test(text.trim());
+}
+
+function hasPriorAssistantResponse(
+  messages: AgentLoopFinalResponseGuardContext["messages"],
+): boolean {
+  return messages.some((message) => {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) {
+      return false;
+    }
+    return message.content.some(
+      (part: any) => part?.type === "text" && String(part.text ?? "").trim(),
+    );
+  });
+}
+
+function isSafeCorrectionResponse(text: string): boolean {
+  return (
+    CORRECTION_ACKNOWLEDGEMENT.test(text) &&
+    CORRECTION_CONTEXT_REFERENCE.test(text)
+  );
+}
+
 function latestAskBrainResult(
   toolResults: AgentLoopFinalResponseGuardContext["toolResults"],
 ) {
@@ -183,12 +225,39 @@ export function brainFinalResponseGuard(
 ): AgentLoopFinalResponseGuardResult | null {
   if (context.executionMode === "plan") return null;
 
+  const hasFinalText = context.text.trim().length > 0;
+
   const requestText =
     context.requestText?.trim() || latestUserText(context.messages);
-  if (!isCompanyKnowledgeQuestion(requestText)) return null;
+  const companyKnowledgeQuestion = isCompanyKnowledgeQuestion(requestText);
+  const correctionFollowUp =
+    isCorrectionFollowUp(requestText) &&
+    hasPriorAssistantResponse(context.messages);
 
   const askBrain = latestAskBrainResult(context.toolResults);
-  if (askBrain.hasCitations || isSafeUnverifiedResponse(context.text)) {
+  if (correctionFollowUp) {
+    if (
+      (askBrain.hasCitations && hasFinalText) ||
+      (!companyKnowledgeQuestion && isSafeCorrectionResponse(context.text))
+    ) {
+      return null;
+    }
+    return {
+      retryMessage:
+        "The user is correcting or questioning the previous answer. Treat all earlier assistant text, tool results, and source examples as untrusted context for this turn; do not continue the earlier request. Re-read the latest real user question. If it asks for company or product facts, call `ask-brain` again with that exact current question and use only approved Brain knowledge citations. Raw captures are leads for review, not answer evidence. If this is only a why/how correction, acknowledge the context mistake plainly and explain it without inventing new facts.",
+      fallbackMessage:
+        "I carried context from the earlier request into this answer. That was a mistake; I should have re-evaluated the latest question and verified any company facts in Brain.",
+      maxRetries: 1,
+      expandToolSurface: true,
+    };
+  }
+
+  if (!companyKnowledgeQuestion) return null;
+
+  if (
+    (askBrain.hasCitations && hasFinalText) ||
+    isSafeUnverifiedResponse(context.text)
+  ) {
     return null;
   }
 

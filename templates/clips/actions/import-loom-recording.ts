@@ -1,5 +1,8 @@
-import { defineAction } from "@agent-native/core";
-import { writeAppState } from "@agent-native/core/application-state";
+import { defineAction } from "@agent-native/core/action";
+import {
+  writeAppState,
+  writeAppStateForCurrentTab,
+} from "@agent-native/core/application-state";
 import { ssrfSafeFetch } from "@agent-native/core/extensions/url-safety";
 import { uploadFile } from "@agent-native/core/file-upload";
 import { buildDeepLink } from "@agent-native/core/server";
@@ -7,6 +10,7 @@ import { extractLoomVideoId, normalizeLoomShareUrl } from "@shared/loom.js";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
 
+import { parseEdits } from "../app/lib/timestamp-mapping.js";
 import { getDb, schema } from "../server/db/index.js";
 import { queueBuilderMediaCompression } from "../server/lib/builder-media-compression.js";
 import { dispatchPostFinalizeJob } from "../server/lib/post-finalize-dispatch.js";
@@ -28,6 +32,7 @@ import {
   enqueueFirstImportEmailIfEligible,
   failLoomImport,
 } from "./lib/loom-import-job.js";
+import { validateRecordingScope } from "./lib/recording-scope.js";
 
 export { enqueueFirstImportEmailIfEligible };
 
@@ -142,9 +147,9 @@ async function fetchLoomOembed(shareUrl: string) {
 
 export default defineAction({
   description:
-    "Import a public Loom share URL, or a direct link to a video file, into Clips as a playable recording. Loom links create the recording immediately and download/reupload Loom's public MP4 plus import Loom's public transcript in the background, since Loom's CDN plus a reupload can take longer than a single request should block on. Other direct video links (e.g. an MP4/WebM/MOV hosted by another screen recorder) are downloaded and reuploaded synchronously without transcript metadata — use request-transcript afterward. If storage is not connected, creates a waiting recording that can be retried after storage setup.",
+    "Import a public Loom share URL, or a direct link to a video file, into Clips as a playable recording. Loom links create the recording immediately and download/reupload Loom's public MP4 when available, or keep a playable Loom embed when Loom allows playback but not MP4 export; public transcripts are imported in the background. Other direct video links (e.g. an MP4/WebM/MOV hosted by another screen recorder) are downloaded and reuploaded synchronously without transcript metadata — use request-transcript afterward. If storage is not connected, creates a waiting recording that can be retried after storage setup.",
   schema: ImportLoomRecordingSchema,
-  run: async (args) => {
+  run: async (args, actionContext) => {
     const loomId = extractLoomVideoId(args.url);
     const isLoom = Boolean(loomId);
     const loomShareUrl = isLoom ? normalizeLoomShareUrl(args.url) : null;
@@ -214,17 +219,21 @@ export default defineAction({
     const { organizationId } = await requireOrganizationAccess(
       existingRecording?.organizationId ?? args.organizationId,
     );
-    const defaultVisibility =
-      await getDefaultRecordingVisibility(organizationId);
+    const defaultVisibility = await getDefaultRecordingVisibility(
+      organizationId,
+      actionContext?.userEmail ?? ownerEmail,
+    );
 
     const now = new Date().toISOString();
     const id = existingRecording?.id ?? nanoid();
     const createdAt = existingRecording?.createdAt ?? now;
+    const spaceIds = await validateRecordingScope(db, {
+      organizationId,
+      ownerEmail,
+      spaceIds: args.spaceIds ?? parseSpaceIds(existingRecording?.spaceIds),
+      folderId: args.folderId ?? existingRecording?.folderId,
+    });
     const oembed = isLoom ? await fetchLoomOembed(loomShareUrl!) : null;
-
-    const spaceIds = (
-      args.spaceIds ?? parseSpaceIds(existingRecording?.spaceIds)
-    ).filter((value, index, arr) => value && arr.indexOf(value) === index);
     const title =
       args.title?.trim() ||
       (existingRecording?.title &&
@@ -244,6 +253,9 @@ export default defineAction({
     const titleSource = args.title
       ? "manual"
       : (existingRecording?.titleSource ?? "upload");
+    const existingEditorThumbnail = Boolean(
+      parseEdits(existingRecording?.editsJson).thumbnail,
+    );
 
     const buildRecordingValues = (
       videoSizeBytes: number,
@@ -255,11 +267,15 @@ export default defineAction({
       spaceIds: stringifySpaceIds(spaceIds),
       title,
       titleSource,
+      recordingPlatform: "import" as const,
+      failureCode: null,
       sourceAppName,
       sourceWindowTitle: sourceUrl,
       description: existingRecording?.description ?? "",
       thumbnailUrl:
-        oembed?.thumbnail_url ?? existingRecording?.thumbnailUrl ?? null,
+        oembed?.thumbnail_url ??
+        (existingEditorThumbnail ? existingRecording?.thumbnailUrl : null) ??
+        null,
       durationMs,
       videoFormat,
       videoSizeBytes,
@@ -313,7 +329,10 @@ export default defineAction({
         updatedAt: now,
       });
       await writeAppState("refresh-signal", { ts: Date.now() });
-      await writeAppState("navigate", { view: "recording", recordingId: id });
+      await writeAppStateForCurrentTab("navigate", {
+        view: "recording",
+        recordingId: id,
+      });
 
       return {
         recordingId: id,
@@ -337,12 +356,6 @@ export default defineAction({
     }
 
     if (isLoom) {
-      // Storage is connected: create/refresh the row now and hand the slow
-      // Loom download + reupload + transcript off to a durable background
-      // job (post-finalize-worker.post.ts's "loom-import" kind /
-      // runLoomImportJob). Loom's CDN plus a reupload can outlast a single
-      // request; the worker claims the row (loomImportClaimId) and moves it
-      // to "ready" or "failed" once done.
       const recordingValues = buildRecordingValues(
         existingRecording?.videoSizeBytes ?? 0,
       );
@@ -384,7 +397,10 @@ export default defineAction({
         updatedAt: now,
       });
       await writeAppState("refresh-signal", { ts: Date.now() });
-      await writeAppState("navigate", { view: "recording", recordingId: id });
+      await writeAppStateForCurrentTab("navigate", {
+        view: "recording",
+        recordingId: id,
+      });
 
       try {
         console.log("[import-loom-recording] dispatching loom-import job", {
@@ -420,9 +436,6 @@ export default defineAction({
       };
     }
 
-    // Direct video links stay synchronous: they typically download and
-    // reupload well within a single request, and this keeps
-    // request-transcript as the deliberate next step for a transcript.
     const media = await downloadDirectVideo(sourceUrl);
     const videoFormat = media.mimeType === "video/webm" ? "webm" : "mp4";
     const upload = await uploadFile({
@@ -468,6 +481,12 @@ export default defineAction({
         createdAt,
       });
     }
+
+    await dispatchPostFinalizeJob({
+      recordingId: id,
+      kind: "thumbnail",
+      requireAccepted: true,
+    });
 
     void queueBuilderMediaCompression({
       recordingId: id,
@@ -538,7 +557,10 @@ export default defineAction({
       updatedAt: now,
     });
     await writeAppState("refresh-signal", { ts: Date.now() });
-    await writeAppState("navigate", { view: "recording", recordingId: id });
+    await writeAppStateForCurrentTab("navigate", {
+      view: "recording",
+      recordingId: id,
+    });
 
     return {
       recordingId: id,
@@ -548,7 +570,7 @@ export default defineAction({
       sourceUrl,
       videoUrl,
       embedUrl: videoUrl,
-      thumbnailUrl: oembed?.thumbnail_url ?? null,
+      thumbnailUrl: recordingValues.thumbnailUrl,
       durationMs,
       importMode: "reuploaded" as const,
       storageProvider: upload.provider,

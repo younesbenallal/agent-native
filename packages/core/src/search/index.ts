@@ -1,5 +1,4 @@
 import type { DbExec } from "../db/index.js";
-import { isPostgres } from "../db/index.js";
 
 export const DEFAULT_SEARCH_NAMESPACE = "creative_context";
 export const PGVECTOR_REQUIRED_MESSAGE =
@@ -44,7 +43,6 @@ type PgVectorOptions =
   | {
       namespace?: string;
       postgres?: boolean;
-      /** The caller has already provisioned this namespace and dimension. */
       indexInitialized?: boolean;
     };
 
@@ -106,10 +104,13 @@ function audienceClause(
   };
 }
 
-export function assertPgVectorAvailable(postgres = isPostgres()): void {
+export function assertPgVectorAvailable(postgres = true): void {
   if (!postgres) throw new Error(PGVECTOR_REQUIRED_MESSAGE);
 }
 
+// guard:allow-unreleased-schema - the table name is derived at call time from
+// the search namespace and embedding dimensions (`${namespace}_vectors${suffix}`),
+// so the set of tables is not known at release time and cannot be pre-created.
 export async function ensurePgVectorIndex(
   db: DbExec,
   dimensions: number,
@@ -191,7 +192,7 @@ export async function deletePgVectors(
     vectorKeys: readonly string[];
     namespace?: string;
   },
-  postgres = isPostgres(),
+  postgres = true,
 ): Promise<number> {
   const names = searchNamespaceIdentifiers(input.namespace, input.dimensions);
   assertPgVectorAvailable(postgres);
@@ -214,7 +215,7 @@ export async function queryPgVectorIndex(
     allowedAudienceIds?: readonly string[];
     namespace?: string;
   },
-  postgres = isPostgres(),
+  postgres = true,
 ): Promise<PgVectorHit[]> {
   const names = searchNamespaceIdentifiers(input.namespace, input.dimensions);
   assertPgVectorAvailable(postgres);
@@ -261,7 +262,7 @@ export async function ensurePostgresFts(
   namespace = DEFAULT_SEARCH_NAMESPACE,
 ): Promise<boolean> {
   const names = searchNamespaceIdentifiers(namespace);
-  if (!isPostgres()) return false;
+
   await db.execute(`
     CREATE TABLE IF NOT EXISTS ${names.ftsTable} (
       chunk_id TEXT PRIMARY KEY,
@@ -331,7 +332,7 @@ export async function queryPostgresFts(
   const namespace = input.namespace ?? DEFAULT_SEARCH_NAMESPACE;
   const names = searchNamespaceIdentifiers(namespace);
   if (
-    !isPostgres() ||
+    !true ||
     input.allowedChunkIds?.length === 0 ||
     input.allowedAudienceIds?.length === 0
   )
@@ -358,8 +359,6 @@ export async function queryPostgresFts(
       score: Number(row.score),
     }));
   } catch (error) {
-    // A read can race the first write for a tenant-specific namespace. Writers
-    // provision it; an absent lane simply contributes no candidates.
     if (isMissingPostgresRelation(error)) return [];
     throw error;
   }
@@ -376,7 +375,7 @@ export async function deletePostgresFtsDocuments(
   namespace = DEFAULT_SEARCH_NAMESPACE,
 ): Promise<number> {
   const names = searchNamespaceIdentifiers(namespace);
-  if (!isPostgres() || !chunkIds.length) return 0;
+  if (!true || !chunkIds.length) return 0;
   await ensurePostgresFts(db, namespace);
   const result = await db.execute({
     sql: `DELETE FROM ${names.ftsTable} WHERE chunk_id IN (${chunkIds.map(() => "?").join(", ")})`,

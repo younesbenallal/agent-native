@@ -7,15 +7,19 @@ import {
 } from "h3";
 import * as jose from "jose";
 
+import "../authorization/check-action.js";
 import { redactArgsToJson } from "../audit/redact.js";
 import {
   extractBearerToken,
   verifyInternalToken,
 } from "../integrations/internal-token.js";
+import { readDeployCredentialEnv } from "../server/credential-provider.js";
 import { getH3App } from "../server/framework-request-handler.js";
+import { publicFrameworkPath } from "../server/framework-route-prefix.js";
 import { readBody } from "../server/h3-helpers.js";
 import { isSameOriginRequest } from "../server/request-origin.js";
 import { generateAgentCard } from "./agent-card.js";
+import { canonicalA2AAudience } from "./audience.js";
 import {
   hasConfiguredA2ASecret,
   isA2AProductionRuntime,
@@ -26,14 +30,8 @@ import {
   getA2AApprovalForOwner,
   settleA2AApproval,
 } from "./task-store.js";
-import type { A2AConfig } from "./types.js";
+import type { A2AConfig, AgentSkill } from "./types.js";
 
-/**
- * One-time warning when A2A is running unauthenticated in development. We
- * don't refuse the request (local templates need to work out of the box),
- * but we log a single noisy line so operators notice if they accidentally
- * deploy with no auth configured.
- */
 let _warnedUnauthA2A = false;
 function warnA2AUnauthOnce(): void {
   if (_warnedUnauthA2A) return;
@@ -48,11 +46,15 @@ function warnA2AUnauthOnce(): void {
 /**
  * Result of verifying an inbound A2A JWT. `email` is the caller identity from
  * the token's `sub` claim (null when verification fails), `orgDomain` mirrors
- * the verified `org_domain` claim when present.
+ * the verified `org_domain` claim when present, and `orgId` mirrors the
+ * optional verified `org_id` claim used when a sender knows its exact org but
+ * cannot resolve that org's domain.
  */
 export interface A2ATokenPayload {
   email: string | null;
   orgDomain: string | null;
+  orgId?: string;
+  claims?: jose.JWTPayload;
 }
 
 function addSecretCandidate(
@@ -73,22 +75,66 @@ function addSecretCandidate(
  * service must not verify here). Only tokens without an `aud` claim (minted
  * before the audience claim shipped) skip the audience check.
  */
-function expectedJwtAudience(event: any | undefined): string | undefined {
+function expectedJwtAudience(
+  event: any,
+  options?: {
+    routePrefix?: string;
+    allowBaseAudience?: boolean;
+  },
+): string | string[] | undefined {
   const fromEnv =
     process.env.APP_URL ||
     process.env.URL ||
     process.env.DEPLOY_URL ||
     process.env.BETTER_AUTH_URL;
-  if (fromEnv) return String(fromEnv).replace(/\/$/, "");
-  // Best-effort: derive from the inbound request host. This is forgeable
-  // (Host-header attack), but only useful as a hint when env-derived URL
-  // is unset; the rest of the JWT verification still uses the secret.
+  const receiverBasePath = process.env.APP_BASE_PATH;
+  if (fromEnv) {
+    return audienceForRoute(
+      canonicalA2AAudience(String(fromEnv), receiverBasePath),
+      options,
+    );
+  }
   try {
     const proto = getRequestHeader(event, "x-forwarded-proto") || "https";
     const host = getRequestHeader(event, "host");
-    if (host) return `${proto}://${host}`;
+    if (host) {
+      return audienceForRoute(
+        canonicalA2AAudience(`${proto}://${host}`, receiverBasePath),
+        options,
+      );
+    }
+    // coercion-ok: undefined makes audience-bearing token verification fail closed.
   } catch {}
   return undefined;
+}
+
+function audienceForRoute(
+  baseAudience: string,
+  options:
+    | {
+        routePrefix?: string;
+        allowBaseAudience?: boolean;
+      }
+    | undefined,
+): string | string[] {
+  const trimmedPrefix = options?.routePrefix?.replace(/^\/+|\/+$/g, "");
+  if (!trimmedPrefix || trimmedPrefix === "_agent-native") return baseAudience;
+  const normalizedPrefix = `/${trimmedPrefix}`;
+  const routeAudience = `${baseAudience.replace(/\/+$/, "")}${normalizedPrefix}`;
+  return options?.allowBaseAudience
+    ? [routeAudience, baseAudience]
+    : routeAudience;
+}
+
+function tokenHasAudienceClaim(token: string): boolean {
+  return typeof jose.decodeJwt(token).aud !== "undefined";
+}
+
+function isDirectReadSkill(skill: AgentSkill): boolean {
+  return (
+    skill.readOnly === true ||
+    (skill.readOnly === undefined && skill.publicAgent?.readOnly === true)
+  );
 }
 
 /**
@@ -104,11 +150,22 @@ function expectedJwtAudience(event: any | undefined): string | undefined {
  * Exported so workspaces can accept A2A callers on the HTTP action route with
  * the same routine — including org-level fallback secrets — instead of
  * reimplementing a partial verifier. Pass the H3 `event` to enable org-domain →
- * org-secret lookup and audience derivation; it is optional.
+ * org-secret lookup and audience derivation; it is optional. A custom mounted
+ * JSON-RPC route also passes its prefix so endpoint-bound tokens verify against
+ * the same audience the client derived from the advertised URL.
  */
 export async function verifyA2AToken(
   token: string,
   event?: any,
+  audienceOptions?: {
+    routePrefix?: string;
+    allowBaseAudience?: boolean;
+    includeClaims?: boolean;
+    /** Only use the deployment-wide secret, never an org-domain secret. */
+    globalSecretOnly?: boolean;
+    /** Only use this explicitly configured credential; never fall back. */
+    verificationSecret?: string;
+  },
 ): Promise<A2ATokenPayload> {
   // Step 1: Peek at JWT claims WITHOUT verification to get org_domain.
   // This is safe because we only use org_domain to look up the secret,
@@ -124,12 +181,24 @@ export async function verifyA2AToken(
     // Malformed token — fall through to global secret attempt
   }
 
-  // Step 2: Build a small, ordered set of candidate secrets. Tokens minted by
-  // current callers prefer the shared A2A_SECRET; older callers may still use
-  // an org-level secret. Try both without logging or reflecting secret details.
+  // Step 2: Build a small, ordered set of candidate secrets. An explicit
+  // verification credential is isolated from the deployment-wide and
+  // org-level credentials so a caller cannot use one app's trust grant as
+  // another app's identity.
   const candidateSecrets: string[] = [];
-  addSecretCandidate(candidateSecrets, process.env.A2A_SECRET);
-  if (orgDomainHint) {
+  const hasExplicitVerificationSecret =
+    audienceOptions?.verificationSecret !== undefined;
+  addSecretCandidate(
+    candidateSecrets,
+    hasExplicitVerificationSecret
+      ? audienceOptions?.verificationSecret
+      : readDeployCredentialEnv("A2A_SECRET"),
+  );
+  if (
+    orgDomainHint &&
+    !audienceOptions?.globalSecretOnly &&
+    !hasExplicitVerificationSecret
+  ) {
     try {
       const { getA2ASecretByDomain } = await import("../org/context.js");
       const orgSecret = await getA2ASecretByDomain(orgDomainHint);
@@ -164,7 +233,7 @@ export async function verifyA2AToken(
       // whose `aud` targets ANOTHER service verify against a shared secret. A
       // token that self-declares an audience must be checked against ours, so
       // when we have nothing to check it against we reject rather than skip.
-      const aud = expectedJwtAudience(event);
+      const aud = expectedJwtAudience(event, audienceOptions);
       if (!aud) return { email: null, orgDomain: null };
       verifyOptions.audience = aud;
     }
@@ -182,9 +251,15 @@ export async function verifyA2AToken(
           new TextEncoder().encode(secret),
           verifyOptions,
         );
+        const orgId =
+          typeof payload.org_id === "string" && payload.org_id.trim()
+            ? payload.org_id.trim()
+            : undefined;
         return {
           email: (payload.sub as string) ?? null,
           orgDomain: (payload.org_domain as string) ?? null,
+          ...(orgId ? { orgId } : {}),
+          ...(audienceOptions?.includeClaims ? { claims: payload } : {}),
         };
       } catch {
         // Try the next candidate without leaking which secret failed.
@@ -196,16 +271,6 @@ export async function verifyA2AToken(
   return { email: null, orgDomain: null };
 }
 
-/**
- * Mount A2A protocol endpoints on an H3/Nitro app.
- *
- * - GET /.well-known/agent-card.json — public agent card (no auth)
- * - POST /_agent-native/a2a — JSON-RPC endpoint (with optional auth)
- *
- * When A2A_SECRET is set, inbound Bearer tokens are verified as JWTs
- * and the caller's email is extracted from the `sub` claim. This provides
- * cryptographic identity verification for cross-app A2A calls.
- */
 export function mountA2A(
   nitroApp: any,
   config: A2AConfig,
@@ -233,28 +298,30 @@ export function mountA2A(
       const host = getRequestHeader(event, "host") ?? "localhost";
       const baseUrl = `${protocol}://${host}`;
 
-      // The anonymous card may only advertise actions safe to disclose
-      // publicly (`requiresAuth !== true`), but `actions/invoke` only ever
-      // runs the opposite set (`requiresAuth === true`). Those are disjoint,
-      // so an unauthenticated card said "no directly callable actions" about
-      // an app whose actions a verified sibling can call — and callers fell
-      // back to open-ended delegation. Show a verified caller what it can
-      // actually invoke; anonymous fetches keep the public list unchanged.
       let skills = filterPublicAgentCardSkills(config);
       if (config.authenticatedSkills?.length) {
         const bearer = extractBearerToken(
           getRequestHeader(event, "authorization"),
         );
         if (bearer) {
-          const payload = await verifyA2AToken(bearer, event);
-          if (payload.email) skills = config.authenticatedSkills;
+          const payload = await verifyA2AToken(bearer, event, {
+            routePrefix,
+            allowBaseAudience: true,
+          });
+          if (payload.email) {
+            skills = tokenHasAudienceClaim(bearer)
+              ? config.authenticatedSkills
+              : config.authenticatedSkills.filter(
+                  (skill) => !isDirectReadSkill(skill),
+                );
+          }
         }
       }
 
       return generateAgentCard(
         { ...config, skills },
         baseUrl,
-        `${routePrefix}/a2a`,
+        publicFrameworkPath(`${routePrefix}/a2a`),
       );
     }),
   );
@@ -435,7 +502,6 @@ export function mountA2A(
     }),
   );
 
-  // JSON-RPC A2A endpoint (with optional auth)
   getH3App(nitroApp).use(
     `${routePrefix}/a2a`,
     defineEventHandler(async (event) => {
@@ -444,11 +510,6 @@ export function mountA2A(
         return { error: "Method not allowed" };
       }
 
-      // h3 prefix-matches mounts, so a request to `/a2a/_process-task`
-      // reaches this handler too. The dedicated mount above runs first and
-      // takes the request, but if that returns `undefined` (or h3 ever
-      // changes ordering semantics) defensively bail here. event.path is
-      // stripped to the remainder after the mount prefix.
       const sub = (event.path || "/").split("?")[0].replace(/^\//, "");
       if (sub.startsWith("_process-task")) return;
 
@@ -468,23 +529,18 @@ export function mountA2A(
       const hasA2ASecret = hasConfiguredA2ASecret();
       const hasApiKey = !!(config.apiKeyEnv && process.env[config.apiKeyEnv]);
 
-      // Try JWT verification first (org-level or global A2A_SECRET-based identity)
       if (bearerToken) {
-        const tokenPayload = await verifyA2AToken(bearerToken, event);
+        const tokenPayload = await verifyA2AToken(bearerToken, event, {
+          routePrefix,
+        });
         verifiedCallerEmail = tokenPayload.email;
         verifiedOrgDomain = tokenPayload.orgDomain;
         if (verifiedCallerEmail) {
-          try {
-            verifiedAudienceBound =
-              typeof jose.decodeJwt(bearerToken).aud !== "undefined";
-          } catch {
-            verifiedAudienceBound = false;
-          }
+          verifiedAudienceBound = tokenHasAudienceClaim(bearerToken);
         }
         bearerTokenRejectedByJwt = !verifiedCallerEmail;
       }
 
-      // Fall back to legacy API key check (exact string match)
       if (!verifiedCallerEmail && config.apiKeyEnv) {
         const expectedKey = process.env[config.apiKeyEnv];
         if (expectedKey) {
@@ -552,8 +608,6 @@ export function mountA2A(
         }
       }
 
-      // Store verified caller identity on the event context so the handler
-      // can set request context from a trusted source instead of metadata
       if (verifiedCallerEmail) {
         event.context.__a2aVerifiedEmail = verifiedCallerEmail;
       }

@@ -7,6 +7,9 @@ const createAssetFromBufferMock = vi.hoisted(() => vi.fn());
 const getDbMock = vi.hoisted(() => vi.fn());
 const serializeAssetMock = vi.hoisted(() => vi.fn((row: unknown) => row));
 const ssrfSafeFetchMock = vi.hoisted(() => vi.fn());
+const libraryAccessMock = vi.hoisted(() =>
+  vi.fn(async () => ({ role: "owner", canApprove: true })),
+);
 
 vi.mock("@agent-native/core", () => ({
   defineAction: (entry: unknown) => entry,
@@ -18,6 +21,32 @@ vi.mock("@agent-native/core/extensions/url-safety", () => ({
 
 vi.mock("@agent-native/core/sharing", () => ({
   assertAccess: assertAccessMock,
+}));
+const deleteDraftMock = vi.hoisted(() => vi.fn(async () => true));
+const unrestrictedScope = vi.hoisted(() => ({
+  unrestricted: true,
+  approvableLibraryIds: new Set<string>(),
+  ownRunIds: new Set<string>(),
+  callerEmail: "viewer@example.test",
+}));
+
+vi.mock("../server/lib/library-access.js", () => ({
+  assertCanDraft: libraryAccessMock,
+  assertCanApprove: libraryAccessMock,
+  assertCanDraftAuthoredBy: libraryAccessMock,
+  assertCanDeleteAsset: libraryAccessMock,
+  draftScopeForLibrary: vi.fn(async () => unrestrictedScope),
+  resolveDraftReadScope: vi.fn(async () => unrestrictedScope),
+  unrestrictedDraftReadScope: vi.fn(() => unrestrictedScope),
+  assertCanUseAssets: vi.fn(),
+  assertCanUseRuns: vi.fn(),
+  canReadDraftAsset: vi.fn(() => true),
+  canReadRun: vi.fn(() => true),
+  draftReadFilter: vi.fn(() => undefined),
+  runReadFilter: vi.fn(() => undefined),
+  sessionReadFilter: vi.fn(() => undefined),
+  canReadSession: vi.fn(() => true),
+  deleteDraftAssetIfUnchanged: deleteDraftMock,
 }));
 
 vi.mock("drizzle-orm", () => ({
@@ -59,8 +88,6 @@ vi.mock("../server/lib/storage.js", () => ({
   getObject: vi.fn(),
 }));
 
-// json.js pulls in @agent-native/core/server; upload-dedupe (kept real) only
-// needs parseJson from it.
 vi.mock("../server/lib/json.js", () => ({
   parseJson: (value: string | null | undefined, fallback: unknown) => {
     if (!value) return fallback;
@@ -88,8 +115,6 @@ function response(
   return new Response(body, { status, headers });
 }
 
-// Each select() consumes the next row set, whether the query ends at
-// `.where(...)` (awaited directly) or chains `.limit(n)`.
 function createDb(rows: unknown[][]) {
   return {
     select: vi.fn(() => ({
@@ -113,8 +138,8 @@ const pngContentHash = () =>
 describe("import-asset-from-url", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    libraryAccessMock.mockResolvedValue({ role: "owner", canApprove: true });
     assertAccessMock.mockResolvedValue(undefined);
-    // Fresh Response per call — a Response body stream can only be read once.
     ssrfSafeFetchMock.mockImplementation(async () =>
       response(pngBytes, {
         "content-type": "image/png; charset=utf-8",
@@ -145,11 +170,7 @@ describe("import-asset-from-url", () => {
       description: "Imported from the launch post.",
     });
 
-    expect(assertAccessMock).toHaveBeenCalledWith(
-      "asset-library",
-      "lib-1",
-      "editor",
-    );
+    expect(libraryAccessMock).toHaveBeenCalledWith("lib-1", expect.any(String));
     expect(ssrfSafeFetchMock).toHaveBeenCalledWith(
       "https://cdn.example.test/blog-hero.png",
       { signal: expect.any(AbortSignal) },
@@ -258,7 +279,7 @@ describe("import-asset-from-url", () => {
   });
 
   it("rejects callers without editor access", async () => {
-    assertAccessMock.mockRejectedValue(new Error("No access"));
+    libraryAccessMock.mockRejectedValue(new Error("No access"));
 
     await expect(
       action.run({
@@ -359,7 +380,6 @@ describe("import-asset-from-url", () => {
       folderId: "",
     });
 
-    // Only the dedupe lookup ran — no membership validation for "" ids.
     expect(db.select).toHaveBeenCalledTimes(1);
     expect(createAssetFromBufferMock).toHaveBeenCalledWith(
       expect.objectContaining({ collectionId: null, folderId: null }),
@@ -382,7 +402,6 @@ describe("import-asset-from-url", () => {
 
     await action.run({ libraryId: "lib-1", url: signedUrl });
 
-    // The fetch uses the full signed URL; the stored provenance does not.
     expect(ssrfSafeFetchMock).toHaveBeenCalledWith(
       signedUrl,
       expect.anything(),

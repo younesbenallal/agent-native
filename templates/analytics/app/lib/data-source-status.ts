@@ -31,7 +31,6 @@ export interface DataSourceProviderStatus {
   provider: string;
   label: string;
   setupLink?: string;
-  // null when the workspace-connection lookup failed: unreadable, not absent.
   configured: boolean | null;
   configuredKeys: string[];
   missingRequiredKeys: string[];
@@ -140,8 +139,6 @@ export function focusedDataSourceFromSearchParams(
   const requestedSourceId = searchParams.get("source")?.trim().toLowerCase();
   if (!requestedSourceId) return { status: "none" };
 
-  // Keep links emitted before PostgreSQL's provider id was aligned with the
-  // UI source id working instead of silently dropping their focus.
   const sourceId =
     requestedSourceId === "postgres" ? "postgresql" : requestedSourceId;
   const source = dataSources.find((candidate) => candidate.id === sourceId);
@@ -172,9 +169,9 @@ export function getGoogleDriveConnection(
 
 const sharedConnectionLabels: Record<SharedConnectionStatusKind, string> = {
   ready: "Ready via workspace",
-  needs_grant: "Needs grant",
-  needs_credentials: "Needs credentials",
-  local_credentials: "Local credentials",
+  needs_grant: "Available in workspace",
+  needs_credentials: "Not connected",
+  local_credentials: "Configured in this app",
 };
 
 function normalizeCredentialKey(key: string): string {

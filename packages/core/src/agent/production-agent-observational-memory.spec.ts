@@ -1,20 +1,7 @@
-/**
- * Specs for the Observational Memory (OM) wiring in the agent loop:
- *
- *   1. PRODUCER - after a clean turn the post-turn compaction hook
- *      (`maybeCompactThread`) is invoked for a thread, fire-and-forget.
- *   2. CONSUMER (long thread) - when the thread HAS persisted observations /
- *      reflections, the assembled context the engine sees is prefixed with the
- *      serialized OM memory block.
- *   3. CONSUMER (short thread) - when the thread has NO OM entries, the engine
- *      sees the messages unchanged (no OM block injected). Common-path safety.
- *
- * The OM module is mocked end-to-end so neither a real model nor a real DB is
- * touched.
- */
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
-// Mock run-store so DB is never touched.
+import { runWithRequestContext } from "../server/request-context.js";
+
 vi.mock("./run-store.js", () => ({
   writeLedgerEntry: vi.fn(async () => {}),
   readLedgerEntry: vi.fn(async () => null),
@@ -32,7 +19,6 @@ vi.mock("./run-store.js", () => ({
   setRunTerminalReason: vi.fn(),
 }));
 
-// Mock the OM module: assert producer + drive the consumer.
 const maybeCompactThreadMock = vi.hoisted(() => vi.fn(async () => ({})));
 const buildObservationalContextMock = vi.hoisted(() => vi.fn());
 
@@ -42,7 +28,6 @@ const OM_BLOCK_TEXT =
 vi.mock("./observational-memory/index.js", () => ({
   maybeCompactThread: maybeCompactThreadMock,
   buildObservationalContext: buildObservationalContextMock,
-  // Use the real-shaped predicates against the mocked context.
   hasObservationalMemory: (ctx: any) =>
     (ctx?.reflections?.length ?? 0) > 0 || (ctx?.observations?.length ?? 0) > 0,
   serializeObservationalMemoryBlock: (ctx: any) =>
@@ -51,7 +36,6 @@ vi.mock("./observational-memory/index.js", () => ({
       : "",
 }));
 
-// Mock context-xray so the OM injection runs on the raw messages unchanged.
 vi.mock("./context-xray/directives-store.js", () => ({
   loadContextDirectives: vi.fn(async () => []),
 }));
@@ -76,9 +60,6 @@ import type {
   EngineMessage,
 } from "./engine/types.js";
 
-// Helpers.
-
-/** Engine that records the messages it was streamed, then ends the turn. */
 function recordingEngine(captured: EngineMessage[][]): AgentEngine {
   return {
     name: "test",
@@ -93,8 +74,6 @@ function recordingEngine(captured: EngineMessage[][]): AgentEngine {
       parallelToolCalls: false,
     },
     async *stream(opts: any): AsyncIterable<EngineEvent> {
-      // Snapshot the array at stream time; the loop later mutates the original
-      // `messages` reference by pushing the assistant reply.
       captured.push([...(opts.messages as EngineMessage[])]);
       yield {
         type: "assistant-content",
@@ -120,7 +99,6 @@ const baseMessages: EngineMessage[] = [
 beforeEach(() => {
   vi.clearAllMocks();
   maybeCompactThreadMock.mockResolvedValue({});
-  // Default: short thread (no OM entries).
   buildObservationalContextMock.mockResolvedValue({
     threadId: "t",
     reflections: [],
@@ -146,7 +124,6 @@ describe("observational memory wiring", () => {
       ownerEmail: "alice@example.com",
     });
 
-    // Fire-and-forget; let the microtask run.
     await Promise.resolve();
     await Promise.resolve();
 
@@ -154,6 +131,37 @@ describe("observational memory wiring", () => {
     const arg = maybeCompactThreadMock.mock.calls[0][0] as any;
     expect(arg.threadId).toBe("thread-om");
     expect(arg.ownerEmail).toBe("alice@example.com");
+  });
+
+  it("registers compaction with the platform keep-alive when one exists", async () => {
+    const kept: Promise<unknown>[] = [];
+    const captured: EngineMessage[][] = [];
+    await runWithRequestContext(
+      {
+        userEmail: "alice@example.com",
+        run: { waitUntil: (p: Promise<unknown>) => kept.push(p) },
+      } as any,
+      () =>
+        runAgentLoop({
+          engine: recordingEngine(captured),
+          model: "test-model",
+          systemPrompt: "system",
+          tools: [],
+          messages: [...baseMessages],
+          actions: {},
+          send: () => {},
+          signal: new AbortController().signal,
+          threadId: "thread-om-waituntil",
+          ownerEmail: "alice@example.com",
+        }),
+    );
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(maybeCompactThreadMock).toHaveBeenCalledTimes(1);
+    expect(kept).toHaveLength(1);
+    await expect(kept[0]).resolves.not.toThrow();
   });
 
   it("does NOT run compaction when there is no threadId", async () => {
@@ -230,17 +238,13 @@ describe("observational memory wiring", () => {
     expect(captured.length).toBe(1);
     const sent = captured[0];
     const texts = blockText(sent);
-    // The serialized OM block must be the leading message.
     expect(texts[0]).toContain("[Observational Memory]");
     expect(sent[0].role).toBe("user");
-    // The recent-raw window is preserved verbatim after the block.
     expect(texts).toContain("recent turn");
-    // The trimmed-away older prefix is no longer replayed.
     expect(texts).not.toContain("old turn");
   });
 
   it("leaves context unchanged for a thread with NO entries (short thread)", async () => {
-    // Default mock = no reflections/observations.
     const inputMessages: EngineMessage[] = [
       { role: "user", content: [{ type: "text", text: "first" }] },
       { role: "assistant", content: [{ type: "text", text: "reply" }] },
@@ -263,7 +267,6 @@ describe("observational memory wiring", () => {
 
     const sent = captured[0];
     const texts = blockText(sent);
-    // No OM block injected; all original turns intact and in order.
     expect(texts.some((t) => t.includes("[Observational Memory]"))).toBe(false);
     expect(texts).toEqual(["first", "reply", "second"]);
   });

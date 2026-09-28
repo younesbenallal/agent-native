@@ -1,18 +1,8 @@
-/**
- * Store for the data-programs primitive: CRUD on the `dataPrograms` ownable
- * resource (via Drizzle) plus a raw-DDL run-result cache
- * (`data_program_runs`) mirroring `../provider-api/staged-datasets-store.ts`.
- *
- * Follows the boot-DDL pattern from `../extensions/store.ts`: a memoized
- * init promise, Postgres probe-then-guarded-DDL via `ensureTableExists` /
- * `ensureIndexExists`, and a plain create-then-catch on SQLite.
- */
-
 import { randomUUID } from "node:crypto";
 
 import { and, eq, isNull } from "drizzle-orm";
 
-import { getDbExec, intType, isPostgres } from "../db/client.js";
+import { getDbExec } from "../db/client.js";
 import { createGetDb } from "../db/create-get-db.js";
 import {
   ensureTableExists,
@@ -25,9 +15,7 @@ import {
   dataPrograms,
   dataProgramShares,
   DATA_PROGRAMS_CREATE_SQL,
-  DATA_PROGRAMS_CREATE_SQL_PG,
   DATA_PROGRAM_SHARES_CREATE_SQL,
-  DATA_PROGRAM_SHARES_CREATE_SQL_PG,
   DATA_PROGRAMS_APP_OWNER_INDEX_SQL,
   DATA_PROGRAMS_APP_NAME_INDEX_SQL,
   DATA_PROGRAM_SHARES_RESOURCE_INDEX_SQL,
@@ -36,107 +24,50 @@ import {
   DATA_PROGRAM_RUNS_LOOKUP_INDEX_SQL,
 } from "./schema.js";
 
-// ---------------------------------------------------------------------------
-// Caps
-// ---------------------------------------------------------------------------
-
 export const MAX_PROGRAM_ROWS = 10_000;
 export const MAX_PROGRAM_RESULT_BYTES = 4 * 1024 * 1024;
 export const MAX_ACTIVE_PROGRAMS_PER_APP = 200;
 export const MIN_REFRESH_TTL_MS = 60_000;
 
-/** How many run rows to retain per (programId, paramsHash) after each write. */
 const DEFAULT_RUN_KEEP = 5;
 
 const getDb = createGetDb({ dataPrograms, dataProgramShares });
 
-// ---------------------------------------------------------------------------
-// Boot DDL
-// ---------------------------------------------------------------------------
-
 let _initPromise: Promise<void> | undefined;
-
-function isDuplicateColumnError(err: unknown): boolean {
-  const code = String((err as { code?: unknown })?.code ?? "");
-  const message = String((err as { message?: unknown })?.message ?? err)
-    .toLowerCase()
-    .trim();
-  return (
-    code === "42701" ||
-    message.includes("duplicate column") ||
-    message.includes("already exists")
-  );
-}
-
-async function ensureSqliteDataProgramRunsColumns(): Promise<void> {
-  const client = getDbExec();
-  try {
-    await client.execute(
-      `ALTER TABLE data_program_runs ADD COLUMN truncated INTEGER NOT NULL DEFAULT 0`,
-    );
-  } catch (err) {
-    if (!isDuplicateColumnError(err)) throw err;
-  }
-}
 
 export async function ensureDataProgramTables(): Promise<void> {
   if (!_initPromise) {
     _initPromise = (async () => {
-      const client = getDbExec();
-      const pg = isPostgres();
-      const integerType = intType();
+      const integerType = "BIGINT";
       const runsCreateSql = dataProgramRunsCreateSql(integerType);
 
-      if (pg) {
-        // PG guard: probe via information_schema, only issue DDL if missing,
-        // bounded lock_timeout — see ../db/ddl-guard.js.
-        await ensureTableExists("data_programs", DATA_PROGRAMS_CREATE_SQL_PG);
-        await ensureTableExists(
-          "data_program_shares",
-          DATA_PROGRAM_SHARES_CREATE_SQL_PG,
-        );
-        await ensureTableExists("data_program_runs", runsCreateSql);
-        await ensureColumnExists(
-          "data_program_runs",
-          "truncated",
-          DATA_PROGRAM_RUNS_TRUNCATED_COLUMN_SQL,
-        );
-        await ensureIndexExists(
-          "data_programs_app_owner_idx",
-          DATA_PROGRAMS_APP_OWNER_INDEX_SQL,
-        );
-        await ensureIndexExists(
-          "data_programs_app_name_idx",
-          DATA_PROGRAMS_APP_NAME_INDEX_SQL,
-        );
-        await ensureIndexExists(
-          "data_program_shares_resource_idx",
-          DATA_PROGRAM_SHARES_RESOURCE_INDEX_SQL,
-        );
-        await ensureIndexExists(
-          "data_program_runs_lookup_idx",
-          DATA_PROGRAM_RUNS_LOOKUP_INDEX_SQL,
-        );
-        return;
-      }
-
-      // SQLite (local dev): plain create-then-catch, matching staged-datasets-store.ts.
-      await client.execute(DATA_PROGRAMS_CREATE_SQL);
-      await client.execute(DATA_PROGRAM_SHARES_CREATE_SQL);
-      await client.execute(runsCreateSql);
-      await ensureSqliteDataProgramRunsColumns();
-      for (const ddl of [
+      await ensureTableExists("data_programs", DATA_PROGRAMS_CREATE_SQL);
+      await ensureTableExists(
+        "data_program_shares",
+        DATA_PROGRAM_SHARES_CREATE_SQL,
+      );
+      await ensureTableExists("data_program_runs", runsCreateSql);
+      await ensureColumnExists(
+        "data_program_runs",
+        "truncated",
+        DATA_PROGRAM_RUNS_TRUNCATED_COLUMN_SQL,
+      );
+      await ensureIndexExists(
+        "data_programs_app_owner_idx",
         DATA_PROGRAMS_APP_OWNER_INDEX_SQL,
+      );
+      await ensureIndexExists(
+        "data_programs_app_name_idx",
         DATA_PROGRAMS_APP_NAME_INDEX_SQL,
+      );
+      await ensureIndexExists(
+        "data_program_shares_resource_idx",
         DATA_PROGRAM_SHARES_RESOURCE_INDEX_SQL,
+      );
+      await ensureIndexExists(
+        "data_program_runs_lookup_idx",
         DATA_PROGRAM_RUNS_LOOKUP_INDEX_SQL,
-      ]) {
-        try {
-          await client.execute(ddl);
-        } catch {
-          // Index already exists — harmless.
-        }
-      }
+      );
     })().catch((err) => {
       _initPromise = undefined;
       throw err;
@@ -153,24 +84,14 @@ export function registerDataProgramsShareable(): void {
     displayName: "Data program",
     titleColumn: "title",
     getDb: () => getDb(),
-    // MANDATORY security invariant: a data program executes its author's
-    // stored code with the VIEWER's credentials (providerFetch resolves the
-    // caller's own auth). A public program would let any authenticated user
-    // run arbitrary stored code under their own token — same threat model as
-    // extensions (../extensions/store.ts registerExtensionsShareable).
     allowPublic: false,
     requireOrgMemberForUserShares: true,
   });
 }
 
-/** Test-only: reset the memoized init promise. */
 export function _resetDataProgramInitPromiseForTests(): void {
   _initPromise = undefined;
 }
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 export type DataProgramRefreshMode = "manual" | "ttl";
 
@@ -267,12 +188,6 @@ function generateProgramId(): string {
   return `dp_${randomUUID().replace(/-/g, "")}`;
 }
 
-/**
- * Create or update a data program. When `id` is omitted, checks for an
- * existing program with the same (appId, ownerEmail, name) slug and updates
- * it in place (upsert-by-slug); otherwise creates a new row. Enforces
- * MAX_ACTIVE_PROGRAMS_PER_APP on create.
- */
 export async function upsertDataProgram(
   input: UpsertDataProgramInput,
 ): Promise<DataProgramRow> {
@@ -403,7 +318,6 @@ export interface ListDataProgramsOptions {
   includeArchived?: boolean;
 }
 
-/** List programs scoped to `appId`, filtered through the sharing access rules. */
 export async function listDataPrograms(
   appId: string,
   ctx: AccessContext,
@@ -422,7 +336,6 @@ export async function listDataPrograms(
   return rows.map(rowFromRaw);
 }
 
-/** Soft-archive: sets `archivedAt`. NEVER hard-deletes — panels/history may still reference the id. */
 export async function archiveDataProgram(
   id: string,
   appId?: string,
@@ -444,10 +357,6 @@ export async function archiveDataProgram(
     .where(where);
   return true;
 }
-
-// ---------------------------------------------------------------------------
-// Run cache
-// ---------------------------------------------------------------------------
 
 export type DataProgramRunStatus =
   | "queued"
@@ -495,7 +404,6 @@ export interface RecordDataProgramRunInput {
   startedAt?: number;
   finishedAt?: number | null;
   durationMs?: number | null;
-  /** How many run rows to keep per (programId, paramsHash) after this write. */
   keep?: number;
 }
 
@@ -536,7 +444,6 @@ function generateRunId(): string {
   return `dpr_${randomUUID().replace(/-/g, "")}`;
 }
 
-/** Insert a new run row (typically `status: "running"` or `"queued"` first, finalized via `updateDataProgramRun`). */
 export async function recordDataProgramRun(
   input: RecordDataProgramRunInput,
 ): Promise<DataProgramRunRow> {
@@ -611,11 +518,9 @@ export interface UpdateDataProgramRunInput {
   executionId?: string | null;
   finishedAt?: number | null;
   durationMs?: number | null;
-  /** How many run rows to keep per (programId, paramsHash) after this write. */
   keep?: number;
 }
 
-/** Finalize an existing run row (e.g. a background execution completing). */
 export async function updateDataProgramRun(
   runId: string,
   updates: UpdateDataProgramRunInput,
@@ -651,7 +556,6 @@ export async function updateDataProgramRun(
     args,
   });
 
-  // Look up (programId, paramsHash) to prune — cheap point read.
   const { rows } = await client.execute({
     sql: `SELECT program_id, params_hash FROM data_program_runs WHERE id = ?`,
     args: [runId],
@@ -702,10 +606,6 @@ export async function getLatestRun(
   return row ? runRowFromDb(row) : null;
 }
 
-/**
- * Return the latest queued/running run row for (programId, paramsHash), if
- * any, so callers can dedupe concurrent executions instead of racing.
- */
 export async function getActiveRun(
   programId: string,
   paramsHash: string,
@@ -723,13 +623,6 @@ export async function getActiveRun(
   return row ? runRowFromDb(row) : null;
 }
 
-/**
- * Delete all but the `keep` most-recent run rows for (programId, paramsHash).
- * Called on every write (prune-on-write, no sweep job). Fetches all ids
- * ordered newest-first and slices in TypeScript rather than `LIMIT ... OFFSET`
- * so the query stays byte-identical across SQLite and Postgres (SQLite's
- * `LIMIT -1 OFFSET n` idiom has no direct Postgres equivalent).
- */
 export async function pruneDataProgramRuns(
   programId: string,
   paramsHash: string,

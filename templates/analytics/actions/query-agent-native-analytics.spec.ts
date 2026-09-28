@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@agent-native/core", () => ({
+  dataTableWidgetResultSchema: {},
   defineAction: (definition: unknown) => definition,
 }));
 vi.mock("@agent-native/core/server", () => ({
@@ -45,6 +46,76 @@ describe("query-agent-native-analytics", () => {
       { userEmail: "alice@example.com", orgId: "org_123" },
       { cache: true },
     );
+  });
+
+  it("returns a native table only when the user asked to see query rows", async () => {
+    const sql = "SELECT events FROM analytics_event_daily_rollups";
+    await expect(action.run({ sql, showTable: true })).resolves.toEqual({
+      widget: "data-table",
+      widgetId: "analytics.query.v1",
+      title: "Analytics query result",
+      table: {
+        title: "Analytics query result",
+        columns: [{ key: "events", label: "events", align: "right" }],
+        rows: [{ events: 3 }],
+      },
+    });
+  });
+
+  it("preserves truncation and omits a complete-looking scalar card", async () => {
+    const result = {
+      rows: [{ events: 3 }],
+      schema: [{ name: "events", type: "number" }],
+      truncated: true,
+    };
+    mocks.queryFirstPartyAnalytics.mockResolvedValueOnce(result);
+
+    await expect(
+      action.run({ sql: "SELECT events FROM analytics_events" }),
+    ).resolves.toEqual(result);
+    expect(action.chatUI.when({}, result)).toBe(false);
+
+    mocks.queryFirstPartyAnalytics.mockResolvedValueOnce(result);
+    await expect(
+      action.run({
+        sql: "SELECT events FROM analytics_events",
+        showTable: true,
+      }),
+    ).resolves.toMatchObject({
+      table: { rows: result.rows, truncated: true },
+    });
+  });
+
+  it("attaches the result renderer only for a single numeric value or a requested table", () => {
+    expect(action.outputSchema).toBeDefined();
+    expect(action.chatUI).toEqual({
+      renderer: "analytics.analysis-result",
+      when: expect.any(Function),
+    });
+    expect(
+      action.chatUI.when(
+        {},
+        { rows: [{ events: 3 }], schema: [{ name: "events", type: "number" }] },
+      ),
+    ).toBe(true);
+    expect(
+      action.chatUI.when(
+        {},
+        {
+          rows: [{ events: 3 }, { events: 4 }],
+          schema: [{ name: "events", type: "number" }],
+        },
+      ),
+    ).toBe(false);
+    expect(
+      action.chatUI.when(
+        { showTable: true },
+        {
+          rows: [{ events: 3 }, { events: 4 }],
+          schema: [{ name: "events", type: "number" }],
+        },
+      ),
+    ).toBe(true);
   });
 
   it("teaches the agent to prefer rollups and bound raw reads", () => {

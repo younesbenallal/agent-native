@@ -5,7 +5,13 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  filterFrameworkToolGroups,
+  resolveFrameworkTools,
+} from "../framework-tools.js";
+import {
+  ALWAYS_ON_CORE_ACTIONS,
   autoDiscoverActions,
+  CORE_ACTION_GROUPS,
   loadActionsFromStaticRegistry,
   mergeCoreSharingActions,
 } from "./action-discovery.js";
@@ -65,6 +71,49 @@ describe("action discovery", () => {
     expect(registry["mutating-read"].readOnly).toBe(false);
   });
 
+  it(
+    "makes audit reads available with a static registry while respecting disabled groups",
+    async () => {
+      const registry = loadActionsFromStaticRegistry({});
+      await mergeCoreSharingActions(registry);
+      const enabled = filterFrameworkToolGroups(
+        registry,
+        resolveFrameworkTools({}).disabledGroups,
+      );
+      const disabled = filterFrameworkToolGroups(
+        registry,
+        resolveFrameworkTools({ frameworkTools: { audit: false } })
+          .disabledGroups,
+      );
+      for (const name of ["list-audit-events", "get-audit-event"]) {
+        expect(enabled[name]?.readOnly).toBe(true);
+        expect(disabled[name]).toBeUndefined();
+        expect(registry[name]).toBeDefined();
+      }
+    },
+    CORE_ACTION_DISCOVERY_TIMEOUT_MS,
+  );
+
+  it("preserves grounding metadata from static action entries", () => {
+    const registry = loadActionsFromStaticRegistry({
+      "grounded-query": {
+        default: {
+          tool: { description: "Grounded query", parameters: {} },
+          grounding: true,
+          run: async () => ({ ok: true }),
+        },
+      },
+      "metadata-read": {
+        tool: { description: "Metadata read", parameters: {} },
+        grounding: false,
+        run: async () => ({ ok: true }),
+      },
+    });
+
+    expect(registry["grounded-query"].grounding).toBe(true);
+    expect(registry["metadata-read"].grounding).toBe(false);
+  });
+
   it("preserves explicit readOnly false from named action entries", () => {
     const registry = loadActionsFromStaticRegistry({
       "named-mutating-read": {
@@ -90,6 +139,20 @@ describe("action discovery", () => {
     });
 
     expect(registry["safe-write"].parallelSafe).toBe(true);
+  });
+
+  it("preserves explicit endsTurn metadata", () => {
+    const registry = loadActionsFromStaticRegistry({
+      "show-questions": {
+        default: {
+          tool: { description: "Show questions", parameters: {} },
+          endsTurn: true,
+          run: async () => ({ ok: true }),
+        },
+      },
+    });
+
+    expect(registry["show-questions"].endsTurn).toBe(true);
   });
 
   it("preserves explicit duplicate-read opt-out metadata", () => {
@@ -268,6 +331,21 @@ describe("action discovery", () => {
     expect(registry["send-email-named"].needsApproval).toBe(gate);
   });
 
+  it("preserves a per-call-only approval policy through discovery", () => {
+    const registry = loadActionsFromStaticRegistry({
+      "send-email": {
+        default: {
+          tool: { description: "Send email", parameters: {} },
+          needsApproval: true,
+          allowPersistentApproval: false,
+          run: async () => ({ ok: true }),
+        },
+      },
+    });
+
+    expect(registry["send-email"].allowPersistentApproval).toBe(false);
+  });
+
   it("threads the http config through named and default static entries", () => {
     const registry = loadActionsFromStaticRegistry({
       "named-get": {
@@ -318,10 +396,8 @@ describe("action discovery", () => {
 
     const entry = registry["greet"];
     expect(entry).toBeDefined();
-    // A synthesized tool definition exposes a single space-separated `args` param.
     expect(entry.tool.parameters?.properties).toHaveProperty("args");
 
-    // Single `args` string is shell-split into CLI tokens.
     const out = await entry.run({ args: '--name "Ada Lovelace"' });
     expect(seenArgs[0]).toEqual(["--name", "Ada Lovelace"]);
     expect(out).toContain("hello Ada Lovelace");
@@ -338,7 +414,6 @@ describe("action discovery", () => {
     });
 
     await registry["kv-action"].run({ id: "abc", title: "Hi there" });
-    // Each entry becomes `--key`, `value` (order follows Object.entries).
     expect(seenArgs[0]).toEqual(["--id", "abc", "--title", "Hi there"]);
   });
 
@@ -356,6 +431,7 @@ describe("action discovery", () => {
         "share-resource",
         "unshare-resource",
         "set-resource-visibility",
+        "offboard-member",
       ]) {
         expect(registry[name], `${name} should be merged`).toBeDefined();
         expect(
@@ -363,9 +439,33 @@ describe("action discovery", () => {
           `${name} must keep toolCallable:false`,
         ).toBe(false);
       }
+      expect(registry["offboard-member"].agentTool).toBe(false);
+      expect(registry["offboard-member"].mcpTool).toBe(false);
+      await expect(
+        registry["offboard-member"].run(
+          { email: "alice@example.com", transferTo: "bob@example.com" },
+          { caller: "tool", userEmail: "alice@example.com" },
+        ),
+      ).rejects.toThrow(
+        "This action can only be called from the signed-in app UI.",
+      );
     },
     CORE_ACTION_DISCOVERY_TIMEOUT_MS,
   );
+
+  it("preserves WebMCP capability scopes in the action registry", () => {
+    const registry = loadActionsFromStaticRegistry({
+      "visual-edit": {
+        default: {
+          tool: { description: "Visual edit", parameters: {} },
+          capabilityScopes: ["visual-edit"],
+          run: async () => ({}),
+        },
+      },
+    });
+
+    expect(registry["visual-edit"].capabilityScopes).toEqual(["visual-edit"]);
+  });
 
   it(
     "merges app-facing MCP actions without exposing them as agent tools",
@@ -395,12 +495,10 @@ describe("action discovery", () => {
     };
     await mergeCoreSharingActions(registry);
 
-    // The template's own share-resource must survive — core must not clobber it.
     expect(registry["share-resource"].run).toBe(templateRun);
     expect(registry["share-resource"].tool.description).toBe(
       "Template share override",
     );
-    // Other core actions still get merged in.
     expect(registry["unshare-resource"]).toBeDefined();
   });
 
@@ -413,6 +511,22 @@ describe("action discovery", () => {
       method: "GET",
     });
     expect(registry["set-localization-preference"]).toBeDefined();
+  });
+
+  it("merges Labs actions and their legacy experiment aliases", async () => {
+    const registry: Record<string, any> = {};
+    await mergeCoreSharingActions(registry);
+
+    for (const name of [
+      "get-labs",
+      "set-lab",
+      "get-experiments",
+      "set-experiment",
+    ]) {
+      expect(registry[name], `${name} should be merged`).toBeDefined();
+      expect(registry[name].frameworkGroup).toBe("labs");
+    }
+    expect(registry["get-experiments"].http).toEqual({ method: "GET" });
   });
 
   it("merges toolkit history and review actions", async () => {
@@ -430,14 +544,88 @@ describe("action discovery", () => {
       "reply-review-comment",
       "resolve-review-thread",
       "delete-review-comment",
+      "update-review-comment",
       "consume-review-feedback",
       "get-review-feedback",
       "set-review-status",
       "send-review-thread-to-agent",
+      "set-review-threads-unread",
     ]) {
       expect(registry[name], `${name} should be merged`).toBeDefined();
     }
     expect(registry["list-resource-history"].readOnly).toBe(true);
     expect(registry["list-review-comments"].readOnly).toBe(true);
+  });
+
+  it("classifies every merged core action as grouped or explicitly always-on", async () => {
+    const registry: Record<string, any> = {};
+    await mergeCoreSharingActions(registry);
+
+    const unclassified = Object.keys(registry).filter(
+      (name) =>
+        CORE_ACTION_GROUPS[name] === undefined &&
+        !ALWAYS_ON_CORE_ACTIONS.has(name),
+    );
+    expect(
+      unclassified,
+      `Add these to CORE_ACTION_GROUPS (gateable via frameworkTools) or ` +
+        `ALWAYS_ON_CORE_ACTIONS (deliberately always-on): ${unclassified.join(", ")}`,
+    ).toEqual([]);
+  });
+
+  it("stamps frameworkGroup on grouped kits and leaves always-on actions untagged", async () => {
+    const registry: Record<string, any> = {};
+    await mergeCoreSharingActions(registry);
+
+    expect(registry["share-resource"].frameworkGroup).toBe("sharing");
+    expect(registry["list-review-comments"].frameworkGroup).toBe("review");
+    expect(registry["restore-resource-version"].frameworkGroup).toBe("history");
+    expect(registry["set-feature-flag"].frameworkGroup).toBe("featureFlags");
+    expect(registry["change-password"].frameworkGroup).toBe("userProfile");
+    expect(registry["upload-image"].frameworkGroup).toBeUndefined();
+    expect(registry["call-mcp-tool"].frameworkGroup).toBeUndefined();
+  });
+
+  it("gives the formerly always-on kits a switch without changing the default", async () => {
+    const registry: Record<string, any> = {};
+    await mergeCoreSharingActions(registry);
+
+    const owned: Record<string, string[]> = {
+      workspaceUserGroups: [
+        "list-workspace-user-groups",
+        "upsert-workspace-user-group",
+        "bulk-update-workspace-user-groups",
+        "delete-workspace-user-group",
+      ],
+      emailCatalog: [
+        "list-transactional-emails",
+        "render-transactional-email-preview",
+        "list-email-log",
+        "get-email-log-body",
+        "list-email-activity",
+        "list-email-engagement",
+      ],
+      orgServiceTokens: [
+        "create-org-service-token",
+        "list-org-service-tokens",
+        "revoke-org-service-token",
+      ],
+    };
+
+    for (const [group, names] of Object.entries(owned)) {
+      for (const name of names) {
+        expect(registry[name]?.frameworkGroup, name).toBe(group);
+        expect(ALWAYS_ON_CORE_ACTIONS.has(name), name).toBe(false);
+      }
+      expect(resolveFrameworkTools({}).isEnabled(group as any), group).toBe(
+        true,
+      );
+      expect(
+        resolveFrameworkTools({
+          frameworkTools: { [group]: false },
+        }).isEnabled(group as any),
+        group,
+      ).toBe(false);
+    }
   });
 });

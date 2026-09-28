@@ -1,12 +1,14 @@
-/* Self-hosted via @fontsource-variable/inter and @fontsource/poppins — no render-blocking Google Fonts request */
 @import "@fontsource-variable/inter";
-/* Poppins has no variable-font Fontsource package; use static weights */
 @import "@fontsource/poppins/300.css";
 @import "@fontsource/poppins/400.css";
 @import "@fontsource/poppins/500.css";
 @import "@fontsource/poppins/600.css";
 @import "@fontsource/poppins/700.css";
 @import "@fontsource/poppins/800.css";
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/500.css";
+@import "@fontsource/jetbrains-mono/600.css";
+@import "@fontsource/jetbrains-mono/700.css";
 
 @import "tailwindcss";
 @import "@agent-native/core/styles/agent-native.css";
@@ -14,14 +16,129 @@
 
 @source "./**/*.{ts,tsx}";
 
-/* Keep the editable agent prompt readable even if the generated text utility
-   is missing or loses a cascade tie during the hosted build. */
+.slides-home-header {
+  container-type: inline-size;
+  border-bottom: 0;
+}
+
+.slides-home-toolbar {
+  display: grid;
+  height: 3.5rem;
+  grid-template-columns:
+    minmax(0, 1fr) minmax(8rem, min(30rem, max(8rem, calc(100cqw - 38rem))))
+    minmax(0, 1fr);
+  grid-template-rows: 3.5rem;
+  column-gap: 0.75rem;
+  padding: 0 1rem;
+}
+
+.slides-home-search {
+  display: flex;
+  max-width: 30rem;
+  align-items: center;
+  align-self: center;
+}
+
+@media (min-width: 64rem) {
+  .slides-home-toolbar {
+    padding-inline: 1.5rem;
+  }
+}
+
+@container (max-width: 52rem) {
+  .slides-home-toolbar .slides-home-import-label {
+    display: none;
+  }
+}
+
+@container (max-width: 32rem) {
+  .slides-home-toolbar {
+    height: 7rem;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: 3.5rem 3.5rem;
+    row-gap: 0;
+  }
+
+  .slides-home-search {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    justify-self: center;
+  }
+}
+
+.slides-home-toolbar h1 {
+  font-size: 1rem;
+  line-height: 1.25rem;
+}
+
+.slides-home-mobile-toolbar {
+  min-width: 0;
+}
+
+@media (max-width: 20rem) {
+  .slides-home-mobile-toolbar {
+    flex-wrap: wrap;
+  }
+
+  .slides-home-mobile-toolbar > :first-child {
+    flex: 0 0 100%;
+  }
+
+  .slides-home-mobile-toolbar > :last-child {
+    margin-inline-start: auto;
+  }
+}
+
+.deck-template-preview-frame {
+  width: 960px;
+  height: 540px;
+  transform: scale(var(--deck-template-scale, 0.25));
+  transform-origin: top left;
+  border: 0;
+  pointer-events: none;
+}
+
+.deck-template-stage {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.deck-template-stage-canvas {
+  width: var(--deck-template-stage-width, 100%);
+  height: var(--deck-template-stage-height, 100%);
+}
+
+.slides-home-prompt-composer-area.agent-composer-area--hero {
+  padding: 0;
+}
+
+[data-slides-home-composer] {
+  --agent-kit-composer-min-height: 9rem;
+  --agent-kit-composer-editor-min-height: 5.125rem;
+}
+
 .agent-composer-root [data-agent-composer-slot="editor-input"] {
   color: hsl(var(--foreground));
 }
 
-/* Hide the sidebar's built-in collapsed tab strip — AgentToggleButton in the
-   toolbar serves this purpose instead, so we don't want a redundant bar. */
+.slides-question-flow
+  .guided-question-flow-options
+  button[aria-pressed="false"] {
+  color: hsl(var(--foreground));
+  background-color: hsl(var(--muted) / 0.55);
+}
+
+.slides-question-flow
+  .guided-question-flow-options
+  button
+  .text-muted-foreground {
+  color: hsl(var(--foreground) / 0.8);
+}
+
 button[title="Open agent sidebar"] {
   display: none !important;
 }
@@ -69,6 +186,7 @@ button[title="Open agent sidebar"] {
   --sidebar-ring: 0 0% 50%;
 
   --accent-cyan: 187 100% 50%;
+  --slides-thumbnail-shadow: 0 0% 0%;
 }
 
 .light {
@@ -111,12 +229,32 @@ button[title="Open agent sidebar"] {
   --sidebar-border: 0 0% 90%;
   --sidebar-ring: 0 0% 65%;
 
-  /* Darker than the dark-theme #00E5FF so text stays >= 4.5:1 against a white popover. */
   --accent-cyan: 193 82% 31%;
 }
 
-/* Slides keeps the shared visual inspector behavior, but the dock and context toolbar need the
-   flatter, filled-control treatment used by the slide editor. */
+[data-slides-thumbnail-scroll]::before {
+  position: absolute;
+  z-index: 20;
+  inset: 0.5rem 0.5rem auto;
+  height: 1rem;
+  pointer-events: none;
+  content: "";
+  opacity: 0;
+  background: radial-gradient(
+    ellipse 82% 125% at 50% 0%,
+    hsl(var(--slides-thumbnail-shadow) / 0.18) 0%,
+    hsl(var(--slides-thumbnail-shadow) / 0.08) 48%,
+    transparent 100%
+  );
+  box-shadow: 0 0.2rem 0.45rem -0.25rem
+    hsl(var(--slides-thumbnail-shadow) / 0.64);
+  transition: opacity 150ms ease-out;
+}
+
+[data-slides-thumbnail-scroll="scrolled"]::before {
+  opacity: 1;
+}
+
 .slide-style-inspector,
 .slide-context-toolbar {
   --slides-inspector-control-background: hsl(var(--muted) / 0.82);
@@ -143,7 +281,7 @@ button[title="Open agent sidebar"] {
 }
 
 .slide-style-inspector .slides-inspector-section {
-  border-bottom: 1px solid var(--slides-inspector-divider);
+  border-bottom: 0;
   border-radius: 0;
   padding: 0.625rem 0.75rem;
 }
@@ -168,8 +306,6 @@ button[title="Open agent sidebar"] {
   box-shadow: none;
 }
 
-/* The toolbar sits on a muted surface, so its inputs need the opposite
-   treatment to stay readable: a light box rather than a darker fill. */
 .slide-context-toolbar input {
   border: 1px solid var(--slides-inspector-divider);
   border-radius: 0.25rem;
@@ -218,7 +354,6 @@ button[title="Open agent sidebar"] {
     white-space: pre;
   }
 
-  /* Custom scrollbar */
   ::-webkit-scrollbar {
     width: 6px;
     height: 6px;
@@ -227,16 +362,53 @@ button[title="Open agent sidebar"] {
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: hsl(var(--muted-foreground) / 0.3);
+    background: hsl(var(--muted-foreground) / 0.22);
     border-radius: 3px;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: hsl(var(--muted-foreground) / 0.5);
+    background: hsl(var(--muted-foreground) / 0.34);
   }
 }
 
 .deck-grid-container {
   container-type: inline-size;
+}
+
+.deck-editor-shell {
+  --slides-editor-surface: hsl(var(--background));
+  container-type: inline-size;
+  container-name: deck-editor;
+}
+
+@supports (background: color-mix(in srgb, white, black)) {
+  .deck-editor-shell {
+    --slides-editor-surface: color-mix(
+      in srgb,
+      hsl(var(--background)) 35%,
+      var(--agent-native-lower-surface, hsl(var(--background))) 65%
+    );
+  }
+}
+
+.deck-editor-context-toolbar-host {
+  min-width: 0;
+  overflow: auto;
+}
+
+.deck-editor-context-toolbar-host--wide {
+  display: none;
+}
+
+.deck-editor-context-toolbar-host--narrow {
+  display: flex;
+  justify-content: flex-start;
+}
+
+.deck-editor-context-toolbar-host--narrow
+  > [data-slide-inline-edit-surface="true"] {
+  min-width: 0;
+  width: 100%;
+  flex: 1 1 auto;
 }
 
 @container (max-width: 36rem) {
@@ -245,7 +417,6 @@ button[title="Open agent sidebar"] {
   }
 }
 
-/* Presentation mode styles */
 .presentation-mode {
   cursor: none;
 }
@@ -253,58 +424,38 @@ button[title="Open agent sidebar"] {
   cursor: default;
 }
 
-/* Slide content styling */
 .slide-content {
-  font-family: "Poppins", sans-serif;
+  font-family: var(--ds-body-font, "Inter", sans-serif);
+  color: var(--ds-text, #1f2933);
 }
 
-/* Per-element inline text editing — highlight the text leaf that is
-   currently being edited so the user can see which block is active. */
+.slide-content [data-slide-text-block="true"],
 .slide-content [data-editing-block="true"] {
-  outline: 2px solid #609ff8;
-  outline-offset: 4px;
-  border-radius: 2px;
   cursor: text;
-}
-.slide-content [data-editing-block="true"]:focus {
-  outline: 2px solid #609ff8;
-}
-/* Subtle hover highlight on editable text leaves to hint clickability.
-   Scoped to `[data-editable]` so read-only decks don't show an outline that
-   makes text look editable when it isn't. */
-.slide-image-clickable[data-editable] .slide-content p:hover,
-.slide-image-clickable[data-editable] .slide-content h1:hover,
-.slide-image-clickable[data-editable] .slide-content h2:hover,
-.slide-image-clickable[data-editable] .slide-content h3:hover,
-.slide-image-clickable[data-editable] .slide-content h4:hover,
-.slide-image-clickable[data-editable] .slide-content span:hover {
-  outline: 1px dashed rgba(96, 159, 248, 0.4);
-  outline-offset: 3px;
-  border-radius: 2px;
 }
 .slide-content h1 {
   @apply text-5xl font-bold mb-6 leading-tight tracking-tight;
-  color: #ffffff;
+  color: var(--ds-text, #1f2933);
 }
 .slide-content h2 {
   @apply text-3xl font-semibold mb-4 leading-snug tracking-tight;
-  color: #ffffff;
+  color: var(--ds-text, #1f2933);
 }
 .slide-content h3 {
   @apply text-2xl font-medium mb-3;
-  color: #ffffff;
+  color: var(--ds-text, #1f2933);
 }
 .slide-content p {
   @apply text-xl leading-relaxed mb-4;
-  color: rgba(255, 255, 255, 0.75);
+  color: var(--ds-text-muted, #667085);
 }
 .slide-content ul {
   @apply text-lg space-y-3 list-disc list-inside;
-  color: rgba(255, 255, 255, 0.75);
+  color: var(--ds-text-muted, #667085);
 }
 .slide-content ol {
   @apply text-lg space-y-3 list-decimal list-inside;
-  color: rgba(255, 255, 255, 0.75);
+  color: var(--ds-text-muted, #667085);
 }
 .slide-content code {
   @apply bg-white/10 px-2 py-0.5 rounded text-base font-mono;
@@ -322,7 +473,7 @@ button[title="Open agent sidebar"] {
 }
 .slide-content strong {
   @apply font-bold;
-  color: #ffffff;
+  color: var(--ds-text, #1f2933);
 }
 .slide-content em {
   @apply italic;
@@ -336,7 +487,6 @@ button[title="Open agent sidebar"] {
   @apply max-w-full max-h-[60vh] mx-auto rounded-lg;
 }
 
-/* Builder brand table styling for slides */
 .slide-content table {
   @apply w-full text-left;
   border-collapse: collapse;
@@ -347,37 +497,133 @@ button[title="Open agent sidebar"] {
 }
 .slide-content td {
   @apply py-3 text-base;
-  color: rgba(255, 255, 255, 0.75);
+  color: var(--ds-text-muted, #667085);
   border-top: 1px solid rgba(255, 255, 255, 0.06);
 }
 .slide-content td:first-child {
   @apply font-semibold;
-  color: #ffffff;
+  color: var(--ds-text, #1f2933);
 }
 
-/* Builder brand hr styling */
 .slide-content hr {
   @apply my-4;
-  border-color: rgba(255, 255, 255, 0.06);
+  border-color: var(--ds-accent, #2457d6);
 }
 
-/* ─── Slide Styles ─── */
-
-/* Full-bleed wrapper for blank-layout slides */
 .fmd-slide {
+  position: relative;
   width: 100%;
   height: 100%;
   display: flex;
   flex-direction: column;
-  font-family: "Poppins", sans-serif;
+  padding: 64px 80px;
+  color: var(--ds-text, #1f2933);
+  background: var(--ds-bg, #f5f2ea);
+  font-family: var(--ds-body-font, "Inter", sans-serif);
   box-sizing: border-box;
   overflow: hidden;
 }
 
+.fmd-slide[data-imported-pptx="true"],
+.fmd-slide[data-imported-pdf="true"] {
+  padding: 0;
+}
+
+.fmd-slide.fmd-slide--title {
+  justify-content: center;
+  align-items: flex-start;
+  gap: 24px;
+  padding: 64px 80px;
+}
+
+.fmd-slide.fmd-slide--content,
+.fmd-slide.fmd-slide--two-column {
+  justify-content: flex-start;
+  gap: 24px;
+  padding: 64px 80px;
+}
+
+.fmd-slide.fmd-slide--statement {
+  align-items: center;
+  justify-content: center;
+  gap: 24px;
+  padding: 64px 80px;
+  text-align: center;
+}
+
+.fmd-slide.fmd-slide--title h1,
+.fmd-slide.fmd-slide--content h1,
+.fmd-slide.fmd-slide--content h2,
+.fmd-slide.fmd-slide--two-column h1,
+.fmd-slide.fmd-slide--two-column h2,
+.fmd-slide.fmd-slide--statement h1,
+.fmd-slide.fmd-slide--statement h2 {
+  color: var(--ds-text, #1f2933);
+  font-family: var(--ds-heading-font, var(--ds-body-font, "Inter", sans-serif));
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+
+.fmd-slide.fmd-slide--title h1 {
+  font-size: 46px;
+  line-height: 1.1;
+}
+
+.fmd-slide.fmd-slide--content h1,
+.fmd-slide.fmd-slide--two-column h1,
+.fmd-slide.fmd-slide--statement h1 {
+  font-size: 38px;
+  line-height: 1.15;
+}
+
+.fmd-slide.fmd-slide--content h2,
+.fmd-slide.fmd-slide--two-column h2 {
+  font-size: 30px;
+  line-height: 1.2;
+}
+
+.fmd-slide.fmd-slide--statement h2 {
+  font-size: 42px;
+  line-height: 1.15;
+}
+
+.fmd-slide .fmd-subtitle,
+.fmd-slide .fmd-muted {
+  color: var(--ds-text-muted, #667085);
+}
+
+.fmd-slide .fmd-subtitle {
+  font-size: 22px;
+  line-height: 1.4;
+}
+
+.fmd-slide .fmd-columns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 32px;
+  width: 100%;
+  min-height: 0;
+}
+
+.fmd-slide .fmd-callout {
+  padding: 20px 24px;
+  border: 1px solid var(--ds-accent, rgba(255, 255, 255, 0.2));
+  border-radius: var(--ds-radius, 12px);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.fmd-slide .fmd-accent,
+.fmd-slide .fmd-cyan {
+  color: var(--ds-accent, #2457d6);
+}
+
 .fmd-autofit-scale {
+  transform-origin: top left;
+}
+
+.fmd-autofit-scale[data-fmd-autofit-active] {
   transform: translate(var(--fmd-fit-x, 0px), var(--fmd-fit-y, 0px))
     scale(var(--fmd-fit-scale, 1));
-  transform-origin: top left;
 }
 
 .fmd-slide > [data-fmd-autofit-content] {
@@ -393,9 +639,8 @@ button[title="Open agent sidebar"] {
   overflow: visible;
 }
 
-/* Section label - cyan uppercase */
 .fmd-label {
-  color: #00e5ff;
+  color: var(--ds-accent, #00e5ff);
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 3px;
@@ -403,12 +648,10 @@ button[title="Open agent sidebar"] {
   margin-bottom: 8px;
 }
 
-/* Cyan accent color */
 .fmd-cyan {
-  color: #00e5ff !important;
+  color: var(--ds-accent, #00e5ff);
 }
 
-/* Large stat numbers */
 .fmd-stat {
   color: #00e5ff;
   font-size: 56px;
@@ -425,7 +668,6 @@ button[title="Open agent sidebar"] {
   font-family: "Poppins", sans-serif;
 }
 
-/* Card component */
 .fmd-card {
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid rgba(255, 255, 255, 0.08);
@@ -440,7 +682,6 @@ button[title="Open agent sidebar"] {
   padding: 16px 20px;
 }
 
-/* Grid layouts */
 .fmd-grid-2 {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -460,7 +701,6 @@ button[title="Open agent sidebar"] {
   gap: 14px;
 }
 
-/* Title slide heading */
 .fmd-title-heading {
   font-size: 46px;
   font-weight: 800;
@@ -470,7 +710,6 @@ button[title="Open agent sidebar"] {
   letter-spacing: -0.5px;
 }
 
-/* Large centered heading */
 .fmd-heading-lg {
   font-size: 38px;
   font-weight: 800;
@@ -481,7 +720,6 @@ button[title="Open agent sidebar"] {
   letter-spacing: -0.5px;
 }
 
-/* Large heading - smaller variant for fitting on 2 lines */
 .fmd-heading-lg-sm {
   font-size: 28px;
   font-weight: 800;
@@ -492,7 +730,6 @@ button[title="Open agent sidebar"] {
   letter-spacing: -0.5px;
 }
 
-/* Medium heading */
 .fmd-heading-md {
   font-size: 28px;
   font-weight: 700;
@@ -501,7 +738,6 @@ button[title="Open agent sidebar"] {
   font-family: "Poppins", sans-serif;
 }
 
-/* Body text */
 .fmd-body {
   font-size: 14px;
   line-height: 1.5;
@@ -516,7 +752,6 @@ button[title="Open agent sidebar"] {
   font-family: "Poppins", sans-serif;
 }
 
-/* Small uppercase label */
 .fmd-card-title {
   font-size: 13px;
   font-weight: 700;
@@ -527,7 +762,6 @@ button[title="Open agent sidebar"] {
   font-family: "Poppins", sans-serif;
 }
 
-/* Row with border */
 .fmd-row {
   display: flex;
   align-items: flex-start;
@@ -539,7 +773,6 @@ button[title="Open agent sidebar"] {
   border-bottom: none;
 }
 
-/* Bullet list for slides */
 .fmd-bullets {
   list-style: disc;
   padding-left: 18px;
@@ -559,7 +792,6 @@ button[title="Open agent sidebar"] {
   font-weight: 600;
 }
 
-/* Icon placeholder */
 .fmd-icon {
   width: 36px;
   height: 36px;
@@ -571,7 +803,6 @@ button[title="Open agent sidebar"] {
   flex-shrink: 0;
 }
 
-/* Workflow step chip */
 .fmd-step {
   display: inline-flex;
   align-items: center;
@@ -586,7 +817,6 @@ button[title="Open agent sidebar"] {
   white-space: nowrap;
 }
 
-/* Staircase workflow layout */
 .fmd-staircase {
   display: flex;
   flex-direction: column;
@@ -598,7 +828,6 @@ button[title="Open agent sidebar"] {
   align-items: center;
 }
 
-/* Big centered text slides (DEMO, APPENDIX) */
 .fmd-big-text {
   font-size: 80px;
   font-weight: 900;
@@ -607,7 +836,6 @@ button[title="Open agent sidebar"] {
   letter-spacing: -1px;
 }
 
-/* Table styles for FMD */
 .fmd-table {
   width: 100%;
   border-collapse: collapse;
@@ -637,7 +865,6 @@ button[title="Open agent sidebar"] {
   font-size: 15px;
 }
 
-/* Builder logo text */
 .fmd-builder-logo {
   display: flex;
   align-items: center;
@@ -653,7 +880,6 @@ button[title="Open agent sidebar"] {
   height: 24px;
 }
 
-/* Approval workflow */
 .fmd-approval-item {
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid rgba(255, 255, 255, 0.08);
@@ -666,7 +892,6 @@ button[title="Open agent sidebar"] {
   min-width: 340px;
 }
 
-/* Timeline line */
 .fmd-timeline {
   position: relative;
   padding-left: 24px;
@@ -682,7 +907,6 @@ button[title="Open agent sidebar"] {
   background: rgba(255, 255, 255, 0.1);
 }
 
-/* Customer logo strip */
 .fmd-logos {
   display: flex;
   align-items: center;
@@ -699,7 +923,6 @@ button[title="Open agent sidebar"] {
   letter-spacing: 1px;
 }
 
-/* Value props row */
 .fmd-value-props {
   display: flex;
   gap: 16px;
@@ -711,7 +934,6 @@ button[title="Open agent sidebar"] {
   padding: 20px 16px;
 }
 
-/* Integration flow */
 .fmd-flow {
   display: flex;
   align-items: center;
@@ -756,7 +978,6 @@ button[title="Open agent sidebar"] {
   color: rgba(0, 229, 255, 0.5);
 }
 
-/* Quadrant chart */
 .fmd-quadrant {
   position: relative;
   width: 400px;
@@ -799,7 +1020,6 @@ button[title="Open agent sidebar"] {
   text-align: center;
 }
 
-/* Slide 2 table layout */
 .fmd-table-row {
   display: flex;
   align-items: flex-start;
@@ -837,7 +1057,6 @@ button[title="Open agent sidebar"] {
   font-family: "Poppins", sans-serif;
 }
 
-/* Image placeholder - dashed border box for images to be swapped in later */
 .fmd-img-placeholder {
   border: 2px dashed rgba(255, 255, 255, 0.15);
   border-radius: 8px;
@@ -854,7 +1073,6 @@ button[title="Open agent sidebar"] {
   overflow: hidden;
 }
 
-/* Small inline icon placeholder */
 .fmd-icon-placeholder {
   width: 28px;
   height: 28px;
@@ -869,7 +1087,6 @@ button[title="Open agent sidebar"] {
   background: rgba(0, 229, 255, 0.03);
 }
 
-/* Logo placeholder */
 .fmd-logo-placeholder {
   border: 1.5px dashed rgba(255, 255, 255, 0.2);
   border-radius: 0;
@@ -884,46 +1101,97 @@ button[title="Open agent sidebar"] {
   padding: 4px 12px;
 }
 
-/* Force logos to pure white on dark backgrounds */
 .slide-content .fmd-slide img.fmd-logo-white,
 .slide-content .fmd-slide img[src*="brandfetch"] {
   filter: brightness(0) invert(1) !important;
 }
 
-/* Prevent slide-content defaults from overriding FMD styles */
+/* Author-supplied slide HTML owns its own colors.
+   The `.slide-content <tag>` palette above is a fallback for MARKDOWN slides
+   that declare no colors of their own. Without this reset a light-themed slide
+   keeps the hardcoded white on headings and body text and is illegible — and
+   no edit to the slide can repair it, because the color lives here, not in the
+   slide. It is a per-element declaration, so specificity is not the lever:
+   an inherited color from the slide's own wrapper loses to any rule at all.
+   SlideRenderer stamps `[data-slide-content-scope]` on every container that
+   renders slide-authored HTML — always on the raw-HTML container, and on a
+   markdown layout whenever the slide declares a color (markdown layouts render
+   the same agent HTML through rehype-raw, and were missed the first time).
+   Was scoped to `.fmd-slide`, which only covered slides that happened to carry
+   that class. */
+.slide-content[data-slide-content-scope] h1,
+.slide-content[data-slide-content-scope] h2,
+.slide-content[data-slide-content-scope] h3,
+.slide-content[data-slide-content-scope] h4,
+.slide-content[data-slide-content-scope] h5,
+.slide-content[data-slide-content-scope] h6,
+.slide-content[data-slide-content-scope] p,
+.slide-content[data-slide-content-scope] ul,
+.slide-content[data-slide-content-scope] ol,
+.slide-content[data-slide-content-scope] li,
+.slide-content[data-slide-content-scope] strong,
+.slide-content[data-slide-content-scope] em,
+.slide-content[data-slide-content-scope] td,
+.slide-content[data-slide-content-scope] th,
+.slide-content[data-slide-content-scope] a {
+  color: inherit;
+}
+
+.slide-content[data-slide-content-scope] p {
+  margin: 0;
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.slide-content[data-slide-content-scope] :is(ul, ol) {
+  font-size: inherit;
+  line-height: inherit;
+}
+
 .slide-content .fmd-slide p,
-.slide-content .fmd-slide li,
-.slide-content .fmd-slide ul,
-.slide-content .fmd-slide ol {
+.slide-content .fmd-slide li {
   margin: 0;
   padding: 0;
   font-size: inherit;
   line-height: inherit;
+}
+
+.slide-content .fmd-slide ul,
+.slide-content .fmd-slide ol {
+  margin: 0;
+  padding-left: 1.5em;
+  font-size: inherit;
+  line-height: inherit;
   color: inherit;
+  list-style-position: outside;
+}
+
+.slide-content .fmd-slide ul {
+  list-style-type: disc;
+}
+
+.slide-content .fmd-slide ol {
+  list-style-type: decimal;
 }
 
 .slide-content .fmd-slide h1,
 .slide-content .fmd-slide h2,
-.slide-content .fmd-slide h3 {
+.slide-content .fmd-slide h3,
+.slide-content .fmd-slide h4 {
   margin: 0;
   padding: 0;
   font-size: inherit;
   line-height: inherit;
-  color: inherit;
   letter-spacing: inherit;
 }
 
-.slide-content .fmd-slide strong {
-  color: inherit;
-}
-
 .slide-content .fmd-slide em {
-  color: inherit;
   font-style: normal;
 }
 
 .slide-content .fmd-slide img {
   border-radius: 0;
+  max-width: none;
   max-height: none;
   margin: 0;
 }
@@ -944,11 +1212,6 @@ button[title="Open agent sidebar"] {
   font-size: inherit;
 }
 
-/* ─── Image Overlay & Click-to-Replace ─── */
-
-/* Hover effect on clickable slide images. Scoped to `[data-editable]` so a
-   read-only deck doesn't show a pointer cursor or glow that implies the image
-   can be clicked to replace it. */
 .slide-image-clickable[data-editable] img,
 .slide-image-clickable[data-editable] .fmd-img-placeholder {
   cursor: pointer;
@@ -960,7 +1223,6 @@ button[title="Open agent sidebar"] {
   box-shadow: 0 0 0 2px rgba(96, 159, 248, 0.4);
 }
 
-/* Image overlay floating menu */
 .image-overlay-menu {
   position: fixed;
   z-index: 300;
@@ -972,6 +1234,8 @@ button[title="Open agent sidebar"] {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
   animation: overlay-fade-in 0.12s ease-out;
 }
 
@@ -983,6 +1247,24 @@ button[title="Open agent sidebar"] {
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+.slide-thumbnail-ai-shimmer {
+  background-image: linear-gradient(
+    100deg,
+    transparent 30%,
+    rgba(255, 255, 255, 0.058) 50%,
+    transparent 70%
+  );
+  background-position: 150% 0;
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.6s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .slide-thumbnail-ai-shimmer {
+    animation: none;
   }
 }
 
@@ -1007,169 +1289,92 @@ button[title="Open agent sidebar"] {
   color: hsl(var(--popover-foreground));
 }
 
-/* ─── Inline Slide Editor (TipTap) ─── */
+.image-overlay-position {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: hsl(var(--popover-foreground) / 0.8);
+}
 
-.slide-tiptap-editor {
-  font-family: "Poppins", sans-serif;
-  color: rgba(255, 255, 255, 0.9);
-  caret-color: #609ff8;
+.image-overlay-position:hover,
+.image-overlay-position:focus-within {
+  background: hsl(var(--accent));
+  color: hsl(var(--popover-foreground));
+}
+
+.image-overlay-position select {
+  min-width: 0;
+  flex: 1;
+  border: 0;
   outline: none;
-  cursor: text;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
 }
 
-.slide-tiptap-editor .tiptap {
+.image-overlay-position option {
+  background: hsl(var(--popover));
+  color: hsl(var(--popover-foreground));
+}
+
+:where(.slide-content [contenteditable="true"]) {
   outline: none;
-  min-height: 100%;
-  height: 100%;
+  overflow-wrap: inherit;
+  line-break: inherit;
 }
 
-/* Placeholder */
-.slide-tiptap-editor .tiptap p.is-editor-empty:first-child::before {
-  content: attr(data-placeholder);
-  color: rgba(255, 255, 255, 0.2);
-  pointer-events: none;
-  float: left;
-  height: 0;
+.slide-content .fmd-slide p:empty {
+  min-height: 1em;
 }
 
-/* Headings */
-.slide-tiptap-editor .tiptap h1 {
-  font-size: 54px;
-  font-weight: 900;
-  color: #ffffff;
-  line-height: 1.1;
-  letter-spacing: -1px;
-  margin-bottom: 32px;
-}
-
-.slide-tiptap-editor .tiptap h2 {
-  font-size: 40px;
-  font-weight: 900;
-  color: #ffffff;
-  line-height: 1.15;
-  letter-spacing: -0.5px;
-  margin-bottom: 24px;
-}
-
-.slide-tiptap-editor .tiptap h3 {
-  font-size: 28px;
+.slide-content .fmd-slide h1 {
+  font-size: 2em;
   font-weight: 700;
-  color: #ffffff;
-  line-height: 1.2;
-  margin-bottom: 16px;
+  line-height: 1.25;
 }
 
-/* Paragraph */
-.slide-tiptap-editor .tiptap p {
-  font-size: 22px;
-  color: rgba(255, 255, 255, 0.85);
+.slide-content .fmd-slide h2 {
+  font-size: 1.5em;
+  font-weight: 600;
+  line-height: 1.375;
+}
+
+.slide-content .fmd-slide h3 {
+  font-size: 1.25em;
+  font-weight: 500;
   line-height: 1.5;
-  margin-bottom: 16px;
 }
 
-/* Lists */
-.slide-tiptap-editor .tiptap ul {
-  padding-left: 0;
-  margin-bottom: 16px;
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+.slide-content .fmd-slide h4 {
+  font-size: 1em;
+  font-weight: 500;
+  line-height: 1.5;
 }
 
-.slide-tiptap-editor .tiptap ul li {
-  display: flex;
-  align-items: baseline;
-  gap: 18px;
-  font-size: 22px;
-  color: rgba(255, 255, 255, 0.85);
-  line-height: 1.4;
+[data-slide-layer-hover-outline="true"] {
+  border: 1px solid rgba(96, 159, 248, 0.55);
+  box-shadow: 0 0 0 1px rgba(96, 159, 248, 0.12);
 }
 
-.slide-tiptap-editor .tiptap ul li::before {
-  content: "●";
-  color: #ffffff;
-  font-size: 8px;
-  position: relative;
-  top: -4px;
-  flex-shrink: 0;
+[data-slide-container-outline="true"] {
+  border: 1px dashed rgba(96, 159, 248, 0.7);
 }
 
-/* TipTap wraps li content in <p> — remove its margin */
-.slide-tiptap-editor .tiptap ul li p {
-  margin: 0;
-  font-size: inherit;
-  color: inherit;
+[data-layer-row-content]:hover {
+  outline: 1px solid rgba(96, 159, 248, 0.55);
+  outline-offset: -1px;
 }
 
-.slide-tiptap-editor .tiptap ol {
-  padding-left: 28px;
-  margin-bottom: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+[data-layer-row-content][data-layer-selection="primary"] {
+  outline: 1px solid #609ff8;
+  outline-offset: -1px;
 }
 
-.slide-tiptap-editor .tiptap ol li {
-  font-size: 22px;
-  color: rgba(255, 255, 255, 0.85);
-  line-height: 1.4;
-  list-style-type: decimal;
-}
-
-.slide-tiptap-editor .tiptap ol li p {
-  margin: 0;
-  font-size: inherit;
-  color: inherit;
-}
-
-/* Blockquote */
-.slide-tiptap-editor .tiptap blockquote {
-  border-left: 4px solid #00e5ff;
-  padding-left: 24px;
-  color: rgba(255, 255, 255, 0.7);
-  font-size: 24px;
-  font-style: italic;
-  margin-bottom: 16px;
-}
-
-/* Inline formatting */
-.slide-tiptap-editor .tiptap strong {
-  color: #ffffff;
-  font-weight: 700;
-}
-
-.slide-tiptap-editor .tiptap em {
-  color: rgba(255, 255, 255, 0.9);
-  font-style: italic;
-}
-
-.slide-tiptap-editor .tiptap s {
-  opacity: 0.6;
-}
-
-.slide-tiptap-editor .tiptap code {
-  background: rgba(255, 255, 255, 0.1);
-  padding: 2px 8px;
-  border-radius: 4px;
-  color: #00e5ff;
-  font-family: monospace;
-  font-size: 0.85em;
-}
-
-.slide-tiptap-editor .tiptap a {
-  color: #00e5ff;
-  text-decoration: underline;
-}
-
-/* Selection highlight */
-.slide-tiptap-editor .tiptap ::selection {
-  background: rgba(96, 159, 248, 0.35);
-}
-
-/* Google Slides-style object selection chrome. The edge hit targets are wider
-   than their visible bars, but both centers sit on the 1px outline rather than
-   drifting into the selected object through the outline's border box. */
 [data-slide-selection-chrome="true"] [data-slide-resize-handle] {
   box-sizing: border-box;
 }
@@ -1263,8 +1468,6 @@ button[title="Open agent sidebar"] {
   width: 4px;
   height: 14px;
 }
-
-/* ─── Slide Transition Keyframes ─── */
 
 @keyframes slide-fade-in {
   from {
@@ -1373,8 +1576,6 @@ button[title="Open agent sidebar"] {
 .slide-anim-zoom-exit {
   animation: slide-zoom-out 250ms cubic-bezier(0.55, 0.055, 0.675, 0.19) both;
 }
-
-/* ─── Element Animation Keyframes ─── */
 
 @keyframes elem-appear {
   from {

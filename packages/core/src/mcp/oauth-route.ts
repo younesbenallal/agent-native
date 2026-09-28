@@ -1,19 +1,13 @@
-/**
- * Standard remote MCP OAuth 2.1 endpoints.
- *
- * These routes let MCP hosts such as Claude Code and ChatGPT authenticate
- * through their native remote-MCP OAuth flow instead of pasting bearer tokens.
- * The issued access tokens are audience-bound to `/mcp`, carry
- * the same user/org identity as the existing connect flow, and are mediated by
- * `verifyAuth` before any MCP tool/resource request runs.
- */
-
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 import type { H3Event } from "h3";
 import { getHeader, getMethod, getQuery, setResponseStatus } from "h3";
 
-import { getOrgDomain } from "../org/context.js";
+import {
+  getActiveOrgSettingForEvent,
+  getOrgDomain,
+  listOrgMembershipsForEvent,
+} from "../org/context.js";
 import { getConfiguredLoginHtml, getSession } from "../server/auth.js";
 import { getAuthSecret } from "../server/better-auth-instance.js";
 import { readBody } from "../server/h3-helpers.js";
@@ -41,7 +35,11 @@ import {
   normalizeOAuthScope,
   signMcpOAuthAccessToken,
 } from "./oauth-token.js";
-import { MCP_PUBLIC_ROUTE_PREFIX, MCP_ROUTE_PREFIXES } from "./route-paths.js";
+import {
+  MCP_LEGACY_ROUTE_PREFIX,
+  MCP_PUBLIC_ROUTE_PREFIX,
+  MCP_ROUTE_PREFIXES,
+} from "./route-paths.js";
 
 export interface McpOAuthRouteOptions {
   appId?: string;
@@ -181,10 +179,19 @@ export function getMcpOAuthIssuer(event: H3Event): string | undefined {
   return appendConfiguredBasePath(baseUrl);
 }
 
-export function getMcpOAuthResource(event: H3Event): string | undefined {
+function normalizeMcpResourcePath(routePath?: string): string {
+  return routePath === MCP_LEGACY_ROUTE_PREFIX
+    ? MCP_LEGACY_ROUTE_PREFIX
+    : MCP_PUBLIC_ROUTE_PREFIX;
+}
+
+export function getMcpOAuthResource(
+  event: H3Event,
+  routePath = MCP_PUBLIC_ROUTE_PREFIX,
+): string | undefined {
   const issuer = getMcpOAuthIssuer(event);
   if (!issuer) return undefined;
-  return `${issuer}${MCP_PUBLIC_ROUTE_PREFIX}`;
+  return `${issuer}${normalizeMcpResourcePath(routePath)}`;
 }
 
 function mcpResourcesForIssuer(issuer: string): string[] {
@@ -209,8 +216,6 @@ export function getMcpOAuthAudiences(event: H3Event): string[] {
   const configuredIssuer = (() => {
     const base = configuredPublicBaseUrl();
     if (!base) return undefined;
-    // Re-apply base path if present so the configured resource is also
-    // base-path-aware, consistent with how getMcpOAuthResource computes it.
     return appendConfiguredBasePath(base);
   })();
   const seen = new Set<string>();
@@ -232,14 +237,22 @@ export function getMcpOAuthAudiences(event: H3Event): string[] {
 
 export function getMcpOAuthProtectedResourceMetadataUrl(
   event: H3Event,
+  routePath = MCP_PUBLIC_ROUTE_PREFIX,
 ): string | undefined {
   const issuer = getMcpOAuthIssuer(event);
   if (!issuer) return undefined;
-  return `${issuer}/.well-known/oauth-protected-resource`;
+  const metadataUrl = new URL(`${issuer}/.well-known/oauth-protected-resource`);
+  if (normalizeMcpResourcePath(routePath) === MCP_LEGACY_ROUTE_PREFIX) {
+    metadataUrl.searchParams.set("resource", MCP_LEGACY_ROUTE_PREFIX);
+  }
+  return metadataUrl.toString();
 }
 
-export function buildMcpOAuthChallenge(event: H3Event): string {
-  const metadata = getMcpOAuthProtectedResourceMetadataUrl(event);
+export function buildMcpOAuthChallenge(
+  event: H3Event,
+  routePath = MCP_PUBLIC_ROUTE_PREFIX,
+): string {
+  const metadata = getMcpOAuthProtectedResourceMetadataUrl(event, routePath);
   const scope = MCP_OAUTH_RESOURCE_SCOPE;
   return metadata
     ? `Bearer resource_metadata="${metadata}", scope="${scope}"`
@@ -271,7 +284,13 @@ export function handleMcpOAuthProtectedResourceMetadata(
   if (getMethod(event) !== "GET") {
     return oauthError("invalid_request", "Method not allowed", 405);
   }
-  const resource = getMcpOAuthResource(event);
+  const requestedResourcePath = getQuery(event).resource;
+  const resource = getMcpOAuthResource(
+    event,
+    requestedResourcePath === MCP_LEGACY_ROUTE_PREFIX
+      ? MCP_LEGACY_ROUTE_PREFIX
+      : MCP_PUBLIC_ROUTE_PREFIX,
+  );
   const issuer = getMcpOAuthIssuer(event);
   if (!resource || !issuer) {
     return oauthError("server_error", "Unable to derive MCP resource", 500);
@@ -550,8 +569,6 @@ function isValidCodeVerifier(value: unknown): value is string {
   );
 }
 
-// Shared styling for the browser-facing OAuth pages (consent + post-authorize
-// confirmation) so they read as one coherent dark surface.
 const OAUTH_PAGE_BASE_STYLE = `
   :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #09090b; color: #f4f4f5; }
   body { min-height: 100vh; display: grid; place-items: center; margin: 0; padding: 24px; }
@@ -561,7 +578,14 @@ const OAUTH_PAGE_BASE_STYLE = `
   .actions { display: flex; gap: 10px; justify-content: flex-end; }
   button, .btn { border: 0; border-radius: 6px; padding: 10px 14px; font: inherit; font-weight: 650; cursor: pointer; text-decoration: none; display: inline-block; }
   .primary { background: #f4f4f5; color: #09090b; }
-  .secondary { background: #27272a; color: #f4f4f5; }`;
+  /* guard:allow-raw-color — standalone OAuth page intentionally owns its dark palette */
+  .secondary { background: #27272a; color: #f4f4f5; }
+  /* guard:allow-raw-color — standalone OAuth page intentionally owns its dark palette */
+  .field-label { display: block; margin: 0 0 8px; color: #d4d4d8; font-weight: 650; }
+  /* guard:allow-raw-color — standalone OAuth page intentionally owns its dark palette */
+  select { width: 100%; min-height: 42px; box-sizing: border-box; margin: 0 0 22px; border: 1px solid #3f3f46; border-radius: 6px; background: #18181b; color: #f4f4f5; padding: 10px 36px 10px 12px; font: inherit; line-height: 1.25; color-scheme: dark; appearance: auto; }
+  /* guard:allow-raw-color — standalone OAuth page intentionally owns its dark palette */
+  option { background: #18181b; color: #f4f4f5; }`;
 
 function renderConsentPage(params: {
   appName: string;
@@ -570,13 +594,33 @@ function renderConsentPage(params: {
   redirectUri: string;
   scopes: string[];
   fields: Record<string, string>;
+  organizations: Array<{
+    id: string;
+    name: string;
+    domain: string | null;
+  }>;
 }): string {
   const hidden = Object.entries(params.fields)
+    .filter(
+      ([key]) => key !== "organization_id" || params.organizations.length <= 1,
+    )
     .map(
       ([key, value]) =>
         `<input type="hidden" name="${escapeHtml(key)}" value="${escapeHtml(value)}">`,
     )
     .join("\n");
+  const organizationSelector =
+    params.organizations.length > 1
+      ? `<label class="field-label" for="organization_id">Organization</label>
+    <select id="organization_id" name="organization_id" required>
+      ${params.organizations
+        .map(
+          (organization) =>
+            `<option value="${escapeHtml(organization.id)}"${organization.id === params.fields.organization_id ? " selected" : ""}>${escapeHtml(organization.name)}${organization.domain ? ` (${escapeHtml(organization.domain)})` : ""}</option>`,
+        )
+        .join("\n      ")}
+    </select>`
+      : "";
   const scopes = params.scopes
     .map((scope) => `<li><code>${escapeHtml(scope)}</code></li>`)
     .join("");
@@ -599,6 +643,7 @@ function renderConsentPage(params: {
   <p>After authorization, your browser will return to <code>${escapeHtml(params.redirectUri)}</code>.</p>
   <form method="post">
     ${hidden}
+    ${organizationSelector}
     <div class="actions">
       <button class="secondary" type="submit" name="decision" value="deny">Deny</button>
       <button class="primary" type="submit" name="decision" value="approve">Authorize</button>
@@ -609,11 +654,6 @@ function renderConsentPage(params: {
 </html>`;
 }
 
-// Shown after the user approves a native/desktop client (cursor://, vscode://, …)
-// whose redirect is a private-use scheme. A bare 302 to a custom scheme hands the
-// code to the OS app but leaves the browser tab dangling on a blank/error page, so
-// we render a friendly confirmation that also re-fires the deep link (so the client
-// still receives the code) and tells the user they can return to their agent.
 function renderAuthorizedPage(params: {
   appName: string;
   clientName: string | null;
@@ -784,14 +824,53 @@ async function handleAuthorize(
       error: "invalid_scope",
     });
   }
+
+  const activeOrgSetting = await getActiveOrgSettingForEvent(
+    event,
+    session.email,
+  );
+  const explicitPersonal = activeOrgSetting?.orgId === null;
+  const requestedOrganizationId =
+    method === "POST" && params.organization_id !== undefined
+      ? params.organization_id || null
+      : explicitPersonal
+        ? null
+        : (activeOrgSetting?.orgId ?? session.orgId ?? null);
+  const memberships = await listOrgMembershipsForEvent(
+    event,
+    session.email,
+    requestedOrganizationId,
+  );
+  const organizations =
+    memberships?.map((membership) => ({
+      id: membership.orgId,
+      name: membership.orgName,
+      domain: membership.allowedDomain,
+    })) ??
+    (!explicitPersonal && session.orgId
+      ? [{ id: session.orgId, name: "Organization", domain: null }]
+      : []);
+  const organizationOptions = explicitPersonal
+    ? [{ id: "", name: "Personal", domain: null }, ...organizations]
+    : organizations;
+  const defaultOrganizationId = explicitPersonal
+    ? ""
+    : activeOrgSetting?.orgId &&
+        organizations.some(({ id }) => id === activeOrgSetting.orgId)
+      ? activeOrgSetting.orgId
+      : session.orgId && organizations.some(({ id }) => id === session.orgId)
+        ? session.orgId
+        : organizations[0]?.id;
+
   if (method === "GET") {
     return html(
       renderConsentPage({
-        appName: options.appName || options.appId || "Agent Native",
+        appName: options.appName || options.appId || "Agent-Native",
         email: session.email,
         clientName: client.clientName || client.clientId,
         redirectUri,
         scopes: scope.split(/\s+/),
+        organizations: organizationOptions,
         fields: {
           response_type: "code",
           client_id: clientId,
@@ -801,6 +880,7 @@ async function handleAuthorize(
           state: state ?? "",
           code_challenge: params.code_challenge,
           code_challenge_method: "S256",
+          organization_id: defaultOrganizationId ?? "",
           consent_token: signConsentToken({
             email: session.email,
             clientId,
@@ -836,24 +916,38 @@ async function handleAuthorize(
     });
   }
 
-  const orgDomain = await resolveOrgDomain(session.orgId);
+  const selectedOrganizationId =
+    params.organization_id === undefined
+      ? defaultOrganizationId
+      : params.organization_id;
+  const selectedOrganization = organizations.find(
+    ({ id }) => id === selectedOrganizationId,
+  );
+  const selectedPersonal =
+    selectedOrganizationId === "" &&
+    (explicitPersonal || organizations.length === 0);
+  if (organizations.length > 0 && !selectedPersonal && !selectedOrganization) {
+    return oauthError(
+      "invalid_request",
+      "A valid organization selection is required",
+    );
+  }
+
+  const orgDomain = selectedOrganization
+    ? await resolveOrgDomain(selectedOrganization.id)
+    : undefined;
   const code = await createOAuthCode({
     clientId,
     redirectUri,
     codeChallenge: params.code_challenge,
     codeChallengeMethod: "S256",
     ownerEmail: session.email,
-    orgId: session.orgId ?? null,
+    orgId: selectedOrganization?.id ?? null,
     orgDomain: orgDomain ?? null,
     scope,
     resource,
   });
 
-  // Native/desktop clients register a private-use scheme (cursor://, vscode://, …).
-  // A 302 to that scheme opens the app but leaves the browser tab dangling, so we
-  // render a friendly confirmation page that re-fires the deep link instead. For
-  // https/loopback callbacks the client (or its local server) renders its own page,
-  // so keep the standard redirect there.
   let isDeepLinkRedirect = false;
   try {
     const protocol = new URL(redirectUri).protocol;
@@ -867,7 +961,7 @@ async function handleAuthorize(
   if (isDeepLinkRedirect) {
     return html(
       renderAuthorizedPage({
-        appName: options.appName || options.appId || "Agent Native",
+        appName: options.appName || options.appId || "Agent-Native",
         clientName: client.clientName ?? null,
         redirectUrl: buildCodeRedirectUrl({
           redirectUri,

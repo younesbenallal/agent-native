@@ -1,5 +1,6 @@
 import { agentNative } from "@agent-native/core/vite";
 import { reactRouter } from "@react-router/dev/vite";
+import { wgslVitePlugin } from "@vgpu/wgsl/loader-vite";
 import { defineConfig } from "vite";
 
 const reactRouterPlugins = reactRouter as unknown as () => any[];
@@ -9,10 +10,9 @@ const agentNativePlugins = agentNative as unknown as (
 
 export default defineConfig({
   plugins: [
+    wgslVitePlugin(),
     ...reactRouterPlugins(),
     ...agentNativePlugins({
-      // shiki only runs in AssistantChat's useEffect — keep it out of the
-      // CF Pages Functions bundle (25 MiB limit).
       ssrStubs: ["shiki"],
     }),
   ],

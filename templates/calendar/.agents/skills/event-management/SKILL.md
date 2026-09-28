@@ -15,11 +15,23 @@ Create, search, list, update, and delete calendar events. Events come from the G
 
 **Events live in Google Calendar, not SQL.** Never use `db-query` or `db-exec` to work with events. Always use the dedicated scripts which query the Google Calendar API directly.
 
+Event detail panels and popovers expose `calendar.event-detail.bottom` as an
+`ExtensionSlot` with `slotContext` containing the event id, title, times,
+timezones, location, attendees, and account email. Use the first-party
+attendee-timezone UI or a source edit for adornments next to guest rows; the
+slot does not inject per-row UI.
+
 ## Scripts
 
 ### list-events
 
 Query events from Google Calendar within a date range.
+
+Use `list-google-calendars` first when the user wants events from calendars
+shared with any connected account. Pass the returned opaque `sourceKey` values
+as `calendarSourceKeys`; never construct or decode them. Non-primary calendars
+are view-only in Calendar, even when Google reports an editable access role,
+and are excluded from booking availability.
 
 ```bash
 # Today's events (--to is exclusive, so use tomorrow)
@@ -85,7 +97,8 @@ pnpm action create-event \
 ```
 
 Required for ordinary events: `--title`, `--start`, `--end` (ISO datetime
-format). Out-of-office events default the title to `Out of office` when it is
+format). Out-of-office events default the title to `Out of office`, and
+working-location events use Google's generated display title when `--title` is
 omitted.
 Optional: `--description`, `--location`, `--attendees`, `--addGoogleMeet`, `--addZoom`, `--sendUpdates`, `--accountEmail`.
 
@@ -150,9 +163,22 @@ pnpm action create-event \
 
 Working-location events sync from Google with `workingLocationProperties` and
 render as native working locations in the UI instead of generic all-day events.
-They are transparent/non-blocking for availability. Google allows timed working
-locations or single-day all-day working locations; multi-day all-day ranges must
-be represented as separate daily working-location events.
+They are transparent/non-blocking for availability. All-day working locations
+use an exclusive `--end` date and can span multiple days; timed working
+locations use ISO datetime start and end values.
+
+Creating from a calendar day uses the selected Home, Office, or Other type —
+do not leave the draft as Home and create that instead. Office does not need a
+custom building name; Other does. The Other name is `workingLocationLabel`
+(drafts keep `location` empty), so create must send that label — not an empty
+`location`. Create and update reject a blank Other name instead of storing
+`Working`. If that day already has a working location
+on the same account, update that day's occurrence (`scope: "single"`) instead
+of creating a second event. Timed (not all-day) working locations need a
+summary of Home, Office, or the custom label — never the generated
+`Working location` placeholder. All-day ones omit summary so Google can derive
+the title. Converting a timed location that ends at local midnight back to
+all-day keeps that single day; do not add another exclusive day.
 
 `--fullDay true` is semantic only for out-of-office creation. It does not send
 Google an all-day `date` event, which Google rejects for this event type.
@@ -232,6 +258,25 @@ Update an existing Google Calendar event. Use the event `id` from `list-events`,
 `search-events`, or `get-event`. Always preserve the event's `accountEmail` on
 the update so multi-account calendars use the right connected account.
 
+To move an existing event between connected Google account calendars, pass its
+current account as `--accountEmail` and the destination account as
+`--targetAccountEmail`:
+
+```bash
+pnpm action update-event \
+  --id google-event-id \
+  --accountEmail work@example.com \
+  --targetAccountEmail personal@example.com
+```
+
+The action creates a copy on the destination account and deletes the source
+event. It preserves the supported event fields and creates a fresh Google Meet
+when the original has one. Do not combine a calendar move with other event
+field changes. If guests are present, pass `--sendUpdates all` or
+`--sendUpdates none` explicitly when the desired notification behavior matters.
+Moving an entire recurring series is not supported; use `--scope single` for
+one occurrence.
+
 ```bash
 pnpm action update-event --id google-event-id --accountEmail secondary@example.com --title "New title"
 pnpm action update-event --id google-event-id --start 2026-04-03T10:00:00 --end 2026-04-03T10:30:00
@@ -306,6 +351,88 @@ pnpm action delete-event --id google-event-id --accountEmail secondary@example.c
 pnpm action delete-event --id google-event-id --scope thisAndFollowing
 pnpm action delete-event --id google-event-id --removeOnly true
 ```
+
+One event only. For more than one, use `delete-events`.
+
+### delete-events
+
+Every "remove all …" / "clear …" request goes here, in **one** call. Looping
+`delete-event` per event cannot finish a real weekend cleanup inside a hosted
+foreground run — that is the failure a user sees as "the agent stopped before
+finishing" — and a partial loop leaves the calendar half-cleaned with no record
+of which events survived. See the `reliable-mutations` skill.
+
+Select by range plus `--daysOfWeek` and/or `--query`, or pass explicit `--ids`.
+A filtered selection needs **both** `--from` and `--to` — a one-sided range would
+silently widen or shrink a destructive request. Preview with `--dryRun true`,
+show the user the matched list, then repeat the same call without `--dryRun`.
+
+```bash
+# What would go?
+pnpm action delete-events \
+  --from 2026-04-01 --to 2026-05-01 \
+  --daysOfWeek saturday,sunday \
+  --dryRun true
+
+# Delete it
+pnpm action delete-events \
+  --from 2026-04-01 --to 2026-05-01 \
+  --daysOfWeek saturday,sunday
+
+# Explicit ids from a previous list-events/search-events
+pnpm action delete-events --ids google-a,google-b --accountEmail secondary@example.com
+```
+
+`--daysOfWeek` accepts full or 3-letter day names, `weekend`, or `weekdays`, and
+resolves each event's day in the timezone the calendar is pinned to (the saved
+`timezone` setting, then the browser's) — a Sunday 5pm America/Los_Angeles
+meeting is Monday in UTC, so a UTC comparison deletes the wrong day. Pass
+`--timezone` to override; an invalid zone is rejected, never silently treated as
+UTC. Events are selected by where they **start**: `--from` inclusive, `--to`
+exclusive, so an event starting exactly on the end bound, or a multi-day event
+that began before `--from`, is left alone. Both bounds must be real dates; a
+blank or impossible date (`2026-02-30`, with or without a time) is rejected
+rather than rolled forward.
+
+`--removeOnly true` cannot honor `--scope thisAndFollowing`: Google only lets a
+non-organizer drop one occurrence at a time, so that pair is rejected instead of
+reporting a series-wide removal that did not happen. Use `--scope single` per
+occurrence, or `--scope all` to drop the whole series from your own calendar.
+
+A filtered selection only ever removes the matched occurrences, so it accepts
+`--scope single`. `all` and `thisAndFollowing` act on a whole recurring series —
+which for a daily series would also delete the weekdays the user kept, and would
+not match the dry-run preview — so they require explicit `--ids` or
+`delete-event`, and take exactly one id per call because they mutate the series
+master.
+
+The commit re-reads the calendar, so it acts on the user's intent ("the weekend
+is clear") rather than a frozen list — an event that moved onto a Saturday
+between preview and confirmation is still removed. When the user should get
+exactly the reviewed set and nothing else, pass the `--ids` from the dry-run
+result instead of repeating the filter.
+
+The result is a per-event report, not a boolean. Read `deleted`, `failed`, and
+`skipped` and give the user the counts; a `failed` entry carries the provider
+error and a `skipped` entry says why the app cannot delete it (ICS feeds are
+read-only; a booking, including the Google event backing one, is cancelled from
+the booking so that deleting the event cannot leave the booking confirmed — this
+holds for explicit `--ids` too). Never report a bulk delete as done from the
+absence of a thrown error.
+
+`coverageComplete: false` plus `unreadableSources` means a feed could not be
+read, so the sweep does not account for everything the user can see. Deletable
+events are still deleted — a third-party feed outage should not block a cleanup,
+and ICS events were never deletable — but say plainly that the feed was not
+covered instead of reporting a clean pass.
+
+The action refuses rather than guesses when the calendar read was incomplete (an
+expired account token) or when more than 200 events match — narrow the filter
+and run again. An `unreadableSources` entry means an ICS feed could not be read,
+so mention that the sweep did not cover it.
+
+`delete-events` only reads the signed-in user's own accounts, bookings, and
+subscribed feeds; it cannot touch an overlaid person's calendar.
 
 ### rsvp-event
 
@@ -385,9 +512,12 @@ When the user says:
 | "schedule a meeting"                           | `create-event --title ... --start ... --end ...`                             |
 | "draft an invite"                              | `manage-event-draft --action create --title ... --start ... --end ...`       |
 | "schedule a Zoom meeting"                      | `create-event --title ... --start ... --end ... --addZoom=true`              |
+| "move an event to another connected calendar"   | `update-event --id ... --accountEmail ... --targetAccountEmail ...`         |
 | "move/rename/update a meeting"                 | `update-event --id ...`                                                      |
 | "add Zoom to this meeting"                     | `update-event --id ... --addZoom=true`                                       |
 | "delete/remove a meeting"                      | `delete-event --id ...`                                                      |
+| "remove all Saturday and Sunday meetings"      | `delete-events --from ... --to ... --daysOfWeek saturday,sunday`             |
+| "clear my calendar next week"                  | `delete-events --from ... --to ...` (preview with `--dryRun true` first)     |
 | "remove weekends from a daily recurring event" | `update-event --id ... --recurrence "RRULE:FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR"` |
 | "what's coming up"                             | `list-events` (uses default 30-day forward window)                           |
 

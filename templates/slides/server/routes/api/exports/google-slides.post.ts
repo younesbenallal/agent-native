@@ -1,10 +1,11 @@
-import { getSession, runWithRequestContext } from "@agent-native/core/server";
+import { runWithRequestContext } from "@agent-native/core/server";
 import {
   defineEventHandler,
   readMultipartFormData,
   setResponseStatus,
 } from "h3";
 
+import { resolveSlidesRequestAuth } from "../../../handlers/request-auth-context.js";
 import { getGoogleDocsAccessToken } from "../../../lib/google-docs-oauth.js";
 
 const PPTX_CONTENT_TYPE =
@@ -13,15 +14,33 @@ const GOOGLE_SLIDES_MIME = "application/vnd.google-apps.presentation";
 const UPLOAD_URL =
   "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink";
 
-/**
- * Uploads a browser-generated PPTX into the user's Drive, letting Drive convert
- * it to a native Google Slides deck. The PPTX comes from the client because the
- * browser export renders the real slide DOM — the server-side pptxgenjs export
- * is a lower-fidelity fallback and would ship a visibly worse deck to Google.
- */
+function isGoogleReconnectError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /invalid_grant|connection expired|token(?: has been)? expired|please reconnect/i.test(
+    message,
+  );
+}
+
+function googleSlidesEditUrl(result: {
+  id?: string;
+  webViewLink?: string;
+}): string | undefined {
+  const id = result.id?.trim();
+  if (id && /^[A-Za-z0-9_-]+$/.test(id)) {
+    return `https://docs.google.com/presentation/d/${id}/edit`;
+  }
+  return result.webViewLink;
+}
+
 export default defineEventHandler(async (event) => {
-  const session = await getSession(event).catch(() => null);
-  if (!session?.email) {
+  const auth = await resolveSlidesRequestAuth(event);
+  if (!auth.ok) {
+    setResponseStatus(event, auth.statusCode);
+    return { error: auth.error };
+  }
+  const session = auth.context;
+  const sessionEmail = session.email;
+  if (!sessionEmail) {
     setResponseStatus(event, 401);
     return { error: "Unauthorized" };
   }
@@ -38,13 +57,27 @@ export default defineEventHandler(async (event) => {
     return { error: "file required" };
   }
 
-  // Same request context the actions run in — Google's client credentials can
-  // be org-scoped vault secrets, and resolving them without the org reports the
-  // integration as unconfigured.
-  const account = await runWithRequestContext(
-    { userEmail: session.email, orgId: session.orgId },
-    () => getGoogleDocsAccessToken(session.email),
-  );
+  let account: Awaited<ReturnType<typeof getGoogleDocsAccessToken>>;
+  try {
+    account = await runWithRequestContext(
+      { userEmail: sessionEmail, orgId: session.orgId },
+      () =>
+        getGoogleDocsAccessToken(sessionEmail, {
+          requireDriveUploadScope: true,
+        }),
+    );
+  } catch (error) {
+    if (isGoogleReconnectError(error)) {
+      setResponseStatus(event, 409);
+      return {
+        error:
+          "Google Drive connection expired. Connect Google again, then retry.",
+        code: "google-not-connected",
+      };
+    }
+    setResponseStatus(event, 502);
+    return { error: "Could not use the Google Drive connection. Try again." };
+  }
   if (!account) {
     setResponseStatus(event, 409);
     return {
@@ -62,22 +95,50 @@ export default defineEventHandler(async (event) => {
     `\r\n--${boundary}--`,
   ]);
 
-  const response = await fetch(UPLOAD_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${account.accessToken}`,
-      "Content-Type": `multipart/related; boundary=${boundary}`,
-    },
-    body,
-  });
+  let response: Response;
+  try {
+    response = await fetch(UPLOAD_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${account.accessToken}`,
+        "Content-Type": `multipart/related; boundary=${boundary}`,
+      },
+      body,
+    });
+  } catch {
+    setResponseStatus(event, 502);
+    return { error: "Could not reach Google Drive. Try again." };
+  }
 
   const result = (await response.json().catch(() => null)) as {
     id?: string;
     webViewLink?: string;
-    error?: { message?: string };
+    error?: {
+      message?: string;
+      errors?: Array<{ reason?: string }>;
+    };
   } | null;
 
-  if (!response.ok || !result?.webViewLink) {
+  const hasInsufficientPermissions =
+    response.status === 403 &&
+    (result?.error?.errors?.some(
+      ({ reason }) => reason === "insufficientPermissions",
+    ) ||
+      /insufficient(?:permissions| permission| scope)/i.test(
+        result?.error?.message ?? "",
+      ));
+
+  if (response.status === 401 || hasInsufficientPermissions) {
+    setResponseStatus(event, 409);
+    return {
+      error:
+        "Google Drive connection expired. Connect Google again, then retry.",
+      code: "google-not-connected",
+    };
+  }
+
+  const url = result ? googleSlidesEditUrl(result) : undefined;
+  if (!response.ok || !url) {
     setResponseStatus(event, 502);
     return {
       error:
@@ -86,5 +147,5 @@ export default defineEventHandler(async (event) => {
     };
   }
 
-  return { url: result.webViewLink, accountEmail: account.accountEmail };
+  return { url, accountEmail: account.accountEmail };
 });

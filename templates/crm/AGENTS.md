@@ -7,20 +7,12 @@ HubSpot/Salesforce lens; UI and agent share actions.
 
 - `crm` — read before CRM work: provider/credential boundaries, lists,
   enrichment, signals, dashboards, and Clips evidence.
-- Before building common workspace or agent UI, read `agent-native-toolkit`;
-  read `customizing-agent-native` when extending shared framework capabilities.
-
-Source of truth: `shared/crm-contract.ts` (vocabulary, field and write policy),
-`shared/crm-attributes.ts` (types), `server/lib/record-fields.ts` (the only
-sanctioned field-value write).
 
 ## Core model
 
-- **Typed attributes**, 17 types: text, number, checkbox, currency, date,
-  timestamp, rating, status, select, record-reference, actor-reference,
-  location, domain, email-address, phone-number, plus system-only interaction
-  and personal-name. Call `list-crm-attributes` first; never guess a slug or
-  type.
+- UI feedback: target 100 ms, never exceed 400 ms; acknowledge before network work.
+- **Typed attributes**, 17 types, two of them system-only (interaction and
+  personal-name). Call `list-crm-attributes` first; never guess a slug or type.
 - **Managed options.** A status/select value must already exist as an option;
   writing an unknown one is a 422, never a silent auto-create.
 - **Values are bitemporal.** A change closes the current row and opens a new
@@ -39,6 +31,7 @@ sanctioned field-value write).
 
 - Workspace Connections own provider credentials. Never request, store, log, or
   return a provider token.
+- For external integrations, inspect the workspace/provider connection catalog first; reuse its scoped resolver.
 - The mirror is thin: unknown fields are remote-only, sensitive ones redacted,
   only allow-listed fields mirrored. Raw payloads, transcripts, media, and
   base64 never enter SQL — evidence is a URL/id plus a bounded quote.
@@ -64,7 +57,7 @@ sanctioned field-value write).
 |`list-crm-lists` / `create-crm-list` / `update-crm-list` / `list-crm-list-entries` / `add-crm-record-to-list` / `update-crm-list-entry` / `remove-crm-list-entry`|Lists and pipelines; a stage move is `update-crm-list-entry`.|
 |`list-crm-saved-views` / `save-crm-saved-view` / `delete-crm-saved-view` / `run-crm-saved-view-program`|Saved table/board views and a view's data program.|
 |`list-crm-proposals` / `apply-crm-proposals`|Review a pending provider change and record the handoff.|
-|`find-crm-duplicates` / `merge-crm-records`|Scored duplicate candidates with reasons; merge into a survivor.|
+|`find-crm-duplicates` / `merge-crm-records`|Scored duplicate candidates with reasons; optional explicit Jev review of one record; merge into a survivor.|
 |`list-crm-enrichment-slots` / `estimate-crm-enrichment` / `run-crm-enrichment`|Slot credential state; cost estimate; the gated verify/spend run.|
 |`run-crm-attribute-fill`|Manual fill: get the brief, reason, call again with values.|
 |`list-crm-tasks` / `manage-crm-task`|Read and manage follow-up tasks.|
@@ -80,3 +73,8 @@ sanctioned field-value write).
   slot, or scope is reported as itself, never as empty. Read a value back before
   reporting it done.
 - Recover from a recoverable error rather than abandoning the task.
+
+## Source Changes
+
+Before building common workspace or agent UI, read `agent-native-toolkit`; read
+`customizing-agent-native` before adapting shared UI.

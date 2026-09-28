@@ -1,10 +1,15 @@
+// @vitest-environment happy-dom
+
 import { describe, expect, it, vi } from "vitest";
 
 import {
   createSlidesCanvasGestureController,
   createSlidesCanvasInteractionCore,
   isWithinSlidesCanvasEdgeMoveBand,
+  resolveSlidesCanvasDragTarget,
+  resolveSlidesCanvasNudge,
   resolveSlidesCanvasPointerIntent,
+  resolveSlidesCanvasRotation,
   SLIDES_CANVAS_EDGE_MOVE_BAND,
 } from "./slides-canvas-adapter";
 
@@ -30,14 +35,14 @@ describe("Slides canvas interaction adapter", () => {
     expect(SLIDES_CANVAS_EDGE_MOVE_BAND).toBe(8);
   });
 
-  it("keeps snapping and object alignment disabled until Slides implements them", () => {
+  it("advertises the supported snapping and multi-object layout capabilities", () => {
     const core = createSlidesCanvasInteractionCore();
 
-    expect(core.capabilities.snapping).toBe(false);
-    expect(core.capabilities.alignment).toBe(false);
-    expect(core.capabilities.distribution).toBe(false);
-    expect(core.capabilities.grouping).toBe(false);
-    expect(core.capabilities.rotation).toBe(false);
+    expect(core.capabilities.snapping).toBe(true);
+    expect(core.capabilities.alignment).toBe(true);
+    expect(core.capabilities.distribution).toBe(true);
+    expect(core.capabilities.grouping).toBe(true);
+    expect(core.capabilities.rotation).toBe(true);
   });
 
   it("uses the shared nudge and resize geometry", () => {
@@ -61,6 +66,110 @@ describe("Slides canvas interaction adapter", () => {
     ).toEqual({ x: 140, y: 50, width: 160, height: 100 });
   });
 
+  it("supports Alt center resizing with Shift aspect locking", () => {
+    const preview = vi.fn(() => ({ handled: true }) as const);
+    const controller = createSlidesCanvasGestureController({
+      preview,
+      commit: vi.fn(() => ({ handled: true }) as const),
+    });
+
+    controller.pointerDown({
+      kind: "resize",
+      objectIds: ["title"],
+      pointer: { x: 100, y: 100 },
+      viewport: { left: 0, top: 0, width: 500, height: 250 },
+      canvas: { width: 1000, height: 500 },
+      handle: "se",
+      rect: { x: 100, y: 100, width: 200, height: 100 },
+    });
+
+    expect(
+      controller.pointerMove({ x: 115, y: 105, altKey: true, shiftKey: true }),
+    ).toMatchObject({
+      phase: "active",
+      gesture: {
+        rect: { x: 70, y: 85, width: 260, height: 130 },
+      },
+    });
+
+    controller.pointerUp({ x: 115, y: 105, altKey: true, shiftKey: true });
+    controller.pointerDown({
+      kind: "resize",
+      objectIds: ["title"],
+      pointer: { x: 100, y: 100 },
+      viewport: { left: 0, top: 0, width: 500, height: 250 },
+      canvas: { width: 1000, height: 500 },
+      handle: "e",
+      rect: { x: 100, y: 100, width: 200, height: 100 },
+    });
+
+    expect(
+      controller.pointerMove({ x: 120, y: 100, altKey: true, shiftKey: true }),
+    ).toMatchObject({
+      phase: "active",
+      gesture: {
+        rect: { x: 60, y: 80, width: 280, height: 140 },
+      },
+    });
+  });
+
+  it("keeps modifier-arrow chords native while nudging plain arrows", () => {
+    expect(resolveSlidesCanvasNudge({ key: "ArrowRight" })).toMatchObject({
+      delta: { x: 1, y: 0 },
+    });
+    expect(
+      resolveSlidesCanvasNudge({ key: "ArrowRight", shiftKey: true }),
+    ).toMatchObject({ delta: { x: 10, y: 0 } });
+    expect(
+      resolveSlidesCanvasNudge({ key: "ArrowRight", metaKey: true }),
+    ).toBeNull();
+    expect(
+      resolveSlidesCanvasNudge({ key: "ArrowRight", ctrlKey: true }),
+    ).toBeNull();
+    expect(resolveSlidesCanvasNudge({ key: "ArrowRight", altKey: true })).toBe(
+      null,
+    );
+  });
+
+  it("maps Alt+Arrow to 15-degree rotation and Shift+Alt+Arrow to one degree", () => {
+    expect(
+      resolveSlidesCanvasRotation({
+        key: "ArrowRight",
+        altKey: true,
+        shiftKey: false,
+        metaKey: false,
+        ctrlKey: false,
+      }),
+    ).toBe(15);
+    expect(
+      resolveSlidesCanvasRotation({
+        key: "ArrowLeft",
+        altKey: true,
+        shiftKey: true,
+        metaKey: false,
+        ctrlKey: false,
+      }),
+    ).toBe(-1);
+    expect(
+      resolveSlidesCanvasRotation({
+        key: "ArrowRight",
+        altKey: true,
+        shiftKey: false,
+        metaKey: true,
+        ctrlKey: false,
+      }),
+    ).toBeNull();
+    expect(
+      resolveSlidesCanvasRotation({
+        key: "ArrowUp",
+        altKey: true,
+        shiftKey: false,
+        metaKey: false,
+        ctrlKey: false,
+      }),
+    ).toBeNull();
+  });
+
   it("reserves only a selected object's edge band for movement", () => {
     expect(
       resolveSlidesCanvasPointerIntent({
@@ -79,7 +188,7 @@ describe("Slides canvas interaction adapter", () => {
         pointerWithinMoveBand: false,
         targetIsEditableText: true,
       }),
-    ).toBe("move-object-body");
+    ).toBe("edit-text");
     expect(
       resolveSlidesCanvasPointerIntent({
         hasSelectedObject: true,
@@ -89,6 +198,48 @@ describe("Slides canvas interaction adapter", () => {
         targetIsEditableText: false,
       }),
     ).toBe("move-object-body");
+  });
+
+  it("keeps a direct text-leaf click in edit mode outside the move band", () => {
+    expect(
+      resolveSlidesCanvasPointerIntent({
+        hasSelectedObject: true,
+        targetWithinSelectedObject: true,
+        targetContainsSelectedObject: false,
+        pointerWithinMoveBand: false,
+        targetIsEditableText: true,
+      }),
+    ).toBe("edit-text");
+  });
+
+  it("lets Alt-drag duplicate from the body of a text layer", () => {
+    expect(
+      resolveSlidesCanvasPointerIntent({
+        hasSelectedObject: true,
+        targetWithinSelectedObject: true,
+        targetContainsSelectedObject: false,
+        pointerWithinMoveBand: false,
+        targetIsEditableText: true,
+        duplicateModifierActive: true,
+      }),
+    ).toBe("move-object-body");
+  });
+
+  it("uses the object under the pointer when no prior selection exists", () => {
+    const image = document.createElement("img");
+    const wrapper = document.createElement("div");
+
+    expect(resolveSlidesCanvasDragTarget(null, image)).toBe(image);
+    expect(resolveSlidesCanvasDragTarget(null, wrapper)).toBe(wrapper);
+  });
+
+  it("keeps a selected parent as the drag target for nested content", () => {
+    const wrapper = document.createElement("div");
+    const image = document.createElement("img");
+    wrapper.append(image);
+
+    expect(resolveSlidesCanvasDragTarget(wrapper, image)).toBe(wrapper);
+    expect(resolveSlidesCanvasDragTarget(image, wrapper)).toBe(image);
   });
 
   it("uses the same measured outside edge band for hover and pointer intent", () => {
@@ -123,6 +274,18 @@ describe("Slides canvas interaction adapter", () => {
         targetIsEditableText: true,
       }),
     ).toBe("edit-text");
+  });
+
+  it("moves the selected object from whitespace over its selection perimeter", () => {
+    expect(
+      resolveSlidesCanvasPointerIntent({
+        hasSelectedObject: true,
+        targetWithinSelectedObject: false,
+        targetContainsSelectedObject: false,
+        pointerWithinMoveBand: true,
+        targetIsEditableText: false,
+      }),
+    ).toBe("move-object-perimeter");
   });
 
   it("passes semantic commands through the supplied HTML persistence adapter", () => {
@@ -179,8 +342,6 @@ describe("Slides canvas interaction adapter", () => {
       committed: true,
       gesture: { canvasDelta: { x: 20, y: 20 } },
     });
-    // Releasing at the already-previewed pointer does not run a second
-    // preview, so DOM-backed adapters cannot flash or mutate twice on drop.
     expect(preview).toHaveBeenCalledTimes(1);
     expect(commit).toHaveBeenCalledTimes(1);
   });

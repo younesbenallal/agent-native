@@ -1,101 +1,91 @@
 # Factory
 
-Factory is the visual workspace for building agent factories from incoming work
-to governed delivery. The map is the source of truth; Dispatch owns the shared
-inbox and routing, while Factory owns graph versions, queue state, rules,
-decisions, feedback, agent runs, and provider audit records.
+Factory is a workspace of named factories: Inbox, automations, and a reviewable
+map. Dispatch owns shared inbox routing. Factory owns queue state, rules, jobs,
+and graph versions.
 
-Before building common workspace or agent UI, read `agent-native-toolkit`; use
-`customizing-agent-native` for the configure → compose → eject → propose
-ladder.
+## Skills
+
+- `factory-graphs` — read before Map, node, route, or graph-version work.
+- `capture-learnings` — record a user preference or correction so it outlives
+  the thread.
+- `turn-into-app`, `turn-into-skill` — promote a proven workflow into its own
+  app or a reusable skill.
 
 ## Core rules
 
-- Keep app state in SQL via Drizzle and scope every read/write by org and
-  member. Use actions as the UI, agent, CLI, MCP, and A2A surface.
-- Keep migrations additive and portable. These tables intentionally use explicit
-  `ownerEmail`/`orgId` columns for org-visible data, not `ownableColumns()`;
-  do not call `accessFilter` on them without adding deliberate visibility data.
-- Resolve Slack through `server/connectors/credentials.ts`, passing caller
-  identity at the entrypoint. The dependency guard does not inspect nested
-  connector code, so a new direct `process.env.SLACK_BOT_TOKEN` read is a bug.
+- UI feedback: target 100 ms, never exceed 400 ms; acknowledge before network work.
+- Keep app state in SQL via Drizzle, scope reads/writes by org and member, and
+  use actions as the UI, agent, CLI, MCP, and A2A surface.
 - A missing callback, partial thread, unreadable provider response, or missed
-  reconciliation is not success. Preserve typed failure or
+  reconciliation is not success; preserve typed failure or
   `reconciliation_required` state.
-- Hard guards are code, not prompt text: auth, session, identity,
-  credentials/vault, migrations, payments, security, and publishable
-  `packages/*` changes always require human review.
-- All work is deduped by Factory item and rule/run identity. Provider comment IDs
-  are not the idempotency boundary.
-- Slack interaction uses the generic Agent-Native Slack adapter. Clear-bug Slack
-  automations add 👀 and tag `@builderio` in the source thread; GitHub and Sentry
-  clear bugs use the Builder run API. Clips, Design, and Content are always
-  owner-managed and never enter autonomous dispatch or PR governance.
-- PR governance requires verified BuilderIO membership, a clear bug, passing
-  CI, and handled review feedback. Product or UX implications stay
-  manual. Auto-merge additionally requires a verified Factory Builder run.
-- Reuse the existing ai-services GitHub read and Builder execution APIs. Do not
-  duplicate GitHub installation/webhook infrastructure in this template.
-- Do not add CRUD routes under `server/routes/api/`; actions are the domain
-  surface. Provider callbacks are the only exception and must verify signatures.
-- Factory graph edits create immutable blueprint versions. AI proposes a graph
-  with `source=ai`; a person reviews and publishes it through
-  the same action surface as manual edits.
+- Deduplicate by Factory item and rule/run identity, not provider comment ID.
+- Slack clear bugs go through `dispatch-factory-item`; never post Slack
+  messages or `@handles`. GitHub issues and Sentry tag `@builderio-bot`
+  on a GitHub issue. Read `review-latest-feedback` for thread evidence.
+  Also needs `risk`/`confidence`.
+- PR governance follows `review-prs`: verify membership and evidence; skip
+  drafts and external authors; apply the verified `liamdebeasi` exception for
+  ordinary gates; keep ultra-scary risks manual; never auto-merge.
+- Graph edits create immutable blueprint versions. AI proposes with `source=ai`;
+  a person reviews and publishes through the same action surface.
+- Provider credentials belong to Dispatch/shared workspace integrations, never
+  to a Factory or Factory graph. Agents use shared provider APIs and connected
+  MCP tools through the workspace grant boundary.
+- Never put provider keys in hosted deployment env or Factory bootstrap.
+  Hosted Factory reads Slack/GitHub/Sentry from workspace connections or the
+  org vault. Local development may read `.env` Slack/GitHub/Sentry keys last.
+- For external integrations, inspect the workspace/provider connection catalog first; reuse its scoped resolver.
 
 ## Application state
 
-- `navigation.view`: `factory` when the workspace is open.
-- `navigation.factoryId`: selected Factory id when present.
-- `navigation.factoryTab`: `map` | `inbox` | `rules` | `automations` | `settings`.
-- `navigation.factoryNodeId` / `navigation.factoryEdgeId`: selected graph item.
-- A selected graph node or edge is part of `navigation` context. Read
-  `view-screen` before answering why a route exists or changing the selected
-  Factory.
+- `navigation.view` is `factory` or `agents`. No `factoryId` means the factory
+  list. Opening a factory defaults to Inbox. `view-screen` matches the visible
+  tab; read `factory-graphs` only for Map edits.
 
 ## Action contract
 
 | Action | Purpose |
 | --- | --- |
-| `list-triage-items` / `get-triage-item` | Inspect queue and evidence. |
+| `list-triage-items` / `get-triage-item` | Inspect queue evidence; pass `factoryId`. |
+| `get-triage-config` / `save-triage-config` | Read or save observation settings for one factory. |
 | `poll-slack-channel` | Observe Slack history; never writes to Slack. |
 | `get-slack-feedback-context` | Read the bounded full Slack thread before classification. |
-| `poll-github-sources` / `poll-sentry-errors` | Observe bounded GitHub and Sentry source queues. |
+| `poll-github-sources` / `poll-sentry-errors` | Observe bounded source queues. |
 | `ingest-github-observation` | Store read-only PR evidence. |
-| `list-triage-rules` / `save-triage-rule` | Tune prompt rules and guards. |
+| `list-triage-rules` / `save-triage-rule` | Tune rules and guards. |
 | `evaluate-triage-item` | Append a decision. |
 | `record-triage-feedback` | Capture human correction for learning. |
-| `approve-factory-item` | Explicitly authorize one bounded run. |
-| `start-builder-for-item` | Govern clear-bug dispatch; Slack tags Builder in-thread, other sources use Builder API. |
-| `govern-agent-native-pull-request` | Apply CI, review, internal-author, product, and owner gates to PR approval/merge. |
-| `list-factory-automations` / `save-factory-automation` / `run-factory-automation` | Inspect and edit org-owned Factory prompts, models, schedules, and runs. |
-| `get-factory-automation-health` | Inspect the durable scheduler heartbeat and last scheduler error when runs appear stale. |
-| `suggest-factory-rules` | Mine feedback and fast approvals into proposals. |
-| `reconcile-triage-run` | Persist callback/provider reconciliation. |
-| `list-factories` / `get-factory-graph` | Inspect Factory definitions, graph versions, and live evidence metrics. |
-| `save-factory-graph` | Create or version a complete visual graph; never starts provider work. |
+| `dispatch-factory-item` | Tag Builder or record a skip; requires `risk`/`confidence`. Optional `reaction` marks the source if that provider can. |
+| `govern-factory-pull-request` | Apply PR evidence and ownership gates. |
+| `babysit-factory-pull-request` / `propose-pr-babysit-status` | Ping a bot PR after a decision, or read the briefing. |
+| `list-factory-automations` / `create-factory-automation` / `save-factory-automation` / `run-factory-automation` | List, create, edit, or run jobs. Factories start empty. Hosted jobs need a workspace connection or vault token. Author filters use Slack `U`/`W` or GitHub numeric ids. Limits are action-enforced. |
+| `list-factory-audit` | Inspect inbox additions, worked items, and actions for one factory. |
+| `get-factory-automation-health` | Inspect scheduler heartbeat and last error. |
+| `suggest-factory-rules` | Mine feedback into proposals. |
+| `reconcile-triage-run` | Persist PR-monitor observations; no GitHub write. |
+| `list-factories` / `get-factory-graph` / `delete-factory` | Inspect Factory definitions, versions, and metrics, or permanently delete a user-created Factory after exact-name confirmation. Delete also removes jobs, run history, and poll cursors. Unconfirmed cleanup returns `verified:false`. |
+| `create-factory` | Create a named empty factory and open its Inbox. |
+| `save-factory-graph` | Version the Map of an existing factory. Do not use this to create one. |
+| graph history actions | Factory graph version history. |
 | `list-factory-comments` / `add-factory-comment` | Read or attach comments to a canvas, node, or edge. |
+| `provider-api-catalog` / `provider-api-docs` / `provider-api-request` | Use connected provider APIs with shared credentials; never request raw keys. |
+| `list-workspace-apps` / `update-workspace-app-metadata` | Inventory and edit mounted apps. |
+| `list-workspace-resources` / `create-workspace-resource` / `update-workspace-resource` | Manage shared agent resources. |
+| `import-agent` / `import-agent-pack` / `list-agent-pack` | Import profiles or agent packs. |
+| `start-workspace-app-creation` | Promote an agent and its pack into an app handoff. |
 
-Rules start in shadow mode; hard guards always apply. Editable organization
-automations execute stored prompts; every external mutation needs a durable run,
-idempotency key, and provider confirmation. The legacy observer is disabled
-once organization automations are seeded.
+Rules start in shadow mode; hard guards apply. Organization automations use
+stored prompts; external mutations require durable, idempotent runs and
+provider confirmation. Poll and Builder/PR dispatch run only as this factory's
+scheduled job, not chat and not a workspace-owner email match; teammates may
+edit and Run now Factory jobs. Named creates use `create-factory` and open Inbox. Jobs use
+`create-factory-automation` on the current factory. Persist Map edits with
+`save-factory-graph`; an AI save must not rename. Change rules through triage
+actions, never graph JSON.
 
-Use the visual editor for direct blueprint changes. Use the agent chat for
-natural language design, explanations, and proposals; it must preserve a
-complete graph and use `save-factory-graph` rather than describing an
-unpersisted change. Rule or guard changes must go through the triage rule
-actions, never through graph JSON.
+## Source Changes
 
-## Scheduler identity
-
-`WORKSPACE_OWNER_EMAIL` is read only at startup to find the deployment org and
-stamp seeded automation `createdBy`; it is never caller identity and must not
-enter request authorization or credential resolution.
-
-## Hosting
-
-Production needs `DATABASE_URL`, `WORKSPACE_OWNER_EMAIL`, and
-`FACTORY_PUBLIC_URL`. Builder execution additionally needs the service URL,
-project ID, and workspace-resolved Builder credentials. GitHub and Sentry
-polling use workspace-resolved provider credentials. Provider callbacks and
-external writes must remain auditable and fail closed when evidence is partial.
+Before building common workspace or agent UI, read `agent-native-toolkit`; read
+`customizing-agent-native` before adapting shared UI.

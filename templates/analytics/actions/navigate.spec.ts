@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const writeAppStateForCurrentTab = vi.fn(async () => {});
 const listDashboardSummaries = vi.fn(async () => [] as any[]);
+const normalizeDashboardName = (value: string) =>
+  value.trim().replace(/\s+/g, " ").toLowerCase();
 
 vi.mock("@agent-native/core/application-state", () => ({
   writeAppStateForCurrentTab,
@@ -12,6 +14,7 @@ vi.mock("@agent-native/core/server", () => ({
 }));
 vi.mock("../server/lib/dashboards-store", () => ({
   listDashboardSummaries,
+  normalizeDashboardName,
 }));
 
 const { default: navigateAction } = await import("./navigate");
@@ -23,17 +26,17 @@ describe("navigate action", () => {
     listDashboardSummaries.mockResolvedValue([]);
   });
 
-  it('resolves "Take me to my Agent Native dashboard" by accessible name', async () => {
+  it('resolves "Take me to my Agent-Native dashboard" by accessible name', async () => {
     listDashboardSummaries.mockResolvedValue([
       {
         id: "dashboard-agent-native",
-        name: "Agent Native",
+        name: "Agent-Native",
         ownerEmail: "person@example.com",
       },
     ]);
 
     await navigateAction.run({
-      dashboardName: "Agent Native dashboard",
+      dashboardName: "Agent-Native dashboard",
     } as never);
 
     expect(listDashboardSummaries).toHaveBeenCalledWith(

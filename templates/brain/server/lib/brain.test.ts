@@ -1,5 +1,20 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const testString = (value: unknown) =>
+  typeof value === "string"
+    ? value
+    : value instanceof URLSearchParams
+      ? value.toString()
+      : (JSON.stringify(value) ?? "");
+const requestString = (value: unknown) =>
+  typeof value === "string"
+    ? value
+    : value instanceof URL
+      ? value.toString()
+      : value instanceof Request
+        ? value.url
+        : testString(value);
+
 type Condition =
   | { op: "and"; conditions: Condition[] }
   | { op: "or"; conditions: Condition[] }
@@ -179,6 +194,7 @@ const mocks = vi.hoisted(() => {
       "locatorHmac",
       "disposition",
       "categoriesJson",
+      "classifierFailureReason",
       "confidenceBand",
       "policyVersion",
       "upstreamProvider",
@@ -212,7 +228,7 @@ const mocks = vi.hoisted(() => {
   };
   const dbExec = {
     execute: vi.fn(async ({ sql, args }: { sql: string; args: unknown[] }) => {
-      if (sql.includes("WHERE id = ? AND capture_id = ?")) {
+      if (sql.includes("WHERE id = $3 AND capture_id = $4")) {
         const [status, updatedAt, id, captureId, leaseToken] = args;
         const row = rows.ingestQueue.find(
           (item) =>
@@ -266,6 +282,7 @@ const mocks = vi.hoisted(() => {
       return { rowsAffected: 1 };
     }),
   };
+  const track = vi.fn();
 
   const tableRows = (tableRef: Row) => {
     if (tableRef === schema.brainSources) return rows.sources;
@@ -283,7 +300,7 @@ const mocks = vi.hoisted(() => {
   };
 
   function likeNeedle(value: unknown) {
-    return String(value ?? "")
+    return testString(value ?? "")
       .replace(/^%|%$/g, "")
       .replace(/\\([\\%_])/g, "$1")
       .toLowerCase();
@@ -344,7 +361,7 @@ const mocks = vi.hoisted(() => {
         : Number(value) <= Number(condition.val);
     }
     if (condition.op === "like") {
-      const value = String(row[condition.col.name] ?? "").toLowerCase();
+      const value = testString(row[condition.col.name] ?? "").toLowerCase();
       return value.includes(likeNeedle(condition.val));
     }
     if (condition.op === "ne") return row[condition.col.name] !== condition.val;
@@ -443,14 +460,24 @@ const mocks = vi.hoisted(() => {
       ) {
         throw new Error("unique active source");
       }
-      tableRows(tableRef).push({ ...row });
+      const existingSensitivityEvent =
+        tableRef === schema.brainSensitivityEvents
+          ? tableRows(tableRef).find(
+              (item) =>
+                item.locatorHmac === row.locatorHmac &&
+                item.policyVersion === row.policyVersion,
+            )
+          : undefined;
+      if (!existingSensitivityEvent) tableRows(tableRef).push({ ...row });
       return {
         onConflictDoUpdate: vi.fn(async ({ set }: { set: Row }) => {
-          const existing = tableRows(tableRef).find(
-            (item) =>
-              item.locatorHmac === row.locatorHmac &&
-              item.policyVersion === row.policyVersion,
-          );
+          const existing =
+            existingSensitivityEvent ??
+            tableRows(tableRef).find(
+              (item) =>
+                item.locatorHmac === row.locatorHmac &&
+                item.policyVersion === row.policyVersion,
+            );
           if (existing) Object.assign(existing, set);
           return { rowsAffected: 1 };
         }),
@@ -507,6 +534,7 @@ const mocks = vi.hoisted(() => {
     queueClaimRowsAffected,
     audienceHook,
     dbExec,
+    track,
     userEmail: "owner@example.test",
     orgId: "org-1" as string | null,
     settings: {
@@ -532,9 +560,23 @@ vi.mock("@agent-native/core/db", () => ({
   getDbExec: () => mocks.dbExec,
 }));
 
+vi.mock("@agent-native/core/tracking", () => ({ track: mocks.track }));
+
 vi.mock("@agent-native/core/db/schema", () => ({
+  boolean: (name: string) => ({
+    name,
+    notNull: () => ({
+      default: () => ({ name }),
+    }),
+  }),
   createSharesTable: (name: string) => ({ __tableName: name }),
   integer: (name: string) => ({
+    name,
+    notNull: () => ({
+      default: () => ({ name }),
+    }),
+  }),
+  bigint: (name: string) => ({
     name,
     notNull: () => ({
       default: () => ({ name }),
@@ -583,6 +625,7 @@ vi.mock("drizzle-orm", () => ({
 vi.mock("@agent-native/core/server/request-context", () => ({
   getRequestUserEmail: () => mocks.userEmail,
   getRequestOrgId: () => mocks.orgId,
+  getRequestContext: () => undefined,
   runWithRequestContext: async (_context: Row, fn: () => Promise<unknown>) =>
     fn(),
 }));
@@ -606,6 +649,13 @@ vi.mock("h3", () => ({
 
 vi.mock("@agent-native/core/credentials", () => ({
   resolveCredential: vi.fn(async () => "test-token"),
+  resolveCredentialDetailed: vi.fn(
+    async (_key: string, ctx: { userEmail: string }) => ({
+      value: "test-token",
+      scope: "user",
+      scopeId: ctx.userEmail,
+    }),
+  ),
 }));
 
 vi.mock("@agent-native/core/workspace-connections", () => ({
@@ -623,6 +673,24 @@ vi.mock("@agent-native/core/settings", () => ({
   putSetting: vi.fn(async (_key: string, value: typeof mocks.settings) => {
     mocks.settings = { ...mocks.settings, ...value };
   }),
+  // Mirrors the store's compare-and-swap: a write lands only when the row is
+  // still the one the updater read, otherwise the updater reruns.
+  mutateSetting: vi.fn(
+    async (
+      _key: string,
+      updater: (
+        current: typeof mocks.settings,
+      ) => typeof mocks.settings | Promise<typeof mocks.settings>,
+    ) => {
+      for (;;) {
+        const snapshot = mocks.settings;
+        const next = await updater(snapshot);
+        if (mocks.settings !== snapshot) continue;
+        mocks.settings = next;
+        return next;
+      }
+    },
+  ),
 }));
 
 vi.mock("./audiences.js", () => ({
@@ -716,6 +784,8 @@ vi.mock("@agent-native/core/sharing", () => ({
   }),
 }));
 
+import { mutateSetting, putSetting } from "@agent-native/core/settings";
+
 import claimDistillationAction from "../../actions/claim-distillation.js";
 import getCaptureAction from "../../actions/get-capture.js";
 import { buildPilotTrustLane } from "../../actions/get-pilot-report.js";
@@ -731,12 +801,14 @@ import {
   buildBrainAgentGuidance,
   createCapture,
   previewKnowledgeCanonicalResource,
+  recordBlockedCapture,
   retireUpstreamDeletedCapture,
   safeCitationUrl,
   serializeSource,
   setKnowledgeCanonicalResource,
   sha256Hex,
   validateEvidence,
+  writeBrainSettings,
   writeKnowledgeRecord,
 } from "./brain.js";
 import { buildSanitizerSystemPrompt } from "./capture-sanitization.js";
@@ -753,6 +825,7 @@ import { enqueueCaptureInvalidation } from "./ingest-queue.js";
 
 function resetMocks() {
   vi.clearAllMocks();
+  mocks.track.mockReset();
   vi.unstubAllGlobals();
   for (const values of Object.values(mocks.rows)) values.length = 0;
   mocks.rows.audiences.push({
@@ -1000,6 +1073,19 @@ describe("Brain knowledge quality gates", () => {
 
     expect(result.sources).toEqual([
       expect.objectContaining({ id: "source-1", recordCount: 1 }),
+    ]);
+  });
+
+  it("includes canonical health for sources in the source listing", async () => {
+    seedSource({
+      provider: "granola",
+      configJson: JSON.stringify({ autoSync: true }),
+    });
+
+    const result = await listSourcesAction.run({ includeArchived: false });
+
+    expect(result.sources).toEqual([
+      expect.objectContaining({ id: "source-1", health: "needs_sync" }),
     ]);
   });
 
@@ -1329,6 +1415,49 @@ describe("Brain knowledge quality gates", () => {
     });
   });
 
+  it("persists and updates classifier failure reasons on blocked events", async () => {
+    const source = seedSource();
+    const input = {
+      id: "blocked-capture-example",
+      existing: null,
+      source: source as never,
+      values: {
+        sourceId: "source-1",
+        externalId: "blocked-external-example",
+        title: "Blocked capture example",
+        kind: "note" as const,
+        content: "Ambiguous company note for a persistence test.",
+      },
+      decision: {
+        disposition: "quarantined" as const,
+        categories: [],
+        confidenceBand: "uncertain" as const,
+        policyVersion: "test-policy-v1",
+        safeSegments: [],
+        safeContent: "",
+        classifier: "deterministic" as const,
+      },
+      retentionHours: 72,
+    };
+
+    await recordBlockedCapture({
+      ...input,
+      classifierFailureReason: "jev-unavailable",
+    });
+    expect(mocks.rows.sensitivityEvents[0]).toMatchObject({
+      classifierFailureReason: "jev-unavailable",
+    });
+
+    await recordBlockedCapture({
+      ...input,
+      classifierFailureReason: "jev-timeout",
+    });
+    expect(mocks.rows.sensitivityEvents).toHaveLength(1);
+    expect(mocks.rows.sensitivityEvents[0]).toMatchObject({
+      classifierFailureReason: "jev-timeout",
+    });
+  });
+
   it("prevents an in-flight refresh from recreating an upstream-deleted capture", async () => {
     seedSource({ provider: "slack" });
     const externalId = "slack:C123:1770919200.000100";
@@ -1653,6 +1782,27 @@ describe("Brain knowledge quality gates", () => {
     expect(mocks.rows.captures).toHaveLength(1);
   });
 
+  it("recognizes PostgreSQL unique-violation codes when the message is generic", async () => {
+    seedSource();
+    mocks.insertControls.error = Object.assign(new Error("insert failed"), {
+      code: "23505",
+    });
+    mocks.insertControls.beforeThrow = (_tableRef, row) => {
+      mocks.rows.captures.push({ ...row, id: "capture-from-postgres-race" });
+    };
+
+    const capture = await createCapture({
+      sourceId: "source-1",
+      externalId: "external-1",
+      title: "Planning note",
+      kind: "note",
+      content: "Decision: ship the beta on May 20.",
+    });
+
+    expect(capture.id).toBe("capture-from-postgres-race");
+    expect(mocks.rows.captures).toHaveLength(1);
+  });
+
   it("creates a proposal for company-tier knowledge below the auto-publish confidence gate", async () => {
     seedSource();
     seedCapture();
@@ -1709,6 +1859,31 @@ describe("Brain knowledge quality gates", () => {
       audienceId: "aud_org",
       audienceAclHash: "acl-hash",
     });
+  });
+
+  it("keeps saved knowledge successful when creation telemetry throws", async () => {
+    seedSource();
+    seedCapture();
+    mocks.track.mockImplementationOnce(() => {
+      throw new Error("tracking unavailable");
+    });
+
+    const result = await writeKnowledgeRecord({
+      title: "Beta date",
+      body: "The team decided to ship the beta on May 20.",
+      evidence: [
+        {
+          captureId: "capture-1",
+          quote: "Decision: ship the beta on May 20.",
+        },
+      ],
+      confidence: 95,
+      proposalMode: "never",
+    });
+
+    expect(result.mode).toBe("knowledge");
+    expect(mocks.rows.knowledge).toHaveLength(1);
+    expect(mocks.track).toHaveBeenCalledOnce();
   });
 
   it("keeps auto-redacted knowledge unpublished when its evidence source opts out of review", async () => {
@@ -2544,7 +2719,7 @@ describe("Brain knowledge quality gates", () => {
 describe("Brain connector smoke coverage", () => {
   it("tests Slack credentials and channel metadata without reading history", async () => {
     const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input));
+      const url = new URL(requestString(input));
       if (url.pathname.endsWith("/auth.test")) {
         return Response.json({
           ok: true,
@@ -2588,14 +2763,61 @@ describe("Brain connector smoke coverage", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(2);
     expect(
       fetchSpy.mock.calls.some((call) =>
-        String(call[0]).includes("conversations.history"),
+        requestString(call[0]).includes("conversations.history"),
       ),
     ).toBe(false);
   });
 
+  it("fails Slack channel validation closed for invalid requested refs", async () => {
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(requestString(input));
+      if (url.pathname.endsWith("/auth.test")) {
+        return Response.json({
+          ok: true,
+          team: "Acme",
+          team_id: "T123",
+          user: "brain-bot",
+          user_id: "U123",
+        });
+      }
+      if (url.pathname.endsWith("/conversations.info")) {
+        const channel = url.searchParams.get("channel");
+        if (channel === "C999") {
+          return Response.json({ ok: false, error: "channel_not_found" });
+        }
+        return Response.json({
+          ok: true,
+          channel: {
+            id: channel,
+            name: "product-decisions",
+            is_channel: true,
+            is_archived: false,
+          },
+        });
+      }
+      return Response.json({ ok: false, error: "unexpected_method" });
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const result = await testSlackConnection({
+      channelRefs: ["C123", "C999", "D123", "project"],
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      checkedChannels: 4,
+      channels: [
+        { ref: "C123", status: "ok" },
+        { ref: "C999", status: "missing" },
+        { ref: "D123", status: "excluded", directExcluded: true },
+        { ref: "project", status: "skipped" },
+      ],
+    });
+  });
+
   it("surfaces Slack missing-scope details without reading history", async () => {
     const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input));
+      const url = new URL(requestString(input));
       if (url.pathname.endsWith("/auth.test")) {
         return Response.json({
           ok: true,
@@ -2624,14 +2846,14 @@ describe("Brain connector smoke coverage", () => {
     );
     expect(
       fetchSpy.mock.calls.some((call) =>
-        String(call[0]).includes("conversations.history"),
+        requestString(call[0]).includes("conversations.history"),
       ),
     ).toBe(false);
   });
 
   it("runs a Slack pilot report without reading history by default", async () => {
     const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input));
+      const url = new URL(requestString(input));
       if (url.pathname.endsWith("/auth.test")) {
         return Response.json({
           ok: true,
@@ -2686,7 +2908,59 @@ describe("Brain connector smoke coverage", () => {
     expect(mocks.rows.captures).toHaveLength(0);
     expect(
       fetchSpy.mock.calls.some((call) =>
-        String(call[0]).includes("conversations.history"),
+        requestString(call[0]).includes("conversations.history"),
+      ),
+    ).toBe(false);
+  });
+
+  it("blocks a pilot before history reads when a requested channel is invalid", async () => {
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(requestString(input));
+      if (url.pathname.endsWith("/auth.test")) {
+        return Response.json({
+          ok: true,
+          team: "Acme",
+          team_id: "T123",
+          user: "brain-bot",
+          url: "https://acme.slack.com/",
+        });
+      }
+      if (url.pathname.endsWith("/conversations.info")) {
+        return Response.json({
+          ok: true,
+          channel: {
+            id: "C123",
+            name: "product-decisions",
+            is_channel: true,
+            is_archived: false,
+          },
+        });
+      }
+      return Response.json({ ok: false, error: "history_must_not_run" });
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    const source = seedSource({
+      id: "slack-source",
+      title: "Slack product",
+      provider: "slack",
+      configJson: JSON.stringify({ channelIds: ["C123", "D123"] }),
+    });
+
+    const report = await runSlackPilot(source as never, { readHistory: true });
+
+    expect(report).toMatchObject({
+      ok: false,
+      status: "blocked",
+      historyRead: false,
+      channelValidation: {
+        requested: 2,
+        ok: 1,
+        excluded: 1,
+      },
+    });
+    expect(
+      fetchSpy.mock.calls.some((call) =>
+        requestString(call[0]).includes("conversations.history"),
       ),
     ).toBe(false);
   });
@@ -2694,7 +2968,7 @@ describe("Brain connector smoke coverage", () => {
   it("caps a Slack pilot history sync and reports captures and stats", async () => {
     const historyUrls: URL[] = [];
     const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input));
+      const url = new URL(requestString(input));
       if (url.pathname.endsWith("/auth.test")) {
         return Response.json({
           ok: true,
@@ -2926,7 +3200,7 @@ describe("Brain connector smoke coverage", () => {
 
   it("keeps Granola meeting captures scoped to normalized attendees", async () => {
     const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input));
+      const url = new URL(requestString(input));
       if (url.pathname === "/v1/notes") {
         return Response.json({
           notes: [
@@ -2992,7 +3266,7 @@ describe("Brain connector smoke coverage", () => {
 
   it("falls back to the source owner for Granola notes without safe attendees", async () => {
     const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input));
+      const url = new URL(requestString(input));
       if (url.pathname === "/v1/notes") {
         return Response.json({
           notes: [{ id: "not_noattendees1", title: "Product review" }],
@@ -3035,7 +3309,7 @@ describe("Brain connector smoke coverage", () => {
 
   it("syncs only an allow-listed Slack channel and stores a permalink citation", async () => {
     const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input));
+      const url = new URL(requestString(input));
       if (url.pathname.endsWith("/conversations.info")) {
         return Response.json({
           ok: true,
@@ -3145,7 +3419,7 @@ describe("Brain connector smoke coverage", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
-        const url = new URL(String(input));
+        const url = new URL(requestString(input));
         if (url.pathname.endsWith("/conversations.info")) {
           return Response.json({
             ok: true,
@@ -3216,7 +3490,7 @@ describe("Brain connector smoke coverage", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
-        const url = new URL(String(input));
+        const url = new URL(requestString(input));
         if (url.pathname.endsWith("/conversations.info")) {
           return Response.json({
             ok: true,
@@ -3291,7 +3565,7 @@ describe("Brain connector smoke coverage", () => {
   it("consumes the Slack history page budget and persists the next cursor", async () => {
     const historyCursors: Array<string | null> = [];
     const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input));
+      const url = new URL(requestString(input));
       if (url.pathname.endsWith("/conversations.info")) {
         return Response.json({
           ok: true,
@@ -3376,7 +3650,7 @@ describe("Brain connector smoke coverage", () => {
     const calls: string[] = [];
     const fetchSpy = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
-        const url = new URL(String(input));
+        const url = new URL(requestString(input));
         if (url.pathname.endsWith("/conversations.info")) {
           return Response.json({
             ok: true,
@@ -3392,9 +3666,9 @@ describe("Brain connector smoke coverage", () => {
         if (url.pathname.endsWith("/conversations.join")) {
           calls.push("join");
           expect(init?.method).toBe("POST");
-          expect(new URLSearchParams(String(init?.body)).get("channel")).toBe(
-            "C123",
-          );
+          expect(
+            new URLSearchParams(testString(init?.body)).get("channel"),
+          ).toBe("C123");
           return Response.json({ ok: true });
         }
         if (url.pathname.endsWith("/conversations.history")) {
@@ -3460,7 +3734,7 @@ describe("Brain connector smoke coverage", () => {
   it("paginates private Slack membership before deriving the member-scoped audience", async () => {
     const membershipCursors: Array<string | null> = [];
     const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input));
+      const url = new URL(requestString(input));
       if (url.pathname.endsWith("/conversations.info")) {
         return Response.json({
           ok: true,
@@ -3546,7 +3820,7 @@ describe("Brain connector smoke coverage", () => {
     expect(membershipCursors).toEqual([null, "members-page-2"]);
     expect(
       fetchSpy.mock.calls.filter((call) =>
-        String(call[0]).includes("users.info"),
+        requestString(call[0]).includes("users.info"),
       ),
     ).toHaveLength(3);
     expect(JSON.stringify(result.captures[0]?.metadata)).not.toContain(
@@ -3554,11 +3828,105 @@ describe("Brain connector smoke coverage", () => {
     );
   });
 
+  it("ignores Slack bot and app members when deriving a private-channel audience", async () => {
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(requestString(input));
+      if (url.pathname.endsWith("/conversations.info")) {
+        return Response.json({
+          ok: true,
+          channel: {
+            id: "G123",
+            name: "leadership",
+            is_group: true,
+            is_private: true,
+            is_archived: false,
+          },
+        });
+      }
+      if (url.pathname.endsWith("/conversations.members")) {
+        return Response.json({
+          ok: true,
+          members: ["U123", "BAGENT", "APP1", "UDELETED"],
+        });
+      }
+      if (url.pathname.endsWith("/users.info")) {
+        const user = url.searchParams.get("user");
+        if (user === "BAGENT") {
+          return Response.json({ ok: true, user: { is_bot: true } });
+        }
+        if (user === "APP1") {
+          return Response.json({ ok: true, user: { is_app_user: true } });
+        }
+        if (user === "UDELETED") {
+          return Response.json({ ok: true, user: { deleted: true } });
+        }
+        return Response.json({
+          ok: true,
+          user: { profile: { email: "ada@example.test" } },
+        });
+      }
+      if (url.pathname.endsWith("/conversations.history")) {
+        return Response.json({
+          ok: true,
+          messages: [
+            {
+              type: "message",
+              text: "Decision: publish the roadmap next week.",
+              ts: "1770919200.000100",
+            },
+          ],
+        });
+      }
+      if (url.pathname.endsWith("/conversations.replies")) {
+        return Response.json({
+          ok: true,
+          messages: [
+            {
+              type: "message",
+              text: "Decision: publish the roadmap next week.",
+              ts: "1770919200.000100",
+            },
+          ],
+        });
+      }
+      if (url.pathname.endsWith("/chat.getPermalink")) {
+        return Response.json({
+          ok: true,
+          permalink:
+            "https://example.slack.com/archives/G123/p1770919200000100",
+        });
+      }
+      return Response.json({ ok: false, error: "unexpected_method" });
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    const source = seedSource({
+      id: "slack-private-bot-source",
+      provider: "slack",
+      configJson: JSON.stringify({ channelIds: ["G123"] }),
+    });
+
+    const result = await runConnectorSync(source as never);
+
+    expect(result).toMatchObject({ status: "success", capturesCreated: 1 });
+    expect(
+      fetchSpy.mock.calls.filter((call) =>
+        requestString(call[0]).includes("users.info"),
+      ),
+    ).toHaveLength(4);
+    expect(vi.mocked(ensureCaptureAudience)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "slack-private-channel",
+        memberEmails: ["ada@example.test"],
+        upstreamRefHash: "G123",
+      }),
+    );
+  });
+
   it("caches private Slack member emails and bounds concurrent user lookups within a sync", async () => {
     let activeUserLookups = 0;
     let maxActiveUserLookups = 0;
     const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input));
+      const url = new URL(requestString(input));
       const channelId = url.searchParams.get("channel") ?? "G123";
       if (url.pathname.endsWith("/conversations.info")) {
         return Response.json({
@@ -3642,7 +4010,7 @@ describe("Brain connector smoke coverage", () => {
     expect(result).toMatchObject({ status: "success", capturesCreated: 2 });
     expect(
       fetchSpy.mock.calls.filter((call) =>
-        String(call[0]).includes("users.info"),
+        requestString(call[0]).includes("users.info"),
       ),
     ).toHaveLength(7);
     expect(maxActiveUserLookups).toBeGreaterThan(1);
@@ -3654,7 +4022,7 @@ describe("Brain connector smoke coverage", () => {
     const listedCursors: Array<string | null> = [];
     const historyChannels: string[] = [];
     const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input));
+      const url = new URL(requestString(input));
       if (url.pathname.endsWith("/conversations.list")) {
         const cursor = url.searchParams.get("cursor");
         listedCursors.push(cursor);
@@ -3776,7 +4144,7 @@ describe("Brain connector smoke coverage", () => {
 
   it("rejects configured Slack MPIMs before reading history", async () => {
     const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input));
+      const url = new URL(requestString(input));
       if (url.pathname.endsWith("/conversations.info")) {
         return Response.json({
           ok: true,
@@ -3975,7 +4343,7 @@ describe("Brain connector smoke coverage", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
-        const url = new URL(String(input));
+        const url = new URL(requestString(input));
         if (url.pathname.endsWith("/notes")) {
           return Response.json({
             notes: noteIds.map((id, index) => ({
@@ -4024,7 +4392,7 @@ describe("Brain connector smoke coverage", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
-        const url = new URL(String(input));
+        const url = new URL(requestString(input));
         if (url.pathname.endsWith("/notes")) {
           return Response.json({
             notes: ["note_0", "note_1", "note_2"].map((id) => ({
@@ -4134,7 +4502,7 @@ describe("Brain connector smoke coverage", () => {
   it("syncs GitHub issues and pull requests from configured repositories", async () => {
     const fetchSpy = vi.fn(
       async (input: RequestInfo | URL, _init?: RequestInit) => {
-        const url = new URL(String(input));
+        const url = new URL(requestString(input));
         expect(url.pathname).toBe("/repos/acme/brain/issues");
         expect(url.searchParams.get("state")).toBe("all");
         expect(url.searchParams.get("per_page")).toBe("2");
@@ -4351,7 +4719,7 @@ describe("Brain connector smoke coverage", () => {
   it("imports GitHub PR context linked from Slack captures", async () => {
     const fetchSpy = vi.fn(
       async (input: RequestInfo | URL, _init?: RequestInit) => {
-        const url = new URL(String(input));
+        const url = new URL(requestString(input));
         if (url.pathname === "/repos/acme/brain/issues/42") {
           return Response.json({
             id: 420,
@@ -4749,7 +5117,7 @@ describe("Brain demo eval", () => {
       kind: "message",
       content: [
         "Slack #dev-fusion thread",
-        "Engineering architecture: Brain retrieval starts with portable SQL over brain_knowledge.",
+        "Engineering architecture: Brain retrieval starts with Postgres SQL over brain_knowledge.",
         "Raw capture fallback only runs when source policy allows.",
         "V1 has no vector database requirement.",
       ].join("\n"),
@@ -4806,5 +5174,45 @@ describe("Brain demo eval", () => {
     expect(mocks.rows.sources).toHaveLength(1);
     expect(mocks.rows.captures).toHaveLength(6);
     expect(mocks.rows.knowledge).toHaveLength(0);
+  });
+});
+
+describe("writeBrainSettings", () => {
+  beforeEach(() => {
+    resetMocks();
+  });
+
+  it("keeps both of two overlapping one-field saves", async () => {
+    // A plain read-then-overwrite loses the first save under these semantics.
+    const overwrite = async (_key: string, value: Record<string, unknown>) => {
+      mocks.settings = value as typeof mocks.settings;
+    };
+    vi.mocked(putSetting)
+      .mockImplementationOnce(overwrite)
+      .mockImplementationOnce(overwrite);
+    await Promise.all([
+      writeBrainSettings({ requireCitations: false }),
+      writeBrainSettings({ autoArchiveResolved: false }),
+    ]);
+
+    expect(mocks.settings).toMatchObject({
+      requireCitations: false,
+      autoArchiveResolved: false,
+      distillationInstructions:
+        "Distill durable, reusable institutional knowledge. Preserve short direct quotes as evidence.",
+      connectorPollMinutes: 60,
+    });
+  });
+
+  it("fails the save instead of writing defaults when the read fails", async () => {
+    const before = mocks.settings;
+    vi.mocked(mutateSetting).mockRejectedValueOnce(
+      new Error("settings read failed"),
+    );
+
+    await expect(
+      writeBrainSettings({ requireCitations: false }),
+    ).rejects.toThrow("settings read failed");
+    expect(mocks.settings).toBe(before);
   });
 });

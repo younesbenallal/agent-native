@@ -2,9 +2,15 @@ import { createReadStream } from "fs";
 import { stat } from "fs/promises";
 import path from "path";
 
-import { getSession, streamFile } from "@agent-native/core/server";
-import { defineEventHandler, getRouterParam, setResponseStatus } from "h3";
+import { streamFile } from "@agent-native/core/server";
+import {
+  defineEventHandler,
+  getRouterParam,
+  setResponseHeader,
+  setResponseStatus,
+} from "h3";
 
+import { resolveSlidesRequestAuth } from "../../../handlers/request-auth-context.js";
 import { tenantExportDir } from "../../../lib/tenant-files.js";
 
 const CONTENT_TYPES: Record<string, string> = {
@@ -15,15 +21,19 @@ const CONTENT_TYPES: Record<string, string> = {
 };
 
 export default defineEventHandler(async (event) => {
-  const session = await getSession(event).catch(() => null);
-  if (!session?.email) {
+  const auth = await resolveSlidesRequestAuth(event);
+  if (!auth.ok) {
+    setResponseStatus(event, auth.statusCode);
+    return { error: auth.error };
+  }
+  const session = auth.context;
+  if (!session.email) {
     setResponseStatus(event, 401);
     return { error: "Unauthorized" };
   }
 
   const filename = getRouterParam(event, "filename") ?? "";
 
-  // Reject path traversal attempts
   if (
     !filename ||
     filename.includes("/") ||
@@ -37,7 +47,6 @@ export default defineEventHandler(async (event) => {
   const exportsDir = path.resolve(tenantExportDir(session.email));
   const filepath = path.resolve(exportsDir, filename);
 
-  // Double-check resolved path stays inside exportsDir
   if (!filepath.startsWith(exportsDir + path.sep)) {
     setResponseStatus(event, 403);
     return { error: "Forbidden" };
@@ -53,8 +62,9 @@ export default defineEventHandler(async (event) => {
   const ext = path.extname(filename).toLowerCase();
   const contentType = CONTENT_TYPES[ext] ?? "application/octet-stream";
 
-  event.node!.res!.setHeader("Content-Type", contentType);
-  event.node!.res!.setHeader(
+  setResponseHeader(event, "Content-Type", contentType);
+  setResponseHeader(
+    event,
     "Content-Disposition",
     `attachment; filename="${filename}"`,
   );

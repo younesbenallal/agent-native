@@ -1,11 +1,11 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
 
 import { listVaultAudit } from "../server/lib/vault-store.js";
 
 export default defineAction({
   description:
-    "View the vault audit log — secret access, grants, syncs, and requests.",
+    "View the vault audit log — secret access, grants, syncs, and requests. Admin only.",
   schema: z.object({
     limit: z.coerce
       .number()

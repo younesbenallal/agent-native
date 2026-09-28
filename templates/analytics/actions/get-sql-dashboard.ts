@@ -1,5 +1,7 @@
-import { defineAction, embedApp } from "@agent-native/core";
+import { defineAction, embedApp, fail } from "@agent-native/core";
 import {
+  currentRequestUserIsOrgAdmin,
+  getAppConfig,
   getRequestUserEmail,
   getRequestOrgId,
   buildDeepLink,
@@ -10,12 +12,16 @@ import {
   buildDashboardAgentContext,
   buildDashboardSeedAgentContext,
 } from "../server/lib/agent-readable-resource-context";
+import { repairKnownFirstPartyDashboardQueries } from "../server/lib/canonical-first-party-dashboard-repair";
 import { loadDashboardSeed } from "../server/lib/dashboard-seeds";
-import { getDashboard } from "../server/lib/dashboards-store";
+import {
+  getDashboard,
+  getDashboardForReview,
+} from "../server/lib/dashboards-store";
 
 export default defineAction({
   description:
-    "Get a SQL analytics dashboard by ID. By default this returns compact panel summaries and layout/order fields without giant SQL strings; use includeConfig=true only when you need the full dashboard config for a detailed SQL/config edit.",
+    "Get a SQL analytics dashboard by ID. By default this returns compact panel summaries, layout/order fields, and current-version certification status without giant SQL strings; use includeConfig=true only when you need the full dashboard config for a detailed SQL/config edit.",
   schema: z.object({
     id: z.string().describe("The dashboard ID"),
     includeConfig: z
@@ -24,6 +30,17 @@ export default defineAction({
       .describe(
         "If true, include the full dashboard config including panel SQL. Defaults to false to keep agent context compact.",
       ),
+    reviewPreview: z
+      .boolean()
+      .optional()
+      .describe(
+        "Human Review only: read a saved dashboard for an organization owner/admin. Cross-organization reads are limited to the single organization configured as this app's observability super organization.",
+      ),
+    reviewOrgId: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("The customer organization shown in this Human Review row."),
   }),
   http: { method: "GET" },
   readOnly: true,
@@ -60,18 +77,58 @@ export default defineAction({
     const orgId = getRequestOrgId() || null;
     const ctx = { email, orgId };
 
-    const dash = await getDashboard(args.id, ctx);
+    let dash;
+    if (args.reviewPreview) {
+      if (!orgId || !(await currentRequestUserIsOrgAdmin(orgId))) {
+        fail(
+          "Only organization owners and admins can preview reviewed dashboards.",
+          { statusCode: 403 },
+        );
+      }
+      const superOrgId = getAppConfig().observability.superOrgId;
+      const isSuperOrg = superOrgId === orgId;
+      const targetOrgId = isSuperOrg ? args.reviewOrgId : orgId;
+      if (!targetOrgId) {
+        fail(
+          "A customer organization is required for this dashboard preview.",
+          {
+            statusCode: 400,
+          },
+        );
+      }
+      dash = await getDashboardForReview(
+        args.id,
+        isSuperOrg
+          ? { kind: "super-organization", orgId: targetOrgId }
+          : { kind: "organization", orgId: targetOrgId },
+      );
+    } else {
+      dash = await getDashboard(args.id, ctx);
+    }
+    if (args.reviewPreview && (!dash || dash.kind !== "sql")) {
+      fail("Dashboard not found.", { statusCode: 404 });
+    }
     if (!dash || dash.kind !== "sql") {
       const seed = loadDashboardSeed(args.id);
-      if (seed)
-        return buildDashboardSeedAgentContext(args.id, seed, {
+      if (seed) {
+        const config = repairKnownFirstPartyDashboardQueries(
+          args.id,
+          seed,
+        ).config;
+        return buildDashboardSeedAgentContext(args.id, config, {
           includeConfig: args.includeConfig === true,
         });
+      }
       throw Object.assign(new Error("Dashboard not found"), {
         statusCode: 404,
       });
     }
-    return buildDashboardAgentContext(dash, {
+    const dashboard = {
+      ...dash,
+      config: repairKnownFirstPartyDashboardQueries(args.id, dash.config)
+        .config,
+    };
+    return buildDashboardAgentContext(dashboard, {
       includeConfig: args.includeConfig === true,
     });
   },

@@ -1,23 +1,29 @@
-import { resolveCredential } from "@agent-native/core/credentials";
-import type { CredentialContext } from "@agent-native/core/credentials";
+import {
+  resolveCredentialDetailed,
+  type CredentialContext,
+} from "@agent-native/core/credentials";
 import { readAppSecret, type SecretRef } from "@agent-native/core/secrets";
 import {
-  getWorkspaceConnectionAppAccess,
-  listWorkspaceConnectionGrants,
   listWorkspaceConnections,
   resolveWorkspaceConnectionForApp,
   type SerializedWorkspaceConnection,
-  type SerializedWorkspaceConnectionGrant,
   type WorkspaceConnectionAppAccessMode,
   type WorkspaceConnectionCredentialRef,
+  type WorkspaceConnectionForApp,
 } from "@agent-native/core/workspace-connections";
 
 import type { BrainSourceProvider } from "../../shared/types.js";
 
 const APP_ID = "brain";
 
+const SOURCE_CREDENTIAL_KEYS: Record<string, string> = {
+  slack: "SLACK_BOT_TOKEN",
+  granola: "GRANOLA_API_KEY",
+  github: "GITHUB_TOKEN",
+};
+
 interface ResolveSourceCredentialOptions {
-  provider: BrainSourceProvider | string;
+  provider: BrainSourceProvider | (string & {});
   key: string;
   ctx: CredentialContext;
   workspaceConnectionId?: string | null;
@@ -40,6 +46,7 @@ export interface SourceCredentialProvenance {
   key: string;
   provider: string;
   scope?: SecretRef["scope"];
+  scopeId?: string;
   connectionId?: string;
   connectionLabel?: string;
   grantId?: string | null;
@@ -76,12 +83,11 @@ function normalizeCredentialKey(key: string) {
   return key.trim().toUpperCase();
 }
 
-function credentialRefsForConnection(
-  connection: SerializedWorkspaceConnection,
-  grants: SerializedWorkspaceConnectionGrant[],
-) {
-  const grant = grants.find((entry) => entry.connectionId === connection.id);
-  return [...(grant?.credentialRefs ?? []), ...connection.credentialRefs];
+function credentialRefsForConnection(connection: WorkspaceConnectionForApp) {
+  return [
+    ...(connection.explicitGrant?.credentialRefs ?? []),
+    ...connection.credentialRefs,
+  ];
 }
 
 function refMatchesKey(ref: WorkspaceConnectionCredentialRef, key: string) {
@@ -166,22 +172,6 @@ async function readFirstSecretCandidate(
   return {};
 }
 
-function connectionStatusMessage(connection: SerializedWorkspaceConnection) {
-  switch (connection.status) {
-    case "checking":
-      return `${connection.label} is still checking health.`;
-    case "needs_reauth":
-      return `${connection.label} needs to be reauthorized before Brain can use it.`;
-    case "error":
-      return `${connection.label} is in an error state before Brain can use it.`;
-    case "disabled":
-      return `${connection.label} is disabled.`;
-    case "connected":
-    default:
-      return `${connection.label} is connected.`;
-  }
-}
-
 function missingCredentialMessage(
   provider: string,
   key: string,
@@ -260,12 +250,12 @@ async function resolveWorkspaceConnectionCredential({
   provenance: SourceCredentialProvenance;
 } | null> {
   let connections: SerializedWorkspaceConnection[] = [];
-  let grants: SerializedWorkspaceConnectionGrant[] = [];
   try {
-    [connections, grants] = await Promise.all([
-      listWorkspaceConnections({ provider, includeDisabled: true }),
-      listWorkspaceConnectionGrants({ provider, appId: APP_ID }),
-    ]);
+    connections = await listWorkspaceConnections({
+      provider,
+      appId: APP_ID,
+      includeDisabled: true,
+    });
   } catch (err) {
     checked.push({
       source: "workspace_connection",
@@ -296,36 +286,50 @@ async function resolveWorkspaceConnectionCredential({
   }
 
   for (const connection of providerConnections) {
-    const access = getWorkspaceConnectionAppAccess(connection, APP_ID, grants);
-    if (!access.available) {
+    let resolved;
+    try {
+      resolved = await resolveWorkspaceConnectionForApp({
+        appId: APP_ID,
+        provider,
+        connectionId: connection.id,
+        includeDisabled: true,
+        requireConnected: true,
+      });
+    } catch (err) {
       checked.push({
         source: "workspace_connection",
         key,
-        status: "not_granted",
-        message: access.reason,
+        status: "error",
+        message: `Workspace connection lookup failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
         connectionId: connection.id,
         connectionLabel: connection.label,
-        grantId: access.grantId,
-        appAccessMode: access.mode,
       });
       continue;
     }
 
-    if (connection.status !== "connected") {
+    if (!resolved.available || !resolved.connection || !resolved.appAccess) {
+      const status =
+        resolved.appAccess?.available && resolved.connection
+          ? "unhealthy"
+          : "not_granted";
       checked.push({
         source: "workspace_connection",
         key,
-        status: "unhealthy",
-        message: connectionStatusMessage(connection),
+        status,
+        message: resolved.reason,
         connectionId: connection.id,
         connectionLabel: connection.label,
-        grantId: access.grantId,
-        appAccessMode: access.mode,
+        grantId: resolved.appAccess?.grantId ?? null,
+        appAccessMode: resolved.appAccess?.mode,
       });
       continue;
     }
 
-    const matchingRefs = credentialRefsForConnection(connection, grants).filter(
+    const access = resolved.appAccess;
+    const connectionResult = resolved.connection;
+    const matchingRefs = credentialRefsForConnection(connectionResult).filter(
       (ref) => refMatchesKey(ref, key),
     );
     if (matchingRefs.length === 0) {
@@ -333,12 +337,13 @@ async function resolveWorkspaceConnectionCredential({
         source: "workspace_connection",
         key,
         status: "missing",
-        message: `${connection.label} is granted to Brain but does not reference ${key}.`,
-        connectionId: connection.id,
-        connectionLabel: connection.label,
+        message: `${connectionResult.label} is granted to Brain but does not reference ${key}.`,
+        connectionId: connectionResult.id,
+        connectionLabel: connectionResult.label,
         grantId: access.grantId,
         appAccessMode: access.mode,
       });
+      continue;
     }
 
     for (const ref of matchingRefs) {
@@ -348,9 +353,9 @@ async function resolveWorkspaceConnectionCredential({
           source: "workspace_connection",
           key,
           status: "missing",
-          message: `${connection.label} references ${ref.key}, but its scope is unavailable in this request.`,
-          connectionId: connection.id,
-          connectionLabel: connection.label,
+          message: `${connectionResult.label} references ${ref.key}, but its scope is unavailable in this request.`,
+          connectionId: connectionResult.id,
+          connectionLabel: connectionResult.label,
           grantId: access.grantId,
           appAccessMode: access.mode,
         });
@@ -363,10 +368,10 @@ async function resolveWorkspaceConnectionCredential({
           source: "workspace_connection",
           key,
           status: "available",
-          message: `${key} is available through ${connection.label}.`,
+          message: `${key} is available through ${connectionResult.label}.`,
           scope: found.ref.scope,
-          connectionId: connection.id,
-          connectionLabel: connection.label,
+          connectionId: connectionResult.id,
+          connectionLabel: connectionResult.label,
           grantId: access.grantId,
           appAccessMode: access.mode,
         });
@@ -377,8 +382,9 @@ async function resolveWorkspaceConnectionCredential({
             key,
             provider,
             scope: found.ref.scope,
-            connectionId: connection.id,
-            connectionLabel: connection.label,
+            scopeId: found.ref.scopeId,
+            connectionId: connectionResult.id,
+            connectionLabel: connectionResult.label,
             grantId: access.grantId,
             appAccessMode: access.mode,
             credentialRefLabel: ref.label,
@@ -391,10 +397,10 @@ async function resolveWorkspaceConnectionCredential({
         key,
         status: found.error ? "error" : "missing",
         message: found.error
-          ? `${connection.label} credential lookup failed: ${found.error}`
-          : `${connection.label} references ${ref.key}, but no vault value was found.`,
-        connectionId: connection.id,
-        connectionLabel: connection.label,
+          ? `${connectionResult.label} credential lookup failed: ${found.error}`
+          : `${connectionResult.label} references ${ref.key}, but no vault value was found.`,
+        connectionId: connectionResult.id,
+        connectionLabel: connectionResult.label,
         grantId: access.grantId,
         appAccessMode: access.mode,
       });
@@ -429,6 +435,7 @@ async function resolveRegisteredSecretCredential(
         key: options.key,
         provider: options.provider,
         scope: found.ref.scope,
+        scopeId: found.ref.scopeId,
       },
     };
   }
@@ -482,7 +489,10 @@ async function resolveSourceCredentialDetailed(
     };
   }
 
-  const localCredential = await resolveCredential(options.key, options.ctx);
+  const localCredential = await resolveCredentialDetailed(
+    options.key,
+    options.ctx,
+  );
   if (localCredential) {
     checked.push({
       source: "brain_local",
@@ -494,11 +504,13 @@ async function resolveSourceCredentialDetailed(
       provider: options.provider,
       key: options.key,
       available: true,
-      value: localCredential,
+      value: localCredential.value,
       provenance: {
         source: "brain_local",
         key: options.key,
         provider: options.provider,
+        scope: localCredential.scope,
+        scopeId: localCredential.scopeId,
       },
       checked,
       missingMessage: null,
@@ -542,11 +554,21 @@ async function resolveSourceCredentialDetailed(
   };
 }
 
+export async function resolveSourceCredentialWithProvenance(
+  options: ResolveSourceCredentialOptions,
+): Promise<
+  { value: string; provenance: SourceCredentialProvenance } | undefined
+> {
+  const resolution = await resolveSourceCredentialDetailed(options);
+  return resolution.value && resolution.provenance
+    ? { value: resolution.value, provenance: resolution.provenance }
+    : undefined;
+}
+
 export async function resolveSourceCredential(
   options: ResolveSourceCredentialOptions,
 ): Promise<string | undefined> {
-  const resolution = await resolveSourceCredentialDetailed(options);
-  return resolution.value;
+  return (await resolveSourceCredentialWithProvenance(options))?.value;
 }
 
 export async function inspectSourceCredentialAvailability(
@@ -561,7 +583,7 @@ export async function assertSourceWorkspaceConnectionAvailable({
   provider,
   workspaceConnectionId,
 }: {
-  provider: BrainSourceProvider | string;
+  provider: BrainSourceProvider | (string & {});
   workspaceConnectionId: string;
 }) {
   let result: Awaited<ReturnType<typeof resolveWorkspaceConnectionForApp>>;
@@ -587,4 +609,40 @@ export async function assertSourceWorkspaceConnectionAvailable({
     connection: result.connection,
     access: result.appAccess,
   };
+}
+
+/**
+ * Source setup must prove the selected connection can actually supply the
+ * provider credential. Connection access alone is only metadata and can leave
+ * a source saved in a state every later sync will fail to use.
+ */
+export async function assertSourceCredentialAvailable({
+  provider,
+  workspaceConnectionId,
+  ctx,
+}: {
+  provider: BrainSourceProvider | (string & {});
+  workspaceConnectionId: string;
+  ctx: CredentialContext | null;
+}) {
+  const key = SOURCE_CREDENTIAL_KEYS[provider.trim().toLowerCase()];
+  if (!key) return;
+  if (!ctx) {
+    throw new Error(
+      "Source workspace connection setup requires an authenticated credential context.",
+    );
+  }
+
+  const availability = await inspectSourceCredentialAvailability({
+    provider,
+    key,
+    ctx,
+    workspaceConnectionId,
+  });
+  if (!availability.available) {
+    throw new Error(
+      availability.missingMessage ??
+        `The selected ${provider} workspace connection cannot provide ${key}.`,
+    );
+  }
 }

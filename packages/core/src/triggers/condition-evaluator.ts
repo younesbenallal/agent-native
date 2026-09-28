@@ -16,17 +16,16 @@
 
 import { createHash } from "node:crypto";
 
-/**
- * Bumped whenever the prompt template, model, or hardening logic changes.
- * Included in the cache key so cached "yes" answers from a previous
- * (potentially weaker) prompt don't satisfy conditions in the new prompt.
- */
+import { createTtlCache } from "../shared/ttl-cache.js";
+
 const CONDITION_EVAL_VERSION = "v2";
 
-// LRU cache: hash → { result: boolean, expiresAt: number }
-const _cache = new Map<string, { result: boolean; expiresAt: number }>();
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const CACHE_TTL_MS = 5 * 60 * 1000;
 const MAX_CACHE_SIZE = 500;
+const _cache = createTtlCache<boolean>({
+  ttlMs: CACHE_TTL_MS,
+  maxEntries: MAX_CACHE_SIZE,
+});
 
 function cacheKey(condition: string, payload: unknown): string {
   // Salt the cache key with the prompt version + a separate hash of the
@@ -45,28 +44,6 @@ function cacheKey(condition: string, payload: unknown): string {
   return createHash("sha256").update(raw).digest("hex").slice(0, 32);
 }
 
-function pruneCache(): void {
-  if (_cache.size <= MAX_CACHE_SIZE) return;
-  const now = Date.now();
-  for (const [key, entry] of _cache) {
-    if (entry.expiresAt < now) _cache.delete(key);
-  }
-  // If still too large, drop oldest entries
-  if (_cache.size > MAX_CACHE_SIZE) {
-    const excess = _cache.size - MAX_CACHE_SIZE;
-    let deleted = 0;
-    for (const key of _cache.keys()) {
-      if (deleted >= excess) break;
-      _cache.delete(key);
-      deleted++;
-    }
-  }
-}
-
-/**
- * Evaluate whether a natural-language condition matches an event payload.
- * Returns true if the condition is empty/undefined (unconditional trigger).
- */
 export async function evaluateCondition(
   condition: string | undefined,
   payload: unknown,
@@ -76,14 +53,11 @@ export async function evaluateCondition(
 
   const key = cacheKey(condition, payload);
   const cached = _cache.get(key);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.result;
-  }
+  if (cached !== undefined) return cached;
 
   const result = await callHaikuClassifier(condition, payload, apiKey);
 
-  pruneCache();
-  _cache.set(key, { result, expiresAt: Date.now() + CACHE_TTL_MS });
+  _cache.set(key, result);
   return result;
 }
 
@@ -102,10 +76,6 @@ async function callHaikuClassifier(
     payloadStr = String(payload);
   }
 
-  // Defuse any "</event_payload>" tag in the payload itself so an attacker
-  // can't close the wrapper early and append their own instructions outside
-  // the tagged block. The escape is reversible-looking (still readable) but
-  // breaks the literal closing tag the model uses to bound the data.
   const safePayload = payloadStr.replace(/<\/event_payload>/gi, "</_payload>");
 
   const prompt = `You are a condition evaluator. Given an event payload and a natural-language condition, determine if the condition is satisfied.
@@ -120,8 +90,9 @@ Condition: "${condition}"
 
 Does the event payload satisfy the condition above? Respond with ONLY "yes" or "no".`;
 
+  let res: Response;
   try {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
+    res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -134,30 +105,51 @@ Does the event payload satisfy the condition above? Respond with ONLY "yes" or "
         messages: [{ role: "user", content: prompt }],
       }),
     });
-
-    if (!res.ok) {
-      console.error(
-        `[triggers] Condition eval failed: ${res.status} ${res.statusText}`,
-      );
-      return false;
-    }
-
-    const data = (await res.json()) as {
-      content: Array<{ type: string; text?: string }>;
-    };
-    const text =
-      data.content
-        ?.find((b) => b.type === "text")
-        ?.text?.trim()
-        .toLowerCase() ?? "";
-    return text.startsWith("yes");
   } catch (err) {
     console.error("[triggers] Condition eval error:", err);
-    return false;
+    throw new Error(
+      err instanceof Error
+        ? `Condition evaluation failed: ${err.message}`
+        : "Condition evaluation failed: network error",
+    );
   }
+
+  if (!res.ok) {
+    console.error(
+      `[triggers] Condition eval failed: ${res.status} ${res.statusText}`,
+    );
+    throw new Error(
+      `Condition evaluation failed: ${res.status} ${res.statusText}`,
+    );
+  }
+
+  let data: { content: Array<{ type: string; text?: string }> };
+  try {
+    data = (await res.json()) as {
+      content: Array<{ type: string; text?: string }>;
+    };
+  } catch (err) {
+    console.error("[triggers] Condition eval error:", err);
+    throw new Error(
+      err instanceof Error
+        ? `Condition evaluation failed: ${err.message}`
+        : "Condition evaluation failed: invalid response",
+    );
+  }
+
+  const text =
+    data.content
+      ?.find((b) => b.type === "text")
+      ?.text?.trim()
+      .toLowerCase() ?? "";
+  if (!text.startsWith("yes") && !text.startsWith("no")) {
+    throw new Error(
+      `Condition evaluation failed: unexpected classifier response "${text}"`,
+    );
+  }
+  return text.startsWith("yes");
 }
 
-/** Clear the condition cache (for testing). */
 export function __clearConditionCache(): void {
   _cache.clear();
 }

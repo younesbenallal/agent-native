@@ -1,22 +1,33 @@
 import { useChatModels } from "@agent-native/core/client/agent-chat";
 import { agentNativePath } from "@agent-native/core/client/api-path";
 import { ChangelogSettingsCard } from "@agent-native/core/client/changelog";
+import { useFeatureFlagState } from "@agent-native/core/client/feature-flags";
 import {
   callAction,
   useActionMutation,
   useChangeVersions,
 } from "@agent-native/core/client/hooks";
 import { LanguagePicker, useT } from "@agent-native/core/client/i18n";
-import { TeamPage } from "@agent-native/core/client/org";
+import { STANDARD_APP_ROUTES } from "@agent-native/core/client/navigation";
 import {
   AccountSettingsCard,
   SettingsGroup,
   SettingsRow,
+  SettingsShellSkeleton,
   SettingsTabsPage,
   useAgentSettingsTabs,
+  type SettingsAppArea,
   type SettingsSearchEntry,
   type SettingsTabItem,
 } from "@agent-native/core/client/settings";
+import { SETTINGS_REDESIGN_FLAG } from "@agent-native/core/feature-flags/registry";
+import {
+  legacyMailSettingsTab,
+  legacyMailSettingsTabForPath,
+  mailSettingsRedirect,
+  mailSettingsSectionFromPath,
+  type MailSettingsAreaId,
+} from "@shared/settings-navigation";
 import type {
   Alias,
   AutomationAction,
@@ -37,16 +48,24 @@ import {
   IconClock,
   IconPlayerPlay,
   IconSignature,
+  IconPhoto,
   IconFilter,
   IconInfoCircle,
   IconMessage2,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState, useEffect, useRef, useMemo } from "react";
-import { useSearchParams } from "react-router";
+import {
+  Navigate,
+  useLocation,
+  useNavigate,
+  useSearchParams,
+} from "react-router";
 import { toast } from "sonner";
 
+import { AiFilterSection } from "@/components/settings/AiFilterSection";
 import { GmailFiltersSection } from "@/components/settings/GmailFiltersSection";
+import "@/components/settings/slack-channel-extension";
 import { SnippetsSection } from "@/components/settings/SnippetsSection";
 import {
   AlertDialog,
@@ -89,11 +108,11 @@ import {
 } from "@/hooks/use-automations";
 import { useSettings, useUpdateSettings } from "@/hooks/use-emails";
 import { useNavigationState } from "@/hooks/use-navigation-state";
+import { isMailFrameworkAutomation } from "@/lib/automation-visibility";
+import { openFilePicker, uploadFile } from "@/lib/upload";
 import { cn } from "@/lib/utils";
 
 import changelog from "../../CHANGELOG.md?raw";
-
-// ─── Alias Edit Row ───────────────────────────────────────────────────────────
 
 function AliasEditRow({
   alias,
@@ -161,8 +180,6 @@ function AliasEditRow({
     </div>
   );
 }
-
-// ─── Alias Row ────────────────────────────────────────────────────────────────
 
 function AliasRow({
   alias,
@@ -296,9 +313,7 @@ function AliasRow({
   );
 }
 
-// ─── Aliases Section ──────────────────────────────────────────────────────────
-
-function AliasesSection() {
+function AliasesSection({ embedded = false }: { embedded?: boolean }) {
   const t = useT();
   const { data: aliases = [], isLoading } = useAliases();
   const createAlias = useCreateAlias();
@@ -306,14 +321,12 @@ function AliasesSection() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [showNewForm, setShowNewForm] = useState(false);
 
-  // Handle ?alias=<id> query param — open that alias in edit mode
   const aliasParam = searchParams.get("alias");
   useEffect(() => {
     if (aliasParam && aliases.length > 0) {
       const exists = aliases.find((a) => a.id === aliasParam);
       if (exists) {
         setEditingId(aliasParam);
-        // Clear the param so it doesn't re-trigger on every render
         setSearchParams((prev) => {
           const next = new URLSearchParams(prev);
           next.delete("alias");
@@ -332,32 +345,40 @@ function AliasesSection() {
     );
   };
 
+  const newAliasButton = (
+    <Button
+      size="sm"
+      onClick={() => {
+        setShowNewForm(true);
+        setEditingId(null);
+      }}
+    >
+      <IconPlus className="h-3.5 w-3.5" />
+      {t("settings.newAlias")}
+    </Button>
+  );
+
   return (
     <div>
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
-        <div>
-          <h2 className="text-[16px] font-semibold text-foreground">
-            {t("settings.aliases")}
-          </h2>
-          <p className="text-[13px] text-muted-foreground mt-0.5">
-            {t("settings.aliasesDescription")}
-          </p>
+      {embedded ? (
+        <div className="mb-4 flex justify-end">{newAliasButton}</div>
+      ) : (
+        <div className="flex items-center justify-between mb-6">
+          <div>
+            <h2 className="text-[16px] font-semibold text-foreground">
+              {t("settings.aliases")}
+            </h2>
+            <p className="text-[13px] text-muted-foreground mt-0.5">
+              {t("settings.aliasesDescription")}
+            </p>
+          </div>
+          {newAliasButton}
         </div>
-        <Button
-          size="sm"
-          onClick={() => {
-            setShowNewForm(true);
-            setEditingId(null);
-          }}
-        >
-          <IconPlus className="h-3.5 w-3.5" />
-          {t("settings.newAlias")}
-        </Button>
-      </div>
+      )}
 
       {/* Content */}
-      <div className="max-w-2xl space-y-2">
+      <div className={embedded ? "space-y-2" : "max-w-2xl space-y-2"}>
         {/* New alias form at top */}
         {showNewForm && (
           <AliasEditRow
@@ -411,11 +432,14 @@ function AliasesSection() {
   );
 }
 
-// ─── Action Badge ─────────────────────────────────────────────────────────────
-
 function ActionBadge({ action }: { action: AutomationAction }) {
+  const t = useT();
   const label =
-    action.type === "label" ? `label: ${action.labelName}` : action.type;
+    action.type === "label"
+      ? `label: ${action.labelName}`
+      : action.type === "notify"
+        ? t("settings.notify")
+        : action.type;
   return (
     <span className="inline-flex items-center rounded-full bg-indigo-500/15 px-2 py-0.5 text-[11px] font-medium text-indigo-300">
       {label}
@@ -423,9 +447,8 @@ function ActionBadge({ action }: { action: AutomationAction }) {
   );
 }
 
-// ─── Action Builder ───────────────────────────────────────────────────────────
-
 const ACTION_TYPES = [
+  { value: "notify", labelKey: "settings.notify" },
   { value: "label", labelKey: "settings.applyLabel" },
   { value: "archive", labelKey: "settings.archive" },
   { value: "mark_read", labelKey: "settings.markRead" },
@@ -470,7 +493,7 @@ function ActionBuilder({
               }
             }}
           >
-            <SelectTrigger className="h-8 w-[140px] text-[13px]">
+            <SelectTrigger size="sm" className="w-[140px] text-[13px]">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -484,12 +507,13 @@ function ActionBuilder({
 
           {action.type === "label" && (
             <Input
+              size="sm"
               value={action.labelName}
               onChange={(e) =>
                 updateAction(idx, { type: "label", labelName: e.target.value })
               }
               placeholder={t("settings.labelName")}
-              className="flex-1 h-8 px-2 text-[13px] placeholder:text-muted-foreground/40"
+              className="flex-1 px-2 text-[13px] placeholder:text-muted-foreground/40"
             />
           )}
 
@@ -510,8 +534,6 @@ function ActionBuilder({
     </div>
   );
 }
-
-// ─── Automation Edit Row ──────────────────────────────────────────────────────
 
 function AutomationEditRow({
   rule,
@@ -537,7 +559,6 @@ function AutomationEditRow({
 
   const handleSave = () => {
     if (!name.trim() || !condition.trim() || actions.length === 0) return;
-    // Validate label actions have names
     const valid = actions.every(
       (a) => a.type !== "label" || (a.type === "label" && a.labelName.trim()),
     );
@@ -599,8 +620,6 @@ function AutomationEditRow({
   );
 }
 
-// ─── Automation Row ───────────────────────────────────────────────────────────
-
 function AutomationRow({
   rule,
   isEditing,
@@ -657,11 +676,7 @@ function AutomationRow({
       className="flex items-start gap-3 rounded-lg border border-border/30 bg-card px-4 py-3 group hover:border-border/60"
     >
       <div className="pt-0.5">
-        <Switch
-          checked={rule.enabled}
-          onCheckedChange={handleToggle}
-          className="scale-90"
-        />
+        <Switch checked={rule.enabled} onCheckedChange={handleToggle} />
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-0.5">
@@ -725,11 +740,10 @@ function AutomationRow({
   );
 }
 
-// ─── Framework Triggers Subsection ──────────────────────────────────────────
-
 interface FrameworkTrigger {
   id: string;
   name: string;
+  appId?: string;
   triggerType: string;
   event?: string;
   condition?: string;
@@ -750,12 +764,7 @@ function TriggersSubsection() {
       const res = await fetch(agentNativePath("/_agent-native/automations"));
       if (!res.ok) return [];
       const all: FrameworkTrigger[] = await res.json();
-      // Filter to mail domain triggers only (event-based)
-      return all.filter(
-        (t) =>
-          t.domain === "mail" ||
-          (t.triggerType === "event" && t.event && t.event.startsWith("mail.")),
-      );
+      return all.filter(isMailFrameworkAutomation);
     },
     staleTime: 30_000,
   });
@@ -866,9 +875,13 @@ function TriggersSubsection() {
   );
 }
 
-// ─── Automations Section ─────────────────────────────────────────────────────
+type AutomationSettings = {
+  engine?: string;
+  model?: string;
+  allowAutomationSends: boolean;
+};
 
-function AutomationsSection() {
+function AutomationsSection({ embedded = false }: { embedded?: boolean }) {
   const t = useT();
   const { data: rules = [], isLoading } = useAutomations();
   const createAutomation = useCreateAutomation();
@@ -893,12 +906,10 @@ function AutomationsSection() {
     );
   }, [availableModels]);
 
-  // Refetch on any settings write or agent action so agent-driven changes
-  // (e.g. update-automation-settings) show up without a manual refresh.
   const settingsSync = useChangeVersions(["settings", "action"]);
-  const { data: autoSettings } = useQuery({
+  const { data: autoSettings } = useQuery<AutomationSettings>({
     queryKey: ["automation-settings", settingsSync],
-    queryFn: async () => {
+    queryFn: async (): Promise<AutomationSettings> => {
       try {
         return await callAction(
           "get-automation-settings",
@@ -906,7 +917,7 @@ function AutomationsSection() {
           { method: "GET" },
         );
       } catch {
-        return { model: defaultModel };
+        return { model: defaultModel, allowAutomationSends: false };
       }
     },
     staleTime: 30_000,
@@ -914,6 +925,7 @@ function AutomationsSection() {
   });
 
   const queryClient = useQueryClient();
+  const [isSavingAutomationSends, setIsSavingAutomationSends] = useState(false);
   const selectedModel = autoSettings?.model || defaultModel;
   const selectedEngine =
     autoSettings?.engine ||
@@ -926,16 +938,57 @@ function AutomationsSection() {
     )?.value ||
     modelOptions[0]?.value ||
     "loading";
+  const automationRules = rules.filter((rule) => rule.kind !== "ai-filter");
 
   const handleModelChange = async (value: string) => {
     const [engine, model] = value.split("::");
     if (!engine || !model) return;
-    queryClient.setQueryData(["automation-settings"], { engine, model });
+    queryClient.setQueriesData<AutomationSettings>(
+      { queryKey: ["automation-settings"] },
+      (current) =>
+        current
+          ? { ...current, engine, model }
+          : { engine, model, allowAutomationSends: false },
+    );
     await callAction(
       "update-automation-settings",
       { engine, model },
       { method: "PUT" },
     );
+  };
+
+  const handleAutomationSendsChange = async (enabled: boolean) => {
+    if (!autoSettings || isSavingAutomationSends) return;
+    const previous = autoSettings.allowAutomationSends;
+    queryClient.setQueriesData<AutomationSettings>(
+      { queryKey: ["automation-settings"] },
+      (current) =>
+        current ? { ...current, allowAutomationSends: enabled } : current,
+    );
+    setIsSavingAutomationSends(true);
+    try {
+      await callAction(
+        "update-automation-settings",
+        { allowAutomationSends: enabled },
+        { method: "PUT" },
+      );
+    } catch (error) {
+      queryClient.setQueriesData<AutomationSettings>(
+        { queryKey: ["automation-settings"] },
+        (current) =>
+          current ? { ...current, allowAutomationSends: previous } : current,
+      );
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t("settings.automationSendSettingSaveFailed"),
+      );
+    } finally {
+      setIsSavingAutomationSends(false);
+      await queryClient.invalidateQueries({
+        queryKey: ["automation-settings"],
+      });
+    }
   };
 
   const handleCreate = (data: {
@@ -947,6 +1000,142 @@ function AutomationsSection() {
       onSuccess: () => setShowNewForm(false),
     });
   };
+
+  const modelSelect = (
+    <Select
+      value={selectedValue}
+      onValueChange={handleModelChange}
+      disabled={modelOptions.length === 0}
+    >
+      <SelectTrigger
+        size="sm"
+        className="w-[260px] text-xs"
+        aria-label={embedded ? t("settings.rulesModel") : undefined}
+      >
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        {modelOptions.length === 0 ? (
+          <SelectItem value="loading" disabled className="text-xs">
+            {t("settings.loadingModels")}
+          </SelectItem>
+        ) : (
+          modelOptions.map((m) => (
+            <SelectItem key={m.value} value={m.value} className="text-xs">
+              {m.label}
+            </SelectItem>
+          ))
+        )}
+      </SelectContent>
+    </Select>
+  );
+
+  const newRuleButton = (
+    <Button
+      size="sm"
+      onClick={() => {
+        setShowNewForm(true);
+        setEditingId(null);
+      }}
+    >
+      <IconPlus className="h-3.5 w-3.5" />
+      {t("settings.newRule")}
+    </Button>
+  );
+
+  const ruleList = (
+    <div className={embedded ? "space-y-2" : "max-w-2xl space-y-2"}>
+      {/* New rule form */}
+      {showNewForm && (
+        <AutomationEditRow
+          onSave={handleCreate}
+          onCancel={() => setShowNewForm(false)}
+          isPending={createAutomation.isPending}
+        />
+      )}
+
+      {/* Loading state */}
+      {isLoading &&
+        Array.from({ length: 4 }).map((_, i) => (
+          <div
+            key={i}
+            className="flex items-center gap-3 rounded-lg border border-border/20 bg-card/50 p-3"
+          >
+            <Skeleton className="h-8 w-8 rounded-md" />
+            <div className="flex-1 space-y-1.5">
+              <Skeleton className="h-3 w-40" />
+              <Skeleton className="h-3 w-56" />
+            </div>
+            <Skeleton className="h-5 w-9 rounded-full" />
+          </div>
+        ))}
+
+      {/* Empty state */}
+      {!isLoading && automationRules.length === 0 && !showNewForm && (
+        <div className="rounded-lg border border-border/20 bg-card/50 py-12 text-center">
+          <IconBolt className="h-8 w-8 text-muted-foreground/20 mx-auto mb-3" />
+          <p className="text-[13px] text-muted-foreground/50 mb-1">
+            {t("settings.noAutomationRules")}
+          </p>
+          <p className="text-[12px] text-muted-foreground/30 max-w-sm mx-auto">
+            {t("settings.noAutomationRulesDescription")}
+          </p>
+        </div>
+      )}
+
+      {/* Rule list */}
+      {automationRules.map((rule) => (
+        <AutomationRow
+          key={rule.id}
+          rule={rule}
+          isEditing={editingId === rule.id}
+          onEdit={() => {
+            setEditingId(rule.id);
+            setShowNewForm(false);
+          }}
+          onCancelEdit={() => setEditingId(null)}
+        />
+      ))}
+    </div>
+  );
+
+  // The redesigned Settings lists event-triggered automations on the core
+  // Automations page, so this area holds only Mail's inbox rules.
+  if (embedded) {
+    return (
+      <div className="flex flex-col gap-8">
+        <SettingsGroup id="rules-settings">
+          <SettingsRow
+            id="rules-model"
+            label={t("settings.rulesModel")}
+            description={t("settings.rulesModelDescription")}
+            control={modelSelect}
+          />
+          <SettingsRow
+            id="allow-automation-sends"
+            label={t("settings.allowAutomationSends")}
+            description={t("settings.allowAutomationSendsDescription")}
+            control={
+              autoSettings ? (
+                <Switch
+                  aria-label={t("settings.allowAutomationSends")}
+                  checked={autoSettings.allowAutomationSends}
+                  disabled={isSavingAutomationSends}
+                  onCheckedChange={handleAutomationSendsChange}
+                />
+              ) : (
+                <Skeleton className="h-5 w-9 rounded-full" />
+              )
+            }
+          />
+        </SettingsGroup>
+        <div className="flex flex-col gap-4">
+          <div className="flex justify-end">{newRuleButton}</div>
+          {ruleList}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div>
@@ -960,96 +1149,26 @@ function AutomationsSection() {
             {t("settings.automationsDescription")}
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <Select
-            value={selectedValue}
-            onValueChange={handleModelChange}
-            disabled={modelOptions.length === 0}
-          >
-            <SelectTrigger className="w-[260px] h-8 text-xs">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {modelOptions.length === 0 ? (
-                <SelectItem value="loading" disabled className="text-xs">
-                  {t("settings.loadingModels")}
-                </SelectItem>
-              ) : (
-                modelOptions.map((m) => (
-                  <SelectItem key={m.value} value={m.value} className="text-xs">
-                    {m.label}
-                  </SelectItem>
-                ))
-              )}
-            </SelectContent>
-          </Select>
-        </div>
-        <Button
-          size="sm"
-          onClick={() => {
-            setShowNewForm(true);
-            setEditingId(null);
-          }}
-        >
-          <IconPlus className="h-3.5 w-3.5" />
-          {t("settings.newRule")}
-        </Button>
+        <div className="flex items-center gap-2">{modelSelect}</div>
+        {newRuleButton}
+      </div>
+
+      <div className="max-w-2xl mb-6">
+        {autoSettings ? (
+          <SettingsSwitchRow
+            title={t("settings.allowAutomationSends")}
+            description={t("settings.allowAutomationSendsDescription")}
+            checked={autoSettings.allowAutomationSends}
+            disabled={isSavingAutomationSends}
+            onCheckedChange={handleAutomationSendsChange}
+          />
+        ) : (
+          <Skeleton className="h-16 w-full" />
+        )}
       </div>
 
       {/* Content */}
-      <div className="max-w-2xl space-y-2">
-        {/* New rule form */}
-        {showNewForm && (
-          <AutomationEditRow
-            onSave={handleCreate}
-            onCancel={() => setShowNewForm(false)}
-            isPending={createAutomation.isPending}
-          />
-        )}
-
-        {/* Loading state */}
-        {isLoading &&
-          Array.from({ length: 4 }).map((_, i) => (
-            <div
-              key={i}
-              className="flex items-center gap-3 rounded-lg border border-border/20 bg-card/50 p-3"
-            >
-              <Skeleton className="h-8 w-8 rounded-md" />
-              <div className="flex-1 space-y-1.5">
-                <Skeleton className="h-3 w-40" />
-                <Skeleton className="h-3 w-56" />
-              </div>
-              <Skeleton className="h-5 w-9 rounded-full" />
-            </div>
-          ))}
-
-        {/* Empty state */}
-        {!isLoading && rules.length === 0 && !showNewForm && (
-          <div className="rounded-lg border border-border/20 bg-card/50 py-12 text-center">
-            <IconBolt className="h-8 w-8 text-muted-foreground/20 mx-auto mb-3" />
-            <p className="text-[13px] text-muted-foreground/50 mb-1">
-              {t("settings.noAutomationRules")}
-            </p>
-            <p className="text-[12px] text-muted-foreground/30 max-w-sm mx-auto">
-              {t("settings.noAutomationRulesDescription")}
-            </p>
-          </div>
-        )}
-
-        {/* Rule list */}
-        {rules.map((rule) => (
-          <AutomationRow
-            key={rule.id}
-            rule={rule}
-            isEditing={editingId === rule.id}
-            onEdit={() => {
-              setEditingId(rule.id);
-              setShowNewForm(false);
-            }}
-            onCancelEdit={() => setEditingId(null)}
-          />
-        ))}
-      </div>
+      {ruleList}
 
       {/* Event-triggered automations (framework-level triggers) */}
       <div className="max-w-2xl mt-10">
@@ -1067,15 +1186,14 @@ function AutomationsSection() {
   );
 }
 
-// ─── Drafting Section ────────────────────────────────────────────────────────
-
-function DraftingSection() {
+function DraftingSection({ embedded = false }: { embedded?: boolean }) {
   const t = useT();
   const { data: settings, isLoading } = useSettings();
   const updateSettings = useUpdateSettings();
   const queryClient = useQueryClient();
   const [signature, setSignature] = useState("");
   const [writingStyle, setWritingStyle] = useState("");
+  const signatureSelectionRef = useRef({ start: 0, end: 0 });
   const importSignature = useActionMutation("import-gmail-signature", {
     onSuccess: (result) => {
       setSignature(result.signature);
@@ -1107,6 +1225,49 @@ function DraftingSection() {
   const isDirty =
     signature !== savedSignature || writingStyle !== savedWritingStyle;
 
+  const insertSignatureImage = async (
+    file: File,
+    start: number,
+    end: number,
+  ) => {
+    try {
+      const result = await uploadFile(file);
+      const markdown = `![${file.name.replace(/\.[^.]+$/, "")}](${result.url})`;
+      setSignature(
+        (current) =>
+          `${current.slice(0, start)}${markdown}${current.slice(end)}`,
+      );
+    } catch {
+      toast.error(t("settings.signatureImageUploadFailed"));
+    }
+  };
+
+  const handleSignaturePaste = (
+    event: React.ClipboardEvent<HTMLTextAreaElement>,
+  ) => {
+    const image = Array.from(event.clipboardData.items)
+      .find((item) => item.kind === "file" && item.type.startsWith("image/"))
+      ?.getAsFile();
+    if (!image) return;
+    event.preventDefault();
+    const target = event.currentTarget;
+    void insertSignatureImage(
+      image,
+      target.selectionStart,
+      target.selectionEnd,
+    );
+  };
+
+  const handleSignatureImage = async () => {
+    const file = await openFilePicker("image/*");
+    if (!file) return;
+    await insertSignatureImage(
+      file,
+      signatureSelectionRef.current.start,
+      signatureSelectionRef.current.end,
+    );
+  };
+
   const handleSave = () => {
     updateSettings.mutate(
       {
@@ -1125,6 +1286,164 @@ function DraftingSection() {
     );
   };
 
+  const autocompleteSwitch = (
+    <Switch
+      id="mail-autocomplete-setting"
+      aria-label={embedded ? t("settings.autocomplete") : undefined}
+      checked={settings?.autocompleteEnabled ?? false}
+      onCheckedChange={(checked) =>
+        updateSettings.mutate(
+          { autocompleteEnabled: checked },
+          {
+            onError: (error) =>
+              toast.error(
+                error instanceof Error
+                  ? error.message
+                  : t("settings.autocompleteSaveFailed"),
+              ),
+          },
+        )
+      }
+      disabled={updateSettings.isPending}
+    />
+  );
+  const sendAndMarkDoneSwitch = (
+    <Switch
+      id="mail-send-and-mark-done-setting"
+      aria-label={embedded ? t("settings.sendAndMarkDone") : undefined}
+      checked={settings?.sendAndArchive ?? false}
+      onCheckedChange={(checked) =>
+        updateSettings.mutate(
+          { sendAndArchive: checked },
+          {
+            onError: () =>
+              toast.error(t("settings.draftingSettingsSaveFailed")),
+          },
+        )
+      }
+      disabled={updateSettings.isPending}
+    />
+  );
+  const importSignatureButton = (
+    <Button
+      type="button"
+      variant="ghost"
+      size="sm"
+      className="h-6 px-2 text-[11px]"
+      onClick={() => importSignature.mutate({})}
+      disabled={importSignature.isPending}
+    >
+      {importSignature.isPending && (
+        <IconLoader2 className="h-3 w-3 animate-spin" />
+      )}
+      {t("settings.importFromGmail")}
+    </Button>
+  );
+  const signatureImageButton = (
+    <Button
+      type="button"
+      variant="ghost"
+      size="sm"
+      className="h-6 px-2 text-[11px]"
+      onClick={() => void handleSignatureImage()}
+    >
+      <IconPhoto className="h-3 w-3" />
+      {t("settings.addSignatureImage")}
+    </Button>
+  );
+  const signatureInput = (
+    <Textarea
+      value={signature}
+      aria-label={embedded ? t("settings.signature") : undefined}
+      onChange={(event) => setSignature(event.target.value)}
+      onPaste={handleSignaturePaste}
+      onSelect={(event) => {
+        signatureSelectionRef.current = {
+          start: event.currentTarget.selectionStart,
+          end: event.currentTarget.selectionEnd,
+        };
+      }}
+      placeholder={"Best,\nSteve"}
+      rows={5}
+      className="resize-none px-3 py-2 text-[13px] placeholder:text-muted-foreground/40"
+    />
+  );
+  const writingStyleInput = (
+    <Textarea
+      value={writingStyle}
+      aria-label={embedded ? t("settings.writingStyle") : undefined}
+      onChange={(event) => setWritingStyle(event.target.value)}
+      placeholder={t("settings.writingStylePlaceholder")}
+      rows={4}
+      className="resize-none px-3 py-2 text-[13px] placeholder:text-muted-foreground/40"
+    />
+  );
+  const saveButtons = (
+    <div className="flex items-center gap-2">
+      <Button
+        size="sm"
+        onClick={handleSave}
+        disabled={!isDirty || updateSettings.isPending}
+      >
+        {updateSettings.isPending && (
+          <IconLoader2 className="h-3.5 w-3.5 animate-spin" />
+        )}
+        {t("settings.saveDraftingSettings")}
+      </Button>
+      {isDirty && (
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => {
+            setSignature(savedSignature);
+            setWritingStyle(savedWritingStyle);
+          }}
+        >
+          {t("settings.reset")}
+        </Button>
+      )}
+    </div>
+  );
+
+  if (embedded) {
+    if (isLoading) return <SettingsRowsSkeleton groups={[2, 2]} />;
+    return (
+      <div className="flex flex-col gap-8">
+        <SettingsGroup id="composing">
+          <SettingsRow
+            id="autocomplete"
+            label={t("settings.autocomplete")}
+            control={autocompleteSwitch}
+          />
+          <SettingsRow
+            id="send-and-mark-done"
+            label={t("settings.sendAndMarkDone")}
+            control={sendAndMarkDoneSwitch}
+          />
+        </SettingsGroup>
+        <div className="flex flex-col gap-4">
+          <SettingsGroup id="signature-and-style">
+            <SettingsRow
+              id="signature"
+              label={t("settings.signature")}
+              description={t("settings.signatureHelp")}
+              control={importSignatureButton}
+            >
+              <div className="flex flex-col gap-2">
+                {signatureInput}
+                <div>{signatureImageButton}</div>
+              </div>
+            </SettingsRow>
+            <SettingsRow id="writing-style" label={t("settings.writingStyle")}>
+              {writingStyleInput}
+            </SettingsRow>
+          </SettingsGroup>
+          {saveButtons}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div>
       <div className="mb-6">
@@ -1139,37 +1458,41 @@ function DraftingSection() {
       <div className="max-w-2xl space-y-4">
         {isLoading ? (
           <>
+            <Skeleton className="h-12 w-full" />
             <Skeleton className="h-36 w-full" />
             <Skeleton className="h-32 w-full" />
           </>
         ) : (
           <>
+            <div className="flex items-center justify-between rounded-lg border border-border/20 bg-card/50 px-4 py-3">
+              <label
+                htmlFor="mail-autocomplete-setting"
+                className="text-[13px] font-medium text-foreground"
+              >
+                {t("settings.autocomplete")}
+              </label>
+              {autocompleteSwitch}
+            </div>
+
+            <div className="flex items-center justify-between rounded-lg border border-border/20 bg-card/50 px-4 py-3">
+              <label
+                htmlFor="mail-send-and-mark-done-setting"
+                className="text-[13px] font-medium text-foreground"
+              >
+                {t("settings.sendAndMarkDone")}
+              </label>
+              {sendAndMarkDoneSwitch}
+            </div>
+
             <div className="rounded-lg border border-border/20 bg-card/50 p-4">
               <div className="mb-1.5 flex items-center justify-between gap-3">
                 <label className="block text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
                   {t("settings.signature")}
                 </label>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className="h-6 px-2 text-[11px]"
-                  onClick={() => importSignature.mutate({})}
-                  disabled={importSignature.isPending}
-                >
-                  {importSignature.isPending && (
-                    <IconLoader2 className="h-3 w-3 animate-spin" />
-                  )}
-                  {t("settings.importFromGmail")}
-                </Button>
+                {importSignatureButton}
+                {signatureImageButton}
               </div>
-              <Textarea
-                value={signature}
-                onChange={(event) => setSignature(event.target.value)}
-                placeholder={"Best,\nSteve"}
-                rows={5}
-                className="resize-none px-3 py-2 text-[13px] placeholder:text-muted-foreground/40"
-              />
+              {signatureInput}
               <p className="mt-2 text-[12px] text-muted-foreground">
                 {t("settings.signatureHelp")}
               </p>
@@ -1179,39 +1502,10 @@ function DraftingSection() {
               <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
                 {t("settings.writingStyle")}
               </label>
-              <Textarea
-                value={writingStyle}
-                onChange={(event) => setWritingStyle(event.target.value)}
-                placeholder={t("settings.writingStylePlaceholder")}
-                rows={4}
-                className="resize-none px-3 py-2 text-[13px] placeholder:text-muted-foreground/40"
-              />
+              {writingStyleInput}
             </div>
 
-            <div className="flex items-center gap-2">
-              <Button
-                size="sm"
-                onClick={handleSave}
-                disabled={!isDirty || updateSettings.isPending}
-              >
-                {updateSettings.isPending && (
-                  <IconLoader2 className="h-3.5 w-3.5 animate-spin" />
-                )}
-                {t("settings.saveDraftingSettings")}
-              </Button>
-              {isDirty && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    setSignature(savedSignature);
-                    setWritingStyle(savedWritingStyle);
-                  }}
-                >
-                  {t("settings.reset")}
-                </Button>
-              )}
-            </div>
+            {saveButtons}
           </>
         )}
       </div>
@@ -1219,7 +1513,34 @@ function DraftingSection() {
   );
 }
 
-function TrackingRow({
+/** Layout-matching placeholder for areas built from `SettingsGroup` rows. */
+function SettingsRowsSkeleton({ groups }: { groups: readonly number[] }) {
+  return (
+    <div className="flex flex-col gap-8">
+      {groups.map((rows, group) => (
+        <div
+          key={group}
+          className="divide-y divide-border/60 overflow-hidden rounded-xl border border-border/70 bg-card"
+        >
+          {Array.from({ length: rows }).map((_, row) => (
+            <div
+              key={row}
+              className="flex items-center justify-between gap-4 px-5 py-4 sm:px-6"
+            >
+              <div className="flex-1 space-y-2">
+                <Skeleton className="h-3.5 w-40" />
+                <Skeleton className="h-3 w-64 max-w-full" />
+              </div>
+              <Skeleton className="h-5 w-9 rounded-full" />
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SettingsSwitchRow({
   title,
   description,
   checked,
@@ -1249,7 +1570,7 @@ function TrackingRow({
   );
 }
 
-function TrackingSection() {
+function TrackingSection({ embedded = false }: { embedded?: boolean }) {
   const t = useT();
   const { data: settings, isLoading } = useSettings();
   const updateSettings = useUpdateSettings();
@@ -1261,6 +1582,38 @@ function TrackingSection() {
       tracking: { ...tracking, ...patch },
     });
   };
+
+  if (embedded) {
+    if (isLoading) return <SettingsRowsSkeleton groups={[2]} />;
+    return (
+      <SettingsGroup id="tracking-settings">
+        <SettingsRow
+          id="track-opens"
+          label={t("settings.trackEmailOpens")}
+          description={t("settings.trackEmailOpensDescription")}
+          control={
+            <Switch
+              aria-label={t("settings.trackEmailOpens")}
+              checked={tracking.opens}
+              onCheckedChange={(v) => update({ opens: v })}
+            />
+          }
+        />
+        <SettingsRow
+          id="track-clicks"
+          label={t("settings.trackLinkClicks")}
+          description={t("settings.trackLinkClicksDescription")}
+          control={
+            <Switch
+              aria-label={t("settings.trackLinkClicks")}
+              checked={tracking.clicks}
+              onCheckedChange={(v) => update({ clicks: v })}
+            />
+          }
+        />
+      </SettingsGroup>
+    );
+  }
 
   return (
     <div>
@@ -1281,13 +1634,13 @@ function TrackingSection() {
           </>
         ) : (
           <>
-            <TrackingRow
+            <SettingsSwitchRow
               title={t("settings.trackEmailOpens")}
               description={t("settings.trackEmailOpensDescription")}
               checked={tracking.opens}
               onCheckedChange={(v) => update({ opens: v })}
             />
-            <TrackingRow
+            <SettingsSwitchRow
               title={t("settings.trackLinkClicks")}
               description={t("settings.trackLinkClicksDescription")}
               checked={tracking.clicks}
@@ -1299,8 +1652,6 @@ function TrackingSection() {
     </div>
   );
 }
-
-// ─── Slack Intake Section ───────────────────────────────────────────────────
 
 type SlackStatus = {
   enabled: boolean;
@@ -1418,8 +1769,6 @@ function SlackIntakeSection() {
   );
 }
 
-// ─── What's New Section ──────────────────────────────────────────────────────
-
 function GeneralSection() {
   const t = useT();
   return (
@@ -1469,14 +1818,181 @@ function WhatsNewSection() {
   );
 }
 
-// ─── Settings Page ────────────────────────────────────────────────────────────
+type MailSettingsAppArea = SettingsAppArea & { id: MailSettingsAreaId };
+
+/** Mail's areas: tabs on Mail › General in the redesigned Settings. */
+function useMailSettingsAreas(): MailSettingsAppArea[] {
+  const t = useT();
+  return useMemo<MailSettingsAppArea[]>(
+    () => [
+      {
+        id: "drafting",
+        label: t("settings.drafting"),
+        icon: IconSignature,
+        keywords: "signature writing style compose reply draft",
+        searchEntries: [
+          {
+            id: "mail-autocomplete",
+            label: t("settings.autocomplete"),
+            keywords: "autocomplete suggestions compose",
+            hash: "autocomplete",
+          },
+          {
+            id: "mail-send-and-mark-done",
+            label: t("settings.sendAndMarkDone"),
+            keywords: "send archive mark done",
+            hash: "send-and-mark-done",
+          },
+          {
+            id: "mail-signature",
+            label: t("settings.signature"),
+            keywords: "signature sign off gmail import image",
+            hash: "signature",
+          },
+          {
+            id: "mail-writing-style",
+            label: t("settings.writingStyle"),
+            keywords: "writing style tone voice",
+            hash: "writing-style",
+          },
+        ],
+        content: <DraftingSection embedded />,
+      },
+      {
+        id: "snippets",
+        label: t("settings.snippets"),
+        icon: IconMessage2,
+        keywords: "snippets templates canned responses shortcuts",
+        content: <SnippetsSection embedded />,
+      },
+      {
+        id: "rules",
+        label: t("settings.rules"),
+        icon: IconBolt,
+        keywords: "rules inbox automations triggers labels archive star",
+        searchEntries: [
+          {
+            id: "mail-rules-model",
+            label: t("settings.rulesModel"),
+            keywords: "model llm rules automations",
+            hash: "rules-model",
+          },
+          {
+            id: "mail-allow-automation-sends",
+            label: t("settings.allowAutomationSends"),
+            keywords: "send automatically rules automations",
+            hash: "allow-automation-sends",
+          },
+        ],
+        content: <AutomationsSection embedded />,
+      },
+      {
+        id: "ai-filter",
+        label: t("settings.aiFilter"),
+        icon: IconFilter,
+        keywords:
+          "ai filter spam auto label unwanted mail suggestions feedback",
+        content: <AiFilterSection embedded />,
+      },
+      {
+        id: "gmail-filters",
+        label: t("settings.gmailFilters"),
+        icon: IconFilter,
+        keywords: "gmail filters import rules",
+        content: <GmailFiltersSection embedded />,
+      },
+      {
+        id: "aliases",
+        label: t("settings.aliases"),
+        icon: IconUsers,
+        keywords: "aliases groups distribution lists recipients",
+        content: <AliasesSection embedded />,
+      },
+      {
+        id: "tracking",
+        label: t("settings.tracking"),
+        icon: IconChartBar,
+        keywords: "tracking opens clicks pixel analytics",
+        searchEntries: [
+          {
+            id: "mail-track-opens",
+            label: t("settings.trackEmailOpens"),
+            keywords: "tracking opens pixel read receipts",
+            hash: "track-opens",
+          },
+          {
+            id: "mail-track-clicks",
+            label: t("settings.trackLinkClicks"),
+            keywords: "tracking clicks links",
+            hash: "track-clicks",
+          },
+        ],
+        content: <TrackingSection embedded />,
+      },
+    ],
+    [t],
+  );
+}
 
 export function SettingsPage() {
+  const flag = useFeatureFlagState(SETTINGS_REDESIGN_FLAG.key);
+  if (flag.status === "loading") {
+    return <SettingsShellSkeleton className="flex-1" />;
+  }
+  return flag.enabled ? <MailSettingsShell /> : <LegacyMailSettings />;
+}
+
+/**
+ * Mail › General with Mail's areas as tabs. Language is on Account ›
+ * Preferences, members on Organization › Members, and Slack draft requests
+ * on Channels › Slack (see `slack-channel-extension`).
+ */
+function MailSettingsShell() {
+  const agentSettingsTabs = useAgentSettingsTabs();
+  const appAreas = useMailSettingsAreas();
+  const [searchParams] = useSearchParams();
+  const { pathname } = useLocation();
+  const navState = useNavigationState();
+  const section = mailSettingsSectionFromPath(pathname);
+
+  useEffect(() => {
+    navState.sync({ view: "settings", settingsSection: section });
+  }, [section]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const redirect = mailSettingsRedirect(searchParams.get("section"));
+  if (redirect) {
+    const rest = new URLSearchParams(searchParams);
+    rest.delete("section");
+    const search = rest.toString();
+    return (
+      <Navigate
+        to={{ pathname: redirect, search: search ? `?${search}` : "" }}
+        replace
+      />
+    );
+  }
+
+  return (
+    <SettingsTabsPage
+      className="flex-1"
+      extraTabs={agentSettingsTabs}
+      appAreas={appAreas}
+      whatsNewMarkdown={changelog}
+    />
+  );
+}
+
+function LegacyMailSettings() {
   const t = useT();
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [searchParams] = useSearchParams();
+  const location = useLocation();
+  const navigate = useNavigate();
   const navState = useNavigationState();
   const agentSettingsTabs = useAgentSettingsTabs();
   const [activeSection, setActiveSection] = useState<string>("integrations");
+  // Links use the redesigned routes in both Settings; today's tabs can't
+  // resolve Mail's area paths (`/settings/app/rules`) on their own.
+  const pathTab = legacyMailSettingsTabForPath(location.pathname);
 
   const mailTabs = useMemo<SettingsTabItem[]>(
     () => [
@@ -1501,6 +2017,15 @@ export function SettingsPage() {
         group: "automation",
         content: <AutomationsSection />,
         keywords: "automations rules triggers events labels model",
+      },
+      {
+        id: "ai-filter",
+        label: t("settings.aiFilter"),
+        icon: IconFilter,
+        group: "automation",
+        content: <AiFilterSection />,
+        keywords:
+          "ai filter spam auto label unwanted mail suggestions feedback",
       },
       {
         id: "gmail-filters",
@@ -1554,53 +2079,68 @@ export function SettingsPage() {
   );
 
   const validSectionIds = useMemo(() => {
-    const ids = new Set<string>(["general", "account", "team", "whats-new"]);
+    const ids = new Set<string>(["general", "account", "whats-new"]);
     for (const tab of extraTabs) ids.add(tab.id);
     return ids;
   }, [extraTabs]);
 
-  // Deep links arrive as /settings?section=<id> (e.g. from the agent's
-  // navigate action). Adopt that section, then strip the param so later tab
-  // switches aren't overridden by a stale query value.
+  // Deep links arrive as /settings?section=<id>. Adopt that section, then
+  // strip the param so later tab switches aren't overridden by a stale query
+  // value.
   useEffect(() => {
-    const section = searchParams.get("section");
+    const requested = searchParams.get("section");
+    const section = legacyMailSettingsTab(requested) ?? requested;
     if (!section || !validSectionIds.has(section)) return;
     setActiveSection(section);
-    setSearchParams(
-      (prev) => {
-        const next = new URLSearchParams(prev);
-        next.delete("section");
-        return next;
+    const next = new URLSearchParams(searchParams);
+    next.delete("section");
+    const search = next.toString();
+    navigate(
+      {
+        pathname: location.pathname,
+        search: search ? `?${search}` : "",
+        hash: location.hash,
       },
       { replace: true },
     );
-  }, [searchParams, setSearchParams, validSectionIds]);
+  }, [
+    location.hash,
+    location.pathname,
+    navigate,
+    searchParams,
+    validSectionIds,
+  ]);
 
-  // Keep app state aware of the visible settings section for the agent.
   useEffect(() => {
     navState.sync({ view: "settings", settingsSection: activeSection });
   }, [activeSection]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (pathTab) {
+    const next = new URLSearchParams(location.search);
+    next.set("section", pathTab);
+    return (
+      <Navigate
+        to={{
+          pathname: STANDARD_APP_ROUTES.settings,
+          search: `?${next}`,
+          hash: location.hash,
+        }}
+        replace
+      />
+    );
+  }
 
   return (
     <SettingsTabsPage
       account={<AccountSettingsCard />}
       className="flex-1"
       generalLabel={t("settings.general")}
-      teamLabel={t("settings.team")}
       whatsNewLabel={t("settings.whatsNew")}
       extraTabs={extraTabs}
       generalSearchEntries={generalSearchEntries}
       value={activeSection}
       onValueChange={setActiveSection}
       general={<GeneralSection />}
-      team={
-        <div className="mx-auto w-full max-w-3xl">
-          <TeamPage
-            showTitle={false}
-            createOrgDescription={t("settings.teamDescription")}
-          />
-        </div>
-      }
       whatsNew={<WhatsNewSection />}
     />
   );

@@ -1,16 +1,4 @@
-/**
- * Reset a recording's non-destructive edits back to defaults.
- *
- * Clears `editsJson` entirely — trims, blurs, thumbnail spec. Does NOT touch
- * chapters (those live on `chaptersJson`) nor the stored `thumbnailUrl` /
- * `animatedThumbnailUrl` columns, so the user's current thumbnail stays in
- * place.
- *
- * Usage:
- *   pnpm action clear-edits --recordingId=<id>
- */
-
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
 import { assertAccess } from "@agent-native/core/sharing";
 import { and, eq, isNull } from "drizzle-orm";

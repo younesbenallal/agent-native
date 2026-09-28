@@ -52,6 +52,8 @@ const run = {
   worker_stage: "model",
   diag_stage: '{"stage":"model"}',
   peak_rss_mb: 321,
+  in_flight_since: 8,
+  dispatch_payload: '{"request":"retained"}',
 };
 
 function rowsForThreadLookup(sql: string, args: unknown[]) {
@@ -117,6 +119,19 @@ describe("thread-debug-store", () => {
     expect(result.threads[0]?.id).toBe(thread.id);
   });
 
+  it("matches owner email from the main search query", async () => {
+    const result = await searchAgentThreads({ query: "owner@example.com" });
+
+    expect(result.threads).toHaveLength(1);
+    const searchRequest = mocks.currentExecute.mock.calls.find(
+      ([request]) =>
+        typeof request?.sql === "string" &&
+        request.sql.includes("LOWER(owner_email) LIKE"),
+    )?.[0];
+    expect(searchRequest?.sql).toContain("LOWER(owner_email) LIKE");
+    expect(searchRequest?.args).toContain("%owner@example.com%");
+  });
+
   it("resolves a run id and returns rich run diagnostics", async () => {
     const result = await getAgentThreadDebug({ runId: run.id });
 
@@ -137,6 +152,8 @@ describe("thread-debug-store", () => {
       workerStage: "model",
       diagStage: '{"stage":"model"}',
       peakRssMb: 321,
+      inFlightSince: 8,
+      hasDispatchPayload: true,
     });
     expect(
       mocks.currentExecute.mock.calls.some(([request]) =>
@@ -244,9 +261,9 @@ describe("thread-debug-store", () => {
 
   it("merges all admin-visible sources, sorts globally, limits, and preserves partial health", async () => {
     vi.stubEnv("DISPATCH_ADMIN_EMAILS", "owner@example.com");
-    vi.stubEnv("REMOTE_A_DATABASE_URL", "libsql://remote-a");
-    vi.stubEnv("REMOTE_B_DATABASE_URL", "libsql://remote-b");
-    vi.stubEnv("REMOTE_C_DATABASE_URL", "libsql://remote-c");
+    vi.stubEnv("REMOTE_A_DATABASE_URL", "postgres://remote-a/db");
+    vi.stubEnv("REMOTE_B_DATABASE_URL", "postgres://remote-b/db");
+    vi.stubEnv("REMOTE_C_DATABASE_URL", "postgres://remote-c/db");
 
     mocks.currentExecute.mockImplementation(async ({ sql }) => ({
       rows: sql.includes("JOIN chat_threads")
@@ -255,15 +272,15 @@ describe("thread-debug-store", () => {
     }));
     mocks.createDbExec.mockImplementation(async ({ url }) => ({
       execute: async ({ sql }: { sql: string }) => {
-        if (url === "libsql://remote-a") {
+        if (url === "postgres://remote-a/db") {
           return {
             rows: sql.includes("JOIN chat_threads")
               ? [failureRow("run-a-new", 300), failureRow("run-a-old", 200)]
               : [],
           };
         }
-        if (url === "libsql://remote-b") {
-          throw new Error("SQLITE_ERROR: no such table: agent_runs");
+        if (url === "postgres://remote-b/db") {
+          throw new Error('relation "agent_runs" does not exist');
         }
         throw new Error("connect ECONNREFUSED 127.0.0.1");
       },
@@ -352,7 +369,7 @@ describe("thread-debug-store", () => {
 
   it("does not misclassify a missing additive column as a missing table", async () => {
     mocks.currentExecute.mockRejectedValue(
-      new Error("SQLITE_ERROR: no such column: r.worker_stage"),
+      new Error('column "worker_stage" does not exist'),
     );
 
     const result = await listAgentRunFailures({ sourceId: "current" });
@@ -366,7 +383,7 @@ describe("thread-debug-store", () => {
   });
 
   it("limits all-source requests to the current database for non-admins", async () => {
-    vi.stubEnv("REMOTE_DATABASE_URL", "libsql://remote");
+    vi.stubEnv("REMOTE_DATABASE_URL", "postgres://remote/db");
     mocks.currentExecute.mockImplementation(async ({ sql }) => ({
       rows: sql.includes("JOIN chat_threads")
         ? [failureRow("run-current", Date.now())]
@@ -388,7 +405,7 @@ describe("thread-debug-store", () => {
   });
 
   it("keeps explicit remote sources admin-only", async () => {
-    vi.stubEnv("REMOTE_DATABASE_URL", "libsql://remote");
+    vi.stubEnv("REMOTE_DATABASE_URL", "postgres://remote/db");
 
     await expect(
       listAgentRunFailures({ sourceId: "remote" }),

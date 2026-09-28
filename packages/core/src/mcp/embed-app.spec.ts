@@ -51,8 +51,11 @@ describe("embedApp", () => {
     expect(html).toContain("return { error: text.trim() };");
     expect(html).toContain("record.embedTargetPath");
     expect(html).toContain("record.deepLinkUrl");
-    expect(html.indexOf("structuredOpenLinkUrl")).toBeLessThan(
-      html.indexOf("record.url"),
+    expect(html).toContain(
+      "metaUrl,\n        record.embedTargetPath,\n        record.deepLinkUrl,\n        record.deepLink,\n        structuredOpenLinkUrl,",
+    );
+    expect(html).not.toContain(
+      "record.embedTargetPath,\n        record.deepLinkUrl,\n        record.deepLink,\n        metaUrl,",
     );
     expect(html).toContain("let launchUrl = openStartUrl || openUrl");
     expect(html).not.toContain("launchUrl = openUrl;");
@@ -111,6 +114,7 @@ describe("embedApp", () => {
     expect(html).toContain("await runModuleScriptAsClassic(script, config)");
     expect(html).toContain("stripDevOnlyModuleImports");
     expect(html).toContain("__x00__virtual:react-router");
+    expect(html).toContain("(?:inject-)?hmr-runtime");
     expect(html).toContain("__vite_plugin_react_preamble_installed__");
     expect(html).toContain("$RefreshReg$");
     expect(html).toContain("$RefreshSig$");
@@ -122,18 +126,12 @@ describe("embedApp", () => {
     expect(html).toContain('render.frame === "transplant"');
     expect(html).toContain("isClaudeMcpContentHost()");
     expect(html).toContain("if (isClaudeMcpContentHost()) return true;");
-    // ChatGPT is excluded from the transplant set — it uses the controlled
-    // nested frame, not cross-origin import() inside its sandbox.
     expect(html).toContain(
       'isClaudeMcpContentHost() ||\n        mode === "transplant"',
     );
     expect(html).not.toContain(
       "isClaudeMcpContentHost() ||\n        isChatGptSandboxHost()",
     );
-    // Standards-track MCP Apps hosts (Codex, Cursor, the SDK App fallback, and
-    // our own renderer) keep the host bridge alive by rendering the real app in
-    // a controlled child iframe. Transplant remains a fallback for strict
-    // Claude-style hosts and explicit render-mode requests.
     expect(html).not.toContain("function isNativeMcpAppsBridgeHost()");
     expect(html).not.toContain("isNativeMcpAppsBridgeHost() ||");
     expect(html).toContain(
@@ -154,6 +152,7 @@ describe("embedApp", () => {
     expect(html).toContain('"agentNative.mcpHost.requestDisplayMode"');
     expect(html).toContain('"agentNative.mcpHost.response"');
     expect(html).toContain('"agentNative.embedSessionExpired"');
+    expect(html).toContain("message.embedStartUrl === appFrame?.src");
     expect(html).toContain("refreshExpiredEmbedSession");
     expect(html).toContain("const maxEmbedSessionRefreshAttempts = 2");
     expect(html).toContain("let embedSessionRefreshAttempts = 0");
@@ -215,6 +214,71 @@ describe("embedApp", () => {
     ]);
   });
 
+  it("prefers canonical metadata when legacy open-link fields conflict", () => {
+    const resource = embedApp({ title: "Dashboard" });
+    const html =
+      typeof resource.html === "function"
+        ? resource.html({ actionName: "open_app", appId: "analytics" })
+        : resource.html;
+    const openLinkSource = html.match(
+      /(function openLinkFrom\(params, data\) \{[\s\S]*?\n    \})\n\n    function embedStartUrlFrom/,
+    )?.[1];
+    expect(openLinkSource).toBeDefined();
+
+    const openLinkFrom = new Function(
+      "toolResultMeta",
+      "openLinkWebUrlFrom",
+      "firstNonEmbedStartUrl",
+      "isEmbedStartUrl",
+      `${openLinkSource}; return openLinkFrom;`,
+    )(
+      (params: unknown) => {
+        if (!params || typeof params !== "object" || Array.isArray(params)) {
+          return {};
+        }
+        const meta = (params as { _meta?: unknown })._meta;
+        return meta && typeof meta === "object" && !Array.isArray(meta)
+          ? meta
+          : {};
+      },
+      (value: unknown) => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+          return "";
+        }
+        const webUrl = (value as { webUrl?: unknown }).webUrl;
+        return typeof webUrl === "string" ? webUrl : "";
+      },
+      (values: unknown[]) =>
+        values.find(
+          (value) =>
+            typeof value === "string" &&
+            value.length > 0 &&
+            !value.includes("/_agent-native/embed/start"),
+        ) ?? "",
+      (value: string) => value.includes("/_agent-native/embed/start"),
+    ) as (params: unknown, data: unknown) => string;
+
+    expect(
+      openLinkFrom(
+        {
+          _meta: {
+            "agent-native/openLink": {
+              webUrl: "https://canonical.example/target",
+            },
+          },
+        },
+        {
+          embedTargetPath: "https://legacy.example/embed-target",
+          deepLinkUrl: "https://legacy.example/deep-link-url",
+          deepLink: "https://legacy.example/deep-link",
+          openLink: { webUrl: "https://legacy.example/structured" },
+          openUrl: "https://legacy.example/open-url",
+          url: "https://legacy.example/url",
+        },
+      ),
+    ).toBe("https://canonical.example/target");
+  });
+
   it("leaves dev runtime module URLs untokenized in transplanted app documents", () => {
     const resource = embedApp({ title: "Assets" });
     const html =
@@ -248,6 +312,11 @@ describe("embedApp", () => {
 
     expect(html).toContain('document.createElement("iframe")');
     expect(html).toContain("renderFrameFallback");
+    expect(html).toContain("function clearFallbackOverlay");
+    expect(html).toContain("function renderFallbackOverlay");
+    expect(html).toContain(".fallback-overlay");
+    expect(html).toContain("data-fallback-overlay");
+    expect(html).toContain('frame.addEventListener("error"');
     expect(html).toContain("openFallbackExternal");
     expect(html).toContain("let url = withChatBridgeParam(openUrl)");
     expect(html).toContain("const buttonUrl = openUrl");

@@ -2,6 +2,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   getDashboard: vi.fn(),
+  getDashboardForReview: vi.fn(),
+  currentRequestUserIsOrgAdmin: vi.fn(),
+  superOrgId: undefined as string | undefined,
   loadDashboardSeed: vi.fn(),
 }));
 
@@ -14,6 +17,7 @@ vi.mock("@agent-native/core", async (importOriginal) => {
 });
 
 vi.mock("@agent-native/core/server", () => ({
+  currentRequestUserIsOrgAdmin: mocks.currentRequestUserIsOrgAdmin,
   buildDeepLink: vi.fn(
     ({
       app,
@@ -28,23 +32,32 @@ vi.mock("@agent-native/core/server", () => ({
       return `/${app}/${view}${suffix}`;
     },
   ),
-  getRequestOrgId: () => null,
+  getRequestOrgId: () => "org-a",
   getRequestUserEmail: () => "alice@example.com",
+  getAppConfig: () => ({ observability: { superOrgId: mocks.superOrgId } }),
 }));
 
 vi.mock("../server/lib/dashboards-store", () => ({
   getDashboard: mocks.getDashboard,
+  getDashboardForReview: mocks.getDashboardForReview,
 }));
 
 vi.mock("../server/lib/dashboard-seeds", () => ({
   loadDashboardSeed: mocks.loadDashboardSeed,
 }));
 
+import { LEGACY_NEW_VS_RECURRING_USERS_SQL } from "../server/lib/canonical-first-party-dashboard-repair";
+import { FIRST_PARTY_DASHBOARD_ID } from "../server/lib/first-party-metric-catalog";
+
 const { default: getSqlDashboard } = await import("./get-sql-dashboard");
 
 describe("get-sql-dashboard seed fallback", () => {
   beforeEach(() => {
     mocks.getDashboard.mockReset();
+    mocks.getDashboardForReview.mockReset();
+    mocks.currentRequestUserIsOrgAdmin.mockReset();
+    mocks.currentRequestUserIsOrgAdmin.mockResolvedValue(false);
+    mocks.superOrgId = undefined;
     mocks.loadDashboardSeed.mockReset();
   });
 
@@ -86,7 +99,11 @@ describe("get-sql-dashboard seed fallback", () => {
   it("returns a saved empty dashboard instead of rehydrating its seed", async () => {
     mocks.getDashboard.mockResolvedValue({
       kind: "sql",
-      config: { name: "Blank", panels: [] },
+      config: {
+        name: "Blank",
+        panels: [],
+        createdBy: "spoof@example.com",
+      },
       ownerEmail: "alice@example.com",
       orgId: null,
       visibility: "private",
@@ -97,6 +114,7 @@ describe("get-sql-dashboard seed fallback", () => {
       hiddenAt: null,
       hiddenBy: null,
       createdAt: "2026-06-24T00:00:00.000Z",
+      createdBy: "alice@example.com",
       updatedAt: "2026-06-24T00:00:00.000Z",
     });
     mocks.loadDashboardSeed.mockReturnValue({
@@ -109,12 +127,50 @@ describe("get-sql-dashboard seed fallback", () => {
       layout: { panelOrder: string[] };
       name: string;
       ownerEmail: string | null;
+      createdBy: string | null;
     };
 
     expect(result.name).toBe("Blank");
     expect(result.panels).toEqual([]);
     expect(result.layout.panelOrder).toEqual([]);
     expect(result.ownerEmail).toBe("alice@example.com");
+    expect(result.createdBy).toBe("alice@example.com");
+  });
+
+  it("repairs legacy SQL when reading the persisted first-party dashboard", async () => {
+    mocks.getDashboard.mockResolvedValue({
+      id: FIRST_PARTY_DASHBOARD_ID,
+      kind: "sql",
+      config: {
+        name: "Agent-Native Templates (First-party)",
+        panels: [
+          {
+            id: "new-vs-recurring-users",
+            source: "first-party",
+            sql: LEGACY_NEW_VS_RECURRING_USERS_SQL,
+          },
+        ],
+      },
+      ownerEmail: "alice@example.com",
+      orgId: null,
+      visibility: "org",
+      role: "owner",
+      canEdit: true,
+      canManage: true,
+      archivedAt: null,
+      hiddenAt: null,
+      hiddenBy: null,
+      createdAt: "2026-06-24T00:00:00.000Z",
+      updatedAt: "2026-06-24T00:00:00.000Z",
+    });
+
+    const result = (await getSqlDashboard.run({
+      id: FIRST_PARTY_DASHBOARD_ID,
+      includeConfig: true,
+    })) as { panels: Array<{ sql?: string }> };
+
+    expect(result.panels[0]?.sql).not.toBe(LEGACY_NEW_VS_RECURRING_USERS_SQL);
+    expect(result.panels[0]?.sql).toContain("<> 'www'");
   });
 
   it("omits full panel SQL by default and returns it when includeConfig is true", async () => {
@@ -168,5 +224,89 @@ describe("get-sql-dashboard seed fallback", () => {
     ]);
     expect(compact.panels[0].sql).toBeUndefined();
     expect(full.panels[0].sql).toMatch(/analytics_events/);
+  });
+
+  it("allows an org admin to read a same-org SQL dashboard for Human Review", async () => {
+    mocks.currentRequestUserIsOrgAdmin.mockResolvedValue(true);
+    mocks.getDashboardForReview.mockResolvedValue({
+      id: "review-dashboard",
+      kind: "sql",
+      config: { name: "Review", panels: [] },
+      ownerEmail: "owner@example.com",
+      orgId: "org-a",
+      visibility: "private",
+      role: "viewer",
+      canEdit: false,
+      canManage: false,
+      archivedAt: null,
+      hiddenAt: null,
+      hiddenBy: null,
+      createdAt: "2026-06-24T00:00:00.000Z",
+      createdBy: "owner@example.com",
+      updatedAt: "2026-06-24T00:00:00.000Z",
+    });
+
+    await getSqlDashboard.run({ id: "review-dashboard", reviewPreview: true });
+
+    expect(mocks.currentRequestUserIsOrgAdmin).toHaveBeenCalledWith("org-a");
+    expect(mocks.getDashboardForReview).toHaveBeenCalledWith(
+      "review-dashboard",
+      { kind: "organization", orgId: "org-a" },
+    );
+    expect(mocks.getDashboard).not.toHaveBeenCalled();
+    expect(mocks.loadDashboardSeed).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-admin Human Review dashboard previews before reading", async () => {
+    await expect(
+      getSqlDashboard.run({ id: "review-dashboard", reviewPreview: true }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+
+    expect(mocks.getDashboardForReview).not.toHaveBeenCalled();
+    expect(mocks.getDashboard).not.toHaveBeenCalled();
+  });
+
+  it("hides dashboards outside the current org without falling back to seeds", async () => {
+    mocks.currentRequestUserIsOrgAdmin.mockResolvedValue(true);
+    mocks.getDashboardForReview.mockResolvedValue(null);
+
+    await expect(
+      getSqlDashboard.run({ id: "other-org", reviewPreview: true }),
+    ).rejects.toMatchObject({ statusCode: 404 });
+
+    expect(mocks.loadDashboardSeed).not.toHaveBeenCalled();
+  });
+
+  it("allows only a configured super-org admin to request cross-org previews", async () => {
+    mocks.superOrgId = "org-a";
+    mocks.currentRequestUserIsOrgAdmin.mockResolvedValue(true);
+    mocks.getDashboardForReview.mockResolvedValue({
+      id: "customer-dashboard",
+      kind: "sql",
+      config: { name: "Customer", panels: [] },
+      ownerEmail: "customer@example.com",
+      orgId: "org-b",
+      visibility: "private",
+      role: "viewer",
+      canEdit: false,
+      canManage: false,
+      archivedAt: null,
+      hiddenAt: null,
+      hiddenBy: null,
+      createdAt: "2026-06-24T00:00:00.000Z",
+      createdBy: "customer@example.com",
+      updatedAt: "2026-06-24T00:00:00.000Z",
+    });
+
+    await getSqlDashboard.run({
+      id: "customer-dashboard",
+      reviewPreview: true,
+      reviewOrgId: "org-b",
+    });
+
+    expect(mocks.getDashboardForReview).toHaveBeenCalledWith(
+      "customer-dashboard",
+      { kind: "super-organization", orgId: "org-b" },
+    );
   });
 });

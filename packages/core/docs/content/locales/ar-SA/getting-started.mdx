@@ -1,108 +1,90 @@
 ---
-title: "الخطوات الأولى"
-description: "أنشئ تطبيقاً وكيلياً يرتكز على المحادثة، وأضف إجراءً، واعرض النتائج المنظَّمة مضمَّنةً، ثم طوِّره ليصبح صفحةً دائمة يستطيع الوكيل فتحها."
+title: "البدء"
+description: "أنشئ وكيلاً بواجهة مستخدم للمحادثة واستدعِ الإجراء نفسه من الوكيل وواجهة المستخدم."
 ---
 
-# الخطوات الأولى
+# البدء
 
-Agent-Native مخصَّص للتطبيقات الوكيلية: التطبيقات التي يتشارك فيها وكيل الذكاء الاصطناعي وواجهة المستخدم
-نفس [الإجراءات](/docs/actions) وبيانات SQL وحالة التطبيق. ابدأ
-بالمحادثة حتى يتمكن المستخدمون من التحدث مع الوكيل فوراً، ثم أضف أسطح التطبيق
-التي يستحقها سير عملك.
+<GettingStartedPaths />
 
-أسرع طريقة للبدء هي **قالب المحادثة**: تطبيق بسيط يمنحك
-واجهة محادثة ذكاء اصطناعي جاهزة للعمل، وخيوط محادثة دائمة، ومصادقة، ودليل `actions/`
-جاهز للتوسيع. إنه الأساس الذي تنمو منه معظم تطبيقات Agent-Native.
+Agent-Native هو إطار عمل TypeScript مفتوح المصدر لبناء وكلاء مستقلين بواجهات
+استخدام بديهية. تعرّف كل قدرة مرة واحدة كـ [إجراء](/docs/actions-overview) — دالة
+مكتوبة الأنواع يستخدمها الوكيل كأداة وتستدعيها واجهة المستخدم من الكود.
 
-المسار الأول المفيد هو:
+في هذا الدليل، ستنشئ وكيلاً بواجهة مستخدم للمحادثة وتستدعي إجراء `hello`
+المضمّن فيه من الوكيل وواجهة المستخدم.
 
-1. إنشاء تطبيق محادثة.
-2. توصيل محرك ذكاء اصطناعي حتى يتمكن الوكيل من الرد.
-3. إضافة إجراء واحد.
-4. عرض نتيجة الإجراء مضمَّنةً في المحادثة.
-5. حفظ البيانات في SQL.
-6. إضافة صفحة يستطيع الوكيل فتحها عندما يكون الفحص المرئي أفضل من فقرة أخرى
-   في نص المحادثة.
+## المتطلبات الأساسية
 
-هل تريد تطبيق نطاق كامل عوضاً عن ذلك؟ استنسخ قالباً غنياً مثل
-[Mail](/docs/template-mail)، أو [Calendar](/docs/template-calendar)،
-أو [Forms](/docs/template-forms)، أو [Analytics](/docs/template-analytics)، أو
-[Plan](/docs/template-plan). هل تريد عدم وجود واجهة مستخدم متصفح في الوقت الحالي؟ راجع
-[تطبيقات الأتمتة أولاً](/docs/pure-agent-apps) بعد هذا الدليل التعليمي.
+- [Node.js](https://nodejs.org) 22.22 أو أحدث
+- [pnpm](https://pnpm.io) مثبت ومتاح في `PATH`
+- اتصال LLM للوكيل: Builder.io، أو مفتاح API من Anthropic أو OpenAI، أو نموذج
+  Ollama محلي
 
-## 1. إنشاء تطبيق محادثة {#create-your-app}
+## إنشاء وكيل
 
-ستحتاج إلى [Node.js 22+](https://nodejs.org) و[pnpm](https://pnpm.io).
-
-افتح طرفية، وانتقل إلى الدليل الذي تريد وضع تطبيق Agent Native فيه، ثم شغِّل:
+في دليل جديد، ابدأ من قالب Chat:
 
 ```bash
-npx @agent-native/core@latest create my-app --template chat
+npx --yes @agent-native/core@latest create my-app --standalone --template chat
 cd my-app
+corepack enable
 pnpm install
+```
+
+يوفّر القالب للوكيل واجهة مستخدم في المتصفح، ومصادقة، ومحادثات دائمة، ومزامنة
+مباشرة، وسياقًا للتطبيق، ودليل `actions/`. كما يتضمن إجراء `hello` صغيرًا
+ستستخدمه خلال هذا الدليل.
+
+## بدء خادم التطوير
+
+ابدأ خادم التطوير:
+
+```bash
 pnpm dev
 ```
 
-يمنحك هذا خيوط محادثة دائمة، ومصادقة، ومزامنة مباشرة، ودليل `actions/`،
-وإجراءَي `view-screen` و`navigate` الافتراضيَّين، وتطبيق React صغيراً قابلاً للتوسيع.
+تُفتح واجهة المستخدم تلقائيًا. إذا لم تُفتح، فاستخدم العنوان المحلي الذي يطبعه
+`pnpm dev`؛ يزداد رقم المنفذ إذا كان تطبيق آخر يستخدم 8080.
 
-يبدأ خادم التطوير ويفتح `http://localhost:8080` في متصفحك. قد
-تلاحظ بعض سطور سجل بدء التشغيل مثل `NitroViteError: Vite environment "nitro" is
-unavailable`. هذه حالة تعارض عادية أثناء التشغيل الأولي وتُحلّ من تلقاء نفسها. يكون التطبيق جاهزاً بمجرد ظهور **VITE ready** في مخرجات الطرفية.
+<Callout tone="info">
 
-عند بدء تشغيل التطبيق، قد تجد نفسك في شاشة تسجيل الدخول بدلاً من التطبيق. في هذه الحالة، ما عليك سوى التسجيل بمعلومات تسجيل دخول وهمية لتخطي شاشة تسجيل الدخول.
-في بيئة التطوير المحلية، لا يلزم التحقق الفعلي من البريد الإلكتروني.
+في شاشة الترحيب، اختر **Continue as local dev**. لا تحتاج إلى إدخال بريد
+إلكتروني أو كلمة مرور للتطوير المحلي.
 
-### إذا كنت تريد نوعاً مختلفاً من التطبيقات
+</Callout>
 
-يستخدم هذا الدليل قالب المحادثة لأنه أقصر مسار
-لتطبيق وكيلي: يستطيع الوكيل التصرف من اليوم الأول، ولديك سطح تطبيق حقيقي
-تنمو منه. ومع ذلك، إذا أردت إنشاء نوع مختلف من التطبيقات، شغِّل `create` بدون أعلام للحصول على منتقي CLI لقوالب النطاق وأشكال التطبيقات المتقدمة:
+## الاتصال بنموذج LLM
 
-```bash
-npx @agent-native/core@latest create my-app
+بعد ذلك، صِل LLM. اختر **Connect Builder.io** لاستخدام أرصدة مجانية، أو اختر
+**Custom keys**، ثم اختر موفرًا وأدخل تفاصيل الاتصال المطلوبة.
+
+## تشغيل الإجراء من الوكيل
+
+الإجراء هو دالة مكتوبة الأنواع يمكن لواجهة React استدعاؤها من الكود ويمكن
+للوكلاء استخدامها كأداة. يتضمن قالب Chat إجراء `hello` بسيطًا لتجربة هذا
+النمط قبل كتابة إجراء خاص بك.
+
+في لوحة الوكيل، اطلب:
+
+> Call the hello action for Alex.
+
+يعثر الوكيل على `hello` من وصفه ومخطط إدخاله، ويمرر `Alex` كإدخال `name`، ثم
+يرد:
+
+```text
+Hello, Alex!
 ```
 
-## 2. توصيل محرك ذكاء اصطناعي {#connect-ai}
+## فحص الإجراء
 
-لا تستطيع محادثة الوكيل الرد حتى تقوم بتوصيل محرك ذكاء اصطناعي. بعد تسجيل الدخول، انقر على زر **Connect AI**.
-
-لديك خياران:
-
-**الخيار أ: توصيل Builder.** انقر على **Connect Builder.io** (free tier available)، واختر Builder Space، ثم انقر على زر **Authorize**. لا داعي لتوفير أي مفاتيح يدوياً.
-
-**الخيار ب: إضافة مفاتيحك الخاصة.** أدخل مفتاح Anthropic أو OpenAI API. يمكنك الحصول على
-مفتاح Anthropic من [console.anthropic.com](https://console.anthropic.com).
-
-بدلاً من ذلك، أنشئ ملف `.env` في دليل `my-app/` (نفس
-الدليل الذي يحتوي على `package.json`) قبل تشغيل `pnpm dev`:
-
-```bash
-echo "ANTHROPIC_API_KEY=sk-ant-..." >> .env
-```
-
-أعد تشغيل خادم التطوير. بمجرد توصيل محرك الذكاء الاصطناعي، تختفي لوحة الإعداد
-وسيكون الوكيل جاهزاً للمحادثة.
-
-> **شاشة فارغة؟** أنشئ ملف `.env` في دليل `my-app/` الخاص بك مع
-> `ANTHROPIC_API_KEY=sk-ant-...`، ثم أعد تشغيل `pnpm dev`. تظهر لوحة الإعداد داخل التطبيق فقط بمجرد تحميل التطبيق، لذا يجب إصلاح المفتاح المفقود الذي يمنع
-> التطبيق من العرض عبر متغير البيئة بدلاً من
-> واجهة المستخدم.
-
-## 3. إضافة إجراء {#add-an-action}
-
-الإجراء هو عملية مكتوبة يمكن لكل من وكيلك وواجهة المستخدم الخاصة بك استدعاؤها. هكذا
-يقوم الوكيل بالأشياء في تطبيقك. تعيش الإجراءات في دليل `actions/`
-ويمكن تشغيلها من المحادثة، أو من مكونات React، أو من CLI، أو وفق جدول زمني. تُعرِّفها مرة واحدة وتستدعيها من أي مكان.
-
-### جرِّب الإجراء التمهيدي
-
-يتضمن قالب المحادثة إجراء `hello` في `actions/hello.ts`:
+في دليل `my-app` المحلي، افتح `actions/hello.ts` في محرر الشفرة:
 
 ```ts filename="actions/hello.ts"
 import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
 
+// One action powers every app surface: UI, agent, HTTP, MCP, A2A, and CLI.
 export default defineAction({
   description: "Return a friendly greeting.",
   schema: z.object({
@@ -115,523 +97,113 @@ export default defineAction({
 });
 ```
 
-شغِّله من الطرفية (داخل دليل `my-app/`):
+ركّز الآن على أربعة أجزاء:
 
-```bash
-pnpm action hello --name Alice
-```
+- يوضح `description` للوكيل متى يستخدم الإجراء.
+- يتحقق `schema` من الإدخال ويمنح الوكيل تعريف أداة مكتوب الأنواع.
+- يعرّض `http` هذا الإجراء للقراءة فقط عبر `GET`، ما يسمح لـ
+  `useActionQuery` باستدعائه من React.
+- يحتوي `run` على منطق التطبيق الذي يشترك فيه الوكيل وواجهة المستخدم.
 
-أو افتح تطبيقك على `http://localhost:8080` واسأل الوكيل في المحادثة هناك:
+راجع [تعريف الإجراءات](/docs/actions-defining) للاطلاع على واجهة API الكاملة.
 
-> Use the hello action with the name Alice.
+## استدعاء الإجراء من React
 
-### أضف إجراءك الخاص
+يتضمن القالب `actions/hello.ts`، لكنه لا يتضمن صفحة له. أنشئ
+`app/routes/hello.tsx`:
 
-استبدل الإجراء التمهيدي بأول عملية حقيقية في نطاقك. يعدّ هذا المثال
-الكلمات والجمل والفقرات في أي نص تمرره إليه. يحسب
-كل شيء محلياً، لذا لا يوجد شيء لتهيئته ولا خدمة خارجية للتوصيل:
+```tsx filename="app/routes/hello.tsx"
+import { useActionQuery } from "@agent-native/core/client/hooks";
+import { useState } from "react";
 
-```ts filename="actions/analyze-text.ts"
-import { defineAction } from "@agent-native/core/action";
-import { z } from "zod";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 
-const textStatsSchema = z.object({
-  title: z.string(),
-  points: z.array(z.object({ label: z.string(), value: z.number() })),
-});
+export default function HelloRoute() {
+  const [name, setName] = useState("Alex");
+  const { data } = useActionQuery("hello", { name });
 
-export default defineAction({
-  description: "Count words, sentences, and paragraphs in a block of text.",
-  schema: z.object({
-    text: z
-      .string()
-      .default(
-        "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.",
-      ),
-  }),
-  outputSchema: textStatsSchema,
-  chatUI: {
-    renderer: "text.stats-chart",
-    title: "Text stats",
-  },
-  readOnly: true,
-  run: async ({ text }) => ({
-    title: "Text statistics",
-    points: [
-      { label: "Characters", value: text.length },
-      { label: "Words", value: text.split(/\s+/).filter(Boolean).length },
-      {
-        label: "Sentences",
-        value: text.split(/[.!?]+/).filter(Boolean).length,
-      },
-      {
-        label: "Paragraphs",
-        value: text.split(/\n\n+/).filter(Boolean).length,
-      },
-    ],
-  }),
-});
-```
-
-جرِّبه من الطرفية:
-
-```bash
-pnpm action analyze-text --text "Hello world. How are you today?"
-```
-
-أو افتح تطبيقك على `http://localhost:8080` واسأل الوكيل في المحادثة هناك:
-
-> Run the analyze-text action on "Hello world. How are you today?"
-
-#### عرِّفه مرة واحدة، واستدعه من أي مكان
-
-يمكن الآن الوصول إلى هذا الإجراء من المحادثة، وخطافات React، وCLI، وHTTP، وMCP، وA2A،
-والمهام المجدولة، والـ webhooks.
-
-تلميح: في أي وقت تريد أن يستدعي الوكيل إجراءً محدداً دون غموض، فإن صياغته على هيئة "Run the `<action-name>` action" هي الأكثر موثوقية. تعمل مطالبات اللغة الطبيعية بشكل جيد بمجرد أن يكون لدى الوكيل سياق كافٍ حول نطاق تطبيقك. بالنسبة لتطبيق جديد تماماً بدون بيانات أو سياق بعد، فالصياغة الصريحة أأمن.
-
-## 4. عرض النتيجة مضمَّنةً {#render-inline}
-
-عندما يشغِّل الوكيل `analyze-text`، فإنه يُعيد بيانات منظَّمة: عنوان ومصفوفة
-من الأعداد. افتراضياً سيصف الوكيل تلك البيانات بنثر: "النص يحتوي على 9 كلمات، و2 جملة..." وهكذا. يعمل هذا، لكن يمكنك أيضاً
-عرض النتيجة كمكوِّن واجهة مستخدم حقيقي (رسم بياني شريطي، جدول، بطاقة)
-مباشرةً داخل نص المحادثة، في المكان الذي استجاب فيه الوكيل تماماً.
-
-هذا ما يفعله `chatUI.renderer` في الإجراء. إنه تسمية تقول "عندما
-تظهر نتيجة هذا الإجراء في المحادثة، سلِّمها إلى مكوِّن React هذا بدلاً من
-تلخيصها في نص." يتلقى المكوِّن مخرجات الإجراء المتحقق منها كخصائص
-ويعرض ما تريده.
-
-في الخطوة التالية، ستنشئ `app/chat-renderers.tsx`، لكن أولاً، أضف سطر استيراد واحد
-إلى `app/root.tsx` حتى يعمل عند بدء التشغيل:
-
-```ts filename="app/root.tsx"
-import "./chat-renderers";
-```
-
-أضفه إلى جانب استيراداتك الأخرى في أعلى الملف. هذا هو التغيير الوحيد
-على `root.tsx`. الاستيراد فقط يضمن تشغيل الملف وتسجيل المُعرض. الآن أنشئ ملف المُعرض:
-
-```tsx filename="app/chat-renderers.tsx"
-import {
-  registerActionChatRenderer,
-  type ToolRendererProps,
-} from "@agent-native/core/client/chat";
-
-type TextStatsResult = {
-  title: string;
-  points: Array<{ label: string; value: number }>;
-};
-
-const MAX_BAR_PX = 80;
-
-function TextStatsChart({ context }: ToolRendererProps) {
-  const result = context.resultJson as TextStatsResult;
-  const max = Math.max(...result.points.map((point) => point.value), 1);
   return (
-    <section className="rounded-lg border bg-card p-4">
-      <h3 className="text-sm font-medium">{result.title}</h3>
-      <div className="mt-4 flex items-end gap-2">
-        {result.points.map((point) => (
-          <div
-            key={point.label}
-            className="flex flex-1 flex-col items-center gap-2"
-          >
-            <div
-              className="w-full rounded-t bg-blue-500"
-              style={{
-                height: `${Math.max(Math.round((point.value / max) * MAX_BAR_PX), 2)}px`,
-              }}
-            />
-            <span className="text-xs text-muted-foreground">{point.label}</span>
-          </div>
-        ))}
+    <main className="mx-auto grid w-full max-w-xl gap-6 p-6">
+      <h1 className="text-2xl font-semibold">Hello action</h1>
+      <div className="grid gap-2">
+        <Label htmlFor="name">Name</Label>
+        <Input
+          id="name"
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+        />
       </div>
-    </section>
-  );
-}
-
-registerActionChatRenderer({
-  id: "text.stats-chart",
-  renderer: "text.stats-chart",
-  Component: TextStatsChart,
-});
-```
-
-بمجرد تسجيل المُعرض، يبدو رد الوكيل هكذا. بدلاً من
-فقرة نصية، يُعرض مكوِّن React الخاص بك مباشرةً داخل نص المحادثة.
-
-استخدم هذه الخطوة عندما تنتمي النتيجة إلى المكان الذي يتحدث فيه الوكيل:
-
-- ملخصات الإعداد
-- التقارير القصيرة
-- الموافقات
-- الجداول أو الرسوم البيانية الصغيرة بما يكفي للفحص المضمَّن
-- الروابط إلى مشاهدات التطبيق الدائمة
-
-للمخرجات العامة القابلة لإعادة الاستخدام، يشحن الإطار أيضاً مُعرضات
-`data-chart` و`data-table` المدمجة، بالإضافة إلى `data-insights` لبطاقات الملخص/الرسم البياني/الجدول المجمَّعة. راجع [واجهة المحادثة الأصيلة](/docs/native-chat-ui). لعناصر التحكم المؤقتة التي ينشئها الوكيل في وقت التشغيل، راجع
-[واجهة المستخدم التوليدية](/docs/generative-ui).
-
-## 5. حفظ البيانات في SQL {#persist-data}
-
-في الوقت الحالي، في كل مرة يشغِّل فيها الوكيل `analyze-text` تظهر النتيجة في المحادثة
-ثم تختفي. لا يوجد ما يمكن الرجوع إليه لاحقاً، ولا ما يمكن للوكيل الرجوع إليه،
-ولا طريقة لبناء صفحة حول البيانات. يُصلح الحفظ في SQL ذلك: يكتب الوكيل النتائج في جدول، ويمكن لكل من الوكيل وواجهة المستخدم قراءتها في أي وقت.
-
-تمتلك تطبيقات Agent-Native قاعدة بيانات SQL متاحة افتراضياً: SQLite محلياً،
-ومزوِّدك المُهيَّأ (Postgres، أو Turso/libSQL، أو Cloudflare D1) في
-الإنتاج.
-
-### توصيل ملحق قاعدة البيانات
-
-لا يتضمن قالب المحادثة ملحق قاعدة بيانات افتراضياً. أنشئ
-`server/plugins/db.ts` لتهيئته. هذا ما يشغِّل عمليات الترحيل
-ويجعل قاعدة البيانات متاحة لإجراءاتك:
-
-```ts filename="server/plugins/db.ts"
-import { runMigrations } from "@agent-native/core/db";
-
-export default runMigrations(
-  [
-    {
-      version: 1,
-      sql: `CREATE TABLE IF NOT EXISTS text_analyses (
-        id TEXT PRIMARY KEY,
-        input TEXT NOT NULL,
-        char_count INTEGER NOT NULL,
-        word_count INTEGER NOT NULL,
-        sentence_count INTEGER NOT NULL,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-      )`,
-    },
-  ],
-  { table: "text_analyses_migrations" },
-);
-```
-
-كل إدخال في المصفوفة هو ترحيل إضافي. عندما تضيف أعمدة أو
-جداول جديدة لاحقاً، أضف كائن إصدار جديد. لا تُعدِّل الإصدارات الموجودة أبداً.
-
-### تعريف المخطط
-
-أنشئ `server/db/schema.ts`. قد لا يكون دليل `server/db/` موجوداً بعد،
-لذا أنشئه إذا لزم الأمر. يصف هذا الملف جداولك باستخدام مساعدات مكتوبة حتى
-تحصل إجراءاتك على إكمال تلقائي كامل لـ TypeScript:
-
-```ts filename="server/db/schema.ts"
-import { integer, now, table, text } from "@agent-native/core/db/schema";
-
-export const textAnalyses = table("text_analyses", {
-  id: text("id").primaryKey(),
-  input: text("input").notNull(),
-  charCount: integer("char_count").notNull(),
-  wordCount: integer("word_count").notNull(),
-  sentenceCount: integer("sentence_count").notNull(),
-  createdAt: text("created_at").notNull().default(now()),
-});
-```
-
-استخدم مساعدات مخطط الإطار (`table`، و`text`، و`integer`، و`now`) بدلاً من
-`sqliteTable`، أو `pgTable`، أو الاستيرادات الخاصة بكل لهجة. تختار الخلفية SQL المُهيَّأة تلقائياً، لذا يعمل نفس المخطط محلياً على SQLite وفي
-الإنتاج على أي مزوِّد مدعوم.
-
-بعد إضافة كلا الملفين، أعد تشغيل خادم التطوير حتى يعمل الترحيل:
-
-```bash
-pnpm dev
-```
-
-ابحث عن هذين السطرين في مخرجات الطرفية. يؤكدان إنشاء الجدول:
-
-```
-[db] Applying 1 migration(s) on SQLite/libsql…
-[db] Applied migration v1 (1 statement)
-```
-
-سطور `NitroViteError` وتحذير `BETTER_AUTH_SECRET` و
-تحذير `SECRETS_ENCRYPTION_KEY` التي تظهر أيضاً طبيعية في بيئة التطوير المحلية
-ويمكن تجاهلها.
-
-### إضافة إجراءات للجدول
-
-الآن أنشئ ملفات الإجراءات التي تقرأ الجدول وتكتب إليه. تنتقل هذه إلى
-دليل `actions/`، في نفس المكان مثل `hello.ts` و`analyze-text.ts`. تنشئها
-أنت بنفسك، ملف واحد لكل عملية. سيستدعيها الوكيل وواجهة المستخدم
-بنفس الطريقة التي يستدعيان بها أي إجراء آخر.
-
-**`actions/save-text-analysis.ts`** يكتب صف نتيجة إلى قاعدة البيانات.
-استدعِه بعد تشغيل `analyze-text` لجعل النتيجة دائمة:
-
-```ts filename="actions/save-text-analysis.ts"
-import { defineAction } from "@agent-native/core/action";
-import { getDbExec } from "@agent-native/core/db";
-import { z } from "zod";
-
-export default defineAction({
-  description: "Save a text analysis result to the database.",
-  schema: z.object({
-    input: z.string(),
-    charCount: z.number(),
-    wordCount: z.number(),
-    sentenceCount: z.number(),
-  }),
-  run: async ({ input, charCount, wordCount, sentenceCount }) => {
-    const id = crypto.randomUUID();
-    await getDbExec().execute({
-      sql: `INSERT INTO text_analyses (id, input, char_count, word_count, sentence_count)
-            VALUES (?, ?, ?, ?, ?)`,
-      args: [id, input, charCount, wordCount, sentenceCount],
-    });
-    return { id };
-  },
-});
-```
-
-**`actions/list-text-analyses.ts`** يقرأ جميع النتائج المحفوظة. يمكن للوكيل
-استدعاء هذا لتلخيص التحليلات السابقة، ويمكن لواجهة المستخدم استخدامه لملء صفحة:
-
-```ts filename="actions/list-text-analyses.ts"
-import { defineAction } from "@agent-native/core/action";
-import { getDbExec } from "@agent-native/core/db";
-import { z } from "zod";
-
-export default defineAction({
-  description: "List all saved text analyses, newest first.",
-  schema: z.object({}),
-  run: async () => {
-    const result = await getDbExec().execute(
-      `SELECT id, input, char_count, word_count, sentence_count, created_at
-       FROM text_analyses
-       ORDER BY created_at DESC`,
-    );
-    return result.rows;
-  },
-});
-```
-
-**`actions/delete-text-analysis.ts`** يحذف صفاً بالمعرِّف:
-
-```ts filename="actions/delete-text-analysis.ts"
-import { defineAction } from "@agent-native/core/action";
-import { getDbExec } from "@agent-native/core/db";
-import { z } from "zod";
-
-export default defineAction({
-  description: "Delete a saved text analysis by id.",
-  schema: z.object({ id: z.string() }),
-  run: async ({ id }) => {
-    await getDbExec().execute({
-      sql: `DELETE FROM text_analyses WHERE id = ?`,
-      args: [id],
-    });
-    return { deleted: id };
-  },
-});
-```
-
-بمجرد حفظ هذه الملفات يلتقطها خادم التطوير تلقائياً. لا
-حاجة لإعادة التشغيل. جرِّب سرد التحليلات من الطرفية:
-
-```bash
-pnpm action list-text-analyses
-```
-
-يجب أن ترى مصفوفة فارغة. الجدول موجود والإجراء يعمل؛ ولا يوجد شيء
-محفوظ بعد:
-
-```
-[]
-```
-
-تُحفظ البيانات في `data/app.db`، وهو ملف SQLite في دليل مشروعك يُنشأ
-تلقائياً عند أول تشغيل. في الإنتاج ستوجِّه
-`DATABASE_URL` إلى قاعدة بيانات مستضافة عوضاً عن ذلك، لكن محلياً هذا الملف كل ما تحتاجه.
-
-لحفظ شيء ما، شغِّل أولاً `analyze-text` للحصول على الأعداد:
-
-```bash
-pnpm action analyze-text --text "Hello world"
-```
-
-ستشاهد مخرجات مثل:
-
-```
-{
-  title: 'Text statistics',
-  points: [
-    { label: 'Characters', value: 11 },
-    { label: 'Words', value: 2 },
-    { label: 'Sentences', value: 1 },
-    { label: 'Paragraphs', value: 1 }
-  ]
-}
-```
-
-ثم مرِّر تلك القيم إلى `save-text-analysis`:
-
-```bash
-pnpm action save-text-analysis \
-  --input "Hello world" \
-  --charCount 11 \
-  --wordCount 2 \
-  --sentenceCount 1
-```
-
-الآن شغِّل `list-text-analyses` مجدداً وسترى الصف المحفوظ:
-
-```bash
-pnpm action list-text-analyses
-```
-
-أو اسأل الوكيل في المحادثة على `http://localhost:8080` للقيام بكلتا الخطوتين معاً:
-
-> Run analyze-text on "Hello world", then save the result.
-
-## 6. إضافة صفحة يستطيع الوكيل فتحها {#add-a-page}
-
-المحادثة رائعة للتفاعل الحواري، لكن بعض البيانات يُفضَّل فحصها
-في واجهة مستخدم مخصصة: جدول يمكنك مسحه بالعين وفرزه أو حذف الصفوف منه. تضيف هذه الخطوة
-مسار React يعرض كل شيء محفوظ في `text_analyses`، باستخدام
-نفس إجراءَي `list-text-analyses` و`delete-text-analysis` اللذين كتبتهما بالفعل.
-لا توجد طبقة بيانات ثانية. الصفحة هي مجرد عرض لنفس حالة SQL
-التي يقرأها الوكيل ويكتب إليها.
-
-أنشئ ملف المسار في `app/routes/text-analyses.tsx`. يُلتقط ملفات المسار في
-`app/routes/` تلقائياً من قِبَل الإطار. يصبح اسم الملف
-مسار URL، لذا ستكون هذه الصفحة متاحة على
-`http://localhost:8080/text-analyses`.
-
-```tsx filename="app/routes/text-analyses.tsx"
-import {
-  useActionMutation,
-  useActionQuery,
-} from "@agent-native/core/client/hooks";
-
-export default function TextAnalysesRoute() {
-  const analyses = useActionQuery("list-text-analyses", {});
-  const deleteAnalysis = useActionMutation("delete-text-analysis");
-
-  return (
-    <main className="mx-auto flex max-w-3xl flex-col gap-6 p-6">
-      <header>
-        <h1 className="text-2xl font-semibold">Text analyses</h1>
-        <p className="text-muted-foreground">
-          Results saved by the agent or triggered manually.
-        </p>
-      </header>
-      <section className="flex flex-col gap-3">
-        {analyses.data?.length === 0 && (
-          <p className="text-muted-foreground">No analyses saved yet.</p>
-        )}
-        {analyses.data?.map((row: any) => (
-          <article
-            key={row.id}
-            className="flex items-start justify-between rounded-lg border p-4"
-          >
-            <div className="flex flex-col gap-1">
-              <p className="text-sm font-medium">{row.input}</p>
-              <p className="text-xs text-muted-foreground">
-                {row.word_count} words · {row.char_count} characters ·{" "}
-                {row.sentence_count} sentences
-              </p>
-            </div>
-            <button
-              className="text-xs text-destructive hover:underline"
-              onClick={() => deleteAnalysis.mutate({ id: row.id })}
-            >
-              Delete
-            </button>
-          </article>
-        ))}
-      </section>
+      <p className="text-xl font-medium">{data?.message}</p>
     </main>
   );
 }
 ```
 
-يستدعي `useActionQuery` الإجراء `list-text-analyses` ويُبقي النتيجة حيَّة. إذا
-حفظ الوكيل صفاً جديداً أثناء فتح الصفحة، فإنه يظهر تلقائياً.
-يستدعي `useActionMutation` الإجراء `delete-text-analysis` عندما ينقر المستخدم على Delete،
-ثم يُبطل الاستعلام حتى تتحدث القائمة.
+<Callout tone="info">
 
-افتح `http://localhost:8080/text-analyses` في متصفحك. إذا حفظت
-تحليلاً في الخطوة السابقة، فستراه مُدرَجاً. ثم اسأل الوكيل في المحادثة:
+أعد تشغيل خادم التطوير كي يكتشف المسار الجديد، ثم افتح
+`http://localhost:<port>/hello`.
 
-> Open the text analyses page.
+</Callout>
 
-إذا حصلت على خطأ 404، جرِّب إعادة تشغيل خادم التطوير.
+أثناء كتابة اسم، يستدعي `useActionQuery` الإجراء `hello` ويعرض النتيجة. وهو
+يستنتج أنواع إدخال الإجراء ونتيجته، لذلك لا تحتاج الصفحة إلى مسار API مخصص أو
+تنفيذ ثانٍ للتحية.
 
-## 7. توسيع التنقل {#extend-navigation}
+## تغيير الإجراء
 
-يتم تهيئة الشريط الجانبي في `app/config/nav.ts`. افتحه وأضف إدخالاً
-لصفحة تحليلات النصوص:
+في `actions/hello.ts`، غيّر القيمة المرجعة:
 
-```ts filename="app/config/nav.ts"
-export const navConfig = [
-  {
-    label: "Chat",
-    href: "/",
-    icon: "chat",
-  },
-  {
-    label: "Text analyses",
-    href: "/text-analyses",
-    icon: "list",
-  },
-];
+```ts
+return { message: `Welcome, ${name}.` };
 ```
 
-احفظ الملف. يلتقط خادم التطوير التغيير تلقائياً ويُحدِّث الشريط الجانبي
-دون الحاجة إلى إعادة التشغيل.
+حدّث `/hello`، ثم اطلب من الوكيل استدعاء `hello` مرة أخرى. سيعيد كلاهما
+التحية المحدّثة لأنهما يستدعيان الإجراء نفسه.
 
-### تنقل الوكيل
+## استدعاء الإجراءات بطرق أخرى
 
-يتيح رابط الشريط الجانبي للمستخدمين التنقل يدوياً. يمكن للوكيل أيضاً فتح الصفحات
-من تلقاء نفسه باستخدام إجراءَين مدمجَين يُشحنان مع قالب المحادثة:
+لقد استدعيت الإجراء نفسه من الوكيل وواجهة المستخدم. ويمكن أيضًا استدعاء
+الإجراء نفسه من:
 
-- **`view-screen`** يقرأ المسار الحالي ويُعيد ملخصاً موجزاً لـ
-  ما يراه المستخدم.
-- **`navigate`** يكتب مساراً من نفس الأصل إلى سجل المتصفح.
+| الاستدعاء من                            | استخدمه من أجل                                                       |
+| --------------------------------------- | -------------------------------------------------------------------- |
+| [HTTP API](/docs/http-api)              | استدعاء إجراء من نص برمجي أو خلفية أو تكامل.                         |
+| [CLI](/docs/actions-other-surfaces#cli) | تشغيل إجراء أو اختباره من طرفية.                                     |
+| [MCP](/docs/actions-other-surfaces#mcp) | تمكين عميل ذكاء اصطناعي خارجي من اكتشاف الإجراءات واستدعائها كأدوات. |
+| [A2A](/docs/actions-other-surfaces#a2a) | تمكين وكيل آخر من تفويض العمل إلى وكيلك.                             |
 
-مع إضافة المزيد من الصفحات، أبقِ `navigate` محدَّثاً حتى يظل الوكيل على علم
-بالوجهات الموجودة. وثِّق المسارات المتاحة في `AGENTS.md` حتى يتمكن النموذج من
-الاستدلال عليها.
+يستخدم كل مستدعٍ تعريف الإجراء نفسه. لا تحتاج إلى تنفيذ منفصل لكل واحد. يمثل
+نموذج الإجراءات المشتركة هذا جوهر Agent-Native: إذ تبقى السلوكيات والتحقق
+والصلاحيات متسقة بين واجهة المستخدم والوكلاء والتكاملات مع إضافة قدرات جديدة.
 
-عندما يحتوي التطبيق على مسار محادثة كامل الصفحة وصفحة تطبيق، استخدم مساعدات تسليم المحادثة المشتركة الموصوفة في [أسطح الوكيل](/docs/agent-surfaces#rich-chat):
-`AgentChatSurface`، و`AgentSidebar`، و`useAgentChatHomeHandoff`،
-و`useAgentChatHomeHandoffLinks`، و`chatViewTransition`. هذا يسمح للمحادثة الكاملة بالانزلاق إلى اللوحة الجانبية مع فتح الصفحة، مع الحفاظ على نفس الخيط بينما
-يفحص المستخدم البيانات الدائمة.
+## ما أنشأته
 
-## هيكل المشروع {#project-structure}
+أنشأت وكيلاً بواجهة مستخدم للمحادثة، واستدعيت إجراء `hello` نفسه من الوكيل ومن
+واجهة React، ثم غيّرت التحية مرة واحدة وشاهدت كليهما يتحدثان. يتبع كل إجراء
+تكتبه من الآن فصاعدًا النمط نفسه.
 
-```text
-my-app/
-  actions/         # Agent-callable and UI-callable operations
-  app/             # React routes, pages, and chat surfaces
-  server/          # Nitro server and SQL schema
-  AGENTS.md        # Always-on instructions for the app agent
-  .agents/         # Skills the agent loads when relevant
-  data/app.db      # Local SQLite state when DATABASE_URL is unset
-```
+## الخطوات التالية
 
-## هل تريد نقطة انطلاق تحليلية كاملة؟ {#analytics-starting-point}
+<Cards>
 
-مثال تحليلات النصوص أعلاه صغير عن قصد حتى تتمكن من رؤية
-قطع الإطار. إذا كنت تبني منتج تحليلات حقيقياً، ابدأ من
-[Analytics](/docs/template-analytics) عوضاً عن ذلك. إنه نقطة البداية القوية:
-وصِّل مزوِّديك، واستخدم لوحات المعلومات وإجراءات الوكيل الموجودة، ثم
-خصِّص التطبيق من هناك.
+### [ما هو Agent-Native؟](/docs/what-is-agent-native)
 
-## ما الخطوة التالية {#next}
+تعرّف على سبب مشاركة واجهة المستخدم والوكيل للإجراءات والبيانات والسياق.
 
-- **[الإجراءات](/docs/actions)**: المخططات، والمصادقة، والموافقات، والخطافات، والنقل.
-- **[واجهة المحادثة الأصيلة](/docs/native-chat-ui)**: عرض نتائج الإجراءات كجداول،
-  ورسوم بيانية، وبطاقات مكتوبة.
-- **[قالب المحادثة](/docs/template-chat)**: تطبيق المحادثة البسيط الذي أنشأته للتو.
-- **[قالب Analytics](/docs/template-analytics)**: نقطة انطلاق تطبيق تحليلات قوية؛ وصِّل المزوِّدين وخصِّص من هناك.
-- **[الوعي بالسياق](/docs/context-awareness)**: `view-screen`، و`navigate`،
-  وحالة المسار، والكائنات المحددة.
-- **[أسطح الوكيل](/docs/agent-surfaces)**: المحادثة، وواجهة المستخدم المضمَّنة، وصفحات التطبيق،
-  والشريط الجانبي المضمَّن، والأتمتة، والوكلاء الخارجيون.
-- **[النشر](/docs/deployment)**: ضع تطبيقك على نطاقك الخاص.
+### [المفاهيم الأساسية](/docs/key-concepts)
+
+تعرّف على كيفية توافق الإجراءات وبيانات SQL وسياق التطبيق والوصول والمزامنة
+المباشرة معًا.
+
+### [الإجراءات](/docs/actions-overview)
+
+عرّف إجراءات للقراءة والكتابة والموافقات، ثم استدعها من واجهة المستخدم والوكلاء
+والعملاء الخارجيين.
+
+### [نشر تطبيق](/docs/deploy-an-app)
+
+انتقل من التطوير المحلي إلى قاعدة بيانات دائمة ومصادقة إنتاجية وهدف نشر مدعوم.
+
+</Cards>

@@ -7,6 +7,11 @@ import type { GoogleAuthStatus } from "@shared/api";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import {
+  isSharedCalendarDemo,
+  SHARED_CALENDAR_DEMO_STATUS,
+} from "@/lib/shared-calendar-demo";
+
 export interface DesktopAuthIssue {
   error?: string;
   message?: string;
@@ -35,6 +40,31 @@ interface DesktopAuthOptions {
 interface DesktopGlobals {
   agentNativeDesktop?: unknown;
   electronAPI?: unknown;
+}
+
+const DESKTOP_AUTH_POLL_INTERVAL_MS = 1500;
+const DESKTOP_AUTH_POLL_ABORT_MS = Math.max(
+  10_000,
+  DESKTOP_AUTH_POLL_INTERVAL_MS * 4,
+);
+
+function newDesktopOAuthVerifier(): string | null {
+  const cryptoApi = globalThis.crypto;
+  const randomUuid = cryptoApi?.randomUUID?.bind(cryptoApi);
+  if (typeof randomUuid === "function") {
+    return `${randomUuid()}${randomUuid()}`;
+  }
+  if (typeof cryptoApi?.getRandomValues === "function") {
+    const bytes = new Uint8Array(32);
+    cryptoApi.getRandomValues(bytes);
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary)
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+  }
+  return null;
 }
 
 function bodyError(
@@ -78,8 +108,6 @@ async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
     const cause = err instanceof Error ? err.message : String(err);
     throw new Error(`Network error: ${cause}`);
   }
-  // Track read failures separately from "no body" so a transport hiccup on a
-  // 2xx response doesn't silently turn into a `null` success.
   let raw = "";
   let readFailed = false;
   let readError: unknown;
@@ -95,15 +123,12 @@ async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
     try {
       body = JSON.parse(raw);
     } catch {
-      // not JSON — leave body undefined
       parseFailed = true;
     }
   }
   if (!res.ok) {
     throw bodyError(body, raw, res, "Request failed");
   }
-  // 2xx but the body couldn't be read (stream interruption, decode failure,
-  // etc.). Surface the failure rather than treating it as "no data".
   if (readFailed) {
     const cause =
       readError instanceof Error ? readError.message : String(readError);
@@ -111,10 +136,6 @@ async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
     (error as any).status = res.status;
     throw error;
   }
-  // 2xx with a non-empty, non-JSON body — almost always a misconfigured proxy
-  // or server returning an HTML page with status 200. Throw so callers (status
-  // checks, auth URL hooks) surface the failure instead of silently treating
-  // the response as "no data" / disconnected.
   if (parseFailed) {
     throw bodyError(body, raw, res, "Unexpected non-JSON response");
   }
@@ -122,14 +143,16 @@ async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
 }
 
 export function useGoogleAuthStatus() {
+  const demo = isSharedCalendarDemo();
   return useQuery<GoogleAuthStatus>({
     queryKey: ["google-status"],
     queryFn: async () => {
+      if (demo) return SHARED_CALENDAR_DEMO_STATUS;
       return fetchJson<GoogleAuthStatus>(
         agentNativePath("/_agent-native/google/status"),
       );
     },
-    staleTime: 30_000,
+    staleTime: demo ? Infinity : 30_000,
   });
 }
 
@@ -149,17 +172,15 @@ export function useGoogleAuthUrl(enabled = false) {
     retry: false,
   });
 
-  // Clear cached error when disabled so next enable triggers a fresh fetch
   useEffect(() => {
     if (!enabled && query.isError) {
-      queryClient.resetQueries({ queryKey: ["google-auth-url"] });
+      void queryClient.resetQueries({ queryKey: ["google-auth-url"] });
     }
   }, [enabled, query.isError, queryClient]);
 
   return query;
 }
 
-/** Hook for adding an additional Google account (user is already logged in). */
 export function useGoogleAddAccountUrl(enabled = false) {
   const queryClient = useQueryClient();
   const query = useQuery<{ url: string }>({
@@ -178,7 +199,7 @@ export function useGoogleAddAccountUrl(enabled = false) {
 
   useEffect(() => {
     if (!enabled && query.isError) {
-      queryClient.resetQueries({ queryKey: ["google-add-account-url"] });
+      void queryClient.resetQueries({ queryKey: ["google-add-account-url"] });
     }
   }, [enabled, query.isError, queryClient]);
 
@@ -188,6 +209,7 @@ export function useGoogleAddAccountUrl(enabled = false) {
 export function useGoogleDesktopAuth(options: DesktopAuthOptions = {}) {
   const { onError, onSuccess, timeoutMs = 120_000 } = options;
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollInFlightRef = useRef(false);
   const [isPending, setIsPending] = useState(false);
   const isDesktopGoogleAuth = useMemo(() => {
     if (typeof window === "undefined" || typeof navigator === "undefined") {
@@ -220,6 +242,15 @@ export function useGoogleDesktopAuth(options: DesktopAuthOptions = {}) {
       const flowId =
         globalThis.crypto?.randomUUID?.() ||
         Math.random().toString(36).slice(2) + Date.now().toString(36);
+      const verifier = newDesktopOAuthVerifier();
+      if (!verifier) {
+        setIsPending(false);
+        onError?.({
+          code: "desktop_auth_start_failed",
+          message: "Secure OAuth verifier generation is unavailable.",
+        });
+        return true;
+      }
       const redirectUri = oauthRedirectUri("/_agent-native/google/callback");
       const params = new URLSearchParams({
         redirect_uri: redirectUri,
@@ -276,7 +307,13 @@ export function useGoogleDesktopAuth(options: DesktopAuthOptions = {}) {
             : "/_agent-native/google/auth-url";
           const { url } = await fetchJson<{ url: string }>(
             agentNativePath(`${path}?${params.toString()}`),
-            { credentials: "include" },
+            {
+              method: "POST",
+              credentials: "include",
+              headers: {
+                "X-Agent-Native-Desktop-Verifier": verifier,
+              },
+            },
           );
           openAuthUrl(url);
         } catch (err) {
@@ -285,62 +322,82 @@ export function useGoogleDesktopAuth(options: DesktopAuthOptions = {}) {
       })();
 
       pollRef.current = setInterval(async () => {
+        if (document.hidden || pollInFlightRef.current) return;
+        pollInFlightRef.current = true;
+        const controller = new AbortController();
+        const abortTimer = setTimeout(
+          () => controller.abort(),
+          DESKTOP_AUTH_POLL_ABORT_MS,
+        );
         try {
-          const exchangeRes = await fetch(
-            agentNativePath(
-              `/_agent-native/auth/desktop-exchange?flow_id=${flowId}`,
-            ),
-            { credentials: "include" },
-          );
-          const exchange = await exchangeRes.json();
-          if (exchange?.error) {
-            clearPoll();
-            setIsPending(false);
-            onError?.(exchange);
-            return;
-          }
-          if (exchange?.token) {
-            await fetch(
+          try {
+            const exchangeRes = await fetch(
               agentNativePath(
-                `/_agent-native/auth/session?_session=${exchange.token}`,
+                `/_agent-native/auth/desktop-exchange?flow_id=${encodeURIComponent(flowId)}`,
               ),
-              { credentials: "include" },
+              {
+                credentials: "include",
+                headers: {
+                  "X-Agent-Native-Desktop-Verifier": verifier,
+                },
+                signal: controller.signal,
+              },
             );
-            await finish({ token: exchange.token, email: exchange.email });
-            return;
-          }
-        } catch {
-          // Keep polling; the status endpoint below may still observe success.
-        }
-
-        try {
-          const statusRes = await fetch(
-            agentNativePath("/_agent-native/google/status"),
-            { credentials: "include" },
-          );
-          if (statusRes.ok) {
-            const status = (await statusRes.json()) as GoogleAuthStatus;
-            const connected = startOptions.addAccount
-              ? (status.accounts?.length ?? 0) >
-                (startOptions.previousAccountCount ?? 0)
-              : status.connected;
-            if (connected) {
-              await finish();
+            const exchange = await exchangeRes.json();
+            if (exchange?.error) {
+              clearPoll();
+              setIsPending(false);
+              onError?.(exchange);
               return;
             }
+            if (exchange?.token) {
+              await fetch(
+                agentNativePath(
+                  `/_agent-native/auth/session?_session=${exchange.token}`,
+                ),
+                { credentials: "include", signal: controller.signal },
+              );
+              await finish({ token: exchange.token, email: exchange.email });
+              return;
+            }
+          } catch {
+            // coercion-ok: keep polling; the status endpoint below may still
+            // observe success, and the timeout below reports desktop_auth_timeout.
           }
-        } catch {
-          // Keep polling until the timeout.
-        }
 
-        if (Date.now() - startedAt > timeoutMs) {
-          reportError({
-            code: "desktop_auth_timeout",
-            message:
-              "Google sign-in timed out. Finish sign-in in the browser or try again.",
-          });
+          try {
+            const statusRes = await fetch(
+              agentNativePath("/_agent-native/google/status"),
+              { credentials: "include", signal: controller.signal },
+            );
+            if (statusRes.ok) {
+              const status = (await statusRes.json()) as GoogleAuthStatus;
+              const connected = startOptions.addAccount
+                ? (status.accounts?.length ?? 0) >
+                  (startOptions.previousAccountCount ?? 0)
+                : status.connected;
+              if (connected) {
+                await finish();
+                return;
+              }
+            }
+          } catch {
+            // coercion-ok: keep polling until the bounded timeout below, which
+            // reports desktop_auth_timeout rather than failing silently.
+          }
+
+          if (Date.now() - startedAt > timeoutMs) {
+            reportError({
+              code: "desktop_auth_timeout",
+              message:
+                "Google sign-in timed out. Finish sign-in in the browser or try again.",
+            });
+          }
+        } finally {
+          clearTimeout(abortTimer);
+          pollInFlightRef.current = false;
         }
-      }, 1500);
+      }, DESKTOP_AUTH_POLL_INTERVAL_MS);
 
       return true;
     },
@@ -368,7 +425,7 @@ export function useDisconnectGoogle() {
       );
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["google-status"] });
+      void queryClient.invalidateQueries({ queryKey: ["google-status"] });
     },
   });
 }
@@ -382,7 +439,9 @@ export function useSyncGoogle() {
       });
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["action", "list-events"] });
+      void queryClient.invalidateQueries({
+        queryKey: ["action", "list-events"],
+      });
     },
   });
 }

@@ -14,8 +14,6 @@ export function isWithinSlidesCanvasEdgeMoveBand(
   clientX: number,
   clientY: number,
 ): boolean {
-  // Tiny labels still need a usable center click target. Cap the move band at
-  // one quarter of either dimension so its opposite edges never consume it.
   const edgeBand = Math.min(
     SLIDES_CANVAS_EDGE_MOVE_BAND,
     rect.width / 4,
@@ -37,11 +35,6 @@ export function isWithinSlidesCanvasEdgeMoveBand(
   );
 }
 
-/**
- * Slides owns its persistence adapter: it translates shared semantic commands
- * into mutations of the selected slide's HTML. Toolkit remains unaware of the
- * DOM, coordinate containers, and the one-write-per-gesture boundary.
- */
 export type SlidesCanvasHtmlMutationAdapter = CanvasInteractionAdapter<string>;
 export type SlidesCanvasGestureAdapter = CanvasGestureAdapter<string>;
 
@@ -61,11 +54,11 @@ const slidesCanvasInteractionConfig = {
   minSize: MIN_SLIDE_OBJECT_SIZE,
   capabilities: {
     multiSelection: true,
-    snapping: false,
-    alignment: false,
-    distribution: false,
-    grouping: false,
-    rotation: false,
+    snapping: true,
+    alignment: true,
+    distribution: true,
+    grouping: true,
+    rotation: true,
     marquee: true,
   },
 };
@@ -76,7 +69,31 @@ export function createSlidesCanvasInteractionCore(
   return createCanvasInteractionCore(slidesCanvasInteractionConfig, adapter);
 }
 
-/** Creates one shared controller per live Slides pointer gesture. */
+export function resolveSlidesCanvasNudge(
+  input: Parameters<typeof slidesCanvasInteractionCore.nudge>[0],
+) {
+  if (input.altKey || input.ctrlKey || input.metaKey) return null;
+  return slidesCanvasInteractionCore.nudge(input);
+}
+
+export function resolveSlidesCanvasRotation(
+  input: Pick<
+    KeyboardEvent,
+    "key" | "altKey" | "shiftKey" | "metaKey" | "ctrlKey"
+  >,
+): number | null {
+  if (
+    !input.altKey ||
+    input.metaKey ||
+    input.ctrlKey ||
+    (input.key !== "ArrowLeft" && input.key !== "ArrowRight")
+  ) {
+    return null;
+  }
+  const amount = input.shiftKey ? 1 : 15;
+  return input.key === "ArrowLeft" ? -amount : amount;
+}
+
 export function createSlidesCanvasGestureController(
   adapter: SlidesCanvasGestureAdapter,
 ) {
@@ -86,7 +103,6 @@ export function createSlidesCanvasGestureController(
   });
 }
 
-/** Shared Slides policy for callers that do not need an HTML command adapter. */
 export const slidesCanvasInteractionCore = createSlidesCanvasInteractionCore();
 
 export type SlidesCanvasPointerIntent =
@@ -95,35 +111,48 @@ export type SlidesCanvasPointerIntent =
   | "move-object-perimeter"
   | "none";
 
-/**
- * Slides supplies hit testing and this policy decision, while the shared
- * gesture controller owns threshold, coordinate, modifier, and resize math.
- * A selected object's body begins a thresholded move candidate. An unmoved
- * press still falls through to the click handler for text editing, while a
- * real drag consumes that trailing click.
- */
+export function resolveSlidesCanvasDragTarget(
+  selectedObject: HTMLElement | null,
+  pointerObject: HTMLElement | null,
+): HTMLElement | null {
+  if (
+    selectedObject &&
+    pointerObject &&
+    (selectedObject.contains(pointerObject) ||
+      pointerObject.contains(selectedObject))
+  ) {
+    return selectedObject;
+  }
+  return pointerObject ?? selectedObject;
+}
+
 export function resolveSlidesCanvasPointerIntent({
   hasSelectedObject,
   targetWithinSelectedObject,
   targetContainsSelectedObject,
   pointerWithinMoveBand,
   targetIsEditableText,
+  duplicateModifierActive = false,
 }: {
   hasSelectedObject: boolean;
   targetWithinSelectedObject: boolean;
   targetContainsSelectedObject: boolean;
   pointerWithinMoveBand: boolean;
   targetIsEditableText: boolean;
+  duplicateModifierActive?: boolean;
 }): SlidesCanvasPointerIntent {
   if (
     hasSelectedObject &&
-    (targetWithinSelectedObject || targetContainsSelectedObject) &&
-    pointerWithinMoveBand
+    pointerWithinMoveBand &&
+    (targetWithinSelectedObject ||
+      targetContainsSelectedObject ||
+      !targetIsEditableText)
   ) {
     return "move-object-perimeter";
   }
+  if (targetIsEditableText && !duplicateModifierActive) return "edit-text";
   if (hasSelectedObject && targetWithinSelectedObject) {
     return "move-object-body";
   }
-  return targetIsEditableText ? "edit-text" : "none";
+  return "none";
 }

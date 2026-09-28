@@ -1,43 +1,124 @@
-import type { AgentLoopFinalResponseGuardContext } from "@agent-native/core/server";
-import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 
-const { agentChatPluginOptions, representativeAnalyticsActions } = vi.hoisted(
-  () => ({
-    agentChatPluginOptions: [] as Array<Record<string, unknown>>,
-    representativeAnalyticsActions: {
-      "query-agent-native-analytics": {
-        readOnly: true,
-        tool: {
-          description: "Query first-party analytics",
-          parameters: { type: "object", properties: {} },
-        },
-        run: async () => "ok",
-      },
-      bigquery: {
-        readOnly: true,
-        tool: {
-          description: "Query BigQuery",
-          parameters: { type: "object", properties: {} },
-        },
-        run: async () => "ok",
-      },
-      "hubspot-records": {
-        readOnly: true,
-        tool: {
-          description: "Read HubSpot records",
-          parameters: { type: "object", properties: {} },
-        },
-        run: async () => "ok",
-      },
-    },
-  }),
+import type { AgentLoopFinalResponseGuardContext } from "@agent-native/core/server";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const adhocAnalysisSkill = readFileSync(
+  new URL("../../.agents/skills/adhoc-analysis/SKILL.md", import.meta.url),
+  "utf8",
 );
+const accountHealthSkill = readFileSync(
+  new URL("../../.agents/skills/account-health/SKILL.md", import.meta.url),
+  "utf8",
+);
+
+const {
+  agentChatPluginOptions,
+  getRequestRunContext,
+  getRequestUserEmail,
+  getRequestOrgId,
+  enqueueAnalyticsMemoryCapture,
+  representativeAnalyticsActions,
+  retrieveAnalyticsPromptReferences,
+  summarizeAnalyticsRun,
+  track,
+} = vi.hoisted(() => ({
+  agentChatPluginOptions: [] as Array<Record<string, unknown>>,
+  getRequestRunContext: vi.fn((): Record<string, any> | null => null),
+  getRequestUserEmail: vi.fn(() => "owner@example.test"),
+  getRequestOrgId: vi.fn(() => null),
+  enqueueAnalyticsMemoryCapture: vi.fn(async () => true),
+  retrieveAnalyticsPromptReferences: vi.fn(),
+  summarizeAnalyticsRun: vi.fn(
+    (input: { preloadedReferenceCount: number }) => ({
+      preloaded_reference_count: input.preloadedReferenceCount,
+    }),
+  ),
+  track: vi.fn(),
+  representativeAnalyticsActions: {
+    "query-agent-native-analytics": {
+      readOnly: true,
+      grounding: true,
+      tool: {
+        description: "Query first-party analytics",
+        parameters: { type: "object", properties: {} },
+      },
+      run: async () => "ok",
+    },
+    bigquery: {
+      readOnly: true,
+      grounding: true,
+      tool: {
+        description: "Query BigQuery",
+        parameters: { type: "object", properties: {} },
+      },
+      run: async () => "ok",
+    },
+    "hubspot-records": {
+      readOnly: true,
+      grounding: true,
+      tool: {
+        description: "Read HubSpot records",
+        parameters: { type: "object", properties: {} },
+      },
+      run: async () => "ok",
+    },
+    "get-monitor": {
+      readOnly: true,
+      grounding: true,
+      tool: { description: "Get monitor configuration", parameters: {} },
+      run: async () => "ok",
+    },
+    "list-connected-database-tables": {
+      readOnly: true,
+      grounding: true,
+      tool: { description: "Inspect database schema", parameters: {} },
+      run: async () => "ok",
+    },
+    "test-custom-api-connection": {
+      readOnly: true,
+      grounding: true,
+      tool: { description: "Test a provider connection", parameters: {} },
+      run: async () => "ok",
+    },
+    prometheus: {
+      readOnly: true,
+      grounding: true,
+      tool: {
+        description: "Query Prometheus",
+        parameters: { type: "object", properties: {} },
+      },
+      run: async () => "ok",
+    },
+    "list-data-dictionary": {
+      readOnly: true,
+      tool: {
+        description: "Browse metric definitions",
+        parameters: { type: "object", properties: {} },
+      },
+      run: async () => "ok",
+    },
+  },
+}));
+
+vi.mock("../lib/analytics-agent-context", () => ({
+  retrieveAnalyticsPromptReferences,
+  summarizeAnalyticsRun,
+}));
+vi.mock("../lib/analytics-memory-capture.js", () => ({
+  enqueueAnalyticsMemoryCapture,
+}));
+
+vi.mock("@agent-native/core/tracking", () => ({ track }));
 
 vi.mock("@agent-native/core/server", async (importOriginal) => {
   const original =
     await importOriginal<typeof import("@agent-native/core/server")>();
   return {
     ...original,
+    getRequestRunContext: () => getRequestRunContext(),
+    getRequestUserEmail: () => getRequestUserEmail(),
+    getRequestOrgId: () => getRequestOrgId(),
     createAgentChatPlugin: (options: Record<string, unknown>) => {
       agentChatPluginOptions.push(options);
       return () => {};
@@ -58,9 +139,13 @@ import {
   analyticsDataDictionaryRoutingContext,
   analyticsSourceGuidanceOpening,
   ANALYTICS_OBSERVABILITY_INCIDENT_GUIDANCE,
+  ANALYTICS_CROSS_APP_ROUTING_GUIDANCE,
   ANALYTICS_CUSTOM_BLOCK_GUIDANCE,
   ANALYTICS_BACKGROUND_RUN_NO_PROGRESS_TIMEOUT_MS,
+  ANALYTICS_ACCOUNT_HEALTH_GUIDANCE,
+  INTERNAL_PRODUCT_USAGE_GUIDANCE,
   BOUNDED_STRUCTURED_LOOKUP_GUIDANCE,
+  DASHBOARD_REFERENCE_GUIDANCE,
   BUILT_IN_FIRST_PARTY_SOURCE_GUIDANCE,
   NON_ANALYTICS_FALLBACK_FINAL_MESSAGE,
   NON_ANALYTICS_FALLBACK_RETRY_MESSAGE,
@@ -68,7 +153,147 @@ import {
   realDataFinalGuard,
 } from "./agent-chat";
 
+describe("Analytics prompt-reference preparation", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("skips catalog and embedding retrieval before background dispatch", async () => {
+    const prepareRequest = agentChatPluginOptions[0]?.prepareRequest as (
+      details: Record<string, unknown>,
+    ) => Promise<unknown>;
+
+    await prepareRequest({
+      ownerEmail: "owner@example.test",
+      requestContext: "Current request: count active users",
+      contextPrefetchDeadlineAt: Date.now() + 1_300,
+      dispatchToBackground: true,
+    });
+
+    expect(retrieveAnalyticsPromptReferences).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["durable worker", { isBackgroundWorker: true }],
+    [
+      "server continuation",
+      { isBackgroundWorker: true, internalContinuation: true },
+    ],
+  ] as const)(
+    "retrieves Analytics references in a %s request",
+    async (_, requestOptions) => {
+      const candidate = {
+        id: "analytics-reference-1",
+        description: "Active users definition",
+        metadata: { kind: "analytics-reference" },
+        name: "Active users",
+        scope: "analytics-catalog",
+        content: "Metric: active users.",
+      };
+      vi.mocked(retrieveAnalyticsPromptReferences).mockResolvedValue({
+        jevPromptCandidates: [candidate],
+        jevFallbackCandidateIds: [candidate.id],
+      });
+      const prepareRequest = agentChatPluginOptions[0]?.prepareRequest as (
+        details: Record<string, unknown>,
+      ) => Promise<unknown>;
+
+      const result = await prepareRequest({
+        ownerEmail: "owner@example.test",
+        requestContext: "Current request: count active users",
+        contextPrefetchDeadlineAt: Date.now() + 1_300,
+        dispatchToBackground: false,
+        ...requestOptions,
+      });
+
+      expect(retrieveAnalyticsPromptReferences).toHaveBeenCalledOnce();
+      expect(result).toEqual({
+        jevPromptCandidates: [candidate],
+        jevFallbackCandidateIds: [candidate.id],
+      });
+    },
+  );
+
+  it("uses the bounded recent-user request and shared deadline for retrieval", async () => {
+    const prepareRequest = agentChatPluginOptions[0]?.prepareRequest as (
+      details: Record<string, unknown>,
+    ) => Promise<unknown>;
+    const contextPrefetchDeadlineAt = Date.now() + 1_300;
+
+    await prepareRequest({
+      ownerEmail: "owner@example.test",
+      requestContext:
+        "Recent user requests:\nUser: prior question\n\nCurrent request: count active users",
+      contextPrefetchDeadlineAt,
+      dispatchToBackground: false,
+    });
+
+    expect(retrieveAnalyticsPromptReferences).toHaveBeenCalledWith({
+      request:
+        "Recent user requests:\nUser: prior question\n\nCurrent request: count active users",
+      email: "owner@example.test",
+      orgId: null,
+      deadlineAt: contextPrefetchDeadlineAt,
+    });
+  });
+
+  it("does not spend the preload budget in the foreground before background dispatch", async () => {
+    const prepareRequest = agentChatPluginOptions[0]?.prepareRequest as (
+      details: Record<string, unknown>,
+    ) => Promise<unknown>;
+
+    await prepareRequest({
+      ownerEmail: "owner@example.test",
+      requestContext: "Current request: count active users",
+      contextPrefetchDeadlineAt: Date.now() + 1_300,
+      dispatchToBackground: true,
+    });
+
+    expect(retrieveAnalyticsPromptReferences).not.toHaveBeenCalled();
+  });
+
+  it("reports preloaded references in the worker completion event", async () => {
+    const context = {
+      isBackgroundWorker: true,
+      analyticsJevPrefetch: { preloadedReferenceCount: 2 },
+    };
+    getRequestRunContext.mockReturnValue(context);
+    const onAgentRunComplete = agentChatPluginOptions[0]
+      ?.onAgentRunComplete as (
+      scope: unknown,
+      run: { events: unknown[] },
+    ) => Promise<void>;
+    const run = { threadId: "thread-1", events: [] };
+
+    await onAgentRunComplete(null, run);
+
+    expect(track).toHaveBeenCalledWith("analytics_agent_run_outcome", {
+      preloaded_reference_count: 2,
+      memory_capture_queued: 1,
+    });
+    expect(enqueueAnalyticsMemoryCapture).toHaveBeenCalledWith({
+      owner: "owner@example.test",
+      orgId: null,
+      threadId: "thread-1",
+    });
+    expect(summarizeAnalyticsRun).toHaveBeenCalledWith({
+      events: run.events,
+      groundingActionNames: expect.any(Array),
+      preloadedReferenceCount: 2,
+    });
+  });
+});
+
 describe("Analytics agent Plan mode policy", () => {
+  it("routes one-off stacked charts through the live embed path", () => {
+    expect(adhocAnalysisSkill).toMatch(/use the live\s+`\/chart` embed/);
+    expect(adhocAnalysisSkill).toMatch(
+      /Do not call\s+`generate-chart` for a one-off chat result/,
+    );
+    expect(adhocAnalysisSkill).toContain("config.stacked: true");
+    expect(adhocAnalysisSkill).not.toContain(
+      "call `generate-chart` before formatting the report",
+    );
+  });
+
   it("recovers a silent background dashboard run before the long chunk timeout", () => {
     expect(ANALYTICS_BACKGROUND_RUN_NO_PROGRESS_TIMEOUT_MS).toBe(3 * 60_000);
   });
@@ -78,12 +303,14 @@ describe("Analytics agent Plan mode policy", () => {
 
     expect(guidance).toContain("<data-source-guidance>");
     expect(guidance).toContain(BOUNDED_STRUCTURED_LOOKUP_GUIDANCE);
+    expect(guidance).toContain(ANALYTICS_ACCOUNT_HEALTH_GUIDANCE);
     expect(guidance).toContain(ANALYTICS_OBSERVABILITY_INCIDENT_GUIDANCE);
+    expect(guidance).toContain(ANALYTICS_CROSS_APP_ROUTING_GUIDANCE);
     expect(guidance).toContain(BUILT_IN_FIRST_PARTY_SOURCE_GUIDANCE);
     expect(guidance).toContain(NON_ANALYTICS_REQUEST_GUIDANCE);
     expect(guidance).toContain("run one bounded query");
     expect(guidance).toContain("Once the query succeeds");
-    expect(guidance).toContain("does not waive the real-data requirement");
+    expect(guidance).toContain("never answer from a guess");
     expect(guidance).toContain(
       "This does not replace or restrict external sources",
     );
@@ -109,6 +336,26 @@ describe("Analytics agent Plan mode policy", () => {
     );
   });
 
+  it("guards named account health against scope and metric-definition drift", () => {
+    for (const phrase of [
+      "org ID as a lookup key",
+      "different customer, mixed IDs",
+      "deprecated or retired",
+      "current partial-period snapshot",
+      "total distinct contracted users",
+      "utilization at or above 100%",
+      "each requested product or feature dimension separately",
+    ]) {
+      expect(ANALYTICS_ACCOUNT_HEALTH_GUIDANCE).toContain(phrase);
+    }
+  });
+
+  it("keeps account-health guidance organization- and provider-neutral", () => {
+    expect(accountHealthSkill).not.toMatch(
+      /Builder|Fusion|enterprise_pageview_utilization|monthly_pageviews_and_bandwidth_by_org/i,
+    );
+  });
+
   it("routes built-in product metrics to the first-party query action", () => {
     expect(BUILT_IN_FIRST_PARTY_SOURCE_GUIDANCE).toContain(
       "query-agent-native-analytics",
@@ -117,6 +364,37 @@ describe("Analytics agent Plan mode policy", () => {
       "Do not report the first-party source as disconnected",
     );
     expect(BUILT_IN_FIRST_PARTY_SOURCE_GUIDANCE).toContain("analytics_events");
+  });
+
+  it("routes internal product usage through schema discovery instead of user-supplied SQL", () => {
+    expect(INTERNAL_PRODUCT_USAGE_GUIDANCE).toContain("search-bigquery-schema");
+    expect(INTERNAL_PRODUCT_USAGE_GUIDANCE).toContain(
+      "list-dispatch-usage-metrics",
+    );
+    expect(INTERNAL_PRODUCT_USAGE_GUIDANCE).toContain(
+      "named customer or account such as OCBC",
+    );
+    expect(INTERNAL_PRODUCT_USAGE_GUIDANCE).toContain(
+      "do not ask the user for identifiers",
+    );
+    expect(
+      looksLikeAnalyticsDataRequest(
+        "Pull AI credit usage and branch creation data by user for each month",
+      ),
+    ).toBe(true);
+  });
+
+  it("advertises Analytics as the owner for curated first-party product metrics", () => {
+    expect(ANALYTICS_CROSS_APP_ROUTING_GUIDANCE).toContain(
+      "agent-native signups",
+    );
+    expect(ANALYTICS_CROSS_APP_ROUTING_GUIDANCE).toContain(
+      "built-in first-party source and query catalog",
+    );
+    expect(ANALYTICS_CROSS_APP_ROUTING_GUIDANCE).toContain(
+      "list-dispatch-usage-metrics",
+    );
+    expect(ANALYTICS_CROSS_APP_ROUTING_GUIDANCE).toContain("call-agent");
   });
 
   it("discovers incident sessions without requiring a JavaScript error count", () => {
@@ -143,10 +421,10 @@ describe("Analytics agent Plan mode policy", () => {
   it("routes data-dictionary lookup on demand with compact guidance", () => {
     const context = analyticsDataDictionaryRoutingContext();
 
-    expect(context).toContain("available through");
+    expect(context).toContain("system may preload a small set");
     expect(context).toContain("`list-data-dictionary`");
     expect(context).toContain(
-      "Call `list-data-dictionary` separately only when the user asks",
+      "Call `list-data-dictionary` separately when the catalog has no usable match",
     );
     expect(context).toContain("approved entries as canonical");
     expect(context.length).toBeLessThan(1_000);
@@ -163,22 +441,22 @@ describe("Analytics agent Plan mode policy", () => {
       expect(pluginActions[name]).not.toHaveProperty("allowInPlanMode", false);
     }
   });
-  it("keeps corpus tools discoverable without loading them initially", () => {
+  it("keeps bulk corpus tools on the initial tool surface", () => {
     expect(INITIAL_TOOL_NAMES).toEqual(
       expect.arrayContaining([
         "bigquery",
         "search-analytics-query-catalog",
         "search-bigquery-schema",
         "list-data-dictionary",
+        "provider-api-request",
+        "provider-corpus-job",
+        "query-staged-dataset",
       ]),
     );
     expect(INITIAL_TOOL_NAMES).not.toEqual(
       expect.arrayContaining([
         "provider-api-catalog",
         "provider-api-docs",
-        "provider-api-request",
-        "provider-corpus-job",
-        "query-staged-dataset",
         "run-code",
         "get-code-execution",
         "account-deep-dive",
@@ -213,9 +491,51 @@ describe("Analytics agent Plan mode policy", () => {
     expect(INITIAL_TOOL_NAMES).toContain("query-agent-native-analytics");
   });
 
+  it("keeps the chat file delivery path on the initial tool surface", async () => {
+    expect(INITIAL_TOOL_NAMES).toContain("show-workspace-file");
+
+    const extraContext = agentChatPluginOptions[0]?.extraContext as
+      | (() => Promise<string>)
+      | undefined;
+    const context = await extraContext?.();
+    expect(context).toContain("EXPORT DELIVERY");
+    expect(context).toContain("call `show-workspace-file`");
+    expect(context).toContain("Never save an error or failed response");
+  });
+
+  it("keeps dashboard replication discovery bounded and reference-only", async () => {
+    expect(INITIAL_TOOL_NAMES).toContain("search-dashboard-references");
+    expect(DASHBOARD_REFERENCE_GUIDANCE).toContain(
+      "search-dashboard-references",
+    );
+    expect(DASHBOARD_REFERENCE_GUIDANCE).toContain(
+      "not as proof that its source is authoritative",
+    );
+    expect(DASHBOARD_REFERENCE_GUIDANCE).toContain("get-explorer-dashboard");
+    const context = await (
+      agentChatPluginOptions[0]?.extraContext as () => Promise<string>
+    )?.();
+    expect(context).toContain("DASHBOARD REFERENCE DISCOVERY");
+  });
+
+  it("keeps Brain handoff tools on the initial tool surface", async () => {
+    expect(INITIAL_TOOL_NAMES).toEqual(
+      expect.arrayContaining(["describe-workspace-apps", "call-agent"]),
+    );
+
+    const extraContext = agentChatPluginOptions[0]?.extraContext as
+      | (() => Promise<string>)
+      | undefined;
+    const context = await extraContext?.();
+    expect(context).toContain("Brain is the sibling app");
+    expect(context).toContain("Do not use `list-extensions` to find Brain");
+    expect(context).toContain("use `call-agent` with agent `brain`");
+  });
+
   it("keeps the complete dashboard build path on the initial tool surface", () => {
     expect(INITIAL_TOOL_NAMES).toEqual(
       expect.arrayContaining([
+        "get-explorer-dashboard",
         "update-dashboard",
         "mutate-dashboard",
         "compose-dashboard",
@@ -233,11 +553,23 @@ describe("Analytics agent Plan mode policy", () => {
     const context = await extraContext?.();
     expect(context).toContain("EXECUTION CONTINUITY");
     expect(context).toContain("Do not ask 'want me to proceed?'");
+    expect(context).toContain("APPROVED MUTATION CONTINUITY");
+    expect(context).toContain("saved: true");
+    expect(context).toContain("changed: true");
   });
 
   it("makes Custom Blocks a deliberate one-off exception to native dashboards", () => {
     expect(ANALYTICS_CUSTOM_BLOCK_GUIDANCE).toContain(
       "native dashboard panels and Data Programs first",
+    );
+    expect(ANALYTICS_CUSTOM_BLOCK_GUIDANCE).toContain(
+      "only actions that are HTTP-mounted",
+    );
+    expect(ANALYTICS_CUSTOM_BLOCK_GUIDANCE).toContain(
+      "never call `query-agent-native-analytics`",
+    );
+    expect(ANALYTICS_CUSTOM_BLOCK_GUIDANCE).toContain(
+      "canonical `bigquery` action",
     );
     expect(ANALYTICS_CUSTOM_BLOCK_GUIDANCE).toContain(
       "only when the user explicitly asks",
@@ -299,6 +631,44 @@ function guardContext(params: {
 }
 
 describe("realDataFinalGuard", () => {
+  it("accepts a grounded answer from a source action no name list ever enumerated", () => {
+    const result = realDataFinalGuard(
+      guardContext({
+        userText: "How many sessions did we record in the last 24 hours?",
+        draftText:
+          "We recorded 41,208 sessions in the last 24 hours, from Prometheus (24h range, 1m step).",
+        toolResults: [
+          {
+            name: "prometheus",
+            isError: false,
+            content:
+              '{"resultType":"matrix","data":{"result":[{"values":[]}]}}',
+          },
+        ],
+      }),
+    );
+
+    expect(result).toBeNull();
+  });
+
+  it("still rejects a metric answer whose only tool call was a metadata read", () => {
+    const result = realDataFinalGuard(
+      guardContext({
+        userText: "How many sessions did we record in the last 24 hours?",
+        draftText: "We recorded 41,208 sessions in the last 24 hours.",
+        toolResults: [
+          {
+            name: "list-data-dictionary",
+            isError: false,
+            content: '{"entries":[{"name":"p95_latency"}]}',
+          },
+        ],
+      }),
+    );
+
+    expect(result).not.toBeNull();
+  });
+
   it("retries a dashboard build that pauses after creating an extension shell", () => {
     const result = realDataFinalGuard(
       guardContext({
@@ -482,11 +852,6 @@ describe("realDataFinalGuard", () => {
   });
 
   it("does not demand a connect-sources link when data-source-status never ran", () => {
-    // A draft that ends in a question counts as a safe no-data response, and
-    // this turn only saved a panel. Nothing here shows a source is missing, so
-    // the guard must not instruct the model to say one is unavailable — the
-    // model recognizes that instruction as a prompt injection and refuses it
-    // out loud to the user.
     const result = realDataFinalGuard(
       guardContext({
         userText: "yes add conversion rate",
@@ -518,6 +883,26 @@ describe("realDataFinalGuard", () => {
     );
     expect((result as { retryMessage: string }).retryMessage).not.toContain(
       "which external source is missing",
+    );
+  });
+
+  it("retries a schema request through configured discovery instead of asking the user for table names", () => {
+    const result = realDataFinalGuard(
+      guardContext({
+        userText:
+          "Pull AI credit usage and branch creation data by user for each month",
+        draftText:
+          "Could you provide the BigQuery dataset name, table names, column names, or the exact SQL query?",
+      }),
+    );
+
+    expect(result).toMatchObject({
+      maxRetries: 2,
+      expandToolSurface: true,
+      retryMessage: expect.stringContaining("search-bigquery-schema"),
+    });
+    expect((result as { retryMessage: string }).retryMessage).toContain(
+      "Do not ask the user for warehouse schema identifiers",
     );
   });
 
@@ -732,9 +1117,6 @@ describe("realDataFinalGuard", () => {
   });
 
   it("does not demand a connect-sources link when the status result could not be read", () => {
-    // A failed workspace-connection lookup hides exactly the workspace-held
-    // connections it would take to prove a provider is missing, so the empty
-    // provider list is "we could not look", not "nothing is connected".
     const result = realDataFinalGuard(
       guardContext({
         userText: "what were our HubSpot deals last week",
@@ -938,6 +1320,267 @@ describe("realDataFinalGuard", () => {
     );
 
     expect(result).toBeNull();
+  });
+
+  it("lets a data question through when the draft makes no analytics claim and no tool ran", () => {
+    const result = realDataFinalGuard(
+      guardContext({
+        userText: "What was our signup conversion last week?",
+        draftText:
+          "I'd want to double check the exact denominator before stating a rate here.",
+      }),
+    );
+
+    expect(result).toBeNull();
+  });
+
+  it("still retries a data question with a numeric claim and no tool, carrying an unverified draft prefix", () => {
+    const result = realDataFinalGuard(
+      guardContext({
+        userText: "What was our signup conversion last week?",
+        draftText: "Signup conversion was 4.2% last week.",
+      }),
+    );
+
+    expect(result).toMatchObject({
+      maxRetries: 2,
+      expandToolSurface: true,
+      exhaustedDraftPrefix: expect.stringContaining("Unverified"),
+    });
+  });
+
+  it("drops an unscoped absence claim after corpus retries are exhausted", () => {
+    const result = realDataFinalGuard(
+      guardContext({
+        userText:
+          'Find any closed won deal in HubSpot where products = "fusion", then for all those deals look through all Gong call transcripts after close and let me know if you surface anything around Figma MCP.',
+        draftText: "I found zero mentions.",
+        toolResults: [{ name: "bigquery", isError: false, content: "[]" }],
+      }),
+    );
+
+    expect(result).toMatchObject({
+      maxRetries: 2,
+      expandToolSurface: true,
+      fallbackMessage: expect.stringContaining("exact inspected count"),
+    });
+    expect(result).not.toHaveProperty("exhaustedDraftPrefix");
+  });
+
+  it("treats a completed catalog/dashboard-reference search as discovery, not a dead end", () => {
+    const result = realDataFinalGuard(
+      guardContext({
+        userText: "What was our signup conversion last week?",
+        draftText: "Signup conversion was 4.2% last week.",
+        toolResults: [
+          {
+            name: "search-analytics-query-catalog",
+            isError: false,
+            content: '[{"id":"conversion-dashboard"}]',
+          },
+        ],
+      }),
+    );
+
+    expect(result).toMatchObject({
+      maxRetries: 2,
+      expandToolSurface: true,
+      retryMessage: expect.stringContaining(
+        "You already ran catalog/dashboard-reference discovery",
+      ),
+      exhaustedDraftPrefix: expect.stringContaining("Unverified"),
+    });
+    const { retryMessage, fallbackMessage, exhaustedDraftPrefix } = result as {
+      retryMessage: string;
+      fallbackMessage: string;
+      exhaustedDraftPrefix: string;
+    };
+    expect(retryMessage).not.toMatch(/no match|nothing (was )?found/i);
+    expect(fallbackMessage).not.toContain("[connect data sources](");
+    expect(fallbackMessage).not.toContain("Connect data sources");
+    expect(exhaustedDraftPrefix).not.toContain("connect the missing source");
+  });
+
+  it("does not send a completed create-extension turn into the template-clone retry", () => {
+    const result = realDataFinalGuard(
+      guardContext({
+        userText: "Create an extension showing weekly signups by plan.",
+        draftText:
+          "Done — I created the extension and embedded it as a panel on the Growth dashboard.",
+        toolResults: [
+          {
+            name: "create-extension",
+            isError: false,
+            content: '{"id":"ext-weekly-signups"}',
+          },
+        ],
+      }),
+    );
+
+    expect(result).toBeNull();
+  });
+
+  it("does not discard a completed extension-update summary as an ungrounded analytics answer", () => {
+    const result = realDataFinalGuard(
+      guardContext({
+        userText: "How many signups did we get this week?",
+        draftText:
+          "Done — I switched the extension display window from 7 days to 30 days.",
+        toolResults: [
+          {
+            name: "update-extension",
+            isError: false,
+            content: '{"id":"signups-panel"}',
+          },
+        ],
+      }),
+    );
+
+    expect(result).toBeNull();
+  });
+
+  it("still retries a mutation-turn draft that also states an invented metric", () => {
+    const result = realDataFinalGuard(
+      guardContext({
+        userText: "How many signups did we get this week?",
+        draftText:
+          "Done — I updated the extension; it now shows 1,204 signups this week.",
+        toolResults: [
+          {
+            name: "update-extension",
+            isError: false,
+            content: '{"id":"signups-panel"}',
+          },
+        ],
+      }),
+    );
+
+    expect(result).not.toBeNull();
+  });
+
+  const groundedPriorTurnMessages = (
+    followUp: string,
+  ): AgentLoopFinalResponseGuardContext["messages"] => [
+    {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: "What was our signup count last week from BigQuery?",
+        },
+      ],
+    },
+    {
+      role: "assistant",
+      content: [{ type: "tool-call", id: "tc1", name: "bigquery", input: {} }],
+    },
+    {
+      role: "user",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "tc1",
+          toolName: "bigquery",
+          toolInput: "{}",
+          content: '{"rows":[{"count":532}]}',
+        },
+      ],
+    },
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "text",
+          text: "Signup count last week was 532, from BigQuery.",
+        },
+      ],
+    },
+    {
+      role: "user",
+      content: [{ type: "text", text: followUp }],
+    },
+  ];
+
+  it("treats a follow-up that restates an earlier turn's grounded figures as evidence, not a new ungrounded claim", () => {
+    const followUp = "Was that 532 for the full week?";
+    const result = realDataFinalGuard({
+      messages: groundedPriorTurnMessages(followUp),
+      requestText: followUp,
+      assistantContent: [],
+      text: "Yes — the 532 signups cover the full week, from BigQuery.",
+      toolCalls: [],
+      toolResults: [],
+      retryCount: 0,
+      executionMode: "act",
+    });
+
+    expect(result).toBeNull();
+  });
+
+  it("does not let an earlier turn's query ground a new figure the draft invents this turn", () => {
+    const followUp = "How many signups was that the week before?";
+    const result = realDataFinalGuard({
+      messages: groundedPriorTurnMessages(followUp),
+      requestText: followUp,
+      assistantContent: [],
+      text: "The week before that, signups were 480.",
+      toolCalls: [],
+      toolResults: [],
+      retryCount: 0,
+      executionMode: "act",
+    });
+
+    expect(result?.retryMessage).toMatch(/no real source query ran/);
+    expect(result?.exhaustedDraftPrefix).toMatch(/^Unverified/);
+  });
+
+  it("does not let a figure from three turns back ground a current answer", () => {
+    const followUp = "So signups were 532 last week, right?";
+    const result = realDataFinalGuard({
+      messages: [
+        ...groundedPriorTurnMessages("Thanks!"),
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "You're welcome." }],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Which dashboard should I use for this?" },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Try the Growth dashboard." }],
+        },
+        { role: "user", content: [{ type: "text", text: followUp }] },
+      ],
+      requestText: followUp,
+      assistantContent: [],
+      text: "Yes — signups were 532 last week.",
+      toolCalls: [],
+      toolResults: [],
+      retryCount: 0,
+      executionMode: "act",
+    });
+
+    expect(result?.retryMessage).toMatch(/no real source query ran/);
+  });
+
+  it("does not let an earlier turn's figure be re-attributed to a metric that turn never queried", () => {
+    const followUp = "And how many paying customers this month?";
+    const result = realDataFinalGuard({
+      messages: groundedPriorTurnMessages(followUp),
+      requestText: followUp,
+      assistantContent: [],
+      text: "Paying customers were 532 this month.",
+      toolCalls: [],
+      toolResults: [],
+      retryCount: 0,
+      executionMode: "act",
+    });
+
+    expect(result?.retryMessage).toMatch(/no real source query ran/);
   });
 
   it("does not let the guard's own non-analytics retry turn re-trigger the analytics retry path", () => {

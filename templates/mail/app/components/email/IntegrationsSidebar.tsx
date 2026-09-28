@@ -52,8 +52,6 @@ function safeExternalHref(value?: string | null): string | null {
   }
 }
 
-// ─── Integration definitions ────────────────────────────────────────────────
-
 type ProviderId = "apollo" | "hubspot" | "gong" | "pylon";
 
 interface IntegrationDef {
@@ -181,21 +179,22 @@ const INTEGRATIONS: IntegrationDef[] = [
   },
 ];
 
-// ─── Main Sidebar Component ─────────────────────────────────────────────────
-
 export function IntegrationsSidebar({
   email,
   displayName,
   recentEmails,
+  recentEmailsError,
   threadId,
   focusedEmailId,
 }: {
   email: string;
   displayName: string;
   recentEmails: { id: string; subject: string }[];
+  recentEmailsError?: boolean;
   threadId?: string;
   focusedEmailId?: string;
 }) {
+  const t = useT();
   const statuses = useAllIntegrations();
   const anyConnected =
     statuses.apollo || statuses.hubspot || statuses.gong || statuses.pylon;
@@ -226,7 +225,16 @@ export function IntegrationsSidebar({
       )}
 
       {/* Recent emails */}
-      {recentEmails.length > 0 && (
+      {recentEmailsError ? (
+        <div
+          className="mx-4 border-t border-border/30 px-0 py-3"
+          aria-live="polite"
+        >
+          <p className="text-[11px] text-muted-foreground/70">
+            {t("mail.error.loadTitle")}
+          </p>
+        </div>
+      ) : recentEmails.length > 0 ? (
         <>
           <div className="h-px bg-border/30 mx-4" />
           <div className="px-4 py-3">
@@ -245,7 +253,7 @@ export function IntegrationsSidebar({
             ))}
           </div>
         </>
-      )}
+      ) : null}
 
       {/* Tool extension-point slot — user-installed widgets render here */}
       <ExtensionSlot
@@ -265,8 +273,6 @@ export function IntegrationsSidebar({
     </div>
   );
 }
-
-// ─── Integration Setup ──────────────────────────────────────────────────────
 
 function IntegrationSetup({ statuses }: { statuses: MailIntegrationStatuses }) {
   const [expanded, setExpanded] = useState(false);
@@ -595,8 +601,6 @@ function IntegrationKeyEntry({
   );
 }
 
-// ─── Integration Notice (error / no-data) ──────────────────────────────────
-
 function IntegrationNotice({
   email,
   error,
@@ -698,8 +702,6 @@ function IntegrationNotice({
   );
 }
 
-// ─── Apollo Section ─────────────────────────────────────────────────────────
-
 function ApolloSection({ email }: { email: string }) {
   const t = useT();
   const { data: person, isLoading, error } = useApolloPerson(email);
@@ -711,7 +713,6 @@ function ApolloSection({ email }: { email: string }) {
     );
   }
   if (!person) {
-    // No enrichment data — show basic info (email + domain)
     return (
       <div className="px-4 pt-4 pb-3">
         <h3 className="text-[14px] font-semibold text-foreground truncate">
@@ -920,8 +921,6 @@ function ApolloSection({ email }: { email: string }) {
   );
 }
 
-// ─── HubSpot Section ────────────────────────────────────────────────────────
-
 function HubSpotSection({ email }: { email: string }) {
   const t = useT();
   const {
@@ -1018,8 +1017,6 @@ function HubSpotSection({ email }: { email: string }) {
   );
 }
 
-// ─── Gong Section ───────────────────────────────────────────────────────────
-
 function GongSection({ email }: { email: string }) {
   const t = useT();
   const {
@@ -1075,8 +1072,6 @@ function GongSection({ email }: { email: string }) {
     </>
   );
 }
-
-// ─── Pylon Section ──────────────────────────────────────────────────────────
 
 function PylonSection({ email }: { email: string }) {
   const { data, isLoading, error } = usePylonContact(email) as {
@@ -1158,8 +1153,6 @@ function PylonSection({ email }: { email: string }) {
     </>
   );
 }
-
-// ─── Shared ─────────────────────────────────────────────────────────────────
 
 function SectionHeader({
   logo,

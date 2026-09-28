@@ -6,16 +6,23 @@ import {
   getCookie,
   getMethod,
   getQuery,
+  getRequestHeader,
   setCookie,
   setResponseStatus,
   type H3Event,
 } from "h3";
 
+import { getAppConfig } from "../app-config/index.js";
 import {
   getWorkspaceConnectionProvider,
   type WorkspaceConnectionProvider,
 } from "../connections/catalog.js";
-import { saveOAuthTokens, setOAuthDisplayName } from "../oauth-tokens/store.js";
+import {
+  OAuthAccountOwnedByOtherUserError,
+  saveOAuthTokens,
+  setOAuthDisplayName,
+} from "../oauth-tokens/store.js";
+import { getRegisteredAppRoles, resolveAppRole } from "../org/app-roles.js";
 import { getOrgContext } from "../org/context.js";
 import { decryptSecretValue, encryptSecretValue } from "../secrets/crypto.js";
 import {
@@ -23,12 +30,19 @@ import {
   upsertWorkspaceConnection,
   upsertWorkspaceConnectionGrant,
 } from "../workspace-connections/store.js";
-import { getSession, safeReturnPath } from "./auth.js";
+import {
+  getSession,
+  redirectWithStagedCookies,
+  safeReturnPath,
+} from "./auth.js";
 import { resolveSecret } from "./credential-provider.js";
+import { canonicalFrameworkPathname } from "./framework-route-prefix.js";
 import {
   decodeOAuthState,
   encodeOAuthState,
   getAppUrl,
+  logOAuthStateDecodeFailure,
+  oauthErrorPage,
   resolveOAuthRedirectUri,
   type OAuthStatePayload,
 } from "./google-oauth.js";
@@ -36,7 +50,12 @@ import { runWithRequestContext } from "./request-context.js";
 
 export type GenericWorkspaceOAuthProvider =
   | "figma"
+  | "gmail"
+  | "google_calendar"
+  | "google_docs"
   | "google_drive"
+  | "google_sheets"
+  | "google_slides"
   | "github"
   | "hubspot"
   | "salesforce"
@@ -46,7 +65,12 @@ export type GenericWorkspaceOAuthProvider =
 
 const SUPPORTED_PROVIDERS = new Set<GenericWorkspaceOAuthProvider>([
   "figma",
+  "gmail",
+  "google_calendar",
+  "google_docs",
   "google_drive",
+  "google_sheets",
+  "google_slides",
   "github",
   "hubspot",
   "salesforce",
@@ -59,6 +83,43 @@ const PROVIDER_REQUEST_TIMEOUT_MS = 10_000;
 const PROVIDER_RESPONSE_MAX_BYTES = 256 * 1024;
 const SALESFORCE_PRODUCTION_LOGIN_URL = "https://login.salesforce.com";
 const SALESFORCE_SANDBOX_LOGIN_URL = "https://test.salesforce.com";
+const WORKSPACE_OAUTH_ADMIN_ERROR =
+  "This shared connection requires organization or app-admin access. Personal connections can be connected by any workspace member.";
+const OAUTH_ACCOUNT_OWNERSHIP_ERROR =
+  "This account is already linked to another user. Choose a different account to connect.";
+
+export type WorkspaceProviderOAuthScope = "user" | "organization" | "app";
+
+export function isWorkspaceProviderOAuthScope(
+  value: unknown,
+): value is WorkspaceProviderOAuthScope {
+  return value === "user" || value === "organization" || value === "app";
+}
+
+export function isGoogleWorkspaceOAuthProvider(provider: string): boolean {
+  return (
+    provider === "gmail" ||
+    provider === "google_calendar" ||
+    provider === "google_docs" ||
+    provider === "google_drive" ||
+    provider === "google_sheets" ||
+    provider === "google_slides"
+  );
+}
+
+export function shouldUseRootGoogleOAuthCallback(
+  provider: GenericWorkspaceOAuthProvider,
+): boolean {
+  return isGoogleWorkspaceOAuthProvider(provider);
+}
+
+export async function hasWorkspaceProviderOAuthCredentials(
+  provider: GenericWorkspaceOAuthProvider,
+): Promise<boolean> {
+  const [clientId, clientSecret] =
+    await resolveProviderClientCredentials(provider);
+  return Boolean(clientId && clientSecret);
+}
 
 export interface WorkspaceProviderOAuthFlow {
   provider: GenericWorkspaceOAuthProvider;
@@ -68,8 +129,36 @@ export interface WorkspaceProviderOAuthFlow {
   owner: string;
   orgId?: string;
   appId: string;
+  scope: WorkspaceProviderOAuthScope;
   salesforceLoginUrl?: string;
   expiresAt: number;
+}
+
+function isWorkspaceProviderOAuthFlow(
+  value: unknown,
+): value is WorkspaceProviderOAuthFlow {
+  const flow = record(value);
+  return Boolean(
+    flow &&
+    typeof flow.provider === "string" &&
+    SUPPORTED_PROVIDERS.has(flow.provider as GenericWorkspaceOAuthProvider) &&
+    typeof flow.flowId === "string" &&
+    flow.flowId.length > 0 &&
+    typeof flow.verifier === "string" &&
+    flow.verifier.length > 0 &&
+    typeof flow.redirectUri === "string" &&
+    flow.redirectUri.length > 0 &&
+    typeof flow.owner === "string" &&
+    flow.owner.length > 0 &&
+    (flow.orgId === undefined || typeof flow.orgId === "string") &&
+    typeof flow.appId === "string" &&
+    flow.appId.length > 0 &&
+    isWorkspaceProviderOAuthScope(flow.scope) &&
+    (flow.salesforceLoginUrl === undefined ||
+      typeof flow.salesforceLoginUrl === "string") &&
+    typeof flow.expiresAt === "number" &&
+    Number.isFinite(flow.expiresAt),
+  );
 }
 
 export function workspaceProviderOAuthPath(
@@ -93,6 +182,29 @@ export function createWorkspaceProviderOAuthHandler(
   );
 }
 
+export function oauthFlowFailure(
+  event: H3Event,
+  status: number,
+  message: string,
+): Response | { error: string } {
+  setResponseStatus(event, status);
+  const accept = getRequestHeader(event, "accept") ?? "";
+  if (!accept.includes("text/html")) return { error: message };
+  return oauthErrorPage(message, status);
+}
+
+function oauthAccountOwnershipFailure(
+  event: H3Event,
+  error: unknown,
+): Response | { error: string } | null {
+  if (!(error instanceof OAuthAccountOwnedByOtherUserError)) return null;
+  return oauthFlowFailure(
+    event,
+    error.statusCode,
+    OAUTH_ACCOUNT_OWNERSHIP_ERROR,
+  );
+}
+
 export async function handleWorkspaceProviderOAuthStart(
   event: H3Event,
   providerId: GenericWorkspaceOAuthProvider,
@@ -100,44 +212,72 @@ export async function handleWorkspaceProviderOAuthStart(
   if (getMethod(event) !== "GET") return methodNotAllowed(event);
   const session = await getSession(event).catch(() => null);
   if (!session?.email) return unauthorized(event);
-  const orgContext = await requireWorkspaceProviderOAuthAdmin(event);
+  const query = getQuery(event);
+  const appId = normalizeAppId(
+    text(query.appId) ?? getAppConfig().app.workspaceId ?? "creative-context",
+  );
+  const requestedScope = parseWorkspaceProviderOAuthScope(text(query.scope));
+  if (!requestedScope) {
+    return oauthFlowFailure(
+      event,
+      400,
+      "OAuth connection scope must be user, organization, or app.",
+    );
+  }
+  const orgContext = await requireWorkspaceProviderOAuthAccess(
+    event,
+    appId,
+    requestedScope,
+  );
   if (!orgContext) {
-    return {
-      error:
-        "Only organization owners and admins can connect shared OAuth accounts.",
-    };
+    return oauthFlowFailure(event, 403, WORKSPACE_OAUTH_ADMIN_ERROR);
   }
   const orgId = orgContext.orgId;
   if (!orgId) {
-    setResponseStatus(event, 403);
-    return {
-      error:
-        "Only organization owners and admins can connect shared OAuth accounts.",
-    };
+    return oauthFlowFailure(event, 403, WORKSPACE_OAUTH_ADMIN_ERROR);
   }
   const provider = requiredProvider(providerId);
-  const query = getQuery(event);
   const salesforceLoginUrl =
     providerId === "salesforce"
       ? resolveSalesforceOAuthLoginUrl(text(query.environment))
       : undefined;
   if (providerId === "salesforce" && !salesforceLoginUrl) {
-    setResponseStatus(event, 400);
-    return { error: "Salesforce environment must be production or sandbox." };
+    return oauthFlowFailure(
+      event,
+      400,
+      "Salesforce environment must be production or sandbox.",
+    );
   }
-  const appId = normalizeAppId(
-    text(query.appId) ??
-      process.env.AGENT_NATIVE_WORKSPACE_APP_ID ??
-      process.env.VITE_AGENT_NATIVE_WORKSPACE_APP_ID ??
-      "creative-context",
-  );
+  const useRootGoogleCallback = shouldUseRootGoogleOAuthCallback(providerId);
   const redirectUri = resolveOAuthRedirectUri(
     event,
-    workspaceProviderOAuthPath(providerId, "callback"),
+    useRootGoogleCallback
+      ? "/_agent-native/google/callback"
+      : workspaceProviderOAuthPath(providerId, "callback"),
+    { allowRootCallback: useRootGoogleCallback },
   );
   if (!redirectUri) {
-    setResponseStatus(event, 400);
-    return { error: "Invalid OAuth redirect URI." };
+    return oauthFlowFailure(event, 400, "Invalid OAuth redirect URI.");
+  }
+  if (useRootGoogleCallback) {
+    let parsedRedirectUri: URL;
+    try {
+      parsedRedirectUri = new URL(redirectUri);
+    } catch {
+      return oauthFlowFailure(event, 400, "Invalid OAuth redirect URI.");
+    }
+    if (
+      canonicalFrameworkPathname(parsedRedirectUri.pathname) !==
+        "/_agent-native/google/callback" ||
+      parsedRedirectUri.search ||
+      parsedRedirectUri.hash
+    ) {
+      return oauthFlowFailure(
+        event,
+        400,
+        "Google workspace OAuth must use the shared callback.",
+      );
+    }
   }
   return runWithRequestContext(
     { userEmail: session.email, orgId },
@@ -145,10 +285,11 @@ export async function handleWorkspaceProviderOAuthStart(
       const [clientId, clientSecret] =
         await resolveProviderClientCredentials(providerId);
       if (!clientId || !clientSecret) {
-        setResponseStatus(event, 503);
-        return {
-          error: `${provider.label} OAuth client credentials are not configured.`,
-        };
+        return oauthFlowFailure(
+          event,
+          503,
+          `${provider.label} OAuth client credentials are not configured.`,
+        );
       }
       const verifier = crypto.randomBytes(48).toString("base64url");
       const challenge = crypto
@@ -165,6 +306,8 @@ export async function handleWorkspaceProviderOAuthStart(
         owner: session.email,
         orgId,
         app: appId,
+        scope: orgContext.oauthScope,
+        ...(useRootGoogleCallback ? { provider: providerId } : {}),
         returnUrl,
         flowId,
       });
@@ -176,6 +319,7 @@ export async function handleWorkspaceProviderOAuthStart(
         owner: session.email,
         orgId,
         appId,
+        scope: orgContext.oauthScope,
         ...(salesforceLoginUrl ? { salesforceLoginUrl } : {}),
         expiresAt: Date.now() + FLOW_TTL_SECONDS * 1_000,
       };
@@ -197,6 +341,8 @@ export async function handleWorkspaceProviderOAuthStart(
         redirectUri,
         state,
         challenge,
+        loginHint: session.email,
+        includeGrantedScopes: providerId !== "google_calendar",
         ...(salesforceLoginUrl
           ? {
               authorizationUrl: salesforceOAuthEndpoint(
@@ -206,7 +352,7 @@ export async function handleWorkspaceProviderOAuthStart(
             }
           : {}),
       });
-      return Response.redirect(authorizationUrl, 302);
+      return redirectWithStagedCookies(event, authorizationUrl);
     },
   );
 }
@@ -218,48 +364,68 @@ export async function handleWorkspaceProviderOAuthCallback(
   if (getMethod(event) !== "GET") return methodNotAllowed(event);
   const session = await getSession(event).catch(() => null);
   if (!session?.email) return unauthorized(event);
-  const orgContext = await requireWorkspaceProviderOAuthAdmin(event);
+  const storedFlow = readStoredFlow(event, providerId);
+  if (!storedFlow.flow) {
+    return oauthFlowFailure(
+      event,
+      400,
+      `OAuth flow cookie ${storedFlow.reason}.`,
+    );
+  }
+  const flow = storedFlow.flow;
+  const orgContext = await requireWorkspaceProviderOAuthAccess(
+    event,
+    flow.appId,
+    flow.scope,
+  );
   if (!orgContext) {
-    return {
-      error:
-        "Only organization owners and admins can connect shared OAuth accounts.",
-    };
+    return oauthFlowFailure(event, 403, WORKSPACE_OAUTH_ADMIN_ERROR);
   }
   const orgId = orgContext.orgId;
   if (!orgId) {
-    setResponseStatus(event, 403);
-    return {
-      error:
-        "Only organization owners and admins can connect shared OAuth accounts.",
-    };
+    return oauthFlowFailure(event, 403, WORKSPACE_OAUTH_ADMIN_ERROR);
   }
   const query = getQuery(event);
   const code = text(query.code);
   const stateParam = text(query.state);
   const providerError = text(query.error);
   if (providerError) {
-    setResponseStatus(event, 400);
-    return { error: "OAuth authorization was not completed." };
+    return oauthFlowFailure(
+      event,
+      400,
+      "OAuth authorization was not completed.",
+    );
   }
   if (!code || !stateParam) {
-    setResponseStatus(event, 400);
-    return { error: "OAuth callback is missing code or state." };
+    return oauthFlowFailure(
+      event,
+      400,
+      "OAuth callback is missing code or state.",
+    );
   }
-  const flow = readStoredFlow(event, providerId);
   deleteCookie(event, flowCookieName(providerId), { path: "/" });
   const state = decodeOAuthState(stateParam, "");
-  if (
-    !flow ||
-    !isWorkspaceProviderOAuthFlowValid({
-      flow,
-      state,
-      provider: providerId,
-      sessionEmail: session.email,
-      sessionOrgId: orgId,
-    })
-  ) {
-    setResponseStatus(event, 400);
-    return { error: "OAuth state is invalid or expired." };
+  if (!state.ok) {
+    logOAuthStateDecodeFailure(event, state.reason, providerId);
+    return oauthFlowFailure(
+      event,
+      400,
+      "OAuth state rejected: state is missing, malformed, or has an invalid signature. Start the connection again.",
+    );
+  }
+  const stateError = workspaceProviderOAuthFlowInvalidReason({
+    flow,
+    state,
+    provider: providerId,
+    sessionEmail: session.email,
+    sessionOrgId: orgId,
+  });
+  if (stateError) {
+    return oauthFlowFailure(
+      event,
+      400,
+      `OAuth state rejected: ${stateError}. Start the connection again.`,
+    );
   }
   const provider = requiredProvider(providerId);
   return runWithRequestContext(
@@ -268,10 +434,11 @@ export async function handleWorkspaceProviderOAuthCallback(
       const [clientId, clientSecret] =
         await resolveProviderClientCredentials(providerId);
       if (!clientId || !clientSecret) {
-        setResponseStatus(event, 503);
-        return {
-          error: `${provider.label} OAuth client credentials are not configured.`,
-        };
+        return oauthFlowFailure(
+          event,
+          503,
+          `${provider.label} OAuth client credentials are not configured.`,
+        );
       }
       const tokens = await exchangeWorkspaceProviderOAuthCode({
         providerId,
@@ -309,19 +476,38 @@ export async function handleWorkspaceProviderOAuthCallback(
           session.email,
           identity.accountId,
         );
-        await saveOAuthTokens(
-          provider.oauth!.provider,
-          accountId,
-          tokens,
-          session.email,
-        );
+        try {
+          await saveOAuthTokens(
+            provider.oauth!.provider,
+            accountId,
+            tokens,
+            session.email,
+          );
+        } catch (error) {
+          const response = oauthAccountOwnershipFailure(event, error);
+          if (response) return response;
+          throw error;
+        }
         await setOAuthDisplayName(
           provider.oauth!.provider,
           accountId,
           identity.label,
         );
         const existing = existingConnections.find(
-          (connection) => connection.accountId === accountId,
+          (connection) =>
+            connection.accountId === accountId &&
+            (flow.scope === "user"
+              ? connection.allowedUsers.some(
+                  (allowedUser) =>
+                    allowedUser.toLowerCase() === session.email.toLowerCase(),
+                )
+              : flow.scope === "organization"
+                ? connection.allowedUsers.length === 0 &&
+                  (connection.allowedUserGroups?.length ?? 0) === 0
+                : connection.allowedApps.some(
+                    (allowedApp) =>
+                      allowedApp.toLowerCase() === flow.appId.toLowerCase(),
+                  )),
         );
         const scopes = mergeWorkspaceOAuthValues(
           existing?.scopes ?? [],
@@ -350,7 +536,12 @@ export async function handleWorkspaceProviderOAuthCallback(
           accountLabel: identity.label,
           status: "connected",
           scopes,
-          allowedApps: existing?.allowedApps ?? [],
+          allowedApps:
+            existing?.allowedApps ?? (flow.scope === "app" ? [flow.appId] : []),
+          allowedUsers:
+            flow.scope === "user"
+              ? [session.email]
+              : (existing?.allowedUsers ?? []),
           config: connectionConfig,
           lastCheckedAt: new Date(),
           lastError: null,
@@ -366,7 +557,7 @@ export async function handleWorkspaceProviderOAuthCallback(
       const returnPath =
         state.returnUrl ??
         `/settings/integrations?connected=${encodeURIComponent(providerId)}`;
-      return Response.redirect(getAppUrl(event, returnPath), 302);
+      return redirectWithStagedCookies(event, getAppUrl(event, returnPath));
     },
   );
 }
@@ -378,6 +569,8 @@ export function buildWorkspaceProviderAuthorizationUrl(input: {
   state: string;
   challenge: string;
   authorizationUrl?: string;
+  loginHint?: string;
+  includeGrantedScopes?: boolean;
 }): string {
   if (!input.provider.oauth)
     throw new Error("Provider does not support OAuth.");
@@ -399,10 +592,14 @@ export function buildWorkspaceProviderAuthorizationUrl(input: {
     url.searchParams.set("audience", "api.atlassian.com");
     url.searchParams.set("prompt", "consent");
   }
-  if (input.provider.id === "google_drive") {
+  if (isGoogleWorkspaceOAuthProvider(input.provider.id)) {
     url.searchParams.set("access_type", "offline");
-    url.searchParams.set("include_granted_scopes", "true");
-    url.searchParams.set("prompt", "consent");
+    url.searchParams.set(
+      "include_granted_scopes",
+      String(input.includeGrantedScopes ?? true),
+    );
+    url.searchParams.set("prompt", "consent select_account");
+    if (input.loginHint) url.searchParams.set("login_hint", input.loginHint);
   }
   if (input.provider.oauth.scopes.length) {
     url.searchParams.set("scope", input.provider.oauth.scopes.join(" "));
@@ -557,7 +754,7 @@ export async function exchangeWorkspaceProviderOAuthCode(input: {
     ...(input.providerId === "sentry"
       ? { client_id: input.clientId, client_secret: input.clientSecret }
       : {}),
-    ...(input.providerId === "google_drive"
+    ...(isGoogleWorkspaceOAuthProvider(input.providerId)
       ? { client_id: input.clientId, client_secret: input.clientSecret }
       : {}),
   };
@@ -794,26 +991,22 @@ async function resolveWorkspaceProviderIdentitySingle(
       label: text(user?.email) ?? text(user?.name) ?? "Sentry account",
     };
   }
-  if (providerId === "google_drive") {
+  if (isGoogleWorkspaceOAuthProvider(providerId)) {
     const accessToken = text(tokens.access_token)!;
     const { response, body } = await fetchBoundedProviderJson(
-      "https://www.googleapis.com/drive/v3/about?fields=user(displayName,emailAddress,permissionId)",
+      "https://openidconnect.googleapis.com/v1/userinfo",
       { headers: { Authorization: `Bearer ${accessToken}` } },
-      "Google Drive",
+      "Google Workspace",
     );
-    const user = record(body.user);
-    const accountId = text(user?.permissionId) ?? text(user?.emailAddress);
+    const accountId = text(body.email) ?? text(body.sub);
     if (!response.ok || !accountId) {
       throw new Error(
-        "Google Drive OAuth response did not identify the connected account.",
+        "Google OAuth response did not identify the connected account.",
       );
     }
     return {
       accountId,
-      label:
-        text(user?.emailAddress) ??
-        text(user?.displayName) ??
-        "Google Drive account",
+      label: text(body.email) ?? text(body.name) ?? "Google account",
     };
   }
   const accessToken = text(tokens.access_token)!;
@@ -846,16 +1039,69 @@ function requiredProvider(
 function readStoredFlow(
   event: H3Event,
   provider: GenericWorkspaceOAuthProvider,
-): WorkspaceProviderOAuthFlow | null {
+): { flow: WorkspaceProviderOAuthFlow | null; reason: string } {
   const encrypted = getCookie(event, flowCookieName(provider));
-  if (!encrypted) return null;
+  if (!encrypted) return { flow: null, reason: "is missing" };
+  let decrypted: string;
   try {
-    return JSON.parse(
-      decryptSecretValue(encrypted),
-    ) as WorkspaceProviderOAuthFlow;
+    decrypted = decryptSecretValue(encrypted);
   } catch {
-    return null;
+    return { flow: null, reason: "could not be decrypted" };
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(decrypted);
+  } catch {
+    return { flow: null, reason: "is malformed" };
+  }
+  const parsedRecord = record(parsed);
+  if (parsedRecord && !isWorkspaceProviderOAuthScope(parsedRecord.scope)) {
+    return { flow: null, reason: "has an invalid scope" };
+  }
+  return isWorkspaceProviderOAuthFlow(parsed)
+    ? { flow: parsed, reason: "is valid" }
+    : { flow: null, reason: "is malformed" };
+}
+
+export function workspaceProviderOAuthFlowInvalidReason(input: {
+  flow: WorkspaceProviderOAuthFlow;
+  state: OAuthStatePayload;
+  provider: GenericWorkspaceOAuthProvider;
+  sessionEmail: string;
+  sessionOrgId?: string;
+  now?: number;
+}): string | undefined {
+  if (!Number.isFinite(input.flow.expiresAt)) {
+    return "flow expiry is invalid";
+  }
+  if (input.flow.expiresAt < (input.now ?? Date.now())) return "flow expired";
+  if (input.flow.provider !== input.provider) return "provider mismatch";
+  if (!input.state.flowId) {
+    return "state is missing, malformed, or has an invalid signature";
+  }
+  if (input.state.flowId !== input.flow.flowId) {
+    return "state does not match the OAuth flow";
+  }
+  if (input.state.redirectUri !== input.flow.redirectUri) {
+    return "redirect URI mismatch";
+  }
+  if (input.state.owner !== input.flow.owner) return "state owner mismatch";
+  if (input.state.scope !== input.flow.scope) return "state scope mismatch";
+  if (
+    input.state.provider !== undefined &&
+    input.state.provider !== input.provider
+  ) {
+    return "state provider mismatch";
+  }
+  if (input.sessionEmail !== input.flow.owner) return "session owner mismatch";
+  if (input.state.orgId !== input.flow.orgId) {
+    return "state organization mismatch";
+  }
+  if (input.sessionOrgId !== input.flow.orgId) {
+    return "session organization mismatch";
+  }
+  if (input.state.app !== input.flow.appId) return "state app mismatch";
+  return undefined;
 }
 
 export function isWorkspaceProviderOAuthFlowValid(input: {
@@ -866,17 +1112,7 @@ export function isWorkspaceProviderOAuthFlowValid(input: {
   sessionOrgId?: string;
   now?: number;
 }): boolean {
-  return (
-    input.flow.expiresAt >= (input.now ?? Date.now()) &&
-    input.flow.provider === input.provider &&
-    input.state.flowId === input.flow.flowId &&
-    input.state.redirectUri === input.flow.redirectUri &&
-    input.state.owner === input.flow.owner &&
-    input.sessionEmail === input.flow.owner &&
-    input.state.orgId === input.flow.orgId &&
-    input.sessionOrgId === input.flow.orgId &&
-    input.state.app === input.flow.appId
-  );
+  return workspaceProviderOAuthFlowInvalidReason(input) === undefined;
 }
 
 export function canConnectWorkspaceProviderOAuth(
@@ -989,8 +1225,9 @@ function clientCredentialKeys(
   provider: GenericWorkspaceOAuthProvider,
   field: "id" | "secret",
 ): string[] {
-  const prefix =
-    provider === "google_drive" ? "GOOGLE" : provider.toUpperCase();
+  const prefix = isGoogleWorkspaceOAuthProvider(provider)
+    ? "GOOGLE"
+    : provider.toUpperCase();
   const suffix = field === "id" ? "ID" : "SECRET";
   if (provider === "github") {
     const integrationPrefix = `GITHUB_INTEGRATION_CLIENT_${suffix}`;
@@ -1113,6 +1350,13 @@ function text(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+function parseWorkspaceProviderOAuthScope(
+  value: string | undefined,
+): WorkspaceProviderOAuthScope | null {
+  if (value === undefined) return "organization";
+  return isWorkspaceProviderOAuthScope(value) ? value : null;
+}
+
 function scalarText(value: unknown): string | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return String(value);
   return text(value);
@@ -1125,23 +1369,55 @@ function record(value: unknown): Record<string, unknown> | null {
 }
 
 function methodNotAllowed(event: H3Event) {
-  setResponseStatus(event, 405);
-  return { error: "Method not allowed" };
+  return oauthFlowFailure(event, 405, "Method not allowed");
 }
 
 function unauthorized(event: H3Event) {
-  setResponseStatus(event, 401);
-  return { error: "Authentication required" };
+  return oauthFlowFailure(event, 401, "Authentication required");
 }
 
-async function requireWorkspaceProviderOAuthAdmin(event: H3Event) {
+async function requireWorkspaceProviderOAuthAccess(
+  event: H3Event,
+  appId?: string,
+  requestedScope: WorkspaceProviderOAuthScope = "organization",
+): Promise<
+  | (Awaited<ReturnType<typeof getOrgContext>> & {
+      oauthScope: WorkspaceProviderOAuthScope;
+    })
+  | null
+> {
   const context = await getOrgContext(event).catch(() => null);
-  if (
-    !context ||
-    !canConnectWorkspaceProviderOAuth(context.orgId, context.role)
-  ) {
+  if (!context || !context.orgId) {
     setResponseStatus(event, 403);
     return null;
   }
-  return context;
+  if (requestedScope === "user") {
+    return { ...context, oauthScope: "user" };
+  }
+  if (
+    requestedScope === "organization" &&
+    canConnectWorkspaceProviderOAuth(context.orgId, context.role)
+  ) {
+    return { ...context, oauthScope: "organization" };
+  }
+  if (
+    requestedScope === "app" &&
+    canConnectWorkspaceProviderOAuth(context.orgId, context.role)
+  ) {
+    return { ...context, oauthScope: "app" };
+  }
+  if (appId) {
+    const descriptor = getRegisteredAppRoles(appId);
+    if (descriptor?.roles.some((role) => role === "admin")) {
+      const role = await resolveAppRole(descriptor, {
+        userEmail: context.email,
+        orgId: context.orgId,
+      });
+      if (role.status === "assigned" && role.roles.includes("admin")) {
+        return { ...context, oauthScope: "app" };
+      }
+    }
+  }
+  setResponseStatus(event, 403);
+  return null;
 }

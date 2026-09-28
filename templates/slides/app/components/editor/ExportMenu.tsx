@@ -1,8 +1,6 @@
-import {
-  agentNativePath,
-  appBasePath,
-} from "@agent-native/core/client/api-path";
+import { appBasePath } from "@agent-native/core/client/api-path";
 import { useT } from "@agent-native/core/client/i18n";
+import { startWorkspaceProviderOAuth } from "@agent-native/core/client/integrations";
 import {
   IconDownload,
   IconUpload,
@@ -11,10 +9,19 @@ import {
   IconCopy,
   IconShare2,
   IconBrandGoogle,
-  IconPlugConnected,
 } from "@tabler/icons-react";
-import { toast } from "sonner";
+import { useQueryClient } from "@tanstack/react-query";
+import { forwardRef, useImperativeHandle, useRef, useState } from "react";
 
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -22,251 +29,535 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Spinner } from "@/components/ui/spinner";
+import { useDecks } from "@/context/DeckContext";
 import type { GoogleSlidesExportResult } from "@/lib/export-google-slides-client";
+import {
+  fetchGoogleSlidesExportAvailability,
+  invalidateGoogleSlidesExportAvailability,
+  useGoogleSlidesExportAvailability,
+} from "@/lib/google-slides-export-availability-client";
 
-/** Google Slides' File → Import dialog, primed to ask for a file. */
 const GOOGLE_SLIDES_IMPORT_URL =
   "https://docs.google.com/presentation/u/0/?usp=import";
 
+const IMPORTED_SLIDE_MARKER = 'data-imported-pptx="true"';
+
+const BROWSER_AUTHORED_OBJECT =
+  "[data-slide-object-id]:not([data-pptx-element-kind]), .fmd-freeform-object";
+
+export function canExportPptxFromServer(
+  deck:
+    | { sourceImport?: unknown; slides: { content?: string }[] }
+    | null
+    | undefined,
+): boolean {
+  if (!deck || deck.slides.length === 0) return false;
+  return deck.slides.every((slide) => {
+    const html = slide.content ?? "";
+    if (!html.includes(IMPORTED_SLIDE_MARKER)) return false;
+    return !new DOMParser()
+      .parseFromString(html, "text/html")
+      .querySelector(BROWSER_AUTHORED_OBJECT);
+  });
+}
+
 interface ExportMenuProps {
+  hasSlides: boolean;
   deckId: string;
   deckTitle: string;
   onDuplicate: () => void;
-  onExportPdf: () => void;
+  onExportPdf: () => Promise<void> | void;
   onExportPptx: () => Promise<void> | void;
   onExportGoogleSlides?: () => Promise<GoogleSlidesExportResult>;
   onShareLink?: () => void;
   onShareTeam?: () => void;
+  inline?: boolean;
+  hideExportDialog?: boolean;
+  onExportStatusChange?: (status: ExportStatus) => void;
 }
 
-export function ExportMenu({
-  deckId,
-  deckTitle,
-  onDuplicate,
-  onExportPdf,
-  onExportPptx,
-  onExportGoogleSlides,
-  onShareLink,
-  onShareTeam,
-}: ExportMenuProps) {
+export interface ExportMenuHandle {
+  exportGoogleSlides: () => Promise<void>;
+  exportHtml: () => Promise<void>;
+  exportPdf: () => Promise<void>;
+  exportPptx: () => Promise<void>;
+}
+
+type ExportKind = "html" | "pdf" | "pptx" | "google-slides";
+
+export type ExportStatus =
+  | { state: "idle" }
+  | { state: "exporting"; kind: ExportKind }
+  | {
+      state: "ready";
+      title: string;
+      description?: string;
+      openUrl: string;
+      openLabel?: string;
+    }
+  | { state: "error"; message: string };
+
+export function ExportStatusDialog({
+  status,
+  onStatusChange,
+}: {
+  status: ExportStatus;
+  onStatusChange: (status: ExportStatus) => void;
+}) {
   const t = useT();
-  const triggerBlobDownload = (blob: Blob, filename: string) => {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    a.rel = "noopener";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-  };
+  const exportingLabel =
+    status.state === "exporting"
+      ? status.kind === "html"
+        ? t("editorExport.downloadHtml")
+        : status.kind === "pdf"
+          ? t("editorExport.exportPdf")
+          : status.kind === "pptx"
+            ? t("editorExport.exportPptx")
+            : t("editorExport.openInGoogleSlides")
+      : null;
 
-  const filenameFromDisposition = (
-    value: string | null,
-    fallbackExt: string,
-  ) => {
-    const match = value?.match(/filename="?([^"]+)"?/i);
-    const fallback = deckTitle.replace(/[^a-zA-Z0-9_-]/g, "-") || "deck";
-    return match?.[1] ?? `${fallback}${fallbackExt}`;
-  };
+  return (
+    <Dialog
+      open={status.state !== "idle"}
+      onOpenChange={(open) => {
+        if (!open && status.state !== "exporting") {
+          onStatusChange({ state: "idle" });
+        }
+      }}
+    >
+      <DialogContent hideClose={status.state === "exporting"}>
+        {status.state === "exporting" ? (
+          <>
+            <DialogHeader>
+              <DialogTitle>{t("editorExport.exporting")}</DialogTitle>
+              <DialogDescription>{exportingLabel}</DialogDescription>
+            </DialogHeader>
+            <div className="flex items-center gap-3 py-2" aria-live="polite">
+              <Spinner className="size-5" />
+              <span className="text-sm text-muted-foreground">
+                {t("editorExport.exporting")}
+              </span>
+            </div>
+          </>
+        ) : status.state === "ready" ? (
+          <>
+            <DialogHeader>
+              <DialogTitle>{status.title}</DialogTitle>
+              {status.description ? (
+                <DialogDescription>{status.description}</DialogDescription>
+              ) : null}
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                type="button"
+                onClick={() =>
+                  window.open(status.openUrl, "_blank", "noopener,noreferrer")
+                }
+              >
+                {status.openLabel ?? t("editorExport.openInGoogleSlides")}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => onStatusChange({ state: "idle" })}
+              >
+                {t("comments.close")}
+              </Button>
+            </DialogFooter>
+          </>
+        ) : status.state === "error" ? (
+          <>
+            <DialogHeader>
+              <DialogTitle>{t("editorExport.exportFailed")}</DialogTitle>
+              <DialogDescription className="break-words">
+                {status.message}
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => onStatusChange({ state: "idle" })}
+              >
+                {t("comments.close")}
+              </Button>
+            </DialogFooter>
+          </>
+        ) : null}
+      </DialogContent>
+    </Dialog>
+  );
+}
 
-  const readErrorMessage = async (res: Response, fallback: string) => {
-    try {
-      const data = await res.json();
-      return data.error || data.message || fallback;
-    } catch {
-      return fallback;
-    }
-  };
+export const ExportMenu = forwardRef<ExportMenuHandle, ExportMenuProps>(
+  function ExportMenu(
+    {
+      deckId,
+      deckTitle,
+      hasSlides,
+      onDuplicate,
+      onExportPdf,
+      onExportPptx,
+      onExportGoogleSlides,
+      onShareLink,
+      onShareTeam,
+      inline = false,
+      hideExportDialog = false,
+      onExportStatusChange,
+    },
+    ref,
+  ) {
+    const t = useT();
+    const { getDeck, flushDeckSave } = useDecks();
+    const [menuOpen, setMenuOpen] = useState(false);
+    const queryClient = useQueryClient();
+    const googleSlidesExport = useGoogleSlidesExportAvailability(
+      hasSlides && (inline || menuOpen),
+    );
+    const [exportStatus, setExportStatus] = useState<ExportStatus>({
+      state: "idle",
+    });
+    const exportInFlightRef = useRef(false);
+    const updateExportStatus = (status: ExportStatus) => {
+      setExportStatus(status);
+      onExportStatusChange?.(status);
+    };
+    const triggerBlobDownload = (blob: Blob, filename: string) => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.rel = "noopener";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    };
 
-  const handleExportPptx = async () => {
-    try {
-      await onExportPptx();
-    } catch (err) {
-      console.error("Export failed:", err);
-      toast.error(t("editorExport.exportFailed"), {
-        description:
-          err instanceof Error
-            ? err.message
-            : t("editorExport.exportPptxError"),
-      });
-    }
-  };
+    const filenameFromDisposition = (
+      value: string | null,
+      fallbackExt: string,
+    ) => {
+      const match = value?.match(/filename="?([^"]+)"?/i);
+      const fallback = deckTitle.replace(/[^a-zA-Z0-9_-]/g, "-") || "deck";
+      return match?.[1] ?? `${fallback}${fallbackExt}`;
+    };
 
-  const handleExportGoogleSlides = async () => {
-    if (!onExportGoogleSlides) return;
-    // Opened up-front: browsers only honour window.open() inside the click
-    // gesture, and building the PPTX is async.
-    const target = window.open("", "_blank");
-    try {
-      const result = await onExportGoogleSlides();
-      if (result.url !== null) {
-        if (target) target.location.href = result.url;
-        toast.success(t("editorExport.googleSlidesCreated"), {
-          description: t("editorExport.googleSlidesCreatedHint"),
+    const readErrorMessage = async (res: Response, fallback: string) => {
+      try {
+        const data = await res.json();
+        return data.error || data.message || fallback;
+      } catch {
+        return fallback;
+      }
+    };
+
+    const beginExport = (kind: ExportKind) => {
+      if (exportInFlightRef.current) return false;
+      exportInFlightRef.current = true;
+      updateExportStatus({ state: "exporting", kind });
+      return true;
+    };
+
+    const finishExport = () => {
+      exportInFlightRef.current = false;
+    };
+
+    const runExport = async (
+      kind: ExportKind,
+      action: () => Promise<void> | void,
+      fallbackError: string,
+    ) => {
+      if (!hasSlides || !beginExport(kind)) return;
+      try {
+        await action();
+        updateExportStatus({ state: "idle" });
+      } catch (err) {
+        console.error("Export failed:", err);
+        updateExportStatus({
+          state: "error",
+          message: err instanceof Error ? err.message : fallbackError,
         });
-        return;
+      } finally {
+        finishExport();
       }
-      console.warn("Google Slides upload unavailable:", result.reason);
-      if (target) target.location.href = GOOGLE_SLIDES_IMPORT_URL;
-      toast.success(t("editorExport.googleSlidesDownloaded"), {
-        description: t("editorExport.googleSlidesImportHint"),
-      });
-    } catch (err) {
-      target?.close();
-      console.error("Export failed:", err);
-      toast.error(t("editorExport.exportFailed"), {
-        description:
-          err instanceof Error
-            ? err.message
-            : t("editorExport.exportGoogleSlidesError"),
-      });
-    }
-  };
+    };
 
-  const handleConnectGoogle = async () => {
-    const authUrl = new URL(
-      agentNativePath("/_agent-native/google-docs/auth-url"),
-      window.location.origin,
-    );
-    authUrl.searchParams.set(
-      "return",
-      window.location.pathname + window.location.search,
-    );
-
-    const popup = window.open(
-      "",
-      "google-docs-oauth",
-      "popup,width=520,height=720",
-    );
-    if (!popup) {
-      toast.error(t("editorExport.exportFailed"), {
-        description: t("editorExport.exportGoogleSlidesError"),
-      });
-      return;
-    }
-
-    try {
-      const response = await fetch(authUrl.toString(), {
-        credentials: "same-origin",
-      });
-      if (!response.ok) {
-        throw new Error(
-          await readErrorMessage(
-            response,
-            t("editorExport.exportGoogleSlidesError"),
-          ),
-        );
-      }
-      const data = (await response.json()) as { url?: unknown };
-      if (typeof data.url !== "string") {
-        throw new Error(t("editorExport.exportGoogleSlidesError"));
-      }
-      popup.location.href = data.url;
-    } catch (err) {
-      popup?.close();
-      console.error("Google connection failed:", err);
-      toast.error(t("editorExport.exportFailed"), {
-        description:
-          err instanceof Error
-            ? err.message
-            : t("editorExport.exportGoogleSlidesError"),
-      });
-    }
-  };
-
-  const handleExportHtml = async () => {
-    try {
-      const res = await fetch(`${appBasePath()}/api/exports/html`, {
+    const exportPptxFromServer = async () => {
+      await flushDeckSave(deckId);
+      const res = await fetch(`${appBasePath()}/api/exports/pptx`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ deckId }),
       });
       if (!res.ok) {
         throw new Error(
-          await readErrorMessage(res, t("editorExport.htmlFailed")),
+          await readErrorMessage(res, t("editorExport.exportPptxError")),
         );
       }
-      const blob = await res.blob();
-      const filename = filenameFromDisposition(
-        res.headers.get("content-disposition"),
-        ".html",
+      triggerBlobDownload(
+        await res.blob(),
+        filenameFromDisposition(
+          res.headers.get("content-disposition"),
+          ".pptx",
+        ),
       );
-      triggerBlobDownload(blob, filename);
-    } catch (err) {
-      console.error("Export failed:", err);
-      toast.error(t("editorExport.exportFailed"), {
-        description:
-          err instanceof Error
-            ? err.message
-            : t("editorExport.exportHtmlError"),
-      });
-    }
-  };
+    };
 
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-accent text-xs cursor-pointer whitespace-nowrap">
-          <IconUpload className="w-3.5 h-3.5" />
-          <span className="hidden md:inline">{t("editorExport.export")}</span>
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-52">
-        <DropdownMenuLabel className="text-[11px] text-muted-foreground">
-          {t("editorExport.exportAndDuplicate")}
-        </DropdownMenuLabel>
+    const handleExportPptx = () =>
+      runExport(
+        "pptx",
+        async () => {
+          if (canExportPptxFromServer(getDeck(deckId))) {
+            await exportPptxFromServer();
+            return;
+          }
+          await onExportPptx();
+        },
+        t("editorExport.exportPptxError"),
+      );
+
+    const handleExportPdf = () =>
+      runExport("pdf", onExportPdf, t("deckEditor.pdfRenderFailed"));
+
+    const handleExportHtml = () =>
+      runExport(
+        "html",
+        async () => {
+          const res = await fetch(`${appBasePath()}/api/exports/html`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ deckId }),
+          });
+          if (!res.ok) {
+            throw new Error(
+              await readErrorMessage(res, t("editorExport.htmlFailed")),
+            );
+          }
+          const blob = await res.blob();
+          const filename = filenameFromDisposition(
+            res.headers.get("content-disposition"),
+            ".html",
+          );
+          triggerBlobDownload(blob, filename);
+        },
+        t("editorExport.exportHtmlError"),
+      );
+
+    const handleConnectGoogle = () => {
+      startWorkspaceProviderOAuth("google_drive", {
+        appId: "slides",
+        returnPath: `${window.location.pathname}${window.location.search}`,
+        scope: "user",
+      });
+    };
+
+    const handleExportGoogleSlides = async () => {
+      if (!hasSlides || !onExportGoogleSlides) return;
+      if (!beginExport("google-slides")) return;
+      try {
+        const availability =
+          await fetchGoogleSlidesExportAvailability(queryClient);
+        if (!availability.available) {
+          updateExportStatus({
+            state: "error",
+            message: t("editorExport.googleSlidesUnavailableHint"),
+          });
+          return;
+        }
+        const result = await onExportGoogleSlides();
+        if ("requiresConnection" in result && result.requiresConnection) {
+          updateExportStatus({ state: "idle" });
+          handleConnectGoogle();
+          return;
+        }
+        if (result.url !== null) {
+          updateExportStatus({
+            state: "ready",
+            title: t("editorExport.googleSlidesCreated"),
+            description: t("editorExport.googleSlidesCreatedHint"),
+            openUrl: result.url,
+          });
+          return;
+        }
+        invalidateGoogleSlidesExportAvailability(queryClient);
+        updateExportStatus({
+          state: "ready",
+          title: t("editorExport.googleSlidesDownloaded"),
+          description: `${t("editorExport.googleSlidesImportHint")} ${result.reason}`,
+          openUrl: GOOGLE_SLIDES_IMPORT_URL,
+          openLabel: t("editorExport.googleSlidesOpenImporter"),
+        });
+      } catch (err) {
+        console.error("Export failed:", err);
+        updateExportStatus({
+          state: "error",
+          message:
+            err instanceof Error
+              ? err.message
+              : t("editorExport.exportGoogleSlidesError"),
+        });
+      } finally {
+        finishExport();
+      }
+    };
+
+    useImperativeHandle(
+      ref,
+      () => ({
+        exportGoogleSlides: handleExportGoogleSlides,
+        exportHtml: handleExportHtml,
+        exportPdf: handleExportPdf,
+        exportPptx: handleExportPptx,
+      }),
+      [
+        handleExportGoogleSlides,
+        handleExportHtml,
+        handleExportPdf,
+        handleExportPptx,
+      ],
+    );
+
+    const exportActions = (
+      <>
+        <DropdownMenuItem
+          onClick={() => void handleExportHtml()}
+          disabled={!hasSlides}
+          className="cursor-pointer"
+        >
+          <IconCode className="size-4" />
+          {t("editorExport.downloadHtml")}
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onClick={() => void handleExportPdf()}
+          disabled={!hasSlides}
+          className="cursor-pointer"
+        >
+          <IconFileTypePdf className="size-4" />
+          {t("editorExport.exportPdf")}
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onClick={() => void handleExportPptx()}
+          disabled={!hasSlides}
+          className="cursor-pointer"
+        >
+          <IconDownload className="size-4" />
+          {t("editorExport.exportPptx")}
+        </DropdownMenuItem>
+        {onExportGoogleSlides && (
+          <DropdownMenuItem
+            onClick={() => void handleExportGoogleSlides()}
+            disabled={!hasSlides || !googleSlidesExport.available}
+            className="cursor-pointer"
+          >
+            <IconBrandGoogle className="size-4" />
+            {t("editorExport.openInGoogleSlides")}
+            {hasSlides && !googleSlidesExport.available ? (
+              <span className="ml-auto text-[11px] text-muted-foreground">
+                {t("editorExport.googleSlidesUnavailable")}
+              </span>
+            ) : null}
+          </DropdownMenuItem>
+        )}
+      </>
+    );
+
+    const shareActions = (
+      <>
         {onShareTeam && (
           <DropdownMenuItem onClick={onShareTeam} className="cursor-pointer">
-            <IconShare2 className="w-4 h-4 mr-2" />
+            <IconShare2 className="size-4" />
             {t("editorExport.shareWithTeam")}
           </DropdownMenuItem>
         )}
         {onShareLink && (
           <DropdownMenuItem onClick={onShareLink} className="cursor-pointer">
-            <IconShare2 className="w-4 h-4 mr-2" />
+            <IconShare2 className="size-4" />
             {t("editorExport.publicShareLink")}
           </DropdownMenuItem>
         )}
+      </>
+    );
+
+    const duplicateAction = (
+      <DropdownMenuItem onClick={onDuplicate} className="cursor-pointer">
+        <IconCopy className="size-4" />
+        {t("editorExport.duplicateDeck")}
+      </DropdownMenuItem>
+    );
+
+    const menuContent = (
+      <>
+        <DropdownMenuLabel className="text-[11px] text-muted-foreground">
+          {t("editorExport.exportAndDuplicate")}
+        </DropdownMenuLabel>
+        {shareActions}
         <DropdownMenuSeparator />
-        <DropdownMenuItem onClick={handleExportHtml} className="cursor-pointer">
-          <IconCode className="w-4 h-4 mr-2" />
-          {t("editorExport.downloadHtml")}
-        </DropdownMenuItem>
-        <DropdownMenuItem onClick={onExportPdf} className="cursor-pointer">
-          <IconFileTypePdf className="w-4 h-4 mr-2" />
-          {t("editorExport.exportPdf")}
-        </DropdownMenuItem>
-        <DropdownMenuItem onClick={handleExportPptx} className="cursor-pointer">
-          <IconDownload className="w-4 h-4 mr-2" />
-          {t("editorExport.exportPptx")}
-        </DropdownMenuItem>
-        {onExportGoogleSlides && (
+        {exportActions}
+        <DropdownMenuSeparator />
+        {duplicateAction}
+      </>
+    );
+
+    const inlineMenuContent = (
+      <>
+        {onShareTeam || onShareLink ? (
           <>
-            <DropdownMenuItem
-              onClick={handleConnectGoogle}
-              className="cursor-pointer"
-            >
-              <IconPlugConnected className="w-4 h-4 mr-2" />
-              {t("editorExport.connectGoogle")}
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={handleExportGoogleSlides}
-              className="cursor-pointer"
-            >
-              <IconBrandGoogle className="w-4 h-4 mr-2" />
-              {t("editorExport.openInGoogleSlides")}
-            </DropdownMenuItem>
+            {shareActions}
+            <DropdownMenuSeparator />
           </>
-        )}
+        ) : null}
+        <DropdownMenuSub>
+          <DropdownMenuSubTrigger
+            disabled={!hasSlides}
+            className="cursor-pointer gap-2"
+          >
+            <IconUpload className="size-4" />
+            {t("editorExport.export")}
+          </DropdownMenuSubTrigger>
+          <DropdownMenuSubContent className="w-56">
+            {exportActions}
+          </DropdownMenuSubContent>
+        </DropdownMenuSub>
         <DropdownMenuSeparator />
-        <DropdownMenuItem onClick={onDuplicate} className="cursor-pointer">
-          <IconCopy className="w-4 h-4 mr-2" />
-          {t("editorExport.duplicateDeck")}
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
+        {duplicateAction}
+      </>
+    );
+
+    return (
+      <>
+        {inline ? (
+          inlineMenuContent
+        ) : (
+          <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+            <DropdownMenuTrigger asChild>
+              <button
+                disabled={!hasSlides}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-accent text-xs cursor-pointer whitespace-nowrap disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <IconUpload className="w-3.5 h-3.5" />
+                <span className="hidden md:inline">
+                  {t("editorExport.export")}
+                </span>
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-52">
+              {menuContent}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+        {!hideExportDialog && (
+          <ExportStatusDialog
+            status={exportStatus}
+            onStatusChange={updateExportStatus}
+          />
+        )}
+      </>
+    );
+  },
+);

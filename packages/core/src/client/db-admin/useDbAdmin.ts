@@ -1,16 +1,3 @@
-/**
- * Shared data layer for the dev-mode database admin UI.
- *
- * Both sibling surfaces — TableEditor (`TableEditor.tsx`) and SqlEditor
- * (`SqlEditor.tsx`) — import their data access from this module so the request
- * shapes, error handling, and agent-write auto-refetch behavior stay
- * consistent.
- *
- * Every read hook folds the `["db-admin", "action"]` change counters into its
- * React Query key, so when the agent writes to the database (via an action that
- * emits a change event) the open table or query result refetches immediately —
- * the same "agent writes show up instantly" primitive templates use.
- */
 import {
   useQuery,
   keepPreviousData,
@@ -18,7 +5,6 @@ import {
 } from "@tanstack/react-query";
 
 import type {
-  DbAdminDialect,
   DbAdminTableSummary,
   DbAdminTableSchema,
   DbAdminRowsRequest,
@@ -28,9 +14,8 @@ import type {
   DbAdminQueryResult,
 } from "../../db-admin/types.js";
 import { agentNativePath } from "../api-path.js";
+import { getBrowserTabId } from "../browser-tab-id.js";
 import { useChangeVersions } from "../use-change-version.js";
-
-// ─── Base path ───────────────────────────────────────────────────────────
 
 export const dbAdminBasePath = agentNativePath("/_agent-native/db-admin");
 
@@ -47,38 +32,10 @@ function requestScopeKey(config?: DbAdminRequestConfig): string {
   return config?.scopeKey ?? requestBasePath(config);
 }
 
-// ─── Tab id (request source) ───────────────────────────────────────────────
-
-let cachedTabId: string | null = null;
-
-/**
- * Best-effort stable per-tab identifier sent as `x-request-source` so the
- * backend can attribute changes to this tab (and skip echoing them back to the
- * originator). Mirrors the template `TAB_ID` convention without depending on a
- * template-only module.
- */
 function getRequestSource(): string | undefined {
   if (typeof window === "undefined") return undefined;
-  if (cachedTabId) return cachedTabId;
-  try {
-    const existing = window.sessionStorage.getItem("agentnative.tabId");
-    if (existing) {
-      cachedTabId = existing;
-      return existing;
-    }
-    const generated =
-      typeof crypto !== "undefined" && "randomUUID" in crypto
-        ? crypto.randomUUID()
-        : `tab-${Math.random().toString(36).slice(2)}`;
-    window.sessionStorage.setItem("agentnative.tabId", generated);
-    cachedTabId = generated;
-    return generated;
-  } catch {
-    return undefined;
-  }
+  return getBrowserTabId();
 }
-
-// ─── Low-level fetchers ────────────────────────────────────────────────────
 
 interface ApiEnvelope {
   ok?: boolean;
@@ -143,8 +100,6 @@ export async function dbAdminPost<T>(
   return parseEnvelope<T>(res);
 }
 
-// ─── Shared hook result shape ──────────────────────────────────────────────
-
 export interface DbAdminQueryState<T> {
   data: T | undefined;
   isLoading: boolean;
@@ -163,16 +118,12 @@ function toState<T>(query: UseQueryResult<T, Error>): DbAdminQueryState<T> {
   };
 }
 
-// ─── Overview ──────────────────────────────────────────────────────────────
-
 export interface DbAdminOverview {
-  dialect: DbAdminDialect;
   tables: DbAdminTableSummary[];
 }
 
 interface OverviewResponse {
   ok: true;
-  dialect: DbAdminDialect;
   tables: DbAdminTableSummary[];
 }
 
@@ -188,15 +139,13 @@ export function useOverview(
     queryKey: ["db-admin", requestScopeKey(config), "overview", version],
     queryFn: async () => {
       const res = await dbAdminGet<OverviewResponse>("/overview", config);
-      return { dialect: res.dialect, tables: res.tables };
+      return { tables: res.tables };
     },
     placeholderData: keepPreviousData,
     staleTime: 2000,
   });
   return toState(query);
 }
-
-// ─── Table schema ──────────────────────────────────────────────────────────
 
 interface SchemaResponse {
   ok: true;
@@ -227,8 +176,6 @@ export function useTableSchema(
   });
   return toState(query);
 }
-
-// ─── Table rows ────────────────────────────────────────────────────────────
 
 export function useTableRows(
   table: string | null,
@@ -261,8 +208,6 @@ export function useTableRows(
   });
   return toState(query);
 }
-
-// ─── Mutations ─────────────────────────────────────────────────────────────
 
 export async function mutateTable(
   table: string,

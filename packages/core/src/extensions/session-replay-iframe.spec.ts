@@ -91,6 +91,50 @@ describe("cooperative iframe session replay", () => {
     );
   });
 
+  it("does not inject into a </head> that lives inside a script string", () => {
+    const bridge =
+      "<script>\nvar d = new DOMParser().parseFromString(" +
+      '"<!doctype html><html><head><script></scr" + "ipt></head><body></body></html>", "text/html");\n</script>';
+    const content = `<!doctype html><html><head>${bridge}</head><body><p>preview</p></body></html>`;
+
+    const html = injectSessionReplayIframeBootstrap(content);
+
+    expect(html).toContain(SESSION_REPLAY_IFRAME_PROBE);
+    expect(html.indexOf(bridge)).toBeGreaterThanOrEqual(0);
+    expect(html.indexOf(SESSION_REPLAY_IFRAME_PROBE)).toBeGreaterThan(
+      html.indexOf(bridge),
+    );
+  });
+
+  it("does not inject into a </head> inside an RCDATA element", () => {
+    const html =
+      "<!doctype html><html><head><title>How to close a </head> tag</title>" +
+      "</head><body><textarea></head></textarea><p>preview</p></body></html>";
+
+    const out = injectSessionReplayIframeBootstrap(html);
+
+    expect(out).toContain(SESSION_REPLAY_IFRAME_PROBE);
+    expect(out).toContain("<title>How to close a </head> tag</title>");
+    expect(out.indexOf(SESSION_REPLAY_IFRAME_PROBE)).toBeGreaterThan(
+      out.indexOf("</title>"),
+    );
+  });
+
+  it("does not inject into a </head> inside any raw-text element", () => {
+    for (const tag of ["xmp", "noembed", "noframes", "iframe"]) {
+      const raw = `<${tag}></head></${tag}>`;
+      const html =
+        `<!doctype html><html><head>${raw}</head>` +
+        `<body><p>preview</p></body></html>`;
+      const out = injectSessionReplayIframeBootstrap(html);
+      expect(out, `${tag} raw text was split`).toContain(raw);
+      expect(
+        out.indexOf(SESSION_REPLAY_IFRAME_PROBE),
+        `bootstrap landed inside <${tag}>`,
+      ).toBeGreaterThan(out.indexOf(raw));
+    }
+  });
+
   it("marks every first-party extension iframe host", () => {
     const hostFiles = [
       "AgentNativeExtensionFrame.tsx",

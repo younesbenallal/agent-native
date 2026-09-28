@@ -1,4 +1,4 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
 
 import {
@@ -64,9 +64,14 @@ function enrichDeal(
   owners: Record<string, string>,
 ) {
   const properties: Record<string, unknown> = { ...deal.properties };
-  const stageId = String(properties.dealstage ?? "");
-  const pipelineId = String(properties.pipeline ?? "");
-  const ownerId = String(properties.hubspot_owner_id ?? "");
+  const stageId =
+    typeof properties.dealstage === "string" ? properties.dealstage : "";
+  const pipelineId =
+    typeof properties.pipeline === "string" ? properties.pipeline : "";
+  const ownerId =
+    typeof properties.hubspot_owner_id === "string"
+      ? properties.hubspot_owner_id
+      : "";
   const ownerName = ownerId ? owners[ownerId] : undefined;
   const stageName = lookups.stageLabels[stageId] ?? stageId;
   const pipelineName = lookups.pipelineLabels[pipelineId] ?? pipelineId;
@@ -420,8 +425,6 @@ function buildGuidance(options: {
 }
 
 export default defineAction({
-  // Read-only provider query: safe to call from run-code `appAction` and
-  // reusable across continuation retries (no re-fetch on resume).
   readOnly: true,
   description:
     "Get HubSpot deals with normalized stage, pipeline, owner, forecast, and NBM fields. This is a bounded deal analytics shortcut, not the full HubSpot capability surface. Use query for a specific customer/deal/account deep dive. For cohorts like products field = Publish, closed-won, pipeline = New Business, or close date in a range, use the structured product, pipeline, closedStatus, closedDateFrom, and closedDateTo filters instead of query when the answer is the deal list itself. If the cohort feeds a cross-source join, transcript/message/ticket search, exhaustive absence check, or downstream code/corpus workflow, prefer provider-api-catalog/provider-api-request with provider = hubspot and stageAs so the cohort is available as a staged dataset. Both paths are bounded: at most limit deals are returned (default 25, max 200). HubSpot search returns a total but no server-side aggregates and cannot page past 10,000 matches for one query; compute metrics on filtered/projected rows, and split larger cohorts into non-overlapping date windows while reporting coverage. The structured-filter path returns total as the matched count and a truncated flag; page with offset (or narrow filters) instead of expecting the whole cohort in one call, since a full enriched cohort can be several MB and overruns extension and context budgets. For non-deal CRM records use hubspot-records; for arbitrary HubSpot endpoints, filters, associations, batch APIs, or payloads use provider-api-catalog/provider-api-docs/provider-api-request with provider = hubspot.",
@@ -494,18 +497,19 @@ export default defineAction({
   }),
   http: { method: "GET" },
   publicAgent: { expose: true, readOnly: true, requiresAuth: true },
+  grounding: true,
   run: async ({
     properties,
     owner,
     product,
-    productMatch = "token",
+    productMatch,
     pipeline,
-    closedStatus = "any",
+    closedStatus,
     closedDateFrom,
     closedDateTo,
     query,
-    limit = 25,
-    offset = 0,
+    limit,
+    offset,
     after,
   }) => {
     const trimmedQuery = query?.trim();
@@ -593,9 +597,10 @@ export default defineAction({
       .map((deal) => enrichDeal(deal, lookups, owners))
       .filter((deal) => {
         if (!ownerFilter) return true;
-        const ownerName = String(
-          deal.properties.owner_name ?? "",
-        ).toLowerCase();
+        const ownerName =
+          typeof deal.properties.owner_name === "string"
+            ? deal.properties.owner_name.toLowerCase()
+            : "";
         return ownerName === ownerFilter;
       })
       .filter((deal) => {
@@ -609,9 +614,6 @@ export default defineAction({
         return matchesDateRange(deal, fromMs, toMs);
       });
 
-    // HubSpot applies the cohort filters and pagination before returning the
-    // page. Keep the local checks as a compatibility/correctness guard, but do
-    // not scan and slice the full deal corpus in this action.
     const matchedTotal = dealResult.total;
     const deals = matchedDeals;
     const searchCoverageLimited = matchedTotal >= HUBSPOT_SEARCH_RESULT_CAP;

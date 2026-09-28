@@ -34,6 +34,7 @@ import { formsRoutePath } from "@/lib/form-builder-tabs";
 import { TAB_ID } from "@/lib/tab-id";
 
 import changelog from "../CHANGELOG.md?raw";
+import "./lib/register-chat-renderers";
 import { i18nCatalog } from "./i18n";
 
 import stylesheet from "./global.css?url";
@@ -95,7 +96,6 @@ export function Layout({ children }: { children: React.ReactNode }) {
           dangerouslySetInnerHTML={{ __html: LOCALE_INIT_SCRIPT }}
         />
         <link rel="icon" type="image/svg+xml" href={appPath("/favicon.svg")} />
-        <link rel="manifest" href={appPath("/manifest.json")} />
         <meta name="theme-color" content="#06B6D4" />
         <meta name="mobile-web-app-capable" content="yes" />
         <meta
@@ -232,19 +232,42 @@ function FormsCommandMenu({
   onOpenChange: (open: boolean) => void;
 }) {
   const t = useT();
+  const location = useLocation();
   const navigate = useNavigate();
+  const formId = location.pathname.match(/^\/forms\/([^/]+)/)?.[1];
+  const isResponsesRoute = location.pathname.endsWith("/responses");
   return (
     <CommandMenu
       open={open}
       onOpenChange={onOpenChange}
       changelog={changelog}
       changelogKey="forms"
+      chatStorageKey="forms"
     >
       <CommandMenu.Group heading={t("root.commandForms")}>
-        <CommandMenu.Item onSelect={() => {}}>
-          {t("root.searchForms")}
-        </CommandMenu.Item>
-        <CommandMenu.Item onSelect={() => navigate("/agent")}>
+        {formId && !isResponsesRoute ? (
+          <CommandMenu.Item
+            onSelect={() => navigate(`/forms/${formId}/responses`)}
+          >
+            {t("header.responses")}
+          </CommandMenu.Item>
+        ) : null}
+        {formId && isResponsesRoute ? (
+          <CommandMenu.Item onSelect={() => navigate(`/forms/${formId}`)}>
+            {t("header.form")}
+          </CommandMenu.Item>
+        ) : null}
+        {location.pathname === "/ask" ? (
+          <CommandMenu.Item onSelect={() => navigate("/forms")}>
+            {t("navigation.allForms")}
+          </CommandMenu.Item>
+        ) : null}
+        {location.pathname !== "/ask" && !formId ? (
+          <CommandMenu.Item onSelect={() => navigate("/ask")}>
+            {t("navigation.askForms")}
+          </CommandMenu.Item>
+        ) : null}
+        <CommandMenu.Item onSelect={() => navigate("/settings/agent")}>
           <IconHierarchy2 size={16} />
           {t("root.openAgent")}
         </CommandMenu.Item>
@@ -276,13 +299,12 @@ export default function Root() {
   const location = useLocation();
   const isPublicPath =
     location.pathname === "/f" || location.pathname.startsWith("/f/");
-
   if (isPublicPath) {
     return (
       <AppToolkitProvider>
         <AppProviders
           queryClient={queryClient}
-          isPublicPath
+          isPublicPath={isPublicPath}
           i18n={{ catalog: i18nCatalog }}
         >
           <Outlet />
@@ -293,7 +315,11 @@ export default function Root() {
 
   return (
     <AppToolkitProvider>
-      <AppProviders queryClient={queryClient} i18n={{ catalog: i18nCatalog }}>
+      <AppProviders
+        queryClient={queryClient}
+        skeletonLayout="assistant"
+        i18n={{ catalog: i18nCatalog }}
+      >
         <PrivateAppContent />
       </AppProviders>
     </AppToolkitProvider>

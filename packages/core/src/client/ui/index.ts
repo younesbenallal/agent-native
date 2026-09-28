@@ -35,13 +35,32 @@ export { getClientSurface, type ClientSurface } from "../client-surface.js";
 export { ErrorBoundary } from "../ErrorBoundary.js";
 export { ClientOnly } from "../ClientOnly.js";
 export { DefaultSpinner } from "../DefaultSpinner.js";
+export { Spinner } from "@agent-native/toolkit/ui/spinner";
+export { RuntimeConfigNotice } from "../RuntimeConfigNotice.js";
+export {
+  EnvironmentBadge,
+  buildEnvironmentUrl,
+  isBuilderIoEmployee,
+  resolveEnvironmentChannel,
+  resolveEnvironmentTargets,
+  type EnvironmentBadgePlacement,
+  type EnvironmentBadgeTargets,
+} from "../EnvironmentBadge.js";
 export {
   RouteTransitionIndicator,
   ROUTE_TRANSITION_INDICATOR_DELAY_MS,
 } from "../RouteTransitionIndicator.js";
 export {
+  applyEmbeddedThemeUpdate,
+  buildEmbeddedThemeUpdate,
+  EMBEDDED_THEME_CHANGE_EVENT,
+  EMBEDDED_THEME_UPDATE_MESSAGE,
   getThemeInitScript,
+  parseEmbeddedThemeUpdate,
   themeInitScript,
+  type EmbeddedThemeUpdate,
+  type NormalizedEmbeddedThemeUpdate,
+  type ResolvedTheme,
   type ThemePreference,
 } from "../theme.js";
 export {
@@ -57,3 +76,23 @@ export {
   type AppearancePickerProps,
 } from "../AppearancePicker.js";
 export { AgentNativeIcon } from "../components/icons/AgentNativeIcon.js";
+export {
+  AppSidebar,
+  RouterSidebarLink,
+  AppSidebarHeader,
+  AppSidebarNavItem,
+  AppSidebarNavGroup,
+  AppSidebarSection,
+  AppSidebarFeedbackButton,
+  AppSidebarFooter,
+  useAppSidebar,
+  type AppSidebarProps,
+  type AppSidebarHeaderProps,
+  type AppSidebarNavItemProps,
+  type AppSidebarNavGroupProps,
+  type AppSidebarSectionProps,
+  type AppSidebarFeedbackButtonProps,
+  type AppSidebarFooterProps,
+  type AppSidebarItemDefinition,
+  type AppSidebarContextValue,
+} from "./AppSidebar.js";

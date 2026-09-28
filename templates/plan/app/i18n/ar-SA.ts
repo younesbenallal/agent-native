@@ -33,6 +33,7 @@ const messages = {
     agentDescription:
       "أدر نموذج الوكيل ومفاتيح API والأتمتة والصوت وعناصر التحكم الأخرى.",
     openAgentSettings: "إدارة الوكيل",
+    editorGroupTitle: "المحرر",
     editorTitle: "إضافة VS Code",
     editorDescription:
       "افتح الخطط وراجعها في لوحة جانبية داخل VS Code بدلاً من علامة تبويب منفصلة في المتصفح.",
@@ -379,9 +380,17 @@ const messages = {
         'خاصة بشكل افتراضي. قم بدعوة الأشخاص أو المشاركة مع مؤسستك أو قم بتعيين "عام" لمراجعة أي شخص لديه رابط.',
       peopleAccess: "الأشخاص الذين لديهم حق الوصول {{noun}}",
       generalAccess: "الوصول العام {{noun}}",
+      commenterRoleLabel: "معلّق",
+      commenterRoleDescription: "يمكنه العرض وإضافة التعليقات",
       shareAria: "مشاركة {{noun}}",
       share: "مشاركة {{noun}}",
       shareThis: "شارك هذا {{noun}}",
+      teammateSuggestion: {
+        message: "ادعُ فريقك إلى Plan.",
+        invite: "دعوة الفريق",
+        enableDomain: "السماح لأي شخص من @{{domain}} بالانضمام",
+        enableFailed: "تعذّر تفعيل الانضمام عبر النطاق. حاول مرة أخرى.",
+      },
       hostedCopy:
         "يحتوي {{noun}} المحلي على نسخة مستضافة للمشاركة. افتح {{noun}} المستضاف لإدارة الوصول.",
       publishDescription:
@@ -661,6 +670,7 @@ const messages = {
       createAccount: "إنشاء حساب",
       signIn: "تسجيل الدخول",
       haveAccount: "لدي حساب بالفعل",
+      storageStatusUnavailable: "تعذّر التحقق من تخزين الملفات.",
       retry: "حاول ثانية",
       sendFeedback: "إرسال الملاحظات",
       feedbackPlaceholder: "صف ما حدث قبل ظهور خطأ الخطة هذا.",

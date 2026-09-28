@@ -1,4 +1,4 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { seedFromText } from "@agent-native/core/collab";
 import { assertAccess } from "@agent-native/core/sharing";
 import { and, eq } from "drizzle-orm";
@@ -6,11 +6,28 @@ import { nanoid } from "nanoid";
 import { z } from "zod";
 
 import { getDb, schema } from "../server/db/index.js";
+import { mutateDesignData } from "../server/lib/design-data-mutation.js";
+import {
+  checkpointSkippedResultField,
+  snapshotDesignBeforeAgentEdit,
+} from "../server/lib/design-versions.js";
+import { withDesignSourceMutationTransaction } from "../server/source-workspace.js";
+import {
+  mergeCanvasFramePlacements,
+  nextFreeCanvasRowY,
+  parseCanvasFrameGeometryById,
+} from "../shared/canvas-frames.js";
+import { getOverviewScreenFileIds } from "../shared/design-files.js";
 import {
   assertDesignHtmlCreateIntegrity,
   describeDesignHtmlIntegrityIssue,
 } from "../shared/html-integrity.js";
+import { getResponsiveBreakpointWidths } from "../shared/responsive-frame-layout.js";
 import { annotateScreenHtmlForPersist } from "../shared/screen-annotation.js";
+
+const CREATED_SCREEN_WIDTH = 1440;
+const CREATED_SCREEN_HEIGHT = 1024;
+const CREATED_SCREEN_GAP = 96;
 
 export default defineAction({
   description:
@@ -26,8 +43,7 @@ export default defineAction({
       .default("html")
       .describe("Type of file"),
   }),
-  run: async ({ designId, filename, content, fileType }) => {
-    // Path traversal guard
+  run: async ({ designId, filename, content, fileType }, context) => {
     if (
       filename.includes("..") ||
       filename.includes("/") ||
@@ -37,67 +53,114 @@ export default defineAction({
     }
 
     await assertAccess("design", designId, "editor");
-
-    const db = getDb();
-
-    // Guard against duplicate (designId, filename) — edit-design uses .limit(1)
-    // which is non-deterministic when multiple rows match the same key.
-    const [existing] = await db
-      .select({ id: schema.designFiles.id })
-      .from(schema.designFiles)
-      .where(
-        and(
-          eq(schema.designFiles.designId, designId),
-          eq(schema.designFiles.filename, filename),
-        ),
-      )
-      .limit(1);
-    if (existing) {
-      throw new Error(
-        `File "${filename}" already exists in design ${designId} — use edit-design to modify it`,
-      );
-    }
+    const checkpoint = await snapshotDesignBeforeAgentEdit(designId, context, {
+      allowCheckpointFailureSkip: true,
+    });
+    const checkpointField = checkpointSkippedResultField(checkpoint);
 
     const id = nanoid();
     const now = new Date().toISOString();
 
-    // Stamp missing data-agent-native-node-id attributes before persisting so
-    // the new screen is fully addressable by id-keyed editor operations from
-    // the moment it's created, instead of depending on a client-side backfill
-    // the first time someone opens it.
     const annotatedContent = annotateScreenHtmlForPersist(content, fileType);
 
-    // Reject malformed HTML before the row exists — creation went through raw
-    // inserts, so it was the one write path with no integrity gate.
     const advisory = assertDesignHtmlCreateIntegrity({
       content: annotatedContent,
       fileType: fileType ?? "html",
       filename,
     });
 
-    await db.insert(schema.designFiles).values({
-      id,
-      designId,
-      filename,
-      fileType: fileType ?? "html",
-      content: annotatedContent,
-      createdAt: now,
-      updatedAt: now,
+    await withDesignSourceMutationTransaction(designId, async (tx) => {
+      const [existing] = await tx
+        .select({ id: schema.designFiles.id })
+        .from(schema.designFiles)
+        .where(
+          and(
+            eq(schema.designFiles.designId, designId),
+            eq(schema.designFiles.filename, filename),
+          ),
+        )
+        .limit(1);
+      if (existing) {
+        throw new Error(
+          `File "${filename}" already exists in design ${designId} — use edit-design to modify it`,
+        );
+      }
+
+      await tx.insert(schema.designFiles).values({
+        id,
+        designId,
+        filename,
+        fileType: fileType ?? "html",
+        content: annotatedContent,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      await tx
+        .update(schema.designs)
+        .set({ updatedAt: now })
+        .where(eq(schema.designs.id, designId));
     });
 
-    // Seed collab state for the new file
     await seedFromText(id, annotatedContent);
 
-    // Update the design's updatedAt timestamp
-    await db
-      .update(schema.designs)
-      .set({ updatedAt: now })
-      .where(eq(schema.designs.id, designId));
+    const db = getDb();
 
     const resolvedFileType = fileType ?? "html";
     const renderable =
       (resolvedFileType === "html" || resolvedFileType === "jsx") &&
       content.trim().length > 0;
+
+    if (renderable) {
+      const screenFiles = await db
+        .select({
+          id: schema.designFiles.id,
+          filename: schema.designFiles.filename,
+          fileType: schema.designFiles.fileType,
+        })
+        .from(schema.designFiles)
+        .where(eq(schema.designFiles.designId, designId));
+      const screenFileIds = getOverviewScreenFileIds(screenFiles);
+
+      await mutateDesignData({
+        designId,
+        mutate: (current) => {
+          const existingFrames = parseCanvasFrameGeometryById(
+            current.canvasFrames,
+          );
+          if (existingFrames[id]) return current;
+          const merged = mergeCanvasFramePlacements({
+            existing: current.canvasFrames,
+            placements: [
+              {
+                fileId: id,
+                filename,
+                x: 0,
+                y: nextFreeCanvasRowY(
+                  current.canvasFrames,
+                  CREATED_SCREEN_GAP,
+                  {
+                    responsiveLayout: {
+                      screenFileIds,
+                      screenMetadataByFileId: current.screenMetadata,
+                      breakpointWidths: getResponsiveBreakpointWidths(
+                        current.breakpointSet,
+                      ),
+                    },
+                  },
+                ),
+                width: CREATED_SCREEN_WIDTH,
+                height: CREATED_SCREEN_HEIGHT,
+              },
+            ],
+            resolveFileId: (placement) => placement.fileId,
+          });
+          return { ...current, canvasFrames: merged.canvasFrames };
+        },
+        isApplied: (current) =>
+          Boolean(parseCanvasFrameGeometryById(current.canvasFrames)[id]),
+      });
+    }
 
     return {
       id,
@@ -105,10 +168,13 @@ export default defineAction({
       filename,
       fileType: resolvedFileType,
       renderable,
-      urlPath: renderable ? `/design/${designId}` : null,
+      urlPath: renderable
+        ? `/design/${encodeURIComponent(designId)}?editorView=overview&screen=${encodeURIComponent(id)}`
+        : null,
       ...(advisory.length > 0
         ? { warnings: advisory.map(describeDesignHtmlIntegrityIssue) }
         : {}),
+      ...checkpointField,
     };
   },
 });

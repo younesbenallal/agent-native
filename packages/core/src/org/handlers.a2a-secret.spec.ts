@@ -4,6 +4,7 @@ const mockExecute = vi.fn();
 const mockGetOrgContext = vi.fn();
 const mockGetSession = vi.fn();
 const mockPutUserSetting = vi.fn();
+const mockGetOrgSetting = vi.fn();
 const mockReadBody = vi.fn();
 const mockDiscoverAgents = vi.fn();
 const mockSignA2AToken = vi.fn();
@@ -33,6 +34,11 @@ vi.mock("../server/auth.js", () => ({
 
 vi.mock("../settings/user-settings.js", () => ({
   putUserSetting: (...args: any[]) => mockPutUserSetting(...args),
+}));
+
+vi.mock("../settings/org-settings.js", () => ({
+  getOrgSetting: (...args: any[]) => mockGetOrgSetting(...args),
+  putOrgSetting: vi.fn(),
 }));
 
 vi.mock("../db/client.js", () => ({
@@ -73,15 +79,51 @@ vi.mock("../extensions/url-safety.js", () => ({
   ssrfSafeFetch: (...args: any[]) => mockSsrfSafeFetch(...args),
 }));
 
+vi.mock("../server/social-sign-in-providers.js", () => ({
+  resolveDeploymentSignInMethods: () => ({
+    emailPassword: true,
+    google: true,
+    github: false,
+  }),
+}));
+
 import {
   getMyOrgHandler,
   revealA2ASecretHandler,
+  setA2ASecretHandler,
   syncA2ASecretHandler,
 } from "./handlers.js";
+
+const ADMIN_CONTEXT = {
+  email: "admin@example.test",
+  orgId: "org_1",
+  orgName: "Example",
+  role: "admin",
+};
+
+describe("cross-app secret handlers", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetOrgContext.mockResolvedValue(ADMIN_CONTEXT);
+    mockReadBody.mockResolvedValue({});
+  });
+
+  it.each([
+    ["reveal", revealA2ASecretHandler],
+    ["set", setA2ASecretHandler],
+    ["sync", syncA2ASecretHandler],
+  ])("rejects an admin trying to %s it", async (_name, handler) => {
+    await expect(handler({} as any)).rejects.toMatchObject({
+      statusCode: 403,
+    });
+    expect(mockExecute).not.toHaveBeenCalled();
+  });
+});
 
 describe("syncA2ASecretHandler", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGetOrgSetting.mockResolvedValue(null);
     vi.stubGlobal("fetch", mockFetch);
     mockReadBody.mockResolvedValue({});
     mockGetOrgContext.mockResolvedValue({
@@ -107,10 +149,14 @@ describe("syncA2ASecretHandler", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     vi.unstubAllGlobals();
   });
 
   it("posts A2A secrets through the SSRF-safe fetch wrapper", async () => {
+    vi.stubEnv("VERCEL_AUTOMATION_BYPASS_SECRET", "test-vercel-bypass");
+    vi.stubEnv("VERCEL_ENV", "preview");
+    vi.stubEnv("VERCEL_URL", "remote.example.test");
     const result = await syncA2ASecretHandler({} as any);
 
     expect(result).toMatchObject({
@@ -125,13 +171,14 @@ describe("syncA2ASecretHandler", () => {
         headers: expect.objectContaining({
           "Content-Type": "application/json",
           Authorization: "Bearer signed-jwt",
+          "x-vercel-protection-bypass": "test-vercel-bypass",
         }),
         body: JSON.stringify({
           secret: "local-secret",
           orgDomain: "example.test",
         }),
       }),
-      { maxRedirects: 3 },
+      { maxRedirects: 3, followRedirects: false },
     );
     expect(mockFetch).not.toHaveBeenCalled();
   });
@@ -173,6 +220,7 @@ describe("syncA2ASecretHandler", () => {
 describe("getMyOrgHandler", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGetOrgSetting.mockResolvedValue(null);
     mockGetOrgContext.mockResolvedValue({
       email: "owner@example.test",
       orgId: "org_1",
@@ -218,6 +266,33 @@ describe("getMyOrgHandler", () => {
     >;
 
     expect(result.a2aSecretSet).toBeUndefined();
+    expect(result.signInMethods).toBeUndefined();
+  });
+
+  it("gives an admin the sign-in methods but not the secret indicator", async () => {
+    mockGetOrgContext.mockResolvedValue(ADMIN_CONTEXT);
+
+    const result = (await getMyOrgHandler({} as any)) as Record<
+      string,
+      unknown
+    >;
+
+    expect(result.a2aSecretSet).toBeUndefined();
+    expect(result.signInMethods).toEqual({
+      emailPassword: true,
+      google: true,
+      github: false,
+    });
+  });
+
+  it("fails instead of reporting org visibility when the default cannot be read", async () => {
+    mockGetOrgSetting.mockRejectedValueOnce(
+      new Error("settings database unavailable"),
+    );
+
+    await expect(getMyOrgHandler({} as any)).rejects.toThrow(
+      "settings database unavailable",
+    );
   });
 });
 

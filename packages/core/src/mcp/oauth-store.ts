@@ -8,12 +8,7 @@
 
 import { randomBytes, randomUUID, createHash } from "node:crypto";
 
-import {
-  getDbExec,
-  isConnectionError,
-  intType,
-  isPostgres,
-} from "../db/client.js";
+import { getDbExec, isConnectionError } from "../db/client.js";
 import { ensureColumnExists, ensureTableExists } from "../db/ddl-guard.js";
 import { applicationTypeForRedirectUris } from "./oauth-client-metadata.js";
 
@@ -21,10 +16,6 @@ let _initPromise: Promise<void> | undefined;
 
 export const MCP_OAUTH_CODE_TTL_MS = 10 * 60_000;
 
-/**
- * Parse a duration string like "30d", "1h", "7d" into seconds.
- * Returns `null` when the input is not a valid recognised pattern.
- */
 function parseDurationSeconds(raw: string): number | null {
   const trimmed = raw.trim();
   const match = trimmed.match(/^(\d+(?:\.\d+)?)\s*([smhd])$/i);
@@ -52,7 +43,6 @@ function resolveAccessTokenTtl(): { str: string; seconds: number } {
   if (env) {
     const secs = parseDurationSeconds(env);
     if (secs !== null) return { str: env, seconds: secs };
-    // Garbage value — fall back to default rather than silently breaking.
     console.warn(
       `[mcp-oauth] Invalid MCP_OAUTH_ACCESS_TOKEN_TTL="${env}", using default "${DEFAULT_ACCESS_TOKEN_TTL}"`,
     );
@@ -65,16 +55,8 @@ function resolveAccessTokenTtl(): { str: string; seconds: number } {
 
 const _accessTokenTtl = resolveAccessTokenTtl();
 
-/**
- * Access-token TTL as a jose-compatible duration string.
- * Defaults to "30d"; override with MCP_OAUTH_ACCESS_TOKEN_TTL env var.
- */
 export const MCP_OAUTH_ACCESS_TOKEN_TTL: string = _accessTokenTtl.str;
 
-/**
- * Access-token TTL in seconds (derived from the same env var).
- * Used to populate the OAuth `expires_in` response field.
- */
 export const MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS: number =
   _accessTokenTtl.seconds;
 
@@ -82,10 +64,9 @@ export const MCP_OAUTH_REFRESH_TOKEN_TTL_MS = 365 * 24 * 60 * 60_000;
 export const MCP_OAUTH_REGISTER_MAX = 60;
 export const MCP_OAUTH_REGISTER_WINDOW_MS = 60_000;
 
-async function ensureTable(): Promise<void> {
+export async function ensureTable(): Promise<void> {
   if (!_initPromise) {
     _initPromise = (async () => {
-      const client = getDbExec();
       const createClientsSql = `
         CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
           client_id TEXT PRIMARY KEY,
@@ -95,7 +76,7 @@ async function ensureTable(): Promise<void> {
           response_types TEXT,
           token_endpoint_auth_method TEXT,
           application_type TEXT,
-          created_at ${intType()}
+          created_at BIGINT
         )
       `;
       const createCodesSql = `
@@ -110,9 +91,9 @@ async function ensureTable(): Promise<void> {
           org_domain TEXT,
           scope TEXT NOT NULL,
           resource TEXT NOT NULL,
-          created_at ${intType()},
-          expires_at ${intType()},
-          consumed_at ${intType()}
+          created_at BIGINT,
+          expires_at BIGINT,
+          consumed_at BIGINT
         )
       `;
       const createRefreshTokensSql = `
@@ -125,50 +106,25 @@ async function ensureTable(): Promise<void> {
           org_domain TEXT,
           scope TEXT NOT NULL,
           resource TEXT NOT NULL,
-          created_at ${intType()},
-          expires_at ${intType()},
-          last_used_at ${intType()},
-          revoked_at ${intType()},
+          created_at BIGINT,
+          expires_at BIGINT,
+          last_used_at BIGINT,
+          revoked_at BIGINT,
           replaced_by_hash TEXT
         )
       `;
 
-      if (isPostgres()) {
-        // PG-guard: probe information_schema first (no lock) and only issue
-        // DDL when the table is actually missing, wrapped in a
-        // transaction-scoped lock_timeout so a contended lock fails fast.
-        await ensureTableExists("mcp_oauth_clients", createClientsSql);
-        await ensureColumnExists(
-          "mcp_oauth_clients",
-          "application_type",
-          `ALTER TABLE mcp_oauth_clients ADD COLUMN IF NOT EXISTS application_type TEXT`,
-        );
-        await ensureTableExists("mcp_oauth_codes", createCodesSql);
-        await ensureTableExists(
-          "mcp_oauth_refresh_tokens",
-          createRefreshTokensSql,
-        );
-        return;
-      }
-
-      // SQLite (local dev): no ACCESS EXCLUSIVE lock problem — keep existing
-      // create-then-execute behaviour.
-      await client.execute(createClientsSql);
-      try {
-        await client.execute(
-          `ALTER TABLE mcp_oauth_clients ADD COLUMN IF NOT EXISTS application_type TEXT`,
-        );
-      } catch {
-        try {
-          await client.execute(
-            `ALTER TABLE mcp_oauth_clients ADD COLUMN application_type TEXT`,
-          );
-        } catch {
-          // Fresh and previously migrated databases already have the column.
-        }
-      }
-      await client.execute(createCodesSql);
-      await client.execute(createRefreshTokensSql);
+      await ensureTableExists("mcp_oauth_clients", createClientsSql);
+      await ensureColumnExists(
+        "mcp_oauth_clients",
+        "application_type",
+        `ALTER TABLE mcp_oauth_clients ADD COLUMN IF NOT EXISTS application_type TEXT`,
+      );
+      await ensureTableExists("mcp_oauth_codes", createCodesSql);
+      await ensureTableExists(
+        "mcp_oauth_refresh_tokens",
+        createRefreshTokensSql,
+      );
     })().catch((err) => {
       _initPromise = undefined;
       throw err;

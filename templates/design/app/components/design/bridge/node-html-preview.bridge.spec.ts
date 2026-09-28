@@ -13,7 +13,8 @@ function hydratedEditorChromeBridgeScript(): string {
     .replace("__DESIGN_CANVAS_BOARD_SURFACE__", "false")
     .replace("__DESIGN_CANVAS_CONTENT_OFFSET_X__", "0")
     .replace("__DESIGN_CANVAS_CONTENT_OFFSET_Y__", "0")
-    .replace("__RUNTIME_LAYER_SNAPSHOT_ENABLED__", "false");
+    .replace("__RUNTIME_LAYER_SNAPSHOT_ENABLED__", "false")
+    .replace(/__INITIAL_SOURCE_HEAD__/g, '""');
 }
 
 describe("node-html-preview iframe bridge", () => {
@@ -49,11 +50,6 @@ describe("node-html-preview iframe bridge", () => {
               }
             ).__nodeHtmlPreviewAcks?.push(event.data);
           });
-          // Probes that `restore` put back the ORIGINAL node object with its
-          // original listeners rather than a re-parsed clone. Deliberately not
-          // a "click": edit mode's document-level capture net suppresses native
-          // interaction on the previewed app, so a click would prove nothing
-          // about node identity here — it never reaches any element listener.
           (window as Window & { __originalClicks?: number }).__originalClicks =
             0;
           document

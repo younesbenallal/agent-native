@@ -1,4 +1,4 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import {
   getRequestOrgId,
   getRequestUserEmail,
@@ -45,6 +45,7 @@ export default defineAction({
   }),
   http: { method: "POST" },
   readOnly: true,
+  grounding: true,
   run: async (args) => {
     return matchErrorIssuesBySignatures(resolveScope(), args.signatures);
   },

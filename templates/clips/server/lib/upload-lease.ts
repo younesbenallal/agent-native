@@ -1,20 +1,13 @@
-/**
- * The upload lease.
- *
- * One authoritative expiry, `recordings.upload_lease_expires_at`, renewed by
- * the client's own chunk POSTs. Liveness is a fact the writer asserts, not
- * something a GC infers by joining `recordings` against `application_state`
- * and comparing timestamps stored in two different encodings.
- *
- * Everything below reads from `recordings`, so the reaper sees every
- * in-progress upload — including buffered uploads that never opened a
- * resumable session, which the old session-keyed sweep could not select.
- */
-
-import { getDbExec, isPostgres } from "@agent-native/core/db";
+import { getDbExec } from "@agent-native/core/db";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 
 import { getDb, schema } from "../db/index.js";
+import {
+  normalizeRecordingPlatform,
+  trackRecordingFailure,
+} from "./recording-failures.js";
+import type { StoredResumableSession } from "./resumable-session.js";
+import { abortResumableUploadSession } from "./resumable-upload-cleanup.js";
 
 /**
  * ponytail: one horizon for both in-progress statuses. A paused recorder emits
@@ -45,13 +38,6 @@ export type UploadLeaseResult =
       durationMs: number | null;
     };
 
-/**
- * Take or renew the lease for one recording.
- *
- * This is a compare-and-set: `WHERE status IN (...)` is what makes racing a
- * concurrent abort or finalize structurally impossible. A terminal row updates
- * zero rows, so a caller never needs to re-check after each write.
- */
 export async function renewUploadLease(
   recordingId: string,
   options: {
@@ -67,7 +53,6 @@ export async function renewUploadLease(
     .set({
       uploadLeaseExpiresAt: uploadLeaseExpiry(now),
       updatedAt: new Date(now).toISOString(),
-      // Chunks can land out of order, so progress only ever moves forward.
       ...(options.uploadProgress === undefined
         ? {}
         : {
@@ -148,27 +133,70 @@ export interface ReapResult {
   expired: ReapedUpload[];
   failed: number;
   scratchKeysDeleted: number;
+  resumableSessionsAborted: number;
+  resumableCleanupFailed: number;
 }
 
-/**
- * Terminate uploads whose lease expired, then reclaim chunk scratch that no
- * live upload claims.
- *
- * The only liveness input is the lease the writer last wrote, and the only
- * thing protecting scratch is the existence of an in-progress `recordings`
- * row. There is no "the recording row was not visible to this probe" branch:
- * in-progress rows are selected from `recordings` itself, and the scratch
- * anti-join runs inside the database rather than across two round trips.
- */
+function resumableSessionKey(
+  recordingId: string,
+  generationId: string | null,
+): string {
+  return generationId
+    ? `resumable-session-${recordingId}-${generationId}`
+    : `resumable-session-${recordingId}`;
+}
+
+function parseStoredResumableSession(
+  value: unknown,
+): StoredResumableSession | null {
+  let parsed: unknown = value;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      // coercion-ok: malformed persisted session is absent, not an active session.
+      return null;
+    }
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const candidate = parsed as Record<string, unknown>;
+  if (
+    typeof candidate.providerId !== "string" ||
+    typeof candidate.sessionId !== "string" ||
+    !candidate.meta ||
+    typeof candidate.meta !== "object" ||
+    typeof candidate.bytesUploaded !== "number" ||
+    !Number.isFinite(candidate.bytesUploaded) ||
+    candidate.bytesUploaded < 0
+  ) {
+    return null;
+  }
+  return candidate as unknown as StoredResumableSession;
+}
+
+async function readResumableSessionState(
+  exec: ReturnType<typeof getDbExec>,
+  placeholder: string,
+  key: string,
+): Promise<{ present: boolean; session: StoredResumableSession | null }> {
+  const result = await exec.execute({
+    sql: `SELECT value FROM application_state WHERE key = ${placeholder}`,
+    args: [key],
+  });
+  const row = (result.rows as Array<{ value?: unknown }> | undefined)?.[0];
+  return {
+    present: row !== undefined,
+    session: row === undefined ? null : parseStoredResumableSession(row.value),
+  };
+}
+
 export async function reapExpiredUploads(
   options: { now?: number; limit?: number; dryRun?: boolean } = {},
 ): Promise<ReapResult> {
   const exec = getDbExec();
-  const pg = isPostgres();
   const nowIso = new Date(options.now ?? Date.now()).toISOString();
   const limit = Math.max(1, Math.min(options.limit ?? 200, 1000));
   const dryRun = options.dryRun === true;
-  const p = (i: number) => (pg ? `$${i}` : "?");
 
   // guard:allow-unscoped — system upload reaper, owner-agnostic by design.
   const probe = await exec.execute({
@@ -176,7 +204,7 @@ export async function reapExpiredUploads(
           FROM recordings
           WHERE status IN ('uploading', 'processing')
             AND upload_lease_expires_at IS NOT NULL
-            AND upload_lease_expires_at < ${p(1)}
+            AND upload_lease_expires_at < $1
           ORDER BY upload_lease_expires_at ASC
           LIMIT ${limit}`,
     args: [nowIso],
@@ -186,9 +214,12 @@ export async function reapExpiredUploads(
     (probe.rows as Array<Record<string, unknown>>) ?? []
   ).map((row) => ({
     id: String(row.id),
-    ownerEmail: String(row.owner_email ?? ""),
-    status: String(row.status ?? ""),
-    leaseExpiresAt: String(row.upload_lease_expires_at ?? ""),
+    ownerEmail: typeof row.owner_email === "string" ? row.owner_email : "",
+    status: typeof row.status === "string" ? row.status : "",
+    leaseExpiresAt:
+      typeof row.upload_lease_expires_at === "string"
+        ? row.upload_lease_expires_at
+        : "",
     uploadGenerationId:
       typeof row.upload_generation_id === "string"
         ? row.upload_generation_id
@@ -196,43 +227,75 @@ export async function reapExpiredUploads(
   }));
 
   let failed = 0;
+  let resumableSessionsAborted = 0;
+  let resumableCleanupFailed = 0;
   if (expired.length > 0 && !dryRun) {
     const ids = expired.map((row) => row.id);
     const result = await exec.execute({
       sql: `UPDATE recordings
             SET status = 'failed',
-                failure_reason = ${p(1)},
-                updated_at = ${p(2)}
+                failure_code = 'upload_timed_out',
+                failure_reason = $1,
+                updated_at = $2
             WHERE status IN ('uploading', 'processing')
-              AND upload_lease_expires_at < ${p(3)}
-              AND id IN (${ids.map((_, i) => p(i + 4)).join(", ")})
-            RETURNING id`,
+              AND upload_lease_expires_at < $3
+              AND id IN (${ids.map((_, i) => `$${i + 4}`).join(", ")})
+            RETURNING id, owner_email, upload_attempt_id, recording_platform`,
       args: [UPLOAD_LEASE_EXPIRED_REASON, nowIso, nowIso, ...ids],
     });
 
-    // The probe is a snapshot. A lease renewed between it and this
-    // compare-and-set keeps its row, so only what the UPDATE actually claimed
-    // may be reported or have its session state swept — reading the probe
-    // list here would tear down a live streaming upload's session.
-    const terminated = new Set(
-      ((result.rows as Array<{ id?: unknown }>) ?? []).map((row) =>
-        String(row.id),
-      ),
-    );
+    const terminatedRows =
+      (result.rows as Array<Record<string, unknown>>) ?? [];
+    const terminated = new Set(terminatedRows.map((row) => String(row.id)));
     expired = expired.filter((row) => terminated.has(row.id));
     failed = terminated.size;
 
+    for (const row of terminatedRows) {
+      if (typeof row.owner_email !== "string") {
+        throw new Error("Upload timeout row is missing owner email");
+      }
+      trackRecordingFailure({
+        recordingId: String(row.id),
+        userId: row.owner_email,
+        uploadAttemptId:
+          typeof row.upload_attempt_id === "string"
+            ? row.upload_attempt_id
+            : null,
+        platform: normalizeRecordingPlatform(row.recording_platform),
+        failureCode: "upload_timed_out",
+      });
+    }
+
     for (const id of terminated) {
-      const generationId = expired.find(
-        (row) => row.id === id,
-      )?.uploadGenerationId;
+      const generationId =
+        expired.find((row) => row.id === id)?.uploadGenerationId ?? null;
+      const sessionKey = resumableSessionKey(id, generationId);
+      const sessionState = await readResumableSessionState(
+        exec,
+        "$1",
+        sessionKey,
+      );
+      if (sessionState.present && !sessionState.session) {
+        resumableCleanupFailed += 1;
+        console.warn(
+          `[upload-reaper-${id}] resumable session state is unreadable; keeping it for manual cleanup`,
+        );
+        continue;
+      }
+      if (sessionState.session) {
+        const cleaned = await abortResumableUploadSession(
+          sessionState.session,
+          { label: `upload-reaper-${id}` },
+        );
+        if (!cleaned) {
+          resumableCleanupFailed += 1;
+          continue;
+        }
+        resumableSessionsAborted += 1;
+      }
       await exec.execute({
-        sql: `DELETE FROM application_state WHERE key = ${p(1)}`,
-        args: [
-          generationId
-            ? `resumable-session-${id}-${generationId}`
-            : `resumable-session-${id}`,
-        ],
+        sql: `DELETE FROM application_state WHERE key = $1`,
+        args: [sessionKey],
       });
     }
   }
@@ -241,15 +304,16 @@ export async function reapExpiredUploads(
     ? (await selectUnclaimedChunkKeys(limit)).length
     : await deleteUnclaimedChunkScratch(limit);
 
-  return { dryRun, expired, failed, scratchKeysDeleted };
+  return {
+    dryRun,
+    expired,
+    failed,
+    scratchKeysDeleted,
+    resumableSessionsAborted,
+    resumableCleanupFailed,
+  };
 }
 
-/**
- * Chunk scratch is claimed by exactly one thing: an in-progress `recordings`
- * row. Anything else — finalized, failed, or hard-deleted recordings — is
- * reclaimable, with no age grace needed, because a stuck upload can only leave
- * the in-progress set through the reaper above.
- */
 async function selectUnclaimedChunkKeys(limit: number): Promise<string[]> {
   // guard:allow-unscoped — system scratch GC, owner-agnostic by design.
   const { rows } = await getDbExec().execute({
@@ -272,8 +336,7 @@ async function selectUnclaimedChunkKeys(limit: number): Promise<string[]> {
 async function deleteUnclaimedChunkScratch(limit: number): Promise<number> {
   const keys = await selectUnclaimedChunkKeys(limit);
   if (keys.length === 0) return 0;
-  const pg = isPostgres();
-  const placeholders = keys.map((_, i) => (pg ? `$${i + 1}` : "?")).join(", ");
+  const placeholders = keys.map((_, i) => `$${i + 1}`).join(", ");
   const result = await getDbExec().execute({
     sql: `DELETE FROM application_state WHERE key IN (${placeholders})`,
     args: keys,

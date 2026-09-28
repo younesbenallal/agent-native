@@ -34,6 +34,7 @@ const messages = {
     agentDescription:
       "에이전트의 모델, API 키, 자동화, 음성 및 기타 제어를 관리합니다.",
     openAgentSettings: "에이전트 관리",
+    editorGroupTitle: "편집기",
     editorTitle: "VS Code 확장 프로그램",
     editorDescription:
       "별도의 브라우저 탭 대신 VS Code 사이드 패널에서 계획을 열고 검토하세요.",
@@ -377,9 +378,17 @@ const messages = {
         "기본적으로 비공개입니다. 사람들을 초대하고, 조직과 공유하거나, 링크가 있는 모든 사람이 검토할 수 있도록 공개로 설정하세요.",
       peopleAccess: "{{noun}} 액세스 권한이 있는 사용자",
       generalAccess: "일반 {{noun}} 액세스",
+      commenterRoleLabel: "댓글 작성자",
+      commenterRoleDescription: "보고 댓글을 추가할 수 있음",
       shareAria: "{{noun}} 공유",
       share: "{{noun}} 공유",
       shareThis: "{{noun}} 공유",
+      teammateSuggestion: {
+        message: "팀원을 Plan에 초대하세요.",
+        invite: "팀원 초대",
+        enableDomain: "@{{domain}}의 누구나 참여 허용",
+        enableFailed: "도메인 참여를 설정하지 못했습니다. 다시 시도하세요.",
+      },
       hostedCopy:
         "이 로컬 {{noun}}에는 공유를 위한 호스팅된 사본이 있습니다. 액세스를 관리하려면 호스팅된 {{noun}}을 엽니다.",
       publishDescription:
@@ -635,6 +644,7 @@ const messages = {
       createAccount: "创建账户",
       signIn: "登录",
       haveAccount: "我已有账户",
+      storageStatusUnavailable: "파일 저장소를 확인할 수 없습니다.",
       retry: "重试",
       sendFeedback: "피드백 보내기",
       feedbackPlaceholder:

@@ -1,16 +1,12 @@
 import { useT } from "@agent-native/core/client/i18n";
 import { IconInfoCircle } from "@tabler/icons-react";
 import { type ReactNode } from "react";
+import { useLocation } from "react-router";
 
+import { dispatchDocsHrefForPath, DocsLink } from "./docs-link";
 import { useSetPageTitle } from "./layout/HeaderActions";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 
-/**
- * DispatchShell renders the per-page title (with an optional click-to-open
- * description popover) into the global header via the HeaderActions store.
- * The actual chrome (sidebar, AgentSidebar, header bar with AgentToggleButton)
- * is provided by `Layout` mounted in `root.tsx`.
- */
 export function DispatchShell({
   title,
   description,
@@ -21,12 +17,16 @@ export function DispatchShell({
   children: ReactNode;
 }) {
   const t = useT();
+  const location = useLocation();
+  const docsHref = dispatchDocsHrefForPath(location.pathname);
   useSetPageTitle(
     <div className="flex items-center gap-2 min-w-0">
       <h1 className="text-lg font-semibold tracking-tight truncate text-foreground">
         {title}
       </h1>
-      {description ? (
+      {docsHref ? (
+        <DocsLink href={docsHref} label={`Open ${title} documentation`} />
+      ) : description ? (
         <Popover>
           <PopoverTrigger asChild>
             <button

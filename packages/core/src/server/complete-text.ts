@@ -9,7 +9,10 @@ import {
   type EngineStreamOptions,
 } from "../agent/engine/index.js";
 import { EngineError } from "../agent/engine/types.js";
-import { getOwnerActiveApiKey } from "../agent/production-agent.js";
+import {
+  resolveOwnerEngineApiKey,
+  type ResolvedOwnerApiKey,
+} from "../agent/production-agent.js";
 import type { ReasoningEffort } from "../shared/reasoning-effort.js";
 import { getRequestUserEmail } from "./request-context.js";
 
@@ -28,22 +31,15 @@ export interface CompleteTextUsage {
 }
 
 export interface CompleteTextOptions {
-  /** Optional system prompt for the single model call. */
   systemPrompt?: string;
-  /** Convenience final user message. Appended after `messages` when both are set. */
   input?: string;
-  /** Optional prior messages for narrow multi-turn transforms. */
   messages?: CompleteTextMessage[];
-  /** Explicit engine name or instance. Omit to use the normal request/default engine. */
   engine?:
     | string
     | AgentEngine
     | { name: string; config: Record<string, unknown> };
-  /** Explicit model. Omit to honor app/user default, then engine default. */
   model?: string;
-  /** App/template id used for org-scoped model defaults. */
   appId?: string;
-  /** Optional direct API key. Prefer request secrets/env resolution when possible. */
   apiKey?: string;
   maxOutputTokens?: number;
   temperature?: number;
@@ -134,32 +130,36 @@ function createCompletionAbortSignal(
 }
 
 async function resolveCompletionApiKey(
-  explicitApiKey: string | undefined,
-): Promise<string | undefined> {
-  if (explicitApiKey) return explicitApiKey;
+  options: CompleteTextOptions,
+): Promise<ResolvedOwnerApiKey> {
+  if (options.apiKey) {
+    return { apiKey: options.apiKey, apiKeyEnvVar: undefined };
+  }
   try {
-    return await getOwnerActiveApiKey(getRequestUserEmail());
+    return await resolveOwnerEngineApiKey({
+      engineOption: options.engine,
+      ownerEmail: getRequestUserEmail(),
+    });
   } catch {
-    return undefined;
+    return { apiKey: undefined, apiKeyEnvVar: undefined };
   }
 }
 
-/**
- * Run a single server-side model completion through the framework engine layer.
- *
- * Prefer `sendToAgentChat()` or actions for product workflows where the user
- * should see, steer, or audit the agent. Use this helper only for narrow text
- * transforms that intentionally do not need tools, chat history, or run state.
- */
 export async function completeText(
   options: CompleteTextOptions,
 ): Promise<CompleteTextResult> {
   registerBuiltinEngines();
 
-  const apiKey = await resolveCompletionApiKey(options.apiKey);
+  const {
+    apiKey,
+    apiKeyEnvVar,
+    credentialProvenance: apiKeyProvenance,
+  } = await resolveCompletionApiKey(options);
   const engine = await resolveEngine({
     engineOption: options.engine,
     apiKey,
+    apiKeyEnvVar,
+    apiKeyProvenance,
     model: options.model,
     appId: options.appId,
   });

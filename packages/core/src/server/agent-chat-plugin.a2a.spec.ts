@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const getObservabilityConfigMock = vi.hoisted(() => vi.fn());
@@ -8,11 +10,14 @@ vi.mock("../observability/traces.js", () => ({
   instrumentAgentLoop: instrumentAgentLoopMock,
 }));
 
+import { extractA2APersistedMutationReceipts } from "../a2a/artifact-response.js";
 import { loadActionsFromStaticRegistry } from "./action-discovery.js";
 import {
   assembleA2AFinalResponse,
+  buildSelectedA2AReceiverContext,
   buildPublicAgentA2ASkills,
   createA2AEngineToolSurface,
+  isSelectedA2AReceiver,
   createSerializedA2ATaskStatusWriter,
   DEFAULT_DELEGATED_MAX_ITERATIONS,
   DEFAULT_DELEGATED_MAX_RUN_INPUT_TOKENS,
@@ -23,8 +28,8 @@ import {
 } from "./agent-chat-plugin.js";
 
 describe("delegated A2A recoverable artifact checkpoints", () => {
-  it("uses an organization A2A secret when no global secret is configured", async () => {
-    vi.stubEnv("A2A_SECRET", "");
+  it("prefers the organization A2A secret when a global secret is also configured", async () => {
+    vi.stubEnv("A2A_SECRET", "global-a2a-secret");
     vi.doMock("../org/context.js", () => ({
       getOrgA2ASecret: vi.fn(async () => "org-only-a2a-secret"),
     }));
@@ -32,6 +37,22 @@ describe("delegated A2A recoverable artifact checkpoints", () => {
     await expect(resolveA2ARecoverableArtifactSecret("org-qa")).resolves.toBe(
       "org-only-a2a-secret",
     );
+
+    vi.doUnmock("../org/context.js");
+    vi.unstubAllEnvs();
+  });
+
+  it("does not use the global secret when organization secret lookup fails", async () => {
+    vi.stubEnv("A2A_SECRET", "global-a2a-secret");
+    vi.doMock("../org/context.js", () => ({
+      getOrgA2ASecret: vi.fn(async () => {
+        throw new Error("organization secret store unavailable");
+      }),
+    }));
+
+    await expect(
+      resolveA2ARecoverableArtifactSecret("org-qa"),
+    ).resolves.toBeUndefined();
 
     vi.doUnmock("../org/context.js");
     vi.unstubAllEnvs();
@@ -204,6 +225,15 @@ describe("delegated A2A final response guards", () => {
     expect(delegatedRunner.mock.calls[0]?.[0]?.systemPrompt).toContain(
       "Do not bounce the work back",
     );
+    expect(delegatedRunner.mock.calls[0]?.[0]?.systemPrompt).toContain(
+      "Reach for your own registered actions first",
+    );
+    expect(delegatedRunner.mock.calls[0]?.[0]?.systemPrompt).toContain(
+      "never use a shell, filesystem, or code-execution tool",
+    );
+    expect(delegatedRunner.mock.calls[0]?.[0]?.systemPrompt).toContain(
+      "This step is cut off after about 12 seconds",
+    );
   });
 
   it("keeps the MCP-local ask_app loop on the same guard contract", async () => {
@@ -238,8 +268,8 @@ describe("delegated A2A final response guards", () => {
     expect(runner).toHaveBeenCalledWith(
       expect.objectContaining({
         finalResponseGuard: guard,
-        maxOutputTokens: 32_000,
-        reasoningEffort: "medium",
+        maxOutputTokens: 64_000,
+        reasoningEffort: "high",
         maxIterations: DEFAULT_DELEGATED_MAX_ITERATIONS,
         maxRunInputTokens: DEFAULT_DELEGATED_MAX_RUN_INPUT_TOKENS,
         toolLimits: expect.objectContaining({
@@ -424,14 +454,78 @@ describe("delegated A2A tool surface", () => {
       "starter",
       "tool-search",
     ]);
-    // `runAgentLoop` uses this full list to load a matched schema after the
-    // initial `tool-search` call, rather than forcing the whole registry into
-    // the first model request.
     expect(surface.availableTools.map((entry) => entry.name)).toEqual([
       "starter",
       "tool-search",
       "rare-analytics-action",
     ]);
+  });
+
+  it("keeps framework automation tools on the delegated first request", () => {
+    const source = readFileSync("src/server/agent-chat-plugin.ts", "utf8");
+    const a2aActionsStart = source.indexOf(
+      "const a2aActions = attachToolSearch(",
+    );
+    const a2aToolSurfaceStart = source.indexOf(
+      "const a2aToolSurface = createA2AEngineToolSurface(",
+      a2aActionsStart,
+    );
+    const a2aActions = source.slice(a2aActionsStart, a2aToolSurfaceStart);
+
+    expect(a2aActions.match(/\.\.\.automationTools,/g)).toHaveLength(2);
+
+    const surface = createA2AEngineToolSurface(
+      [tool("manage-automations"), tool("tool-search"), tool("rare-action")],
+      ["manage-automations"],
+    );
+
+    expect(surface.tools.map((entry) => entry.name)).toEqual([
+      "manage-automations",
+      "tool-search",
+    ]);
+    expect(surface.availableTools.map((entry) => entry.name)).toEqual([
+      "manage-automations",
+      "tool-search",
+      "rare-action",
+    ]);
+  });
+
+  it("prioritizes a selected receiver's bounded local catalog before cross-app tools", () => {
+    const availableTools = [
+      tool("starter"),
+      tool("list-content-databases"),
+      tool("describe-content-database"),
+      tool("describe-workspace-apps"),
+      tool("call-agent"),
+      tool("tool-search"),
+      tool("rare-action"),
+    ];
+
+    const surface = createA2AEngineToolSurface(availableTools, ["starter"], {
+      receiverOwnsObjective: true,
+      localCapabilityNames: [
+        "list-content-databases",
+        "describe-content-database",
+      ],
+    });
+
+    expect(surface.tools.map((entry) => entry.name)).toEqual([
+      "starter",
+      "list-content-databases",
+      "describe-content-database",
+      "tool-search",
+    ]);
+    expect(surface.availableTools).toBe(availableTools);
+  });
+
+  it("matches only the receiver app selected by bounded A2A metadata", () => {
+    expect(isSelectedA2AReceiver("content", "content")).toBe(true);
+    expect(isSelectedA2AReceiver("agent-native-content", "CONTENT")).toBe(true);
+    expect(isSelectedA2AReceiver("design", "content")).toBe(false);
+    expect(isSelectedA2AReceiver(undefined, "content")).toBe(false);
+    expect(buildSelectedA2AReceiverContext("content")).toContain(
+      "The caller already selected this app",
+    );
   });
 
   it("keeps the existing full A2A tool surface without an initial allow-list", () => {
@@ -443,16 +537,6 @@ describe("delegated A2A tool surface", () => {
     expect(surface.availableTools).toBe(availableTools);
   });
 
-  // agent-chat-plugin.ts's MCP `ask_app` inner loop (the `askAgent` closure
-  // passed to `mountMCP`) reuses this exact helper with the same
-  // `effectiveInitialToolNames` the interactive chat path uses, instead of
-  // handing `actionsToEngineTools(mcpActions)` straight to the engine
-  // unfiltered. Before that fix, every external host calling `ask_app` over
-  // MCP triggered a near-full-catalog first request, undermining the compact
-  // MCP catalog this surface exists to keep external callers on. This test
-  // locks in the same compaction guarantee for a registry shaped like the
-  // MCP loop's (template action + a much larger set of framework additions —
-  // resource/docs/chat/fetch/web-search/workspace-files/tool/MCP entries).
   it("compacts the MCP ask_app inner loop's first request the same way as A2A", () => {
     const availableTools = [
       tool("template-app-action"),
@@ -470,11 +554,6 @@ describe("delegated A2A tool surface", () => {
       "template-app-action",
       "tool-search",
     ]);
-    // The full registry is preserved separately so `runAgentLoop`'s mid-run
-    // tool-search expansion (`expandActiveTools` in production-agent.ts,
-    // exercised end-to-end in production-agent.spec.ts's "expands the
-    // provider tool list after tool-search returns matches") can still load
-    // any of these once the model searches for them.
     expect(surface.availableTools).toBe(availableTools);
   });
 });
@@ -665,6 +744,120 @@ describe("assembleA2AFinalResponse", () => {
         { outcome: { state: "completed" } },
       ).finalText,
     ).toBe("Recovered answer");
+  });
+
+  it("returns structured verified Content mutation receipts with the final text", () => {
+    const assembled = assembleA2AFinalResponse(
+      [{ type: "text", text: "Feedback updated." }, { type: "done" }],
+      [
+        {
+          tool: "upsert-database-item-by-key",
+          result: JSON.stringify({
+            receipt: {
+              receiptId: "receipt-row-1",
+              operation: "upsert",
+              outcome: "updated",
+              target: {
+                authorityScope: {
+                  kind: "personal",
+                  id: "alice@example.test",
+                },
+                spaceId: "space-alice",
+                databaseId: "feedback-db",
+                databaseDocumentId: "feedback-db-document",
+              },
+              row: {
+                itemId: "feedback-item-1",
+                documentId: "feedback-document-1",
+                urlPath: "/page/feedback-document-1",
+              },
+              idempotency: {
+                key: "request-1",
+                result: "applied",
+                payloadDigest: "digest-1",
+              },
+              revisions: { before: "before", after: "after" },
+              readback: { verified: true, propertyValues: {} },
+            },
+          }),
+        },
+      ],
+    );
+
+    expect(assembled.mutationReceipts).toEqual([
+      expect.objectContaining({
+        receiptId: "receipt-row-1",
+        row: expect.objectContaining({ documentId: "feedback-document-1" }),
+      }),
+    ]);
+    expect(assembled.finalText).toContain("/page/feedback-document-1");
+  });
+
+  it("signs final mutation receipts with an organization-only secret", () => {
+    vi.stubEnv("A2A_SECRET", "");
+    const secret = "org-only-final-receipt-secret";
+    const toolResults = [
+      {
+        tool: "upsert-database-item-by-key",
+        result: JSON.stringify({
+          receipt: {
+            receiptId: "receipt-org-secret",
+            operation: "upsert",
+            outcome: "created",
+            target: {
+              authorityScope: { kind: "personal", id: "owner@example.test" },
+              spaceId: "space-owner",
+              databaseId: "feedback-db",
+              databaseDocumentId: "feedback-db-document",
+            },
+            row: {
+              itemId: "feedback-item",
+              documentId: "feedback-document",
+              urlPath: "/page/feedback-document",
+            },
+            idempotency: {
+              key: "request-org-secret",
+              result: "applied",
+              payloadDigest: "digest-org-secret",
+            },
+            revisions: { after: "after" },
+            readback: { verified: true, propertyValues: {} },
+          },
+        }),
+      },
+    ];
+
+    const assembled = assembleA2AFinalResponse(
+      [{ type: "text", text: "Created feedback." }, { type: "done" }],
+      toolResults,
+      {
+        persistedArtifactSecret: secret,
+        delegatedTaskId: "task-current",
+      },
+    );
+
+    expect(
+      extractA2APersistedMutationReceipts(
+        [{ tool: "call-agent", result: assembled.finalText }],
+        {
+          persistedArtifactSecrets: [secret],
+          expectedDelegatedTaskId: "task-current",
+        },
+      ),
+    ).toEqual([expect.objectContaining({ receiptId: "receipt-org-secret" })]);
+    expect(
+      extractA2APersistedMutationReceipts(
+        [{ tool: "call-agent", result: assembled.finalText }],
+        {
+          persistedArtifactSecrets: [secret],
+          expectedDelegatedTaskId: "task-other",
+        },
+      ),
+    ).toEqual([]);
+    expect(assembled.mutationReceipts).toEqual([
+      expect.objectContaining({ receiptId: "receipt-org-secret" }),
+    ]);
+    vi.unstubAllEnvs();
   });
 
   it.each([

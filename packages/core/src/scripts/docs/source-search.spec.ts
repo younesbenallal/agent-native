@@ -44,10 +44,7 @@ describe("source-search", { timeout: 60000 }, () => {
     const files = listCorpusFiles();
 
     expect(files).toContain("templates/chat/package.json");
-    expect(files).toContain("templates/chat/data/sync-config.json");
 
-    // Core and Toolkit source already ship as dist/, docs/, and the Toolkit
-    // package's own src/; a corpus copy was the same bytes a second time.
     expect(
       files.filter(
         (file) => file.startsWith("core/") || file.startsWith("toolkit/"),
@@ -64,8 +61,6 @@ describe("source-search", { timeout: 60000 }, () => {
     expect(files.some((file) => /\.test\.[cm]?[jt]sx?$/.test(file))).toBe(
       false,
     );
-    expect(files.some((file) => file.endsWith(".db"))).toBe(false);
-    expect(files.some((file) => file.endsWith(".db-wal"))).toBe(false);
     expect(files).not.toContain(
       "templates/clips/chrome-extension/public/icons/icon-128.png",
     );

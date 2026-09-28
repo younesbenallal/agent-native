@@ -1,26 +1,49 @@
-import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createClient, type Client } from "@libsql/client";
-import { drizzle } from "drizzle-orm/libsql";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { closeDbExec, createGetDb, getDbExec } from "@agent-native/core/db";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as schema from "../schema/index.js";
 import type { EventType } from "../shared/index.js";
 import { SlotConflictError } from "./availability-engine.js";
-import { createBooking, rescheduleBooking } from "./booking-service.js";
+import {
+  cancelBooking,
+  createBooking,
+  rescheduleBooking,
+} from "./booking-service.js";
 import { getBookingByUid, insertBooking } from "./bookings-repo.js";
 import { setSchedulingContext } from "./context.js";
-import { registerCalendarProvider } from "./providers/registry.js";
-import type { CalendarProvider } from "./providers/types.js";
+import {
+  registerCalendarProvider,
+  registerVideoProvider,
+} from "./providers/registry.js";
+import type { CalendarProvider, VideoProvider } from "./providers/types.js";
 
 const HOST_EMAIL = "host@example.com";
 const ATTENDEE_EMAIL = "attendee@example.com";
-const GUEST_EMAIL = "guest@example.com";
 
-let client: Client;
+type SqlStatement = string | { sql: string; args?: unknown[] };
+
+function postgresSql(sql: string): string {
+  let index = 0;
+  return sql.replace(/\?/g, () => "$" + ++index);
+}
+
+async function execute(statement: SqlStatement) {
+  if (typeof statement === "string")
+    return getDbExec().execute(postgresSql(statement));
+  return getDbExec().execute({
+    ...statement,
+    sql: postgresSql(statement.sql),
+  });
+}
+const GUEST_EMAIL = "guest@example.com";
+const createZoomMeetingMock = vi.fn<VideoProvider["createMeeting"]>();
+const deleteZoomMeetingMock =
+  vi.fn<NonNullable<VideoProvider["deleteMeeting"]>>();
+
 let dbDir: string;
 
 function makeEventType(overrides: Partial<EventType> = {}): EventType {
@@ -72,9 +95,20 @@ function makeCalendarProvider(
 }
 
 beforeEach(async () => {
+  createZoomMeetingMock.mockReset().mockResolvedValue({
+    meetingUrl: "https://zoom.us/j/123456789",
+    meetingId: "zoom-meeting-1",
+  });
+  deleteZoomMeetingMock.mockReset().mockResolvedValue();
+  registerVideoProvider({
+    kind: "zoom_video",
+    label: "Test Zoom",
+    createMeeting: createZoomMeetingMock,
+    deleteMeeting: deleteZoomMeetingMock,
+  });
   dbDir = mkdtempSync(join(tmpdir(), "scheduling-booking-test-"));
-  client = createClient({ url: `file:${join(dbDir, `${randomUUID()}.db`)}` });
-  await client.execute(`
+  process.env.DATABASE_URL = `pglite:${dbDir}`;
+  await execute(`
     CREATE TABLE bookings (
       id TEXT PRIMARY KEY,
       uid TEXT NOT NULL UNIQUE,
@@ -96,8 +130,8 @@ beforeEach(async () => {
       ical_uid TEXT NOT NULL,
       ical_sequence INTEGER NOT NULL DEFAULT 0,
       recurring_event_id TEXT,
-      paid INTEGER NOT NULL DEFAULT 0,
-      no_show_host INTEGER NOT NULL DEFAULT 0,
+      paid BOOLEAN NOT NULL DEFAULT false,
+      no_show_host BOOLEAN NOT NULL DEFAULT false,
       metadata TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
@@ -106,7 +140,7 @@ beforeEach(async () => {
       visibility TEXT NOT NULL DEFAULT 'private'
     );
   `);
-  await client.execute(`
+  await execute(`
     CREATE TABLE booking_attendees (
       id TEXT PRIMARY KEY,
       booking_id TEXT NOT NULL,
@@ -114,11 +148,11 @@ beforeEach(async () => {
       name TEXT NOT NULL,
       timezone TEXT,
       locale TEXT,
-      no_show INTEGER NOT NULL DEFAULT 0,
+      no_show BOOLEAN NOT NULL DEFAULT false,
       created_at TEXT NOT NULL
     );
   `);
-  await client.execute(`
+  await execute(`
     CREATE TABLE booking_references (
       id TEXT PRIMARY KEY,
       booking_id TEXT NOT NULL,
@@ -130,7 +164,7 @@ beforeEach(async () => {
       created_at TEXT NOT NULL
     );
   `);
-  await client.execute(`
+  await execute(`
     CREATE TABLE destination_calendars (
       id TEXT PRIMARY KEY,
       credential_id TEXT NOT NULL,
@@ -142,7 +176,7 @@ beforeEach(async () => {
       created_at TEXT NOT NULL
     );
   `);
-  await client.execute(`
+  await execute(`
     CREATE TABLE scheduling_credentials (
       id TEXT PRIMARY KEY,
       type TEXT NOT NULL,
@@ -152,13 +186,13 @@ beforeEach(async () => {
       oauth_token_id TEXT,
       display_name TEXT,
       external_email TEXT,
-      invalid INTEGER NOT NULL DEFAULT 0,
-      is_default INTEGER NOT NULL DEFAULT 0,
+      invalid BOOLEAN NOT NULL DEFAULT false,
+      is_default BOOLEAN NOT NULL DEFAULT false,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
   `);
-  await client.execute(`
+  await execute(`
     CREATE TABLE selected_calendars (
       id TEXT PRIMARY KEY,
       credential_id TEXT NOT NULL,
@@ -169,13 +203,13 @@ beforeEach(async () => {
       created_at TEXT NOT NULL
     );
   `);
-  await client.execute(`
+  await execute(`
     CREATE TABLE workflows (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       trigger TEXT NOT NULL,
       team_id TEXT,
-      disabled INTEGER NOT NULL DEFAULT 0,
+      disabled BOOLEAN NOT NULL DEFAULT false,
       active_on_event_type_ids TEXT NOT NULL DEFAULT '[]',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
@@ -184,13 +218,13 @@ beforeEach(async () => {
       visibility TEXT NOT NULL DEFAULT 'private'
     );
   `);
-  await client.execute(`
+  await execute(`
     CREATE TABLE webhooks (
       id TEXT PRIMARY KEY,
       name TEXT,
       subscriber_url TEXT NOT NULL,
       secret TEXT,
-      active INTEGER NOT NULL DEFAULT 1,
+      active BOOLEAN NOT NULL DEFAULT true,
       event_triggers TEXT NOT NULL DEFAULT '[]',
       team_id TEXT,
       event_type_id TEXT,
@@ -201,7 +235,22 @@ beforeEach(async () => {
       visibility TEXT NOT NULL DEFAULT 'private'
     );
   `);
-  await client.execute(`
+  await execute(`
+    CREATE TABLE scheduled_reminders (
+      id TEXT PRIMARY KEY,
+      booking_id TEXT NOT NULL,
+      workflow_step_id TEXT NOT NULL,
+      method TEXT NOT NULL,
+      scheduled_for TEXT NOT NULL,
+      sent BOOLEAN NOT NULL DEFAULT false,
+      sent_at TEXT,
+      failed BOOLEAN NOT NULL DEFAULT false,
+      failure_reason TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+  `);
+  await execute(`
     CREATE TABLE event_types (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
@@ -210,7 +259,7 @@ beforeEach(async () => {
       length INTEGER NOT NULL DEFAULT 30,
       durations TEXT,
       position INTEGER NOT NULL DEFAULT 0,
-      hidden INTEGER NOT NULL DEFAULT 0,
+      hidden BOOLEAN NOT NULL DEFAULT false,
       color TEXT,
       scheduling_type TEXT NOT NULL DEFAULT 'personal',
       team_id TEXT,
@@ -226,12 +275,12 @@ beforeEach(async () => {
       period_start_date TEXT,
       period_end_date TEXT,
       seats_per_time_slot INTEGER,
-      requires_confirmation INTEGER NOT NULL DEFAULT 0,
-      disable_guests INTEGER NOT NULL DEFAULT 0,
-      hide_calendar_notes INTEGER NOT NULL DEFAULT 0,
+      requires_confirmation BOOLEAN NOT NULL DEFAULT false,
+      disable_guests BOOLEAN NOT NULL DEFAULT false,
+      hide_calendar_notes BOOLEAN NOT NULL DEFAULT false,
       success_redirect_url TEXT,
       booking_limits TEXT,
-      lock_time_zone_toggle INTEGER NOT NULL DEFAULT 0,
+      lock_time_zone_toggle BOOLEAN NOT NULL DEFAULT false,
       recurring_event TEXT,
       event_name TEXT,
       metadata TEXT,
@@ -243,7 +292,7 @@ beforeEach(async () => {
     );
   `);
 
-  const db = drizzle(client, { schema });
+  const db = createGetDb(schema)();
   setSchedulingContext({
     getDb: () => db,
     schema,
@@ -251,14 +300,13 @@ beforeEach(async () => {
   });
 });
 
-afterEach(() => {
-  client.close();
+afterEach(async () => {
+  await closeDbExec();
   rmSync(dbDir, { recursive: true, force: true });
 });
 
-/** `rescheduleBooking` re-loads the event type by id, so it must exist. */
 async function seedEventType(eventType: EventType): Promise<void> {
-  await client.execute({
+  await execute({
     sql: `INSERT INTO event_types (
       id, title, slug, description, length, durations, position, hidden, color,
       scheduling_type, team_id, locations, custom_fields, schedule_id,
@@ -356,18 +404,15 @@ describe("insertBooking", () => {
         timezone: "UTC",
         attendees: [
           { email: ATTENDEE_EMAIL, name: "Attendee One" },
-          // A null email violates the NOT NULL constraint after the first
-          // attendee (and the booking row) have already been written —
-          // proving the whole write is one atomic unit.
           { email: null as unknown as string, name: "Bad Attendee" },
         ],
         ownerEmail: HOST_EMAIL,
       }),
     ).rejects.toThrow();
 
-    const { rows } = await client.execute("SELECT * FROM bookings");
+    const { rows } = await execute("SELECT * FROM bookings");
     expect(rows).toHaveLength(0);
-    const { rows: attendeeRows } = await client.execute(
+    const { rows: attendeeRows } = await execute(
       "SELECT * FROM booking_attendees",
     );
     expect(attendeeRows).toHaveLength(0);
@@ -377,7 +422,7 @@ describe("insertBooking", () => {
 describe("createBooking", () => {
   it("creates a booking with attendees and references on a free slot", async () => {
     const now = new Date().toISOString();
-    await client.execute({
+    await execute({
       sql: `INSERT INTO destination_calendars
         (id, credential_id, user_email, integration, external_id, created_at)
         VALUES (?, ?, ?, ?, ?, ?)`,
@@ -433,7 +478,7 @@ describe("createBooking", () => {
       }),
     ).rejects.toBeInstanceOf(SlotConflictError);
 
-    const { rows } = await client.execute(
+    const { rows } = await execute(
       "SELECT * FROM bookings WHERE host_email = 'host@example.com'",
     );
     expect(rows).toHaveLength(1);
@@ -450,8 +495,6 @@ describe("createBooking", () => {
       attendee: { email: ATTENDEE_EMAIL, name: "Attendee One" },
     });
 
-    // Starts exactly when the first booking ends, so the raw windows don't
-    // overlap — only the buffered event type's 15-minute lead-in collides.
     const bufferedEventType = makeEventType({
       id: "event-type-buffered",
       beforeEventBuffer: 15,
@@ -469,9 +512,6 @@ describe("createBooking", () => {
   });
 
   it("allows an out-of-availability free slot once the conflicting booking is cancelled", async () => {
-    // Sanity check that the conflict guard is scoped to the requested
-    // window, not a blanket rejection — a later, non-overlapping slot for
-    // the same host must still succeed.
     const eventType = makeEventType();
     await createBooking({
       eventType,
@@ -507,9 +547,6 @@ describe("rescheduleBooking", () => {
       attendee: { email: ATTENDEE_EMAIL, name: "Attendee One" },
     });
 
-    // Reschedule to an overlapping-but-shifted slot; if the original
-    // booking's own busy interval weren't excluded, this would always
-    // conflict with itself.
     const rescheduled = await rescheduleBooking({
       uid: original.uid,
       newStartTime: "2026-08-08T10:15:00.000Z",
@@ -548,10 +585,180 @@ describe("rescheduleBooking", () => {
       }),
     ).rejects.toBeInstanceOf(SlotConflictError);
 
-    // The original booking must stay intact after a failed reschedule
-    // attempt — it should never be left marked "rescheduled" with no
-    // successor.
     const stillOriginal = await getBookingByUid(original.uid);
     expect(stillOriginal?.status).toBe("confirmed");
+  });
+
+  it("deletes the old Zoom meeting before releasing the original slot", async () => {
+    const eventType = makeEventType();
+    await seedEventType(eventType);
+    const original = await createBooking({
+      eventType,
+      hostEmail: HOST_EMAIL,
+      startTime: "2026-08-10T10:00:00.000Z",
+      endTime: "2026-08-10T10:30:00.000Z",
+      timezone: "UTC",
+      location: { kind: "zoom", credentialId: "zoom-account" },
+      attendee: { email: ATTENDEE_EMAIL, name: "Attendee One" },
+    });
+
+    await rescheduleBooking({
+      uid: original.uid,
+      newStartTime: "2026-08-10T11:00:00.000Z",
+      newEndTime: "2026-08-10T11:30:00.000Z",
+    });
+
+    expect(deleteZoomMeetingMock).toHaveBeenCalledWith({
+      credentialId: "zoom-account",
+      meetingId: "zoom-meeting-1",
+    });
+    expect((await getBookingByUid(original.uid))?.status).toBe("rescheduled");
+  });
+
+  it("keeps the original active when the replacement Zoom meeting is missing", async () => {
+    const eventType = makeEventType();
+    await seedEventType(eventType);
+    const original = await createBooking({
+      eventType,
+      hostEmail: HOST_EMAIL,
+      startTime: "2026-08-10T10:00:00.000Z",
+      endTime: "2026-08-10T10:30:00.000Z",
+      timezone: "UTC",
+      location: { kind: "zoom", credentialId: "zoom-account" },
+      attendee: { email: ATTENDEE_EMAIL, name: "Attendee One" },
+    });
+    createZoomMeetingMock.mockRejectedValueOnce(
+      new Error("Zoom creation failed"),
+    );
+    deleteZoomMeetingMock.mockRejectedValueOnce(
+      new Error("old meeting must not be touched"),
+    );
+
+    await expect(
+      rescheduleBooking({
+        uid: original.uid,
+        newStartTime: "2026-08-10T11:00:00.000Z",
+        newEndTime: "2026-08-10T11:30:00.000Z",
+      }),
+    ).rejects.toMatchObject({
+      statusCode: 502,
+      errorCode: "video_meeting_creation_failed",
+    });
+
+    expect(deleteZoomMeetingMock).not.toHaveBeenCalled();
+    expect((await getBookingByUid(original.uid))?.status).toBe("confirmed");
+    const { rows } = await execute({
+      sql: "SELECT uid, status FROM bookings WHERE from_reschedule = ?",
+      args: [original.uid],
+    });
+    expect(rows).toHaveLength(1);
+    const replacement = await getBookingByUid(String(rows[0]!.uid));
+    expect(replacement).toMatchObject({ status: "confirmed", references: [] });
+    await expect(cancelBooking({ uid: replacement!.uid })).rejects.toThrow(
+      /Zoom meeting needs host review/i,
+    );
+  });
+
+  it("keeps the original slot confirmed when old Zoom cleanup fails", async () => {
+    const eventType = makeEventType();
+    await seedEventType(eventType);
+    const original = await createBooking({
+      eventType,
+      hostEmail: HOST_EMAIL,
+      startTime: "2026-08-11T10:00:00.000Z",
+      endTime: "2026-08-11T10:30:00.000Z",
+      timezone: "UTC",
+      location: { kind: "zoom", credentialId: "zoom-account" },
+      attendee: { email: ATTENDEE_EMAIL, name: "Attendee One" },
+    });
+    deleteZoomMeetingMock.mockRejectedValueOnce(
+      new Error("Zoom is unavailable"),
+    );
+
+    await expect(
+      rescheduleBooking({
+        uid: original.uid,
+        newStartTime: "2026-08-11T11:00:00.000Z",
+        newEndTime: "2026-08-11T11:30:00.000Z",
+      }),
+    ).rejects.toThrow("Zoom is unavailable");
+    expect((await getBookingByUid(original.uid))?.status).toBe("confirmed");
+    const { rows } = await execute("SELECT status FROM bookings");
+    expect(rows.map((row: any) => row.status).sort()).toEqual([
+      "cancelled",
+      "confirmed",
+    ]);
+    expect(deleteZoomMeetingMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("requires host resolution before rescheduling an unrecorded Zoom meeting", async () => {
+    const eventType = makeEventType();
+    await seedEventType(eventType);
+    createZoomMeetingMock.mockRejectedValueOnce(
+      new Error("ambiguous Zoom failure"),
+    );
+    const original = await createBooking({
+      eventType,
+      hostEmail: HOST_EMAIL,
+      startTime: "2026-08-12T10:00:00.000Z",
+      endTime: "2026-08-12T10:30:00.000Z",
+      timezone: "UTC",
+      location: { kind: "zoom", credentialId: "zoom-account" },
+      attendee: { email: ATTENDEE_EMAIL, name: "Attendee One" },
+    });
+
+    await expect(
+      rescheduleBooking({
+        uid: original.uid,
+        newStartTime: "2026-08-12T11:00:00.000Z",
+        newEndTime: "2026-08-12T11:30:00.000Z",
+      }),
+    ).rejects.toThrow(/Zoom meeting needs host review/i);
+    expect((await getBookingByUid(original.uid))?.status).toBe("confirmed");
+  });
+});
+
+describe("cancelBooking", () => {
+  it("keeps the slot confirmed when Zoom deletion fails", async () => {
+    const booking = await createBooking({
+      eventType: makeEventType(),
+      hostEmail: HOST_EMAIL,
+      startTime: "2026-08-13T10:00:00.000Z",
+      endTime: "2026-08-13T10:30:00.000Z",
+      timezone: "UTC",
+      location: { kind: "zoom", credentialId: "zoom-account" },
+      attendee: { email: ATTENDEE_EMAIL, name: "Attendee One" },
+    });
+    deleteZoomMeetingMock.mockRejectedValueOnce(
+      new Error("Zoom is unavailable"),
+    );
+
+    await expect(cancelBooking({ uid: booking.uid })).rejects.toThrow(
+      "Zoom is unavailable",
+    );
+    expect((await getBookingByUid(booking.uid))?.status).toBe("confirmed");
+  });
+
+  it("requires host resolution before canceling an unrecorded Zoom meeting", async () => {
+    createZoomMeetingMock.mockRejectedValueOnce(
+      new Error("ambiguous Zoom failure"),
+    );
+    const booking = await createBooking({
+      eventType: makeEventType(),
+      hostEmail: HOST_EMAIL,
+      startTime: "2026-08-14T10:00:00.000Z",
+      endTime: "2026-08-14T10:30:00.000Z",
+      timezone: "UTC",
+      location: { kind: "zoom", credentialId: "zoom-account" },
+      attendee: { email: ATTENDEE_EMAIL, name: "Attendee One" },
+    });
+
+    await expect(cancelBooking({ uid: booking.uid })).rejects.toThrow(
+      /Zoom meeting needs host review/i,
+    );
+    expect((await getBookingByUid(booking.uid))?.status).toBe("confirmed");
+
+    await cancelBooking({ uid: booking.uid, zoomMeetingResolved: true });
+    expect((await getBookingByUid(booking.uid))?.status).toBe("cancelled");
   });
 });

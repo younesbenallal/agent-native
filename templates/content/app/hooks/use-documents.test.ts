@@ -1,15 +1,23 @@
+// @vitest-environment happy-dom
+
 import type { ContentDatabaseItem, Document } from "@shared/api";
-import { QueryClient } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, createElement } from "react";
+import { createRoot } from "react-dom/client";
 import { describe, expect, it } from "vitest";
 
 import {
   buildDocumentTree,
   DOCUMENT_QUERY_FRESHNESS_OPTIONS,
   documentUpdateSuccessPatch,
+  fetchCompleteDocumentList,
+  LIST_DOCUMENTS_QUERY_KEY,
   documentPropertiesQueryKey,
   documentQueryKey,
   filterDocumentTreeDocuments,
   isDocumentUpdateConflict,
+  isDocumentUpdateSuperseded,
+  isFavoritesDatabaseCache,
   mergeDocumentIntoDocumentCache,
   mergeDocumentIntoListDocumentsCache,
   patchDocumentCaches,
@@ -17,10 +25,220 @@ import {
   patchDocumentInDatabaseCache,
   patchDocumentInListDocumentsCache,
   restoreQuerySnapshots,
+  restoreDeletedDocumentSnapshots,
+  restoreListDocumentsSnapshot,
+  rollbackOptimisticCreatedDocument,
   setDocumentFavoriteInDatabaseCache,
   setDocumentFavoriteInListCache,
   seedDatabaseItemDocumentCaches,
+  useDocuments,
 } from "./use-documents";
+
+describe("complete document discovery", () => {
+  it("rolls back only its own optimistic create", () => {
+    const queryClient = new QueryClient();
+    const existing = doc("existing", null);
+    const firstCreate = doc("first-create", null);
+    const secondCreate = doc("second-create", null);
+
+    queryClient.setQueryData(LIST_DOCUMENTS_QUERY_KEY, {
+      documents: [existing, firstCreate, secondCreate],
+      pagination: { totalItems: 1 },
+    });
+    rollbackOptimisticCreatedDocument(queryClient, "first-create", true);
+
+    expect(queryClient.getQueryData(LIST_DOCUMENTS_QUERY_KEY)).toEqual({
+      documents: [existing, secondCreate],
+      pagination: { totalItems: 1 },
+    });
+  });
+
+  it("removes a failed optimistic list when no earlier list existed", () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(LIST_DOCUMENTS_QUERY_KEY, {
+      documents: [doc("failed-create", null)],
+    });
+
+    rollbackOptimisticCreatedDocument(queryClient, "failed-create", false);
+
+    expect(queryClient.getQueryData(LIST_DOCUMENTS_QUERY_KEY)).toBeUndefined();
+  });
+
+  it("removes the list after concurrent optimistic creates both fail", () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(LIST_DOCUMENTS_QUERY_KEY, {
+      documents: [doc("first-create", null), doc("second-create", null)],
+    });
+
+    rollbackOptimisticCreatedDocument(queryClient, "first-create", false);
+    rollbackOptimisticCreatedDocument(queryClient, "second-create", false);
+
+    expect(queryClient.getQueryData(LIST_DOCUMENTS_QUERY_KEY)).toBeUndefined();
+  });
+
+  it("restores an existing list snapshot and removes an absent one", () => {
+    const queryClient = new QueryClient();
+    const existing = { documents: [doc("existing", null)] };
+
+    queryClient.setQueryData(LIST_DOCUMENTS_QUERY_KEY, { documents: [] });
+    restoreListDocumentsSnapshot(queryClient, existing);
+    expect(queryClient.getQueryData(LIST_DOCUMENTS_QUERY_KEY)).toEqual(
+      existing,
+    );
+
+    restoreListDocumentsSnapshot(queryClient, undefined);
+    expect(queryClient.getQueryData(LIST_DOCUMENTS_QUERY_KEY)).toBeUndefined();
+  });
+
+  it("restores only deleted entries without overwriting concurrent changes", () => {
+    const queryClient = new QueryClient();
+    const existing = doc("existing", null);
+    const child = doc("child", "existing");
+    const concurrent = doc("concurrent", null);
+    const listSnapshot = { documents: [existing, child] };
+    const existingKey = documentQueryKey("existing");
+    const childKey = documentQueryKey("child");
+
+    queryClient.setQueryData(LIST_DOCUMENTS_QUERY_KEY, {
+      documents: [concurrent],
+    });
+    restoreDeletedDocumentSnapshots(
+      queryClient,
+      listSnapshot,
+      [
+        [existingKey, existing],
+        [childKey, child],
+      ],
+      ["existing", "child"],
+    );
+
+    expect(queryClient.getQueryData(LIST_DOCUMENTS_QUERY_KEY)).toEqual({
+      documents: [concurrent, existing, child],
+    });
+    expect(queryClient.getQueryData(existingKey)).toBe(existing);
+    expect(queryClient.getQueryData(childKey)).toBe(child);
+  });
+
+  it("keeps a concurrently restored document and its newer cache", () => {
+    const queryClient = new QueryClient();
+    const previous = doc("existing", null);
+    const concurrent = { ...previous, title: "Updated elsewhere" };
+    const existingKey = documentQueryKey("existing");
+
+    queryClient.setQueryData(LIST_DOCUMENTS_QUERY_KEY, {
+      documents: [concurrent],
+    });
+    queryClient.setQueryData(existingKey, concurrent);
+    restoreDeletedDocumentSnapshots(
+      queryClient,
+      { documents: [previous] },
+      [[existingKey, previous]],
+      ["existing"],
+    );
+
+    expect(queryClient.getQueryData(LIST_DOCUMENTS_QUERY_KEY)).toEqual({
+      documents: [concurrent],
+    });
+    expect(queryClient.getQueryData(existingKey)).toBe(concurrent);
+  });
+
+  it("keeps object-shaped optimistic cache writes array-shaped for consumers", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+    const optimisticDocument = doc("optimistic-document", null);
+    queryClient.setQueryData(LIST_DOCUMENTS_QUERY_KEY, {
+      documents: [optimisticDocument],
+    });
+    let consumerData: unknown;
+    function Consumer() {
+      consumerData = useDocuments().data;
+      return null;
+    }
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    const actEnvironment = globalThis as typeof globalThis & {
+      IS_REACT_ACT_ENVIRONMENT?: boolean;
+    };
+    const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+    actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+
+    try {
+      await act(async () => {
+        root.render(
+          createElement(
+            QueryClientProvider,
+            { client: queryClient },
+            createElement(Consumer),
+          ),
+        );
+      });
+
+      expect(Array.isArray(consumerData)).toBe(true);
+      expect(consumerData).toEqual([optimisticDocument]);
+    } finally {
+      await act(async () => root.unmount());
+      actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+      queryClient.clear();
+    }
+  });
+
+  it("exhausts every bounded page before returning the document tree", async () => {
+    const documents = Array.from({ length: 401 }, (_, index) =>
+      doc(`document-${index}`, null, index),
+    );
+    const offsets: number[] = [];
+
+    const result = await fetchCompleteDocumentList(async (offset, limit) => {
+      offsets.push(offset);
+      const page = documents.slice(offset, offset + limit);
+      const nextOffset = offset + page.length;
+      return {
+        documents: page,
+        pagination: {
+          offset,
+          limit,
+          totalItems: documents.length,
+          returnedItems: page.length,
+          hasMore: nextOffset < documents.length,
+          nextOffset: nextOffset < documents.length ? nextOffset : null,
+        },
+      };
+    });
+
+    expect(offsets).toEqual([0, 200, 400]);
+    expect(result.map((document) => document.id)).toEqual(
+      documents.map((document) => document.id),
+    );
+  });
+
+  it("rejects a response whose missing boundary could hide clipping", async () => {
+    await expect(
+      fetchCompleteDocumentList(
+        async () =>
+          ({
+            documents: [doc("document-1", null)],
+          }) as never,
+      ),
+    ).rejects.toThrow("returned no pagination boundary");
+  });
+
+  it("rejects a non-advancing continuation", async () => {
+    await expect(
+      fetchCompleteDocumentList(async (_offset, limit) => ({
+        documents: [],
+        pagination: {
+          offset: 0,
+          limit,
+          totalItems: 1,
+          returnedItems: 0,
+          hasMore: true,
+          nextOffset: 0,
+        },
+      })),
+    ).rejects.toThrow("non-advancing continuation");
+  });
+});
 
 describe("document query freshness", () => {
   it("always replaces seeded row snapshots before the editor mounts", () => {
@@ -189,6 +407,11 @@ describe("mergeDocumentIntoListDocumentsCache", () => {
 });
 
 describe("optimistic document favorites", () => {
+  it("does not treat an unavailable database cache entry as a Favorites response", () => {
+    expect(
+      isFavoritesDatabaseCache({ available: false, reason: "missing" }),
+    ).toBe(false);
+  });
   it("updates array and object list caches without disturbing other pages", () => {
     const favorite = { ...doc("a", null), isFavorite: true };
     expect(
@@ -231,6 +454,39 @@ describe("optimistic document favorites", () => {
     expect(updated.items[0].document.isFavorite).toBe(true);
     expect(updated.items[1].document.isFavorite).toBe(false);
     expect(database.items[0].document.isFavorite).toBe(false);
+  });
+
+  it("updates flat navigation rows without treating them as database rows", () => {
+    const navigation = {
+      items: [
+        {
+          membershipId: "item-a",
+          membershipPosition: 0,
+          documentId: "a",
+          title: "A",
+          icon: null,
+          isFavorite: false,
+        },
+        {
+          membershipId: "item-b",
+          membershipPosition: 1,
+          documentId: "b",
+          title: "B",
+          icon: null,
+          isFavorite: false,
+        },
+      ],
+      pagination: { hasMore: false, limit: 20, nextCursor: null },
+    } as any;
+
+    const updated = patchDocumentInDatabaseCache(navigation, "a", {
+      isFavorite: true,
+    })!;
+    expect(updated.items[0]).toMatchObject({
+      documentId: "a",
+      isFavorite: true,
+    });
+    expect(updated.items[1]).toBe(navigation.items[1]);
   });
 
   it("removes unfavorited pages from a cached Favorites database", () => {
@@ -388,12 +644,37 @@ describe("optimistic document titles", () => {
       "get-content-database",
       { databaseId: "files" },
     ] as const;
+    const databasePageKey = [
+      "action",
+      "query-content-database-items",
+      {
+        documentId: "files-page",
+        limit: 100,
+        tableQuery: {
+          search: "",
+          filters: [],
+          sorts: [{ key: "name", direction: "asc" }],
+          filterMode: "and",
+        },
+      },
+    ] as const;
     queryClient.setQueryData(documentQueryKey("a"), doc("a", null));
     queryClient.setQueryData(
       ["action", "list-documents", undefined],
       [doc("a", null)],
     );
     queryClient.setQueryData(databaseKey, {
+      items: [
+        {
+          id: "item-a",
+          databaseId: "files",
+          position: 0,
+          document: doc("a", null),
+          properties: [],
+        },
+      ],
+    });
+    queryClient.setQueryData(databasePageKey, {
       items: [
         {
           id: "item-a",
@@ -429,6 +710,9 @@ describe("optimistic document titles", () => {
     expect(
       queryClient.getQueryData<any>(databaseKey)?.items[0].document.content,
     ).toBe("Saved body");
+    expect(
+      queryClient.getQueryData<any>(databasePageKey)?.items[0].document.title,
+    ).toBe("Page one");
   });
 
   it("patches Page-owned fields across contexts without exchanging memberships", () => {
@@ -506,6 +790,47 @@ describe("mergeDocumentIntoDocumentCache", () => {
         updated,
       ),
     ).toEqual({ ...updated, database });
+  });
+
+  it("copies the authoritative body revision metadata with server content", () => {
+    const current = {
+      ...doc("database-page", null),
+      content: "Local snapshot",
+      revision: "revision-1",
+      bodyRevision: 1,
+      contentHash: "hash-1",
+    };
+    const winning = {
+      ...current,
+      content: "Winning server snapshot",
+      revision: "revision-2",
+      bodyRevision: 2,
+      contentHash: "hash-2",
+    };
+
+    expect(mergeDocumentIntoDocumentCache(current, winning)).toMatchObject({
+      content: "Winning server snapshot",
+      revision: "revision-2",
+      bodyRevision: 2,
+      contentHash: "hash-2",
+    });
+  });
+
+  it("updates suggestion eligibility only when the response carries it", () => {
+    const current = { ...doc("page", null), canSuggest: true };
+
+    expect(
+      mergeDocumentIntoDocumentCache(current, {
+        ...doc("page", null),
+        title: "Updated without capability projection",
+      }),
+    ).toMatchObject({ canSuggest: true });
+    expect(
+      mergeDocumentIntoDocumentCache(current, {
+        ...doc("page", null),
+        canSuggest: false,
+      }),
+    ).toMatchObject({ canSuggest: false });
   });
 
   it("never copies membership or hydration context between query variants", () => {
@@ -619,6 +944,31 @@ describe("isDocumentUpdateConflict", () => {
   });
 });
 
+describe("isDocumentUpdateSuperseded", () => {
+  it("recognizes a settled editor generation", () => {
+    expect(
+      isDocumentUpdateSuperseded({
+        superseded: true,
+        id: "doc-1",
+        document: { ...doc("doc-1", null), urlPath: "/page/doc-1" } as any,
+        editorSessionId: "tab-one",
+        editGeneration: 4,
+        discardedGeneration: 4,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not treat a normal saved document as superseded", () => {
+    expect(
+      isDocumentUpdateSuperseded({
+        ...doc("doc-1", null),
+        urlPath: "/page/doc-1",
+        softDeletedDatabaseIds: [],
+      } as any),
+    ).toBe(false);
+  });
+});
+
 describe("seedDatabaseItemDocumentCaches", () => {
   it("warms properties without treating a database row snapshot as an editable document", () => {
     const queryClient = new QueryClient();
@@ -659,6 +1009,12 @@ describe("seedDatabaseItemDocumentCaches", () => {
     };
 
     seedDatabaseItemDocumentCaches(queryClient, item);
+    expect(
+      queryClient
+        .getQueryCache()
+        .find({ queryKey: documentPropertiesQueryKey("row-page", "database") })
+        ?.isStaleByTime(30_000),
+    ).toBe(true);
 
     expect(queryClient.getQueryData(documentQueryKey("row-page"))).toBe(
       undefined,
@@ -670,6 +1026,8 @@ describe("seedDatabaseItemDocumentCaches", () => {
     ).toEqual({
       documentId: "row-page",
       databaseId: "database",
+      canEditValues: false,
+      canManageSchema: false,
       properties: item.properties,
     });
   });
@@ -777,6 +1135,8 @@ describe("seedDatabaseItemDocumentCaches", () => {
     ).toEqual({
       documentId: "row-page",
       databaseId: "database",
+      canEditValues: false,
+      canManageSchema: false,
       properties: [],
     });
   });
@@ -825,6 +1185,8 @@ describe("seedDatabaseItemDocumentCaches", () => {
     ).toEqual({
       documentId: "row-page",
       databaseId: "database",
+      canEditValues: false,
+      canManageSchema: false,
       properties: [],
     });
   });

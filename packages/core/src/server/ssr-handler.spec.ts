@@ -1,9 +1,14 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  defineAppConfig,
+  resetAppConfigForTests,
+} from "../app-config/index.js";
 import {
   DEFAULT_SSR_CACHE_CONTROL,
   DEFAULT_SSR_CDN_CACHE_CONTROL,
   DEFAULT_SSR_NETLIFY_CDN_CACHE_CONTROL,
+  SSR_QUERY_CACHE_KEY_HEADER,
 } from "../shared/cache-control.js";
 import {
   AGENT_NATIVE_SOCIAL_IMAGE_CACHE_BUSTER,
@@ -80,13 +85,27 @@ function expectNoDefaultCdnCacheHeaders(response: Response) {
 }
 
 describe("createH3SSRHandler", () => {
+  beforeEach(() => {
+    resetAppConfigForTests();
+    defineAppConfig({ app: { homePath: "/home" } });
+  });
+
   afterEach(() => {
+    resetAppConfigForTests();
     delete process.env.APP_BASE_PATH;
     delete process.env.VITE_APP_BASE_PATH;
     delete process.env.SENTRY_CLIENT_DSN;
     delete process.env.SENTRY_DSN;
     delete process.env.SENTRY_ENVIRONMENT;
+    delete process.env.AGENT_NATIVE_DEPLOYMENT_ENVIRONMENT;
+    delete process.env.CONTEXT;
+    delete process.env.NETLIFY_CONTEXT;
+    delete process.env.BRANCH;
+    delete process.env.VERCEL_ENV;
     delete process.env.AGENT_NATIVE_SSR_CACHE;
+    delete process.env.NETLIFY;
+    delete process.env.NETLIFY_LOCAL;
+    delete process.env.SITE_ID;
     mocks.requestHandler.mockClear();
     mocks.getSession.mockClear();
     mocks.getOrgContext.mockClear();
@@ -136,10 +155,6 @@ describe("createH3SSRHandler", () => {
   });
 
   it("keeps the dev 500 body printable when the error names a Vite virtual module", async () => {
-    // Vite ids virtual modules with a leading NUL, and module-resolution errors
-    // carry that id verbatim. A raw NUL in the body makes curl (and some proxies)
-    // treat the only useful line as binary — but the NUL is part of the real id,
-    // so it has to survive as a visible escape rather than be dropped.
     const error = new Error(
       "Failed to load url /app/routes/chat.$threadId.tsx in \0virtual:react-router/server-build. Does the file exist?",
     );
@@ -263,6 +278,103 @@ describe("createH3SSRHandler", () => {
     expect(response.headers.get("speculation-rules")).toBe(
       DEFAULT_SPECULATION_RULES_HEADER,
     );
+    const html = await response.text();
+    const handoff = html.indexOf("data-agent-native-auth-redirect");
+    expect(handoff).toBeGreaterThan(html.indexOf("<head>"));
+    expect(handoff).toBeLessThan(html.indexOf("</head>"));
+    expect(handoff).toBeLessThan(html.indexOf("<body>"));
+  });
+
+  it("only adds the auth handoff to the public root shell", async () => {
+    mocks.requestHandler.mockResolvedValueOnce(
+      new Response("<html><head></head><body>app</body></html>", {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      }),
+    );
+    const handler = createH3SSRHandler(() => ({})) as any;
+
+    const response = await handler(createEvent("/home"));
+
+    expect(await response.text()).not.toContain(
+      "data-agent-native-auth-redirect",
+    );
+  });
+
+  it("keeps a root-only workspace app at its root instead of bouncing to /home", async () => {
+    resetAppConfigForTests();
+    process.env.AGENT_NATIVE_WORKSPACE_APP_ID = "adoption";
+    process.env.AGENT_NATIVE_WORKSPACE_APPS_JSON = JSON.stringify([
+      { id: "adoption", path: "/adoption", homePath: "/" },
+    ]);
+    try {
+      mocks.requestHandler.mockResolvedValueOnce(
+        new Response("<html><head></head><body>app</body></html>", {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        }),
+      );
+      const handler = createH3SSRHandler(() => ({})) as any;
+
+      const response = await handler(createEvent("/"));
+      const html = await response.text();
+
+      expect(html).not.toContain("data-agent-native-auth-redirect");
+      expect(html).toContain('"appHomePath":"/"');
+    } finally {
+      delete process.env.AGENT_NATIVE_WORKSPACE_APP_ID;
+      delete process.env.AGENT_NATIVE_WORKSPACE_APPS_JSON;
+    }
+  });
+
+  it("narrows Netlify query variation on public SSR HTML", async () => {
+    process.env.SITE_ID = "site-test";
+    mocks.requestHandler.mockResolvedValueOnce(
+      new Response("<html><head></head><body>ok</body></html>", {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      }),
+    );
+    const handler = createH3SSRHandler(() => ({})) as any;
+
+    const response = await handler(createEvent("/"));
+
+    expect(response.headers.get("netlify-vary")).toBe("query=_routes|index");
+  });
+
+  it("preserves full Netlify query variation for marked public redirects", async () => {
+    process.env.SITE_ID = "site-test";
+    mocks.requestHandler.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: {
+          [SSR_QUERY_CACHE_KEY_HEADER]: "query",
+          "content-type": "text/html; charset=utf-8",
+          location: "/library?from=home",
+        },
+      }),
+    );
+    const handler = createH3SSRHandler(() => ({})) as any;
+
+    const response = await handler(createEvent("/?from=home"));
+
+    expect(response.headers.get("netlify-vary")).toBe("query");
+    expect(response.headers.get(SSR_QUERY_CACHE_KEY_HEADER)).toBeNull();
+  });
+
+  it("does not expose the internal query variation marker outside Netlify", async () => {
+    mocks.requestHandler.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: {
+          [SSR_QUERY_CACHE_KEY_HEADER]: "query",
+          "content-type": "text/html; charset=utf-8",
+        },
+      }),
+    );
+    const handler = createH3SSRHandler(() => ({})) as any;
+
+    const response = await handler(createEvent("/?from=home"));
+
+    expect(response.headers.get("netlify-vary")).toBeNull();
+    expect(response.headers.get(SSR_QUERY_CACHE_KEY_HEADER)).toBeNull();
   });
 
   it("prefixes the default Speculation-Rules header under APP_BASE_PATH", async () => {
@@ -324,6 +436,40 @@ describe("createH3SSRHandler", () => {
     expectDefaultSsrCacheHeaders(response);
   });
 
+  it("renders byte-identical public HTML across the session-cookie boundary", async () => {
+    const publicHtml =
+      "<html><head></head><body><main>public shell</main></body></html>";
+    mocks.requestHandler
+      .mockResolvedValueOnce(
+        new Response(publicHtml, {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(publicHtml, {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        }),
+      );
+    const handler = createH3SSRHandler(() => ({})) as any;
+
+    const anonymous = await handler(createEvent("/"));
+    const authenticated = await handler(
+      createEvent("/", "GET", { headers: { cookie: "an_session=active" } }),
+    );
+
+    expect(await anonymous.text()).toBe(await authenticated.text());
+    expect(anonymous.headers.get("cache-control")).toBe(
+      authenticated.headers.get("cache-control"),
+    );
+    expect(anonymous.headers.get("vary")).toBe(
+      authenticated.headers.get("vary"),
+    );
+    expect(mocks.requestHandler.mock.calls).toHaveLength(2);
+    for (const [request] of mocks.requestHandler.mock.calls) {
+      expect((request as Request).headers.get("cookie")).toBeNull();
+    }
+  });
+
   it("replaces React Router's default no-cache policy on .data responses", async () => {
     mocks.requestHandler.mockResolvedValueOnce(
       new Response('[{"_1":2},"routes/docs.$slug"]', {
@@ -359,8 +505,6 @@ describe("createH3SSRHandler", () => {
       }),
     );
 
-    // Auth makes no difference: SSR .data is hard-cached for everyone, so an
-    // authenticated request gets the exact same public SWR headers as anonymous.
     expectDefaultSsrCacheHeaders(response);
     expect(response.headers.get("cache-control")).toBe(
       DEFAULT_SSR_CACHE_CONTROL,
@@ -391,8 +535,6 @@ describe("createH3SSRHandler", () => {
       }),
     );
 
-    // The framework hard-caches SSR .data for everyone: a route can no longer
-    // opt .data into private/no-store, even when the request is authenticated.
     expectDefaultSsrCacheHeaders(response);
     expect(response.headers.get("cache-control")).toBe(
       DEFAULT_SSR_CACHE_CONTROL,
@@ -477,8 +619,6 @@ describe("createH3SSRHandler", () => {
       }),
     );
 
-    // Auth makes no difference: SSR HTML is hard-cached for everyone, so a
-    // request with a session cookie gets the same public SWR headers as anonymous.
     expectDefaultSsrCacheHeaders(response);
     expect(response.headers.get("cache-control")).toBe(
       DEFAULT_SSR_CACHE_CONTROL,
@@ -510,9 +650,6 @@ describe("createH3SSRHandler", () => {
       }),
     );
 
-    // The SSR handler does not read the request session, so a loader that calls
-    // getRequestUserEmail() sees undefined — the HTML is impersonal and safe to
-    // hard-cache for everyone.
     expect(await response.text()).toContain("anonymous");
     expect(mocks.getSession).not.toHaveBeenCalled();
     expectDefaultSsrCacheHeaders(response);
@@ -541,8 +678,6 @@ describe("createH3SSRHandler", () => {
       }),
     );
 
-    // No per-user data is baked into the .data response — getRequestUserEmail()
-    // returns undefined even with a session cookie — so it is publicly cached.
     expect(await response.text()).toContain('"email":null');
     expect(mocks.getSession).not.toHaveBeenCalled();
     expectDefaultSsrCacheHeaders(response);
@@ -601,8 +736,6 @@ describe("createH3SSRHandler", () => {
 
     const response = await handler(
       createEvent("/docs", "GET", {
-        // Even with an auth cookie alongside anonymous ones, SSR is still the
-        // impersonal public shell — no cookie combination changes the policy.
         headers: { cookie: "an_docs_session=anon; an_session=1" },
       }),
     );
@@ -627,16 +760,12 @@ describe("createH3SSRHandler", () => {
 
     const response = await handler(createEvent("/"));
 
-    // Anonymous: enforce the public SWR default even if the route said private.
     expect(response.headers.get("cache-control")).toBe(
       DEFAULT_SSR_CACHE_CONTROL,
     );
   });
 
   it("overrides a route-provided Cache-Control on authenticated HTML with the public SWR policy", async () => {
-    // A route may try to set its own Cache-Control even when the request carries
-    // an auth cookie, but the framework hard-caches SSR HTML for everyone, so
-    // the route-provided policy is overridden with the public SWR default.
     mocks.requestHandler.mockResolvedValueOnce(
       new Response("<html><head></head><body>shared</body></html>", {
         headers: {
@@ -653,7 +782,6 @@ describe("createH3SSRHandler", () => {
       }),
     );
 
-    // Route tried to opt out; the framework still enforces the public SWR policy.
     expectDefaultSsrCacheHeaders(response);
     expect(response.headers.get("cache-control")).toBe(
       DEFAULT_SSR_CACHE_CONTROL,
@@ -710,7 +838,6 @@ describe("createH3SSRHandler", () => {
       createEvent("/inbox?embedded=1&__an_embed_token=signed"),
     );
 
-    // An embed token in the request does not pin a session for SSR.
     expect(mocks.getSession).not.toHaveBeenCalled();
     expect(await response.text()).toContain("anonymous");
   });
@@ -732,7 +859,6 @@ describe("createH3SSRHandler", () => {
       }),
     );
 
-    // An Authorization header in the request does not pin a session for SSR.
     expect(mocks.getSession).not.toHaveBeenCalled();
     expect(await response.text()).toContain("anonymous");
   });
@@ -750,7 +876,6 @@ describe("createH3SSRHandler", () => {
 
     const response = await handler(createEvent("/inbox?_session=mobile-token"));
 
-    // A mobile session query credential does not pin a session for SSR.
     expect(mocks.getSession).not.toHaveBeenCalled();
     expect(await response.text()).toContain("anonymous");
   });
@@ -785,6 +910,35 @@ describe("createH3SSRHandler", () => {
     expect(html).toContain('action="/docs/api/search"');
     expect(html).toContain('src="/docs/app.js"');
   });
+
+  it("strips the mount from React Router's root data URL", async () => {
+    process.env.APP_BASE_PATH = "/docs";
+    const handler = createH3SSRHandler(() => ({})) as any;
+
+    const response = await handler(createEvent("/docs.data"));
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("GET /.data");
+  });
+
+  it.each(["/docs.data?_routes=root", "/docs.data#root"])(
+    "does not re-prefix mounted root data redirects with %s",
+    async (location) => {
+      process.env.APP_BASE_PATH = "/docs";
+      mocks.requestHandler.mockResolvedValueOnce(
+        new Response(null, { status: 302, headers: { location } }),
+      );
+      const handler = createH3SSRHandler(() => ({})) as any;
+
+      const response = await handler(createEvent("/docs.data"));
+
+      expect(response.status).toBe(302);
+      expect(response.headers.get("location")).toBe(location);
+      expect(new URL(mocks.requestHandler.mock.calls[0][0].url).pathname).toBe(
+        "/.data",
+      );
+    },
+  );
 
   it("uses APP_BASE_PATH in React Router's mounted hydration context", async () => {
     process.env.APP_BASE_PATH = "/analytics";
@@ -821,6 +975,28 @@ describe("createH3SSRHandler", () => {
     expect(html).toContain("data-agent-native-sentry-config");
     expect(html).toContain("https://public@example/4511270423822336");
     expect(html).toContain('"sentryEnvironment":"production"');
+    expect(html).toContain('"deploymentEnvironment":"production"');
+  });
+
+  it("injects deployment attribution without browser Sentry", async () => {
+    process.env.CONTEXT = "deploy-preview";
+    process.env.NETLIFY_CONTEXT = "production";
+    process.env.BRANCH = "feature/auth";
+    process.env.SENTRY_DSN = "";
+    process.env.SENTRY_CLIENT_DSN = "";
+    mocks.requestHandler.mockResolvedValueOnce(
+      new Response("<html><head></head><body>ok</body></html>", {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      }),
+    );
+    const handler = createH3SSRHandler(() => ({})) as any;
+
+    const response = await handler(createEvent("/"));
+    const html = await response.text();
+
+    expect(html).toContain("data-agent-native-sentry-config");
+    expect(html).toContain('"deploymentEnvironment":"preview"');
+    expect(html).not.toContain("sentryDsn");
   });
 
   it("prefixes mounted SSR redirects", async () => {
@@ -863,10 +1039,16 @@ describe("createH3SSRHandler", () => {
       );
     }
 
-    function expectCacheHeaders(response: Response, expected: string) {
-      for (const name of Object.keys(DEFAULT_SSR_CACHE_HEADERS)) {
-        expect(response.headers.get(name)).toBe(expected);
-      }
+    function expectCacheHeaders(
+      response: Response,
+      expected: string,
+      netlifyExpected = expected,
+    ) {
+      expect(response.headers.get("cache-control")).toBe(expected);
+      expect(response.headers.get("cdn-cache-control")).toBe(expected);
+      expect(response.headers.get("netlify-cdn-cache-control")).toBe(
+        netlifyExpected,
+      );
     }
 
     it("disables SSR caching on HTML when set to off", async () => {
@@ -880,8 +1062,6 @@ describe("createH3SSRHandler", () => {
       const response = await handler(createEvent("/"));
 
       expectCacheHeaders(response, DISABLED_SSR_CACHE_HEADERS["cache-control"]);
-      // Opting out of caching must not turn the shell personal: cookies are
-      // still stripped and the response still cannot vary by credentials.
       expect(response.headers.get("set-cookie")).toBeNull();
       expect(response.headers.get("vary")).toBe("Accept-Encoding");
     });
@@ -938,6 +1118,7 @@ describe("createH3SSRHandler", () => {
       expectCacheHeaders(
         response,
         "public, max-age=30, stale-while-revalidate=30, stale-if-error=3600",
+        "public, durable, s-maxage=30, stale-while-revalidate=30, stale-if-error=3600",
       );
     });
 
@@ -951,7 +1132,41 @@ describe("createH3SSRHandler", () => {
       expectCacheHeaders(
         response,
         "public, max-age=30, stale-while-revalidate=30, stale-if-error=3600",
+        "public, durable, s-maxage=30, stale-while-revalidate=30, stale-if-error=3600",
       );
+    });
+
+    it("caches a 404 shell so dead links stop re-invoking the function", async () => {
+      mocks.requestHandler.mockResolvedValueOnce(
+        new Response("<html><body>not found</body></html>", {
+          status: 404,
+          headers: { "content-type": "text/html; charset=utf-8" },
+        }),
+      );
+      const handler = createH3SSRHandler(() => ({})) as any;
+
+      const response = await handler(createEvent("/docs/does-not-exist"));
+
+      expect(response.status).toBe(404);
+      expectDefaultSsrCacheHeaders(response);
+    });
+
+    it("never caches a 5xx shell", async () => {
+      mocks.requestHandler.mockResolvedValueOnce(
+        new Response("<html><body>boom</body></html>", {
+          status: 503,
+          headers: { "content-type": "text/html; charset=utf-8" },
+        }),
+      );
+      const handler = createH3SSRHandler(() => ({})) as any;
+
+      const response = await handler(createEvent("/docs/boom"));
+
+      expect(response.status).toBe(503);
+      expect(response.headers.get("cache-control") ?? "").not.toContain(
+        "max-age",
+      );
+      expect(response.headers.get("netlify-cdn-cache-control")).toBeNull();
     });
 
     it("keeps the default policy byte-identical when unset", async () => {
@@ -965,6 +1180,7 @@ describe("createH3SSRHandler", () => {
       expectCacheHeaders(
         response,
         "public, max-age=600, stale-while-revalidate=604800, stale-if-error=3600",
+        DEFAULT_SSR_NETLIFY_CDN_CACHE_CONTROL,
       );
     });
 
@@ -979,7 +1195,6 @@ describe("createH3SSRHandler", () => {
 
         const response = await handler(createEvent("/"));
 
-        // Fail safe: a typo must not silently disable the CDN.
         expectDefaultSsrCacheHeaders(response);
         expect(response.headers.get("cache-control")).not.toBe(
           DISABLED_SSR_CACHE_HEADERS["cache-control"],

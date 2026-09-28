@@ -48,14 +48,19 @@ function injectEmbeddedFrameStyle(content: string, style: string): string {
   return `${style}${content}`;
 }
 
+const EMBEDDED_FRAME_FIT_STYLE =
+  "<style data-agent-native-frame-fit>html{height:100%}body{min-height:100%}</style>";
+
 export function getEmbeddedFrameDocumentContent(args: {
   content: string;
   embeddedFrameBackground?: string;
   transparentBackground?: boolean;
   contentOffsetX?: number;
   contentOffsetY?: number;
+  fitBodyToFrame?: boolean;
 }): string {
   const frameStyle = [
+    args.fitBodyToFrame ? EMBEDDED_FRAME_FIT_STYLE : "",
     getEmbeddedFrameBackgroundStyle({
       embeddedFrameBackground: args.embeddedFrameBackground,
       transparentBackground: args.transparentBackground,

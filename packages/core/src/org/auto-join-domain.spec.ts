@@ -13,7 +13,11 @@ vi.mock("../settings/user-settings.js", () => ({
   getUserSetting: (...args: any[]) => mockGetUserSetting(...args),
 }));
 
-import { autoJoinDomainMatchingOrgs } from "./auto-join-domain.js";
+import {
+  __resetDomainMatchCacheForTests,
+  autoJoinDomainMatchingOrgs,
+  invalidateDomainMatchCache,
+} from "./auto-join-domain.js";
 
 function queueSelect(...rows: any[][]) {
   for (const r of rows) {
@@ -26,6 +30,7 @@ describe("autoJoinDomainMatchingOrgs", () => {
     vi.clearAllMocks();
     mockExecute.mockResolvedValue({ rows: [] });
     mockGetUserSetting.mockResolvedValue(null);
+    __resetDomainMatchCacheForTests();
   });
 
   it("returns empty when no orgs match the domain", async () => {
@@ -39,6 +44,67 @@ describe("autoJoinDomainMatchingOrgs", () => {
     const out = await autoJoinDomainMatchingOrgs("notanemail");
     expect(out).toEqual({ joined: [], activeOrgId: null });
     expect(mockExecute).not.toHaveBeenCalled();
+  });
+
+  it("never queries for a free email provider", async () => {
+    for (const email of [
+      "a@gmail.com",
+      "b@outlook.com",
+      "c@yahoo.co.uk",
+      "d@hotmail.com",
+    ]) {
+      const out = await autoJoinDomainMatchingOrgs(email);
+      expect(out).toEqual({ joined: [], activeOrgId: null });
+    }
+    expect(mockExecute).not.toHaveBeenCalled();
+  });
+
+  it("caches a no-match so a repeat call issues no query", async () => {
+    queueSelect([]);
+    expect(await autoJoinDomainMatchingOrgs("a@nomatch.dev")).toEqual({
+      joined: [],
+      activeOrgId: null,
+    });
+    expect(mockExecute).toHaveBeenCalledTimes(1);
+
+    expect(await autoJoinDomainMatchingOrgs("b@nomatch.dev")).toEqual({
+      joined: [],
+      activeOrgId: null,
+    });
+    expect(mockExecute).toHaveBeenCalledTimes(1);
+
+    queueSelect([]);
+    await autoJoinDomainMatchingOrgs("c@other.dev");
+    expect(mockExecute).toHaveBeenCalledTimes(2);
+  });
+
+  it("does NOT cache a failed probe as 'no match'", async () => {
+    mockExecute.mockRejectedValueOnce(
+      new Error('relation "organizations" does not exist'),
+    );
+    expect(await autoJoinDomainMatchingOrgs("a@flaky.dev")).toEqual({
+      joined: [],
+      activeOrgId: null,
+    });
+    expect(mockExecute).toHaveBeenCalledTimes(1);
+
+    queueSelect([{ orgId: "flaky_org" }], []);
+    mockGetUserSetting.mockResolvedValueOnce(null);
+    const out = await autoJoinDomainMatchingOrgs("a@flaky.dev");
+    expect(out.joined).toEqual([{ orgId: "flaky_org" }]);
+  });
+
+  it("stops caching a no-match once allowed_domain is written", async () => {
+    queueSelect([]);
+    await autoJoinDomainMatchingOrgs("a@late.dev");
+    expect(mockExecute).toHaveBeenCalledTimes(1);
+
+    invalidateDomainMatchCache();
+
+    queueSelect([{ orgId: "late_org" }], []);
+    mockGetUserSetting.mockResolvedValueOnce(null);
+    const out = await autoJoinDomainMatchingOrgs("a@late.dev");
+    expect(out.joined).toEqual([{ orgId: "late_org" }]);
   });
 
   it("inserts org_members and sets active-org-id when no prior active org", async () => {
@@ -100,9 +166,6 @@ describe("autoJoinDomainMatchingOrgs", () => {
   });
 
   it("excludes orgs the user is already a member of (NOT EXISTS)", async () => {
-    // The query itself filters via NOT EXISTS, so we just confirm we
-    // call it correctly. When the query returns empty (because the user
-    // is already in the only matching org), the function no-ops.
     queueSelect([]);
     const out = await autoJoinDomainMatchingOrgs("existing@builder.io");
     expect(out.joined).toEqual([]);
@@ -126,8 +189,10 @@ describe("autoJoinDomainMatchingOrgs", () => {
     mockExecute.mockResolvedValueOnce({
       rows: [{ orgId: "orgA" }, { orgId: "orgB" }],
     });
-    mockExecute.mockRejectedValueOnce(new Error("UNIQUE constraint failed"));
-    mockExecute.mockResolvedValueOnce({ rows: [] }); // INSERT orgB succeeds
+    mockExecute.mockRejectedValueOnce(
+      new Error("duplicate key value violates unique constraint"),
+    );
+    mockExecute.mockResolvedValueOnce({ rows: [] });
 
     const out = await autoJoinDomainMatchingOrgs("race@builder.io");
     expect(out.joined).toEqual([{ orgId: "orgB" }]);
@@ -135,7 +200,7 @@ describe("autoJoinDomainMatchingOrgs", () => {
 
   it("swallows missing-table errors (template without org module)", async () => {
     mockExecute.mockRejectedValueOnce(
-      new Error("no such table: organizations"),
+      new Error('relation "organizations" does not exist'),
     );
     const out = await autoJoinDomainMatchingOrgs("a@builder.io");
     expect(out).toEqual({ joined: [], activeOrgId: null });

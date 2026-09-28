@@ -15,12 +15,18 @@ export {
   type UseSemanticNavigationStateResult,
 } from "../route-state.js";
 export {
+  AGENT_NATIVE_WORKSPACE_APP_ROUTE_MESSAGE_TYPE,
+  postAgentNativeWorkspaceAppRoute,
+  type AgentNativeWorkspaceAppRouteMessage,
+} from "../workspace-app-navigation.js";
+export {
   COMMAND_MENU_OPEN_EVENT,
   CommandMenu,
   openAgentSidebar,
   openAgentSettings,
   openCommandMenu,
   submitToAgent,
+  useCommandMenuNestedDialog,
   useCommandMenuShortcut,
   type CommandMenuProps,
   type CommandMenuDoc,
@@ -32,14 +38,23 @@ export {
 export {
   buildOpenRouteLink,
   buildOpenRoutePath,
+  buildLegacyAgentSettingsRoute,
   buildResourceRoute,
+  buildSettingsEntryRoute,
+  buildSettingsRedirectRoute,
   buildSettingsRoute,
   buildStandardAppRoute,
   buildTeamRoute,
   createStandardOpenPathResolver,
+  resolveLegacySettingsId,
+  resolveSettingsSectionRedirect,
+  SETTINGS_PAGE_IDS,
   STANDARD_APP_ROUTES,
   STANDARD_SETTINGS_TABS,
   type BuildResourceRouteOptions,
+  type BuildSettingsRouteOptions,
+  type CoreSettingsPageId,
+  type SettingsRedirect,
   type BuildStandardAppRouteOptions,
   type NavigationLink,
   type NavigationTarget,
@@ -48,6 +63,18 @@ export {
   type StandardOpenPathRoute,
   type StandardSettingsTabId,
 } from "../../navigation/index.js";
+export {
+  getSettingsShortcutHint,
+  isSettingsRoutePath,
+  isSettingsShortcutEvent,
+  OPEN_SETTINGS_PAGE_EVENT,
+  openSettingsPage,
+  SETTINGS_SHORTCUT_PAGE,
+  settingsPagePath,
+  SettingsShortcut,
+  useSettingsShortcut,
+  type OpenSettingsPageDetail,
+} from "../use-settings-shortcut.js";
 export {
   postNavigate,
   isInAgentEmbed,

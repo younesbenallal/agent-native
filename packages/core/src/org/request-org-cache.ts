@@ -1,4 +1,5 @@
 import { getRequestContext } from "../server/request-context.js";
+import { createTtlCache } from "../shared/ttl-cache.js";
 
 /**
  * Per-request memo of the `org_members` read behind `resolveOrgIdForEmail`,
@@ -35,12 +36,6 @@ function cacheForRequest(
   return cache ?? null;
 }
 
-/**
- * Resolve the org ids `email` belongs to, once per request. `null` means the
- * membership rows were unreadable and is cached like any other answer; a
- * rejection is evicted so one transient failure cannot answer every later
- * lookup in the same request.
- */
 export function requestMemberOrgIds(
   email: string,
   load: () => Promise<string[] | null>,
@@ -59,13 +54,30 @@ export function requestMemberOrgIds(
   return pending;
 }
 
-/**
- * Drop this request's memoized memberships after a write to `org_members`.
- * Clears every email rather than one: deleting an organization or removing a
- * member changes the answer for accounts other than the one being written.
- * Requests already in flight elsewhere keep their own snapshot for the rest of
- * their (short) lifetime, the same tradeoff the settings cache documents.
- */
-export function invalidateRequestMemberOrgIds(): void {
+const MEMBER_ORGS_TTL_MS = 15_000;
+
+const processMemberships = createTtlCache<unknown[]>({
+  ttlMs: MEMBER_ORGS_TTL_MS,
+  maxEntries: 2_048,
+});
+
+export async function cachedMemberships<T>(
+  email: string,
+  load: () => Promise<T[] | null>,
+): Promise<T[] | null> {
+  const key = email.trim().toLowerCase();
+  const hit = processMemberships.get(key);
+  if (hit) return hit as T[];
+  const rows = await load();
+  if (rows !== null) processMemberships.set(key, rows as unknown[]);
+  return rows;
+}
+
+export function invalidateMemberOrgCaches(): void {
   cacheForRequest(false)?.clear();
+  processMemberships.clear();
+}
+
+export function __resetProcessMemberOrgCacheForTests(): void {
+  processMemberships.clear();
 }

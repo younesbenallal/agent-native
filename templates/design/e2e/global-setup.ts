@@ -1,36 +1,99 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { createClient } from "@libsql/client";
+import { createDbExec } from "@agent-native/core/db";
 import { chromium, type FullConfig } from "@playwright/test";
 
-/**
- * Global setup: authenticate a test user (email/password; there is no dev auth
- * bypass) and seed one design with a known fixture HTML so specs run against
- * deterministic content. Writes:
- *   e2e/.auth/state.json  - signed session storageState
- *   e2e/.auth/seed.json   - { designId } of the seeded design
- */
+import { e2eBaseURL } from "./base-url";
+import { designE2eRunRoot } from "./global-teardown";
 
-export const E2E_EMAIL = "e2e@local.test";
+export const E2E_EMAIL = "e2e+autoz@local.test";
+export const E2E_MENTION_EMAIL = "alice+e2e@local.test";
 export const E2E_PASSWORD = "password-e2e-1234";
 export const SEED_TITLE = "E2E Seed Design";
 
 const AUTH_DIR = process.env.E2E_AUTH_DIR
   ? path.resolve(process.env.E2E_AUTH_DIR)
-  : path.join(import.meta.dirname, ".auth");
+  : path.join(
+      process.env.E2E_RUN_ROOT ??
+        path.join(import.meta.dirname, "..", "..", ".tmp", "design-e2e"),
+      "auth",
+    );
 const STATE_PATH = path.join(AUTH_DIR, "state.json");
 const SEED_PATH = path.join(AUTH_DIR, "seed.json");
 const BROWSER_CHANNEL = process.env.E2E_BROWSER_CHANNEL;
 const E2E_DATABASE_URL =
   process.env.E2E_DATABASE_URL ??
-  `file:${path.join(import.meta.dirname, "..", "data", "e2e.db")}`;
+  `pglite:${path.join(import.meta.dirname, "..", "data", "e2e-pglite")}`;
+const LOOPBACK_READINESS_TIMEOUT_MS = 10_000;
+const LOOPBACK_READINESS_RETRY_MS = 50;
 
-/**
- * Fixture HTML with distinct, text-identifiable elements. Plain inline styles
- * (no CDN) so the layout is deterministic and offline. The flex row of two
- * buttons exercises reorder/move; headings and paragraphs exercise select.
- */
+async function startLoopbackProvider(port: number): Promise<void> {
+  const runRoot = designE2eRunRoot(path.resolve(import.meta.dirname, ".."));
+  if (!runRoot) throw new Error("loopback provider requires an E2E run root");
+  const loopbackPidPath = path.join(runRoot, "loopback-provider.pid");
+  const child = spawn(
+    process.execPath,
+    [
+      "--import",
+      "tsx/esm",
+      path.join(import.meta.dirname, "loopback-design-provider.ts"),
+    ],
+    {
+      detached: true,
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        E2E_LOOPBACK_PORT: String(port),
+      },
+    },
+  );
+  let spawnError: Error | undefined;
+  child.once("error", (error) => {
+    spawnError = error;
+  });
+  if (!child.pid) throw new Error("loopback provider did not start");
+  await mkdir(path.dirname(loopbackPidPath), { recursive: true });
+  await writeFile(loopbackPidPath, String(child.pid));
+  const deadline = Date.now() + LOOPBACK_READINESS_TIMEOUT_MS;
+  let lastError: unknown;
+  try {
+    while (Date.now() < deadline) {
+      if (spawnError) throw spawnError;
+      try {
+        const response = await fetch(
+          `http://127.0.0.1:${port}/v1/models` /* e2e-harness-ignore: allocated provider port, not Design base URL */,
+          {
+            signal: AbortSignal.timeout(250),
+          },
+        );
+        if (response.ok) {
+          child.unref();
+          return;
+        }
+        lastError = new Error(`HTTP ${response.status}`);
+      } catch (error) {
+        lastError = error;
+      }
+      await new Promise((resolve) =>
+        setTimeout(resolve, LOOPBACK_READINESS_RETRY_MS),
+      );
+    }
+    const detail =
+      lastError instanceof Error ? lastError.message : String(lastError);
+    throw new Error(
+      `loopback provider did not become ready on port ${port}: ${detail}`,
+    );
+  } catch (error) {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill();
+    }
+    await rm(loopbackPidPath, { force: true });
+    throw error;
+  }
+}
+
 export const FIXTURE_HTML = `<!doctype html>
 <html lang="en">
   <head>
@@ -75,7 +138,7 @@ export const FIXTURE_HTML = `<!doctype html>
         <div style="padding:8px;border:1px solid #3f3f46;border-radius:10px">
           <div style="padding:8px;border:1px solid #52525b;border-radius:8px">
             <div style="padding:8px;border:1px solid #71717a;border-radius:6px">
-              <button style="padding:10px 18px;border-radius:8px;border:0;background:#f59e0b;color:#111827;font-size:14px">Deep Layer Button</button>
+              <button data-agent-native-node-id="e2e-deep-layer-button" data-agent-native-layer-name="Deep Layer Button" style="padding:10px 18px;border-radius:8px;border:0;background:#f59e0b;color:#111827;font-size:14px">Deep Layer Button</button>
             </div>
           </div>
         </div>
@@ -113,7 +176,7 @@ function componentIndexId(designId: string, name: string): string {
 export async function seedComponentVariantMetadata(
   designId: string,
 ): Promise<void> {
-  const client = createClient({ url: E2E_DATABASE_URL });
+  const client = await createDbExec({ url: E2E_DATABASE_URL });
   const name = "E2EButton";
   const now = new Date().toISOString();
   const variants = JSON.stringify({
@@ -159,60 +222,200 @@ export async function seedComponentVariantMetadata(
       ],
     });
   } finally {
-    client.close();
+    await client.close?.();
+  }
+}
+
+async function seedMentionMember(
+  browser: import("@playwright/test").Browser,
+  ownerContext: import("@playwright/test").BrowserContext,
+  baseURL: string,
+): Promise<void> {
+  const memberSearch = encodeURIComponent(E2E_MENTION_EMAIL);
+  const membersURL = `${baseURL}/_agent-native/org/members?limit=25&offset=0&search=${memberSearch}`;
+  const existingMembers = await ownerContext.request.get(membersURL);
+  if (!existingMembers.ok()) {
+    const body = await existingMembers.text();
+    if (
+      existingMembers.status() === 400 &&
+      body.includes("You must belong to an organization")
+    ) {
+      return;
+    }
+    throw new Error(
+      `list organization members failed: ${existingMembers.status()} ${body}`,
+    );
+  }
+  const existingPayload = await existingMembers.json();
+  if (
+    Array.isArray(existingPayload?.members) &&
+    existingPayload.members.some(
+      (member: { email?: unknown }) =>
+        String(member.email ?? "").toLowerCase() === E2E_MENTION_EMAIL,
+    )
+  ) {
+    return;
+  }
+
+  const invitation = await ownerContext.request.post(
+    `${baseURL}/_agent-native/org/invitations`,
+    {
+      data: { email: E2E_MENTION_EMAIL, role: "member" },
+      headers: { "Content-Type": "application/json" },
+    },
+  );
+  let invitationId: string | undefined;
+  if (invitation.ok()) {
+    invitationId = String((await invitation.json())?.id ?? "") || undefined;
+  } else {
+    const body = await invitation.text();
+    if (
+      invitation.status() === 400 &&
+      body.includes("You must belong to an organization")
+    ) {
+      return;
+    }
+    if (invitation.status() !== 409) {
+      throw new Error(
+        `invite mention member failed: ${invitation.status()} ${body}`,
+      );
+    }
+  }
+
+  if (!invitationId) {
+    const pending = await ownerContext.request.get(
+      `${baseURL}/_agent-native/org/invitations`,
+    );
+    if (!pending.ok()) {
+      throw new Error(
+        `list pending invitations failed: ${pending.status()} ${await pending.text()}`,
+      );
+    }
+    const pendingPayload = await pending.json();
+    invitationId =
+      String(
+        pendingPayload?.invitations?.find(
+          (item: { email?: unknown }) =>
+            String(item.email ?? "").toLowerCase() === E2E_MENTION_EMAIL,
+        )?.id ?? "",
+      ) || undefined;
+  }
+
+  const memberContext = await browser.newContext();
+  try {
+    const registration = await memberContext.request.post(
+      `${baseURL}/_agent-native/auth/register`,
+      {
+        data: {
+          email: E2E_MENTION_EMAIL,
+          password: E2E_PASSWORD,
+        },
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+    if (!registration.ok() && registration.status() !== 409) {
+      throw new Error(
+        `mention member registration failed: ${registration.status()} ${await registration.text()}`,
+      );
+    }
+
+    const login = await memberContext.request.post(
+      `${baseURL}/_agent-native/auth/login`,
+      {
+        data: {
+          email: E2E_MENTION_EMAIL,
+          password: E2E_PASSWORD,
+        },
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+    if (!login.ok()) {
+      throw new Error(
+        `mention member login failed: ${login.status()} ${await login.text()}`,
+      );
+    }
+
+    if (invitationId) {
+      const acceptance = await memberContext.request.post(
+        `${baseURL}/_agent-native/org/invitations/${encodeURIComponent(invitationId)}/accept`,
+        {
+          data: {},
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+      if (!acceptance.ok() && acceptance.status() !== 404) {
+        throw new Error(
+          `accept mention member invitation failed: ${acceptance.status()} ${await acceptance.text()}`,
+        );
+      }
+    }
+  } finally {
+    await memberContext.close();
+  }
+
+  const members = await ownerContext.request.get(membersURL);
+  if (!members.ok()) {
+    throw new Error(
+      `verify mention member failed: ${members.status()} ${await members.text()}`,
+    );
+  }
+  const payload = await members.json();
+  if (
+    !Array.isArray(payload?.members) ||
+    !payload.members.some(
+      (member: { email?: unknown }) =>
+        String(member.email ?? "").toLowerCase() === E2E_MENTION_EMAIL,
+    )
+  ) {
+    throw new Error(`mention member ${E2E_MENTION_EMAIL} was not provisioned`);
   }
 }
 
 export default async function globalSetup(config: FullConfig) {
+  if (process.env.E2E_AI_SIDEBAR_LOOPBACK === "1")
+    await startLoopbackProvider(config.metadata.sidebarLoopbackPort as number);
   const baseURL =
-    (config.projects[0]?.use?.baseURL as string | undefined) ??
-    "http://127.0.0.1:9333";
+    (config.projects[0]?.use?.baseURL as string | undefined) ?? e2eBaseURL();
   await mkdir(AUTH_DIR, { recursive: true });
 
   const browser = await chromium.launch(
     BROWSER_CHANNEL ? { channel: BROWSER_CHANNEL } : {},
   );
   const context = await browser.newContext();
-  const page = await context.newPage();
 
   try {
-    await page.goto(`${baseURL}/sign-in`, {
-      waitUntil: "domcontentloaded",
-    });
-
-    const isSignIn = async () => /sign in/i.test(await page.title());
-
-    if (await isSignIn()) {
-      // Try to create the account; if it already exists, fall back to sign in.
-      await page.locator("#s-email").fill(E2E_EMAIL);
-      await page.locator("#s-pass").fill(E2E_PASSWORD);
-      await page.locator("#s-pass2").fill(E2E_PASSWORD);
-      await page.locator("#signup-form button[type='submit']").click();
-      await page.waitForTimeout(2500);
-
-      if (await isSignIn()) {
-        // Account exists; switch to the Sign in tab and log in.
-        await page
-          .getByRole("button", { name: "Sign in", exact: true })
-          .first()
-          .click()
-          .catch(() => {});
-        await page.locator("#l-email").fill(E2E_EMAIL);
-        await page.locator("#l-pass").fill(E2E_PASSWORD);
-        await page.locator("#login-form button[type='submit']").click();
-        await page.waitForTimeout(2500);
-      }
+    const registration = await context.request.post(
+      `${baseURL}/_agent-native/auth/register`,
+      {
+        data: {
+          email: E2E_EMAIL,
+          password: E2E_PASSWORD,
+        },
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+    if (!registration.ok() && registration.status() !== 409) {
+      throw new Error(
+        `registration failed: ${registration.status()} ${await registration.text()}`,
+      );
     }
 
-    await page
-      .waitForFunction(() => !/sign in/i.test(document.title), null, {
-        timeout: 20_000,
-      })
-      .catch(() => {});
+    const login = await context.request.post(
+      `${baseURL}/_agent-native/auth/login`,
+      {
+        data: {
+          email: E2E_EMAIL,
+          password: E2E_PASSWORD,
+        },
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+    if (!login.ok()) {
+      throw new Error(`login failed: ${login.status()} ${await login.text()}`);
+    }
 
     await context.storageState({ path: STATE_PATH });
 
-    // Seed a design + fixture file via the authenticated action surface.
     const created = await postAction(
       context.request,
       baseURL,
@@ -229,6 +432,7 @@ export default async function globalSetup(config: FullConfig) {
         `create-design did not return an id: ${JSON.stringify(created)}`,
       );
     }
+    await seedMentionMember(browser, context, baseURL);
     await postAction(context.request, baseURL, "create-file", {
       designId,
       filename: "index.html",
@@ -238,11 +442,32 @@ export default async function globalSetup(config: FullConfig) {
     await postAction(context.request, baseURL, "index-components", {
       designId,
     });
-    await seedComponentVariantMetadata(designId);
 
     await writeFile(SEED_PATH, JSON.stringify({ designId }, null, 2));
     // eslint-disable-next-line no-console
     console.log(`[e2e] seeded design ${designId} for ${E2E_EMAIL}`);
+
+    const warmupPage = await context.newPage();
+    try {
+      await warmupPage.goto(`${baseURL}/design/${designId}`, {
+        waitUntil: "domcontentloaded",
+      });
+      await warmupPage
+        .getByRole("button", { name: "Move", exact: true })
+        .waitFor({ timeout: 180_000 });
+      // eslint-disable-next-line no-console
+      console.log("[e2e] editor warm");
+    } catch (error) {
+      // Not fatal — the suite still runs, the first test just pays the
+      // compile again. Say so out loud rather than reporting a warm editor.
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[e2e] editor warmup did not finish (${(error as Error).message.split("\n")[0]}); ` +
+          "the first test will pay the compile.",
+      );
+    } finally {
+      await warmupPage.close();
+    }
   } finally {
     await browser.close();
   }

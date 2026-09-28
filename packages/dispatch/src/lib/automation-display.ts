@@ -13,15 +13,22 @@ export function automationIdentity(
   return `${item.owner}:${item.path}`;
 }
 
+export function belongsToDispatch(
+  item: Pick<DispatchAutomationItem, "appId">,
+): boolean {
+  return !item.appId || item.appId === "dispatch";
+}
+
 export function automationTroubleshootPath(
   item: Pick<DispatchAutomationItem, "name">,
 ): string {
-  const params = new URLSearchParams({ query: item.name });
-  return `/thread-debug?${params.toString()}`;
+  const params = new URLSearchParams({ mode: "threads", query: item.name });
+  return `/admin/thread-debug?${params.toString()}`;
 }
 
 export function automationTarget(item: DispatchAutomationItem): string {
   if (item.triggerType === "event" && item.event) return item.event;
+  if (item.triggerType === "webhook") return "On webhook";
   if (item.scheduleDescription) return item.scheduleDescription;
   if (item.schedule) return item.schedule;
   return item.triggerType || "schedule";
@@ -61,6 +68,7 @@ export function automationLastCheck(item: DispatchAutomationItem): string {
 export function automationNextRun(item: DispatchAutomationItem): string {
   if (!item.enabled) return "paused";
   if (item.triggerType === "event") return "on event";
+  if (item.triggerType === "webhook") return "on webhook";
   return item.nextRun ? relativeRunTime(item.nextRun) : "not scheduled";
 }
 

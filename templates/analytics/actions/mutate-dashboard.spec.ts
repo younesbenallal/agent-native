@@ -16,14 +16,6 @@ const mocks = vi.hoisted(() => ({
   seedFromText: vi.fn(async () => undefined),
 }));
 
-/**
- * Default passthrough: fetch via the mocked `getDashboard`, run the action's
- * mutate callback once against it, then forward to the mocked
- * `upsertDashboard` (preserving every existing `.mock.calls` assertion below)
- * and return a DashboardRecord-shaped result carrying the mutated config.
- * Individual tests override this with `mockImplementationOnce` to simulate a
- * lost race and prove the action recomputes from fresh state on retry.
- */
 function defaultUpsertDashboardWithRetry(
   id: string,
   ctx: unknown,
@@ -91,6 +83,8 @@ vi.mock("../server/lib/bigquery", () => ({
 }));
 
 const { default: mutateDashboard } = await import("./mutate-dashboard");
+const { DASHBOARD_COLLAB_SYNC_TIMEOUT_MS } =
+  await import("../server/lib/dashboard-collab-sync");
 
 function panel(id: string, source = "first-party") {
   return {
@@ -218,16 +212,58 @@ describe("mutate-dashboard", () => {
     expect(mocks.dryRunQuery).not.toHaveBeenCalled();
   });
 
-  it("advertises one unambiguous code input to the agent", () => {
+  it("returns the SQL save proof when collab sync hangs", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.getDashboard.mockResolvedValue({
+      kind: "sql",
+      config: dashboardConfig(),
+    });
+    mocks.hasCollabState.mockImplementationOnce(
+      () => new Promise<boolean>(() => {}),
+    );
+
+    try {
+      const result: any = await mutateDashboard.run({
+        dashboardId: "traffic",
+        code: 'dashboard.panel("a").setTitle("Alpha");',
+      });
+
+      expect(result.saved).toBe(true);
+      expect(result.changedPanelIds).toEqual(["a"]);
+      expect(result.collabSync).toEqual({
+        status: "queued",
+        timeoutMs: DASHBOARD_COLLAB_SYNC_TIMEOUT_MS,
+      });
+      expect(mocks.upsertDashboard).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(DASHBOARD_COLLAB_SYNC_TIMEOUT_MS);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("Dashboard collab sync timed out for traffic"),
+      );
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("advertises structured operations first and bounds legacy code", () => {
     const parameters = mutateDashboard.tool.parameters as {
-      properties: Record<string, { minLength?: number }>;
+      properties: Record<string, { minLength?: number; maxLength?: number }>;
       required: string[];
     };
 
-    expect(Object.keys(parameters.properties)).toEqual(["dashboardId", "code"]);
-    expect(parameters.required).toEqual(["dashboardId", "code"]);
+    expect(Object.keys(parameters.properties)).toEqual([
+      "dashboardId",
+      "operations",
+      "code",
+      "dryRun",
+      "returnConfig",
+    ]);
+    expect(parameters.required).toEqual(["dashboardId"]);
     expect(parameters.properties.dashboardId.minLength).toBe(1);
-    expect(parameters.properties.code.minLength).toBe(1);
+    expect(parameters.properties.code.maxLength).toBe(12_000);
+    expect(parameters.properties.operations).toBeDefined();
   });
 
   it("accepts structured operations and can dry-run without saving", async () => {
@@ -284,6 +320,23 @@ describe("mutate-dashboard", () => {
     expect(renderedRows(saved)).toEqual([["a", "b", "new"], ["c"]]);
   });
 
+  it("rejects an insert panel without a usable id at the action boundary", async () => {
+    await expect(
+      mutateDashboard.run({
+        dashboardId: "traffic",
+        operations: [
+          {
+            op: "insertPanel",
+            panel: { title: "Missing id" },
+          },
+        ],
+      }),
+    ).rejects.toThrow(/panel\.id must be a non-empty string/);
+
+    expect(mocks.getDashboard).not.toHaveBeenCalled();
+    expect(mocks.upsertDashboard).not.toHaveBeenCalled();
+  });
+
   it("validates SQL-affecting mutations before saving", async () => {
     mocks.getDashboard.mockResolvedValue({
       kind: "sql",
@@ -302,6 +355,48 @@ describe("mutate-dashboard", () => {
     ).rejects.toThrow(/SQL is invalid: bad column/);
 
     expect(mocks.upsertDashboard).not.toHaveBeenCalled();
+  });
+
+  it("validates multiple BigQuery panels in parallel within one batch", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.getDashboard.mockResolvedValue({
+        kind: "sql",
+        config: {
+          ...dashboardConfig(),
+          panels: [panel("a", "bigquery"), panel("b", "bigquery")],
+        },
+      });
+      mocks.dryRunQuery.mockImplementation(
+        async () =>
+          await new Promise<null>((resolve) =>
+            setTimeout(() => resolve(null), 100),
+          ),
+      );
+
+      const pending = mutateDashboard.run({
+        dashboardId: "traffic",
+        operations: [
+          {
+            op: "updatePanel",
+            panelId: "a",
+            patch: { sql: "SELECT 1" },
+          },
+          {
+            op: "updatePanel",
+            panelId: "b",
+            patch: { sql: "SELECT 2" },
+          },
+        ],
+      });
+
+      await vi.advanceTimersByTimeAsync(99);
+      expect(mocks.dryRunQuery).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(pending).resolves.toMatchObject({ saved: true });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not let unrelated legacy-invalid SQL block a valid duplicate", async () => {
@@ -445,12 +540,6 @@ describe("mutate-dashboard", () => {
   });
 
   it("recomputes the mutation against fresh state on retry so a concurrent writer's panel is never dropped", async () => {
-    // Simulates two interleaved writers racing on the same dashboard: this
-    // call inserts panel "writer-b", but its first fenced write is lost
-    // because a concurrent writer already saved a different panel
-    // ("writer-a") in between. A correct retry re-reads that winning save and
-    // reapplies "insert writer-b" on top of it, so both panels land instead
-    // of the second writer clobbering the first's insert.
     const beforeConcurrentWrite = {
       kind: "sql",
       config: dashboardConfig(),
@@ -467,9 +556,9 @@ describe("mutate-dashboard", () => {
     mocks.upsertDashboardWithRetry.mockImplementationOnce(
       async (id: string, ctx: unknown, mutate: (existing: any) => any) => {
         mutateCallCount += 1;
-        await mutate(beforeConcurrentWrite); // attempt 1: lost to the race
+        await mutate(beforeConcurrentWrite);
         mutateCallCount += 1;
-        const { kind, body } = await mutate(afterConcurrentWrite); // retry
+        const { kind, body } = await mutate(afterConcurrentWrite);
         await mocks.upsertDashboard(id, kind, body, ctx);
         return { ...afterConcurrentWrite, kind, config: body };
       },

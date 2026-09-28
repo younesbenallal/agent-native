@@ -1,5 +1,6 @@
 import { defineAction, embedApp } from "@agent-native/core";
 import { writeAppState } from "@agent-native/core/application-state";
+import { parseIconValue, serializeIconValue } from "@agent-native/core/icons";
 import { buildDeepLink } from "@agent-native/core/server";
 import {
   getRequestOrgId,
@@ -9,6 +10,7 @@ import { and, eq, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 
 import { getDb, schema } from "../server/db/index.js";
+import { bodyRevisionForContent } from "../server/lib/document-body-revision.js";
 import {
   parseDocumentFavorite,
   parseDocumentHideFromSearch,
@@ -26,7 +28,11 @@ import {
   isLocalFileDocumentId,
   localDocumentPathFromId,
 } from "./_local-file-documents.js";
-import { documentsPositionScope, withPositionLock } from "./_position-utils.js";
+import {
+  documentsPositionScope,
+  nextAppendPosition,
+  withPositionLock,
+} from "./_position-utils.js";
 
 function nanoid(size = 12): string {
   const chars =
@@ -65,7 +71,7 @@ function serializeDocument(row: typeof schema.documents.$inferSelect) {
 
 export default defineAction({
   description:
-    "Create or refresh a database-backed shareable copy of a local-file document. Use this before sharing a local file with other users.",
+    "Create or refresh a collection-backed shareable copy of a local-file document. Use this before sharing a local file with other users.",
   schema: z.object({
     id: z.string().describe("Local file document ID to make shareable"),
   }),
@@ -74,25 +80,58 @@ export default defineAction({
     resource: embedApp({
       title: "Share document",
       description:
-        "Open the shareable database copy in the real Content editor so the user can invite people or change visibility.",
+        "Open the shareable collection copy in the real Content editor so the user can invite people or change visibility.",
       iframeTitle: "Agent-Native Content",
       openLabel: "Open in Content",
       height: 900,
     }),
   },
   run: async ({ id }) => {
-    if (!isLocalFileDocumentId(id)) {
-      throw new Error("Only local file documents can be upgraded for sharing.");
-    }
-
     const userEmail = getRequestUserEmail();
     if (!userEmail) throw new Error("Not authenticated");
 
-    const localDocument = await getLocalFileDocument(id);
-    const sourcePath = localDocumentPathFromId(id);
-    const now = new Date().toISOString();
     const orgId = getRequestOrgId() ?? null;
+    const organizationFilter = orgId
+      ? eq(schema.documents.orgId, orgId)
+      : isNull(schema.documents.orgId);
     const db = getDb();
+    const localDocument = isLocalFileDocumentId(id)
+      ? await getLocalFileDocument(id)
+      : await db
+          .select()
+          .from(schema.documents)
+          .where(
+            and(
+              eq(schema.documents.id, id),
+              eq(schema.documents.ownerEmail, userEmail),
+              organizationFilter,
+              eq(schema.documents.sourceMode, "local-files"),
+              eq(schema.documents.sourceKind, "file"),
+              isNull(schema.documents.trashedAt),
+            ),
+          )
+          .limit(1)
+          .then(
+            ([row]) =>
+              row && {
+                title: row.title,
+                content: row.content,
+                icon: row.icon,
+                isFavorite: parseDocumentFavorite(row.isFavorite),
+                hideFromSearch: parseDocumentHideFromSearch(row.hideFromSearch),
+                source: serializeDocumentSource(row),
+              },
+          );
+    if (!localDocument) {
+      throw new Error("Only local file documents can be upgraded for sharing.");
+    }
+    const sourcePath = isLocalFileDocumentId(id)
+      ? localDocumentPathFromId(id)
+      : localDocument.source?.path;
+    if (!sourcePath) {
+      throw new Error("The local file document has no source path.");
+    }
+    const now = new Date().toISOString();
     const provisioned = await provisionContentSpaces(db, userEmail);
     const targetSpaceId = orgId
       ? organizationContentSpaceId(orgId)
@@ -109,9 +148,13 @@ export default defineAction({
       .where(
         and(
           eq(schema.documents.ownerEmail, userEmail),
+          organizationFilter,
           eq(schema.documents.sourceMode, "database"),
           eq(schema.documents.sourceKind, "local-file-copy"),
           eq(schema.documents.sourcePath, sourcePath),
+          localDocument.source?.rootPath
+            ? eq(schema.documents.sourceRootPath, localDocument.source.rootPath)
+            : isNull(schema.documents.sourceRootPath),
           or(
             eq(schema.documents.spaceId, targetSpaceId),
             isNull(schema.documents.spaceId),
@@ -127,7 +170,11 @@ export default defineAction({
           spaceId: existing.spaceId ?? targetSpaceId,
           title: localDocument.title,
           content: localDocument.content,
-          icon: localDocument.icon,
+          bodyRevision: bodyRevisionForContent(localDocument.content),
+          icon:
+            typeof localDocument.icon === "string"
+              ? localDocument.icon
+              : serializeIconValue(parseIconValue(localDocument.icon)),
           isFavorite: localDocument.isFavorite ? 1 : 0,
           hideFromSearch: localDocument.hideFromSearch ? 1 : 0,
           sourceRootPath: localDocument.source?.rootPath ?? null,
@@ -159,7 +206,7 @@ export default defineAction({
       documentsPositionScope(userEmail, null),
       async () => {
         const [{ max: maxPosition } = { max: -1 }] = await db
-          .select({ max: sql<number>`COALESCE(MAX(position), -1)` })
+          .select({ max: sql<unknown>`COALESCE(MAX(position), -1)` })
           .from(schema.documents)
           .where(
             and(
@@ -176,8 +223,11 @@ export default defineAction({
           parentId: null,
           title: localDocument.title,
           content: localDocument.content,
-          icon: localDocument.icon,
-          position: (maxPosition ?? -1) + 1,
+          icon:
+            typeof localDocument.icon === "string"
+              ? localDocument.icon
+              : serializeIconValue(parseIconValue(localDocument.icon)),
+          position: nextAppendPosition(maxPosition),
           isFavorite: localDocument.isFavorite ? 1 : 0,
           hideFromSearch: localDocument.hideFromSearch ? 1 : 0,
           visibility: "private",

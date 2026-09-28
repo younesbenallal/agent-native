@@ -1,20 +1,3 @@
-/**
- * The headless agent-run seam used by the evals runner.
- *
- * This invokes the real `runAgentLoop` as a *caller* — resolving a provider-
- * agnostic engine + model from the existing registry, converting the app's
- * actions into engine tools, and collecting the assistant's text + tool calls
- * off the `send` event stream into a compact `AgentRunOutput`. It deliberately
- * does NOT modify `production-agent.ts`: everything it needs (`runAgentLoop`,
- * `actionsToEngineTools`, `ActionEntry`) is already exported from there.
- *
- * The factory shape (`createAgentRunner`) keeps the runner unit-testable: tests
- * inject a fake `runAgentLoop` and a fake engine so no real model is called,
- * while production wires in the genuine loop. The same factory builds the
- * `ScorerAnalyzeContext.judge` helper so LLM-judge scorers stream through the
- * exact same resolved engine.
- */
-
 import {
   resolveEngine,
   getStoredModelForEngine,
@@ -40,7 +23,6 @@ import type {
 const JUDGE_TIMEOUT_MS = 30_000;
 const DEFAULT_AGENT_TIMEOUT_MS = 120_000;
 
-/** The slice of `runAgentLoop` the runner depends on — injectable for tests. */
 export type RunAgentLoopFn = (opts: {
   engine: AgentEngine;
   model: string;
@@ -53,27 +35,16 @@ export type RunAgentLoopFn = (opts: {
 }) => Promise<AgentLoopUsage>;
 
 export interface AgentRunnerConfig {
-  /** App actions to expose to the agent under test. */
   actions: Record<string, ActionEntry>;
-  /** System prompt for the run. */
   systemPrompt?: string;
-  /** Pre-resolved engine; resolved from the registry when omitted. */
   engine?: AgentEngine;
-  /** Pre-resolved model; resolved from the engine's stored/default when omitted. */
   model?: string;
-  /** Per-run wall-clock budget in ms (default 120s). */
   timeoutMs?: number;
-  /**
-   * Seam for tests / custom hosts. Defaults to the real `runAgentLoop`. The
-   * runner never imports `runAgentLoop` directly so this can be swapped.
-   */
   runLoop?: RunAgentLoopFn;
 }
 
 export interface AgentRunner {
-  /** Run the agent loop for one eval input and collect a compact output. */
   runAgent(input: EvalInput): Promise<AgentRunOutput>;
-  /** Analyze context handed to LLM-judge scorers (shares engine/model). */
   analyzeContext(): ScorerAnalyzeContext;
   readonly engine: AgentEngine;
   readonly model: string;
@@ -94,11 +65,6 @@ function toEngineMessages(input: EvalInput): EngineMessage[] {
   return messages;
 }
 
-/**
- * Build an agent runner, resolving the engine/model once up front so every
- * eval case (and every LLM-judge scorer) reuses the same provider-agnostic
- * config. Resolution goes through `resolveEngine` — no model is ever hardcoded.
- */
 export async function createAgentRunner(
   config: AgentRunnerConfig,
 ): Promise<AgentRunner> {
@@ -120,21 +86,55 @@ export async function createAgentRunner(
 
     let text = "";
     const toolCalls: string[] = [];
+    const toolCallDetails: Array<{
+      name: string;
+      id?: string;
+      input: unknown;
+      startedAtEventIndex: number;
+      completedAtEventIndex?: number;
+      completed?: boolean;
+      completedSideEffect?: boolean;
+      isError?: boolean;
+      result?: string;
+    }> = [];
     let ok = true;
     let error: string | undefined;
+    let eventIndex = 0;
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const started = Date.now();
 
     const send = (event: AgentChatEvent): void => {
+      const currentEventIndex = eventIndex++;
       switch (event.type) {
         case "text":
           text += event.text;
           break;
         case "tool_start":
           toolCalls.push(event.tool);
+          toolCallDetails.push({
+            name: event.tool,
+            id: event.id,
+            input: event.input,
+            startedAtEventIndex: currentEventIndex,
+          });
           break;
+        case "tool_done": {
+          const detail = event.id
+            ? toolCallDetails.find((call) => call.id === event.id)
+            : toolCallDetails.find(
+                (call) => call.name === event.tool && !call.completed,
+              );
+          if (detail) {
+            detail.completed = true;
+            detail.completedAtEventIndex = currentEventIndex;
+            detail.completedSideEffect = event.completedSideEffect;
+            detail.isError = event.isError === true;
+            detail.result = event.result;
+          }
+          break;
+        }
         case "error":
           ok = false;
           error = event.error;
@@ -165,6 +165,7 @@ export async function createAgentRunner(
     return {
       text,
       toolCalls,
+      toolCallDetails: toolCallDetails.map(({ id: _id, ...detail }) => detail),
       ok,
       error,
       runId,
@@ -193,6 +194,7 @@ export async function createAgentRunner(
             tools: [],
             abortSignal: signal,
             maxOutputTokens: opts.maxOutputTokens ?? 512,
+            reasoningEffort: "none",
             temperature: 0,
           });
           for await (const event of stream) {

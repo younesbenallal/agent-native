@@ -10,7 +10,7 @@ Una **superficie** es la forma en que los usuarios (u otros sistemas) interactú
 
 ## Cómo se relacionan las superficies entre sí
 
-Las cuatro formas principales de producto se sitúan en un espectro que va desde lo más interactivo hasta completamente headless. Lo que las hace componibles es que la base permanece igual en todo momento: las mismas acciones, la misma base de datos SQL y el mismo bucle del agente impulsan cada forma. Añadir una nueva superficie no significa reescribir lo que hay debajo — solo estás añadiendo una nueva forma de acceder a las mismas operaciones.
+Las cuatro formas principales de producto se sitúan en un espectro que va desde lo más interactivo hasta completamente headless. Lo que las hace componibles es que comparten las mismas acciones y el estado de la aplicación respaldado por SQL. Usa el bucle del agente cuando una superficie necesite un agente. Añadir una nueva superficie no significa reescribir lo que hay debajo — solo estás añadiendo una nueva forma de acceder a las mismas operaciones.
 
 <Diagram id="doc-block-hvdxgh" title="El espectro de superficies" summary={"Una superficie de acción, cuatro formas de producto, cada una añadiendo interfaz de usuario sin cambiar la operación subyacente."}>
 
@@ -41,7 +41,8 @@ Las cuatro formas principales de producto se sitúan en un espectro que va desde
 </div>
 <div class="diagram-base" data-rough>
   <span class="diagram-muted"
-    >mismas acciones · mismo SQL · mismo bucle del agente</span
+    >mismas acciones · estado respaldado por SQL · bucle del agente cuando se
+    use</span
   >
 </div>
 ```
@@ -97,7 +98,7 @@ aprobar trabajo, inspeccionar resultados nativos y mantener un historial de hilo
 Para un punto de partida de aplicación completa, usa la [Plantilla de chat](/docs/template-chat):
 
 ```bash
-npx @agent-native/core@latest create my-chat-app --template chat
+npx --yes @agent-native/core@latest create my-chat-app --template chat
 ```
 
 El chat de página completa más sencillo:
@@ -169,6 +170,45 @@ widget React predefinido, usa [Generative UI](/docs/generative-ui): renderiza in
 aislada en línea, puede leer el estado de la aplicación y el contexto del slot, y puede enviar
 los valores seleccionados de vuelta al chat.
 
+### Superficies de acciones por solicitud
+
+Usa `resolveActionSurface` cuando el agente o hilo seleccionado deba exponer
+solo un subconjunto de acciones nativas autorizado por el servidor. El callback
+se ejecuta en cada solicitud de chat interactivo después de `prepareRequest`.
+Los nombres devueltos forman una lista permitida estricta: las acciones omitidas
+no aparecen en los esquemas del proveedor, el registro de ejecución, la
+precarga del modo Plan ni la búsqueda de `tool-search`.
+
+```ts
+createAgentChatPlugin({
+  actions,
+  nativeActionsInDev: true,
+  resolveActionSurface: async ({ threadId, availableActionNames }) => ({
+    allowedActionNames: await loadAllowedActions(
+      threadId,
+      availableActionNames,
+    ),
+  }),
+});
+```
+
+Cuando el mismo resolver también gestione el chat predeterminado sin
+restricciones, devuelve `{ mode: "default" }`. Así se conservan el filtrado
+normal mediante `initialToolNames` y el descubrimiento con `tool-search`, en
+lugar de cargar todos los esquemas disponibles en la primera solicitud al
+modelo. El modo explícito se conserva en las continuaciones duraderas.
+
+Una lista vacía no expone acciones nativas. Los nombres desconocidos hacen
+fallar la solicitud en vez de ampliar el acceso. Todas las acciones permitidas
+se cargan directamente en la primera solicitud al modelo; incluye
+`tool-search` de forma explícita solo si deseas descubrir herramientas dentro
+del catálogo ya autorizado. El callback solo limita el chat interactivo, no
+HTTP, MCP, A2A, jobs ni triggers. En desarrollo local, usa acciones nativas y
+las instrucciones predeterminadas del framework y los subagentes iniciados
+heredan la misma superficie. Las herramientas shell de confianza se reducen
+automáticamente al sandbox filtrado por solicitud, porque una shell sin
+restricciones no puede imponer una frontera estricta de acciones.
+
 ## Interfaz de usuario nativa integrada {#native-inline-ui}
 
 Úsala cuando tus acciones devuelvan datos estructurados — una lista de registros, un conjunto de datos de gráfico, un resumen de estado — que deban renderizarse como un componente de interfaz de usuario real dentro del hilo de chat en lugar de una descripción de texto simple. Defines un renderizador `chatUI` en la acción, y Agent-Native lo renderiza como un componente React de primera clase: sin iframes, sin ruta de renderizado separada.
@@ -196,7 +236,7 @@ Las aplicaciones completas añaden interfaz de usuario de producto alrededor del
 
 ### Estado SQL
 
-Los datos de la aplicación, la navegación, la configuración y el historial de chat son todos duraderos. El agente lee y escribe las mismas filas que hace la interfaz de usuario.
+Los datos de la aplicación, la navegación, la configuración y el historial de chat son persistentes en SQL. El agente lee y escribe las mismas filas que la interfaz de usuario.
 
 ### Reconocimiento de contexto
 
@@ -204,7 +244,7 @@ El agente conoce la ruta actual, la selección y el objeto enfocado, por lo que 
 
 ### Sincronización en vivo
 
-Los cambios del agente actualizan la interfaz de usuario en tiempo real, y los cambios de la interfaz de usuario actualizan el contexto del agente. Sin sondeo, sin actualización.
+Los cambios del agente actualizan la interfaz de usuario mediante sincronización en vivo, y los cambios de la interfaz de usuario actualizan el contexto del agente. El framework usa SSE con sondeo de respaldo, por lo que no hay que actualizar manualmente.
 
 ### Vínculos profundos
 
@@ -228,7 +268,7 @@ una forma de producto completa.
 
 Toda aplicación Agent-Native eventualmente necesita un lugar donde los usuarios puedan configurar su agente: establecer instrucciones permanentes, revisar lo que ha hecho, conectar servidores MCP, gestionar automatizaciones y controlar el acceso. Construir esa interfaz de usuario desde cero es mucho trabajo. Agent-Native incluye un componente de página completa preconstruido, `AgentTabsPage`, que cubre todo esto en doce pestañas.
 
-Móntalo en `/agent` en tu aplicación. Las plantillas actuales emparejan esa ruta con una entrada de navegación de la aplicación y pasan `agentPageHref="/agent"` a `AgentSidebar`, para que los modos Recursos y Configuración de la barra lateral puedan enlazar a la página completa sin duplicar esos flujos.
+Las plantillas oficiales no la montan: Configuración cubre lo mismo (Agent › Model, Instructions, Memory, Skills, Files y Sub-agents, además de las páginas Automations y MCP server de la aplicación), `/agent` redirige a Configuración y `agentPageHref="/settings/agent"` en `AgentSidebar` abre Settings › Agent › Model. Monta `AgentTabsPage` en su propia ruta cuando una aplicación quiera toda la superficie del agente en una sola página.
 
 ```tsx filename="app/routes/agent.tsx"
 import { AgentTabsPage } from "@agent-native/core/client/agent-chat";
@@ -239,22 +279,22 @@ export default function AgentRoute() {
 
 La página compartida actualmente proporciona doce pestañas en dos grupos:
 
-| Grupo    | Pestaña           | Muestra                                                                                                                                                                                                                                                                   |
-| -------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Recursos | **Files**         | El `ResourcesPanel` existente para archivos personales o de la organización                                                                                                                                                                                               |
-| Recursos | **Instructions**  | Reglas de estilo AGENTS.md siempre activas                                                                                                                                                                                                                                |
-| Recursos | **Agents**        | Perfiles de subagentes personalizados                                                                                                                                                                                                                                     |
-| Recursos | **Memory**        | Notas de memoria a largo plazo                                                                                                                                                                                                                                            |
-| Recursos | **Skills**        | Flujos de trabajo reutilizables                                                                                                                                                                                                                                           |
-| Recursos | **Learnings**     | Correcciones y patrones capturados a lo largo del tiempo                                                                                                                                                                                                                  |
-| Recursos | **Remote agents** | Conexiones A2A a otras aplicaciones agent-native (reemplaza lo que la pestaña Connections solía mostrar)                                                                                                                                                                  |
-| Agente   | **Snapshots**     | Una vista previa del alcance, presupuesto de tokens, secciones del sistema ordenadas agrupadas por procedencia/gobernanza/fuente, y la última instantánea de hilo en vivo. Renombrada desde "Context"; los enlaces antiguos `#context` redirigen aquí.                    |
-| Agente   | **Connections**   | Solo gestión de servidores MCP                                                                                                                                                                                                                                            |
-| Agente   | **Automations**   | Automatizaciones Programadas/por Evento personales y de la organización con flujos de pausa/reanudación, detalles y eliminación. La URL de compatibilidad estable permanece en `/agent#jobs`.                                                                             |
-| Agente   | **Settings**      | Modelo del agente, claves de API, límites, voz y configuración de automatización                                                                                                                                                                                          |
-| Agente   | **Access**        | La URL MCP de la aplicación, una tarjeta de agente A2A cuando esté disponible, y guías de configuración compartidas para Claude, ChatGPT, Cursor, Claude Code, Codex y otros clientes. Enlaza a `/mcp/connect` para el flujo de conexión completo y el respaldo de token. |
+| Grupo    | Pestaña           | Muestra                                                                                                                                                                                                                                                                                                         |
+| -------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Recursos | **Files**         | El `ResourcesPanel` existente para archivos personales o de la organización                                                                                                                                                                                                                                     |
+| Recursos | **Instructions**  | Reglas de estilo AGENTS.md siempre activas                                                                                                                                                                                                                                                                      |
+| Recursos | **Agents**        | Perfiles de subagentes personalizados                                                                                                                                                                                                                                                                           |
+| Recursos | **Memory**        | Notas de memoria a largo plazo                                                                                                                                                                                                                                                                                  |
+| Recursos | **Skills**        | Flujos de trabajo reutilizables                                                                                                                                                                                                                                                                                 |
+| Recursos | **Learnings**     | Correcciones y patrones capturados a lo largo del tiempo                                                                                                                                                                                                                                                        |
+| Recursos | **Remote agents** | Conexiones A2A a otras aplicaciones agent-native (reemplaza lo que la pestaña Connections solía mostrar)                                                                                                                                                                                                        |
+| Agente   | **Snapshots**     | Una vista previa del alcance, presupuesto de tokens, secciones del sistema ordenadas agrupadas por procedencia/gobernanza/fuente, y la última instantánea de hilo en vivo. Renombrada desde "Context"; los enlaces antiguos `#context` redirigen aquí.                                                          |
+| Agente   | **Connections**   | Solo gestión de servidores MCP                                                                                                                                                                                                                                                                                  |
+| Agente   | **Automations**   | Automatizaciones Programadas/por Evento personales y de la organización con flujos de pausa/reanudación, detalles y eliminación. La URL de compatibilidad estable permanece en `/agent#jobs`.                                                                                                                   |
+| Agente   | **Settings**      | Modelo del agente, claves de API, límites, voz y configuración de automatización                                                                                                                                                                                                                                |
+| Agente   | **MCP**           | La URL MCP de la aplicación, una tarjeta de agente A2A cuando esté disponible, y guías de configuración compartidas para Claude, ChatGPT, Cursor, Claude Code, Codex y otros clientes. Encuéntrala en **Settings → MCP server** o usa `/mcp/connect` para el flujo de conexión completo y el respaldo de token. |
 
-La página muestra datos solo de ámbito personal (`user`). No hay un interruptor a nivel de organización hoy. Es una envoltura delgada sobre componentes existentes y verificaciones de acceso, no una nueva consola de administración: Connections describe lo que la aplicación puede llamar; Access describe cómo los clientes externos se conectan a ella.
+La página muestra datos solo de ámbito personal (`user`). No hay un interruptor a nivel de organización hoy. Es una envoltura delgada sobre componentes existentes y verificaciones de acceso, no una nueva consola de administración: Connections describe lo que la aplicación puede llamar; MCP describe cómo los clientes externos se conectan a ella.
 
 Aún no incluido:
 
@@ -397,7 +437,7 @@ Cuando añades el shell de Chat integrado, el framework proporciona cinco superf
 La ruta local más pequeña sin navegador es un scaffold más una acción:
 
 ```bash
-npx @agent-native/core@latest create my-agent --headless
+npx --yes @agent-native/core@latest create my-agent --headless
 cd my-agent
 pnpm install
 ```
@@ -408,6 +448,7 @@ Luego define la operación duradera:
 import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
 
+// One action powers every app surface: UI, agent, HTTP, MCP, A2A, and CLI.
 export default defineAction({
   description: "Summarize this week's submissions.",
   readOnly: true,
@@ -449,7 +490,7 @@ Cada `defineAction` se monta automáticamente en `/_agent-native/actions/<name>`
 
 Este no es un modo sin base de datos ni sin estado. El bucle de agente de la aplicación almacena sesiones,
 hilos, ejecuciones, configuración, credenciales, estado de la aplicación y registros de compartición en
-SQL. El desarrollo local usa SQLite por defecto; las aplicaciones de automatización-primero alojadas deben
+SQL. El desarrollo local usa PGlite por defecto; las aplicaciones de automatización-primero alojadas deben
 usar una base de datos SQL persistente.
 
 Si necesitas todo el bucle del agente sin navegador desde la carpeta del proyecto, usa:
@@ -484,7 +525,7 @@ await runAgentLoop({
 
 Para la mayoría de las aplicaciones, los prompts programados y los webhooks de integración ya llaman a este bucle
 por ti. Úsalo directamente solo cuando construyas un host personalizado sin navegador, un ejecutor de evaluaciones
-o una superficie de orquestación del lado del servidor. Consulta [Servidor: Manejador de agente en producción](/docs/server#agent-handler) para la firma completa.
+o una superficie de orquestación del lado del servidor. Consulta [Servidor: Manejador de agente en producción](/docs/server-plugins#agent-chat-plugin) para la firma completa.
 
 ### Ejecutar contra una carpeta {#folder-loop}
 
@@ -559,7 +600,7 @@ es el lugar canónico para las formas de eventos, los asistentes de runtime y lo
 
 <Cards>
 
-### [Acciones](/docs/actions)
+### [Acciones](/docs/actions-overview)
 
 Define la operación una vez. Cada superficie anterior llama a la misma.
 

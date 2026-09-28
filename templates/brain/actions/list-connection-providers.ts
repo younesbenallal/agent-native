@@ -1,9 +1,13 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import {
   isProviderApiId,
   listProviderApiCatalog,
 } from "@agent-native/core/provider-api";
 import { getCredentialContext } from "@agent-native/core/server";
+import {
+  findWorkspaceDispatchAgent,
+  getBuiltinAgents,
+} from "@agent-native/core/server/agent-discovery";
 import { accessFilter } from "@agent-native/core/sharing";
 import {
   listWorkspaceConnectionProviderCatalogForApp,
@@ -30,13 +34,32 @@ const SUPPORTED_SOURCE_PROVIDERS = new Set([
   "github",
 ]);
 
-function dispatchIntegrationsHref(providerId: string) {
+async function dispatchBaseHref(): Promise<string | undefined> {
+  const workspaceDispatch = await findWorkspaceDispatchAgent();
+  if (workspaceDispatch?.url) return workspaceDispatch.url;
+
+  return getBuiltinAgents(APP_ID).find((agent) => agent.id === "dispatch")?.url;
+}
+
+function dispatchIntegrationsHref(
+  providerId: string,
+  dispatchHref: string | undefined,
+): string | undefined {
   const params = new URLSearchParams({
     provider: providerId,
     appId: APP_ID,
     returnTo: "ask",
   });
-  return `/dispatch/integrations?${params.toString()}`;
+  if (!dispatchHref) return undefined;
+  const base = dispatchHref
+    .replace(/\/(?:overview|apps)\/?$/, "")
+    .replace(/\/$/, "");
+  const path = `integrations?${params.toString()}`;
+  try {
+    return new URL(path, `${base}/`).toString();
+  } catch {
+    return `${base}/${path}`;
+  }
 }
 
 function providerApiConfigured({
@@ -58,9 +81,6 @@ function providerApiConfigured({
       .map((detail) => detail.key),
   );
 
-  // Jira's legacy fallback is one complete Basic-auth tuple. The catalog keys
-  // are individually optional because OAuth is preferred, so the generic
-  // required-key count cannot prove that an unconnected Jira provider is ready.
   if (providerApi.id === "jira") {
     return ["JIRA_BASE_URL", "JIRA_USER_EMAIL", "JIRA_API_TOKEN"].every((key) =>
       availableKeys.has(key),
@@ -262,7 +282,7 @@ async function listWorkspaceConnectionsForCatalog(): Promise<{
 
 export default defineAction({
   description:
-    "Check reusable Brain source and provider API readiness before using a provider. Each provider reports whether authenticated access is configured and includes a focused setupLink. When a requested provider is unavailable, explain the missing connection and return its setupLink instead of attempting provider-api-request.",
+    "Check reusable Brain source and provider API readiness before using a provider. Each provider reports whether authenticated access is configured and includes an absolute Dispatch setupLink when shared setup is needed. When a requested provider is unavailable, explain the missing connection and return its setupLink instead of attempting provider-api-request; if the user is not a workspace admin, mention that a personal MCP connection may be available in chat.",
   schema: z.object({}),
   http: { method: "GET" },
   readOnly: true,
@@ -284,6 +304,7 @@ export default defineAction({
       sourceCounts.set(row.provider, (sourceCounts.get(row.provider) ?? 0) + 1);
     }
 
+    const dispatchHref = await dispatchBaseHref();
     const providers = await Promise.all(
       (workspace.catalog?.providers ?? []).map(async (provider) => {
         const configuredSourceCount = sourceCounts.get(provider.id) ?? 0;
@@ -317,7 +338,7 @@ export default defineAction({
           configured:
             providerApiIsConfigured ??
             (sourceProviderSupported ? credentialHealth.available : null),
-          setupLink: dispatchIntegrationsHref(provider.id),
+          setupLink: dispatchIntegrationsHref(provider.id, dispatchHref),
           credentialHealth,
           providerHealth: providerHealthForProvider({
             credentialHealth,

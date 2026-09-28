@@ -1,12 +1,6 @@
-/**
- * Shared types between client and server
- */
-
 export interface DemoResponse {
   message: string;
 }
-
-// --- Default Style References ---
 
 export const DEFAULT_STYLE_REFERENCE_URLS: string[] = [];
 
@@ -23,16 +17,14 @@ export function normalizeReferenceUrls(
   return normalized;
 }
 
-// --- Image Generation ---
-
 export type ImageGenModel = "gemini" | "openai" | "auto";
 
 export interface ImageGenRequest {
   prompt: string;
   model: ImageGenModel;
   size?: string;
-  referenceImageUrls?: string[]; // URLs of reference images
-  uploadedReferenceImages?: string[]; // base64 data URLs
+  referenceImageUrls?: string[];
+  uploadedReferenceImages?: string[];
 }
 
 export interface ImageGenStatusResponse {
@@ -40,8 +32,6 @@ export interface ImageGenStatusResponse {
   openai: boolean;
   preferredProvider: string | null;
 }
-
-// --- AI Slide Generation ---
 
 export interface SlideGenerateRequest {
   topic: string;
@@ -57,14 +47,12 @@ export interface GeneratedSlide {
   layout: "title" | "content" | "two-column" | "image" | "blank";
   notes: string;
   background?: string;
-  imagePrompt?: string; // prompt to generate an image for this slide
+  imagePrompt?: string;
 }
 
 export interface SlideGenerateResponse {
   slides: GeneratedSlide[];
 }
-
-// --- Share Links ---
 
 export interface ShareDeckRequest {
   deck: {
@@ -82,6 +70,7 @@ export interface SharedDeckResponse {
   title: string;
   slides: SharedDeckSlide[];
   aspectRatio?: import("./aspect-ratios").AspectRatio;
+  designSystem?: DesignSystemData;
 }
 
 export type SharedSlideTransition =
@@ -93,10 +82,23 @@ export type SharedSlideTransition =
 
 export type SharedAnimationType = "appear" | "fade" | "slide-up" | "zoom";
 
+export type SharedAnimationIssueCode =
+  | "invalid-shape"
+  | "invalid-element-path"
+  | "missing-target"
+  | "unsupported-type";
+
+export interface SharedSlideAnimationIssue {
+  index: number;
+  id: string | null;
+  code: SharedAnimationIssueCode;
+}
+
 export interface SharedSlideAnimation {
   id: string;
   elementIndex: number;
   elementPath?: number[];
+  byParagraph?: boolean;
   type: SharedAnimationType;
 }
 
@@ -108,7 +110,12 @@ export interface SharedDeckSlide {
   background?: string;
   transition?: SharedSlideTransition;
   animations?: SharedSlideAnimation[];
+  animationIssues?: SharedSlideAnimationIssue[];
   splitByParagraph?: boolean;
+}
+
+export interface SharedDeckSlideOptions {
+  includeNotes?: boolean;
 }
 
 const SHARED_SLIDE_TRANSITIONS = new Set<SharedSlideTransition>([
@@ -135,7 +142,7 @@ function normalizeString(value: unknown, fallback: string): string {
 }
 
 function normalizeElementPath(value: unknown): number[] | undefined {
-  if (!Array.isArray(value)) return undefined;
+  if (!Array.isArray(value) || value.length === 0) return undefined;
   const path = value.filter(
     (part): part is number =>
       typeof part === "number" &&
@@ -149,10 +156,18 @@ function normalizeElementPath(value: unknown): number[] | undefined {
 function normalizeSlideAnimation(
   value: unknown,
   index: number,
-): SharedSlideAnimation | null {
-  if (!isRecord(value)) return null;
+): { animation: SharedSlideAnimation } | { issue: SharedSlideAnimationIssue } {
+  const id = isRecord(value) && typeof value.id === "string" ? value.id : null;
+  const issue = (code: SharedAnimationIssueCode) => ({
+    issue: { index, id, code },
+  });
+
+  if (!isRecord(value)) return issue("invalid-shape");
 
   const elementPath = normalizeElementPath(value.elementPath);
+  if (value.elementPath !== undefined && !elementPath) {
+    return issue("invalid-element-path");
+  }
   const rawElementIndex = value.elementIndex;
   const hasElementIndex =
     typeof rawElementIndex === "number" &&
@@ -160,42 +175,41 @@ function normalizeSlideAnimation(
     Number.isFinite(rawElementIndex) &&
     rawElementIndex >= 0;
 
-  if (!hasElementIndex && !elementPath) return null;
+  if (!hasElementIndex && !elementPath) return issue("missing-target");
 
   const rawType = value.type;
-  const type = SHARED_ANIMATION_TYPES.has(rawType as SharedAnimationType)
-    ? (rawType as SharedAnimationType)
-    : "slide-up";
+  if (!SHARED_ANIMATION_TYPES.has(rawType as SharedAnimationType)) {
+    return issue("unsupported-type");
+  }
+  const type = rawType as SharedAnimationType;
+  const byParagraph =
+    typeof value.byParagraph === "boolean" ? value.byParagraph : undefined;
 
-  // When an explicit `elementIndex` is present, trust it. Otherwise derive
-  // from the last segment of `elementPath` - keeps the index correlated
-  // with the path's actual leaf so consumers that fall back to
-  // `elementIndex` target the right element instead of silently defaulting
-  // to slide-element 0 (which created an ambiguity between 'animation
-  // explicitly targets element 0' and 'animation only had elementPath').
-  // At least one of the two must be present (guarded above by the
-  // `!hasElementIndex && !elementPath` early return).
   const resolvedElementIndex = hasElementIndex
     ? rawElementIndex
     : (elementPath![elementPath!.length - 1] ?? 0);
 
   return {
-    id: normalizeString(value.id, `animation-${index + 1}`),
-    elementIndex: resolvedElementIndex,
-    ...(elementPath ? { elementPath } : {}),
-    type,
+    animation: {
+      id: normalizeString(value.id, `animation-${index + 1}`),
+      elementIndex: resolvedElementIndex,
+      ...(elementPath ? { elementPath } : {}),
+      ...(byParagraph !== undefined ? { byParagraph } : {}),
+      type,
+    },
   };
 }
 
 export function toSharedDeckSlide(
   value: unknown,
   index: number,
+  options: SharedDeckSlideOptions = {},
 ): SharedDeckSlide {
   const slide = isRecord(value) ? value : {};
   const shared: SharedDeckSlide = {
     id: normalizeString(slide.id, `slide-${index + 1}`),
     content: normalizeString(slide.content, ""),
-    notes: "",
+    notes: options.includeNotes ? normalizeString(slide.notes, "") : "",
     layout: normalizeString(slide.layout, "content"),
   };
 
@@ -212,20 +226,26 @@ export function toSharedDeckSlide(
   }
 
   if (Array.isArray(slide.animations)) {
-    const animations = slide.animations
-      .map((animation, animationIndex) =>
+    const normalizedAnimations = slide.animations.map(
+      (animation, animationIndex) =>
         normalizeSlideAnimation(animation, animationIndex),
-      )
-      .filter((animation): animation is SharedSlideAnimation => !!animation);
+    );
+    const animations = normalizedAnimations.flatMap((result) =>
+      "animation" in result ? [result.animation] : [],
+    );
+    const animationIssues = normalizedAnimations.flatMap((result) =>
+      "issue" in result ? [result.issue] : [],
+    );
     if (animations.length > 0) {
       shared.animations = animations;
+    }
+    if (animationIssues.length > 0) {
+      shared.animationIssues = animationIssues;
     }
   }
 
   return shared;
 }
-
-// --- Deck Version History ---
 
 export interface DeckVersionSlidePreview {
   slideNumber: number;
@@ -262,8 +282,6 @@ export interface DeckVersion extends DeckVersionSummary {
     background?: string;
   }>;
 }
-
-// --- Design Systems ---
 
 export interface DesignSystemData {
   colors: {
@@ -304,8 +322,6 @@ export interface DesignSystemAsset {
   url: string;
   mimeType: string;
 }
-
-// --- Question Flow ---
 
 export interface QuestionFlowQuestion {
   id: string;

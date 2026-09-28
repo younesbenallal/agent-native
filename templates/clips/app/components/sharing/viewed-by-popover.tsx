@@ -20,25 +20,22 @@ interface ClipViewRecord {
 
 export interface ViewedByPopoverProps {
   recordingId: string;
-  /** Rendered as the click target — usually the existing "N views" text. */
   children: React.ReactNode;
   className?: string;
 }
 
-/**
- * Wraps the aggregate view count with a click-to-open popover listing
- * individual view records (who viewed, and when), most recent first.
- * Owner-only data — `list-clip-views` is access-checked server-side, so a
- * non-owner opening this (if ever rendered for them) simply sees an error
- * state, never other viewers' identities.
- */
 export function ViewedByPopover({
   recordingId,
   children,
   className,
 }: ViewedByPopoverProps) {
   const t = useT();
-  const { formatDate, formatRelativeTime } = useFormatters();
+  const formatters = useFormatters();
+  const formatDate = (date: Date) => formatters.formatDate(date);
+  const formatRelativeTime = (
+    value: number,
+    unit: Parameters<typeof formatters.formatRelativeTime>[1],
+  ) => formatters.formatRelativeTime(value, unit);
   const [open, setOpen] = useState(false);
 
   const q = useActionQuery<{ views: ClipViewRecord[] }>(

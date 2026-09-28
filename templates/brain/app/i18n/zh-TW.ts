@@ -49,6 +49,26 @@ const messages = {
     brainNavigationDescription: "在 Brain 工作介面之間導覽。",
   },
   settings: {
+    area: {
+      tabBehavior: "行為",
+      tabPublishing: "發布",
+      tabSafety: "安全",
+      tabPrivacy: "隱私",
+      groupNames: "名稱",
+      groupAnswers: "回答",
+      groupDistillation: "提煉",
+      groupReviewQueue: "審核佇列",
+      groupSources: "來源",
+      groupCaptures: "擷取內容",
+      groupAdvanced: "進階",
+      groupScreening: "篩查",
+      edit: "編輯",
+      cancel: "取消",
+      save: "儲存",
+      saveFailed: "無法儲存變更，請再試一次。",
+      loadFailed: "無法載入 Brain 設定。",
+      retry: "再試一次",
+    },
     pageTitle: "設定",
     agentTitle: "管理代理",
     agentDescription: "管理代理的模型、API 金鑰、自動化、語音和其他控制項。",
@@ -174,6 +194,16 @@ const messages = {
     privacyClassifierModelPlaceholder: "預設隱私分類器模型",
     privacyClassifierEngine: "分類器引擎",
     privacyClassifierEnginePlaceholder: "預設分類器引擎",
+    hours: "{{count}} 小時",
+    privacyClassifierChoice: "敏感度分類器",
+    privacyClassifierJev: "Jev（建議）",
+    privacyClassifierCustom: "自訂模型",
+    privacyClassifierDeterministic: "僅規則篩查",
+    jevCredentialLabel: "Jev 憑證",
+    jevCredentialStoredKey: "已儲存金鑰",
+    jevCredentialGateway: "Builder 連線",
+    jevCredentialNone: "找不到",
+    jevCredentialUnavailable: "查詢失敗",
     quarantineRetentionHours: "隔離保留時數",
     quarantineRetentionHoursDescription:
       "僅含中繼資料的隔離事件將在此期限後刪除。",
@@ -399,6 +429,14 @@ const messages = {
     slackAccessRuleScopes:
       "Slack 存取應支援 auth.test、conversations.info/history 和 chat.getPermalink。試點私人頻道時新增私人頻道存取。",
     allowedChannels: "允許的頻道",
+    invalidAllowedChannels:
+      "不是有效的 Slack 頻道：{{entries}}。請使用類似 C0123456789 的頻道 ID 或 #channel-name。",
+    invalidSlackDirectMessages:
+      "不支援 Slack 私訊：{{entries}}。Brain 僅同步公開和私人頻道。",
+    invalidGithubRepositories:
+      "不是有效的存放庫：{{entries}}。請使用 owner/repo 或 github.com 存放庫 URL。",
+    missingProviderCredential:
+      "{{keys}} 尚未設定，因此在新增之前此來源無法同步。",
     allowedChannelsDescription:
       "Brain 驗證允許清單，拒絕 DMs/MPIMs，並且從不在來源設定中儲存憑證值。",
     messagesPerPage: "每頁訊息數",
@@ -432,6 +470,25 @@ const messages = {
     nextSync: "下次同步 {{date}}",
     waitingForFirstSync: "等待首次同步",
     manualSync: "手動同步",
+    manualImportTitle: "將 Markdown 匯入 {{source}}",
+    manualImportDescription:
+      "選取資料夾或一批 Markdown 檔案。每個檔案都會成為可搜尋的文件，並遵循此來源的存取設定。",
+    chooseMarkdownFolder: "選取 Markdown 資料夾",
+    importMarkdownFiles: "匯入 Markdown 檔案",
+    manualImportNoFiles: "未選取 Markdown 檔案",
+    manualImportFilesSelected: "已選取 {{count}} 個 Markdown 檔案",
+    manualImportFileLimit:
+      "只會匯入 .md 和 .markdown 檔案。資料夾匯入上限為 100 個檔案和 400 萬個字元。",
+    manualImportSkippedFiles: "將略過 {{count}} 個非 Markdown 檔案。",
+    manualImportMoreFiles: "+{{count}} 個其他檔案",
+    manualImportResult:
+      "{{imported}} 個已匯入、{{queued}} 個已排入蒸餾佇列、{{failed}} 個失敗、{{blocked}} 個遭封鎖",
+    manualImportBlocked: "已由 Brain 隱私權政策封鎖。",
+    manualImportMoreIssues: "+{{count}} 個其他檔案需要注意",
+    archiveSource: "封存來源",
+    archiveSourceTitle: "要封存此來源嗎？",
+    archiveSourceDescription:
+      "{{source}} 將離開使用中的來源清單。其捕獲與知識仍可供稽核，不會被硬刪除。",
     queueDistill: "加入提煉佇列",
     retryDistill: "重試提煉",
     captureStatus: {

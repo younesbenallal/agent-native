@@ -1,11 +1,12 @@
 ---
 name: workspace-conventions
 description: >-
-  Shared conventions for a multi-app Agent Native workspace: finding
+  Shared conventions for a multi-app Agent-Native workspace: finding
   version-matched framework docs and source, shared vs app-owned code, file and
   blob storage, env and secrets, agent scratch files, and Dispatch Resources.
   Use when working across workspace apps, storing files or credentials, or
   looking up framework APIs.
+scope: dev
 ---
 
 # Workspace Conventions
@@ -16,25 +17,15 @@ resources, or looking up framework APIs.
 
 ## Framework Docs Lookup
 
-Version-matched Agent Native docs ship with `@agent-native/core` in
-`node_modules/@agent-native/core/docs`. A source-only corpus of core and
-first-party template patterns ships in `node_modules/@agent-native/core/corpus`.
+Read `agent-native-docs` for the lookup workflow (`framework-search` first, then
+the focused `docs-search` / `source-search` readers, and the `rg` fallback).
 
-- From an app directory, use `pnpm action docs-search --query "<topic>"`,
-  `pnpm action docs-search --slug <slug>`, or `pnpm action docs-search --list`.
-  Use `pnpm action source-search --query "<pattern>"` or
-  `pnpm action source-search --path <path>` when source examples matter.
-- If the action runner is unavailable, read
-  `node_modules/@agent-native/core/docs/AGENTS.md` and search
-  `node_modules/@agent-native/core/docs/content/` directly with `rg`. Search
-  `node_modules/@agent-native/core/corpus/` for source examples.
-- For advanced workspace features, start with `workspace`, `multi-app-workspace`,
-  `a2a-protocol`, `pure-agent-apps`, `automations`, `recurring-jobs`,
-  `external-agents`, `mcp-protocol`, `feature-flags`, `sharing`, and `security`.
+The workspace-specific slugs it does not list are `workspace` and
+`multi-app-workspace`. Feature flags and other specialized workflows are
+optional; read their skill only when the app uses them. Use package docs for framework APIs,
+the package corpus for reusable framework/template patterns, and this
+`AGENTS.md` plus `.agents/skills/` for workspace-specific conventions.
 
-Use package docs for framework APIs, the package corpus for reusable
-framework/template patterns, and this `AGENTS.md` plus `.agents/skills/` for
-workspace-specific conventions.
 Before building common workspace or agent UI, read `agent-native-toolkit` to
 inventory existing public kits and installed package seams. Read
 `customizing-agent-native` before adapting shared UI. Use the supported
@@ -48,6 +39,10 @@ Preview before `--apply`, commit `agent-native.ejections.json`, and never edit
   must not call model providers, AI SDK `generateText()` / `streamText()`, or
   other inline LLM APIs directly. Use `sendToAgentChat()` for local app-agent
   work, including hidden `context` and `submit: false` prefill/review flows.
+  Keep actions deterministic and focused. If a workflow is framed as research,
+  analysis, generation, recommendation, or synthesis, let the agent
+  orchestrate provider/data actions in the open AgentSidebar instead of hiding
+  the work in one opaque action or a separate follow-up textbox.
   Only use `useAgentChatContext`, `setAgentChatContextItem`,
   `listAgentChatContext`, `removeAgentChatContextItem`, and
   `clearAgentChatContext` when UI needs two-way sync with staged context chips.
@@ -60,11 +55,20 @@ Preview before `--apply`, commit `agent-native.ejections.json`, and never edit
   ZIPs, screenshots, thumbnails, session replay chunks) in configured file/blob
   storage and persist only URLs, ids, or handles.
 - Store shared runtime configuration in the workspace root `.env`; use
-  `apps/<app>/.env` only for app-specific overrides. Never hardcode API keys,
+  `apps/<app>/.env` only for app-specific overrides. For public app behavior,
+  prefer the default in `agent-native.config.ts` and use the deterministic
+  `AGENT_NATIVE_CONFIG_<UPPER_SNAKE_PATH>` alias only when a non-secret value
+  needs a deployment override. Never hardcode API keys,
   tokens, webhook URLs, signing secrets, private Builder/internal data, customer
   data, or credential-looking literals in source, docs, prompts, fixtures,
   application state, action responses, or generated app content. Use
   secrets/OAuth/runtime configuration and obvious placeholders in examples.
+- Each app deploys its own `/*` page function, and that function ships whatever
+  the app's server bundle depends on — including a dependency only a background
+  job uses. Before an app takes on a heavy runtime (headless browser, ffmpeg,
+  media processing, ML), read `.agents/skills/performance/SKILL.md` §9 and keep
+  that work in a background function or job. A dependency belonging to one app
+  does not belong in `packages/shared`.
 - Prefer framework defaults until the workspace has a real custom rule,
   component, plugin, action, or skill to share.
 - Keep the Workspace files view for user-authored or user-requested resources.
@@ -87,5 +91,6 @@ Preview before `--apply`, commit `agent-native.ejections.json`, and never edit
 - **agent-native-toolkit** — Inventory of shared workspace and agent UI.
 - **customizing-agent-native** — The configure → compose → eject ladder.
 - **delegate-to-agent** — Routing every AI feature through the agent chat.
+- **performance** — Load cost, and (§9) cold-start artifact size per app.
 - **secrets** — Registering API keys and service credentials.
 - **storing-data** — Where structured data and large payloads belong.

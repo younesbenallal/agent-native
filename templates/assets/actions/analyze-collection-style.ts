@@ -1,5 +1,4 @@
-import { defineAction } from "@agent-native/core";
-import { assertAccess } from "@agent-native/core/sharing";
+import { defineAction } from "@agent-native/core/action";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
 
@@ -11,13 +10,11 @@ import {
 } from "../server/lib/generation.js";
 import { extractDominantColors } from "../server/lib/image-processing.js";
 import { nowIso, parseJson, stringifyJson } from "../server/lib/json.js";
+import { assertCanApprove } from "../server/lib/library-access.js";
 import { getObject } from "../server/lib/storage.js";
 import type { StyleBrief } from "../shared/api.js";
 import { serializeLibrary } from "./_helpers.js";
 
-/**
- * Synthesize a reusable style guide from a library's reference images.
- */
 export default defineAction({
   description:
     "Analyze reference images in an asset library or collection and update the style brief with palette plus vision-derived brand/style traits.",
@@ -27,7 +24,7 @@ export default defineAction({
     paletteSize: z.coerce.number().int().min(3).max(12).default(6),
   }),
   run: async ({ libraryId, collectionId, paletteSize }) => {
-    await assertAccess("asset-library", libraryId, "editor");
+    await assertCanApprove(libraryId, "Saving a style analysis");
     const db = getDb();
     const [library] = await db
       .select()
@@ -80,7 +77,6 @@ export default defineAction({
         (): string[] => [],
       );
       colors.forEach((hex, idx) => {
-        // Earlier colors in each ref's palette dominate; weight accordingly.
         const weight = colors.length - idx;
         colorScores.set(hex, (colorScores.get(hex) ?? 0) + weight);
       });

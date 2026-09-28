@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { coreTemplates, getTemplate } from "../../cli/templates-meta.js";
+import { isTruthyRuntimeValue } from "../../shared/runtime-config.js";
+import { normalizeWorkspaceAppHomePath } from "../../shared/workspace-app-audience.js";
 
 export interface OrgSwitcherAppLink {
   id: string;
@@ -35,6 +37,21 @@ function runtimeEnv(): RuntimeEnv {
 function envString(env: RuntimeEnv, key: string): string | undefined {
   const value = env[key];
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function envFlag(env: RuntimeEnv, key: string): boolean {
+  return isTruthyRuntimeValue(env[key]);
+}
+
+function projectedWorkspaceRuntime(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    (
+      window as Window & {
+        __AGENT_NATIVE_CONFIG__?: { workspaceRuntime?: unknown };
+      }
+    ).__AGENT_NATIVE_CONFIG__?.workspaceRuntime === true
+  );
 }
 
 function titleCase(value: string): string {
@@ -137,6 +154,9 @@ function appEntryToLink(
     typeof record.icon === "string" && record.icon.trim()
       ? record.icon.trim()
       : getTemplate(id)?.icon;
+  const explicitHomePath =
+    typeof record.homePath === "string" ? record.homePath.trim() : "";
+  const homePath = normalizeWorkspaceAppHomePath(record.homePath);
 
   return {
     id,
@@ -144,7 +164,13 @@ function appEntryToLink(
       typeof record.name === "string" && record.name.trim()
         ? record.name.trim()
         : titleCase(id),
-    href: isDispatch ? appendPath(baseHref, "overview") : baseHref,
+    href: isDispatch
+      ? appendPath(baseHref, "overview")
+      : homePath === "/"
+        ? baseHref
+        : explicitUrl && !explicitHomePath
+          ? baseHref
+          : appendPath(baseHref, homePath),
     description:
       typeof record.description === "string" && record.description.trim()
         ? record.description.trim()
@@ -229,28 +255,50 @@ export function isWorkspaceAppEnvironment(
   env: RuntimeEnv = runtimeEnv(),
 ): boolean {
   return (
-    envString(env, "VITE_AGENT_NATIVE_WORKSPACE") === "1" ||
+    envFlag(env, "VITE_AGENT_NATIVE_WORKSPACE") ||
+    projectedWorkspaceRuntime() ||
     Boolean(envString(env, "VITE_WORKSPACE_GATEWAY_URL")) ||
     Boolean(envString(env, "VITE_AGENT_NATIVE_WORKSPACE_APPS_JSON"))
   );
+}
+
+function dispatchPageHref(
+  apps: OrgSwitcherAppLink[],
+  page: "overview" | "apps" | "vault" | "workspace",
+  env: RuntimeEnv,
+): string {
+  const dispatch = apps.find((app) => app.isDispatch);
+  if (dispatch) return appendPath(dispatchBaseHref(dispatch.href), page);
+  return appendPath(workspaceHref("/dispatch", null, env), page);
 }
 
 export function dispatchOverviewHref(
   apps: OrgSwitcherAppLink[],
   env: RuntimeEnv = runtimeEnv(),
 ): string {
-  const dispatch = apps.find((app) => app.isDispatch);
-  if (dispatch) return appendPath(dispatchBaseHref(dispatch.href), "overview");
-  return appendPath(workspaceHref("/dispatch", null, env), "overview");
+  return dispatchPageHref(apps, "overview", env);
 }
 
 export function dispatchAppsHref(
   apps: OrgSwitcherAppLink[],
   env: RuntimeEnv = runtimeEnv(),
 ): string {
-  const dispatch = apps.find((app) => app.isDispatch);
-  if (dispatch) return appendPath(dispatchBaseHref(dispatch.href), "apps");
-  return appendPath(workspaceHref("/dispatch", null, env), "apps");
+  return dispatchPageHref(apps, "apps", env);
+}
+
+export function dispatchVaultHref(
+  apps: OrgSwitcherAppLink[],
+  env: RuntimeEnv = runtimeEnv(),
+): string {
+  return dispatchPageHref(apps, "vault", env);
+}
+
+/** Dispatch's Resources page, where workspace resources are edited. */
+export function dispatchResourcesHref(
+  apps: OrgSwitcherAppLink[],
+  env: RuntimeEnv = runtimeEnv(),
+): string {
+  return dispatchPageHref(apps, "workspace", env);
 }
 
 export function visibleOrgAppLinks(
@@ -265,42 +313,46 @@ export function visibleOrgAppLinks(
 }
 
 function initialWorkspaceLinks(env: RuntimeEnv): OrgSwitcherAppLink[] {
-  return (
-    parseWorkspaceAppLinksJson(
-      envString(env, "VITE_AGENT_NATIVE_WORKSPACE_APPS_JSON"),
-      env,
-    ) ?? [
-      {
-        id: DISPATCH_ID,
-        name: "Dispatch",
-        href: appendPath(workspaceHref("/dispatch", null, env), "overview"),
-        description: "Workspace hub",
-        icon: getTemplate(DISPATCH_ID)?.icon,
-        isDispatch: true,
-        status: "ready",
-      },
-    ]
-  );
+  return [
+    {
+      id: DISPATCH_ID,
+      name: "Dispatch",
+      href: appendPath(workspaceHref("/dispatch", null, env), "overview"),
+      description: "Workspace hub",
+      icon: getTemplate(DISPATCH_ID)?.icon,
+      isDispatch: true,
+      status: "ready",
+    },
+  ];
 }
 
-function workspaceAppFetchUrls(env: RuntimeEnv): string[] {
-  const urls: string[] = [];
+export function workspaceAppFetchUrls(env: RuntimeEnv): string[] {
+  const urls = [
+    "/_agent-native/actions/list-workspace-apps?includeAgentCards=false",
+  ];
   const gatewayUrl = envString(env, "VITE_WORKSPACE_GATEWAY_URL");
   if (gatewayUrl) {
     try {
-      urls.push(
-        new URL(
-          "/_workspace/apps",
-          `${stripTrailingSlash(gatewayUrl)}/`,
-        ).toString(),
-      );
+      const gateway = new URL(gatewayUrl);
+      const localGateway = [
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        "::1",
+      ].includes(gateway.hostname.replace(/^\[|\]$/g, "").toLowerCase());
+      if (localGateway) {
+        urls.push(
+          new URL(
+            "/_workspace/apps",
+            `${stripTrailingSlash(gatewayUrl)}/`,
+          ).toString(),
+        );
+      }
     } catch {
-      // Fall through to the same-origin Dispatch action below.
+      // coercion-ok: malformed gateway URL leaves the authenticated action as
+      // the only hosted source.
     }
   }
-  urls.push(
-    "/_agent-native/actions/list-workspace-apps?includeAgentCards=false",
-  );
   return urls;
 }
 
@@ -310,6 +362,8 @@ export interface UseOrgSwitcherAppLinksResult {
   isLoading: boolean;
   dispatchHref: string;
   dispatchAllAppsHref: string;
+  dispatchVaultHref: string;
+  dispatchResourcesHref: string;
 }
 
 export function useOrgSwitcherAppLinks(
@@ -363,5 +417,7 @@ export function useOrgSwitcherAppLinks(
     isLoading,
     dispatchHref: dispatchOverviewHref(apps, env),
     dispatchAllAppsHref: dispatchAppsHref(apps, env),
+    dispatchVaultHref: dispatchVaultHref(apps, env),
+    dispatchResourcesHref: dispatchResourcesHref(apps, env),
   };
 }

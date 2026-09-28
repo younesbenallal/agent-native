@@ -81,7 +81,6 @@ export function Layout({ children }: { children: React.ReactNode }) {
           suppressHydrationWarning
           dangerouslySetInnerHTML={{ __html: LOCALE_INIT_SCRIPT }}
         />
-        <link rel="manifest" href={appPath("/manifest.json")} />
         <meta name="theme-color" content="#18181b" />
         <meta name="mobile-web-app-capable" content="yes" />
         <meta
@@ -159,9 +158,10 @@ function AppContent() {
         onOpenChange={setCmdkOpen}
         changelog={changelog}
         changelogKey="brain"
+        chatStorageKey="brain"
       >
         <CommandMenu.Group heading={t("root.commandNavigate")}>
-          <CommandMenu.Item onSelect={() => navigate("/")}>
+          <CommandMenu.Item onSelect={() => navigate("/home")}>
             {t("navigation.askBrain")}
           </CommandMenu.Item>
           <CommandMenu.Item onSelect={() => navigate("/search")}>
@@ -179,11 +179,8 @@ function AppContent() {
           <CommandMenu.Item onSelect={() => navigate("/ops")}>
             {t("navigation.ops")}
           </CommandMenu.Item>
-          <CommandMenu.Item onSelect={() => navigate("/settings")}>
-            {t("navigation.settings")}
-          </CommandMenu.Item>
           <CommandMenu.Item
-            onSelect={() => navigate("/agent")}
+            onSelect={() => navigate("/settings/agent")}
             keywords={[
               "agent",
               "context",
@@ -213,21 +210,17 @@ export default function Root() {
     createAgentNativeQueryClient({
       defaultOptions: {
         queries: {
-          // Brain has a faster sync cadence for source distillation status;
-          // 20 s keeps the source list fresh without hammering the server.
           staleTime: 20_000,
-          // Flat retry: Brain data fetches are rarely auth failures so a
-          // flat count is sufficient.
           retry: 1,
         },
       },
     }),
   );
-
   return (
     <AppToolkitProvider>
       <AppProviders
         queryClient={queryClient}
+        skeletonLayout="assistant"
         tooltipDelayDuration={250}
         i18n={{ catalog: i18nCatalog }}
       >

@@ -10,13 +10,16 @@ import {
 import { IconChevronRight, IconGripVertical } from "@tabler/icons-react";
 import {
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type ReactNode,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import { toast } from "sonner";
 
+import { QueryErrorState } from "@/components/QueryErrorState";
 import {
   documentPropertiesResponseMatchesScope,
   useDocumentProperties,
@@ -41,15 +44,45 @@ const BLOCK_FIELD_DRAG_THRESHOLD = 6;
 
 interface DocumentBlockFieldsProps {
   documentId: string;
-  databaseId: string;
-  databaseDocumentId: string;
+  databaseId: string | null;
+  databaseDocumentId: string | null;
   canEdit: boolean;
+  suggesting?: boolean;
+  enteringSuggestion?: boolean;
+  onPrimaryFieldAvailabilityChange?: (
+    scope: string,
+    available: boolean,
+  ) => void;
   /**
    * The fully-wired collaborative body editor for the primary "Content" field.
    * Rendered as-is when solo (chromeless) and inside a header/collapsible shell
    * when there are multiple Blocks fields.
    */
   primaryEditor: ReactNode;
+  onAdditionalContentChange?: (
+    documentId: string,
+    propertyId: string,
+    content: string | null,
+  ) => void;
+}
+
+function isBlocksFieldRevisionConflict(error: unknown): boolean {
+  if (error instanceof Error) {
+    return error.message.includes("Blocks field revision conflict");
+  }
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as {
+    status?: unknown;
+    message?: unknown;
+    error?: unknown;
+    cause?: unknown;
+  };
+  if (candidate.status === 409) return true;
+  return [candidate.message, candidate.error, candidate.cause].some(
+    (value) =>
+      typeof value === "string" &&
+      value.includes("Blocks field revision conflict"),
+  );
 }
 
 export function blockFieldsFromProperties(
@@ -172,23 +205,6 @@ function BlockFieldDragPreview({
   );
 }
 
-// The render decision for a row's Blocks fields, computed from the loaded
-// field list AND whether that list has actually arrived from the server.
-//
-// Three states must stay distinct so we NEVER blindly write the document body
-// when the solo field's identity/primacy is unknown:
-//
-//   - "loading"      — field data has not arrived yet. The list is `[]` but that
-//                      does NOT mean zero fields; render a non-editable
-//                      placeholder, never a writable body editor.
-//   - "empty"        — loaded, and there are genuinely zero Blocks fields (e.g.
-//                      the only field was deleted → metadata-only row). Render no
-//                      block editor (an "add a Blocks field" affordance is fine),
-//                      NOT the body editor.
-//   - "solo"         — loaded, exactly one Blocks field. Route to THAT field's
-//                      store: primary → body editor, non-primary → block-field
-//                      controller. Solo does NOT imply primary.
-//   - "multi"        — loaded, 2+ fields. Each gets a header.
 export type BlockFieldsRenderState =
   | { kind: "loading" }
   | { kind: "empty" }
@@ -203,7 +219,7 @@ export type BlockFieldsRenderState =
 // (shared/api.ts → DocumentPropertiesResponse).
 export function isLoadedForDocument(
   documentId: string,
-  databaseId: string,
+  databaseId: string | null,
   data: DocumentPropertiesResponse | undefined,
 ): boolean {
   return documentPropertiesResponseMatchesScope(documentId, databaseId, data);
@@ -213,9 +229,6 @@ export function blockFieldsRenderState(args: {
   loaded: boolean;
   blockFields: DocumentProperty[];
 }): BlockFieldsRenderState {
-  // Until the field list has arrived we cannot know how many Blocks fields the
-  // row has, nor which one is solo, nor whether it is primary. Treat as loading
-  // and render a non-editable placeholder — never a body-backed writable editor.
   if (!args.loaded) return { kind: "loading" };
 
   const { blockFields } = args;
@@ -229,6 +242,16 @@ export function blockFieldsRenderState(args: {
     field,
     target: blocksStorageTarget(field.definition.options),
   };
+}
+
+export function primaryBlocksFieldAvailable(
+  state: BlockFieldsRenderState,
+): boolean {
+  if (state.kind === "solo") return state.target === "document_body";
+  return (
+    state.kind === "multi" &&
+    state.fields.some((field) => isPrimaryBlocksField(field.definition.options))
+  );
 }
 
 /**
@@ -247,26 +270,51 @@ export function DocumentBlockFields({
   databaseId,
   databaseDocumentId,
   canEdit,
+  suggesting = false,
+  enteringSuggestion = false,
+  onPrimaryFieldAvailabilityChange,
   primaryEditor,
+  onAdditionalContentChange,
 }: DocumentBlockFieldsProps) {
   const t = useT();
   const query = useDocumentProperties(documentId, databaseId);
+  const canEditFields =
+    canEdit &&
+    query.data?.canEditValues === true &&
+    databaseId !== null &&
+    databaseDocumentId !== null;
   const properties = query.data?.properties ?? [];
   const blockFields = useMemo(
     () => blockFieldsFromProperties(properties),
     [properties],
   );
 
-  // Placeholder data may belong to the previous row or database. Trust it only
-  // after both response identities match the active scope.
   const loaded = isLoadedForDocument(documentId, databaseId, query.data);
   const state = blockFieldsRenderState({ loaded, blockFields });
+  const primaryAvailable = !query.isError && primaryBlocksFieldAvailable(state);
+  const scope = `${documentId}:${databaseId ?? ""}:${databaseDocumentId ?? ""}`;
+  useLayoutEffect(() => {
+    onPrimaryFieldAvailabilityChange?.(scope, primaryAvailable);
+  }, [onPrimaryFieldAvailabilityChange, primaryAvailable, scope]);
 
+  // A failed property read is not an empty field list. Rendering the editor in
+  // that state could bind the body before we know which storage target owns it.
+  if (query.isError) {
+    return (
+      <div className="grid gap-1" data-block-fields-state="error">
+        <QueryErrorState
+          compact
+          onRetry={() => globalThis.location.reload()}
+          retrying={query.isRefetching}
+        />
+      </div>
+    );
+  }
+
+  // Placeholder data may belong to the previous row or database. Trust it only
+  // after both response identities match the active scope.
   switch (state.kind) {
     case "loading":
-      // Field data not yet arrived: render a NON-editable placeholder, never a
-      // writable body editor. We do not know yet whether the solo field (if any)
-      // is primary, so routing to the body could clobber a non-primary field.
       return (
         <div
           className="grid gap-1"
@@ -277,9 +325,6 @@ export function DocumentBlockFields({
         </div>
       );
     case "empty":
-      // Loaded with zero Blocks fields (the only field was deleted → a
-      // metadata-only row). Render NO block editor — definitely not the body
-      // editor. An affordance to add a Blocks field is appropriate here.
       return (
         <div className="grid gap-1" data-block-fields-state="empty">
           {canEdit ? (
@@ -290,23 +335,17 @@ export function DocumentBlockFields({
         </div>
       );
     case "solo":
-      // Solo (chromeless: no header) — but solo does NOT mean primary. Route to
-      // WHICHEVER store backs the lone field:
-      //   - primary     → the collaborative body editor (`documents.content`)
-      //   - non-primary → the debounced block-field-store editor
       if (state.target === "block_field_store") {
         return (
           <div className="grid gap-1" data-block-fields-state="solo">
             <AdditionalBlockEditor
-              // Identity key: a documentId/propertyId change unmounts the old
-              // instance (flushing its pending save) and mounts a fresh one with
-              // a fresh save controller — so the controller can never DISPLAY one
-              // field while SAVING to another across an identity change.
               key={`${documentId}:${state.field.definition.id}`}
               documentId={documentId}
-              databaseDocumentId={databaseDocumentId}
+              databaseDocumentId={databaseDocumentId ?? documentId}
               property={state.field}
-              canEdit={canEdit}
+              canEdit={canEditFields && !suggesting}
+              allowPendingSave={canEditFields && enteringSuggestion}
+              onContentChange={onAdditionalContentChange}
             />
           </div>
         );
@@ -320,11 +359,13 @@ export function DocumentBlockFields({
       return (
         <MultiBlockFields
           documentId={documentId}
-          databaseId={databaseId}
-          databaseDocumentId={databaseDocumentId}
-          canEdit={canEdit}
+          databaseId={databaseId ?? ""}
+          databaseDocumentId={databaseDocumentId ?? documentId}
+          canEdit={canEditFields && !suggesting}
+          allowPendingSave={canEditFields && enteringSuggestion}
           blockFields={state.fields}
           primaryEditor={primaryEditor}
+          onAdditionalContentChange={onAdditionalContentChange}
           t={t}
         />
       );
@@ -336,16 +377,24 @@ function MultiBlockFields({
   databaseId,
   databaseDocumentId,
   canEdit,
+  allowPendingSave,
   blockFields,
   primaryEditor,
+  onAdditionalContentChange,
   t,
 }: {
   documentId: string;
   databaseId: string;
   databaseDocumentId: string;
   canEdit: boolean;
+  allowPendingSave: boolean;
   blockFields: DocumentProperty[];
   primaryEditor: ReactNode;
+  onAdditionalContentChange?: (
+    documentId: string,
+    propertyId: string,
+    content: string | null,
+  ) => void;
   t: ReturnType<typeof useT>;
 }) {
   const reorder = useReorderDocumentProperty(
@@ -511,14 +560,13 @@ function MultiBlockFields({
                 primaryEditor
               ) : (
                 <AdditionalBlockEditor
-                  // Identity key (see solo case): remount on a documentId/
-                  // propertyId change so a reused instance never saves the new
-                  // doc's edits to the old field's closure.
                   key={`${documentId}:${property.definition.id}`}
                   documentId={documentId}
                   databaseDocumentId={databaseDocumentId}
                   property={property}
                   canEdit={canEdit}
+                  allowPendingSave={allowPendingSave}
+                  onContentChange={onAdditionalContentChange}
                 />
               )}
             </BlockFieldShell>
@@ -582,13 +630,7 @@ function BlockFieldShell({
 
   return (
     <section
-      className={cn(
-        // Borderless, Capacities-style: fields are separated by the header +
-        // spacing, not a box. Field drop targets live only in the explicit
-        // between-field zones rendered by MultiBlockFields.
-        "group/blockfield rounded-md",
-        isDragging && "opacity-50",
-      )}
+      className={cn("group/blockfield rounded-md", isDragging && "opacity-50")}
       data-block-field-shell
       data-block-field-id={property.definition.id}
     >
@@ -610,8 +652,6 @@ function BlockFieldShell({
             <IconGripVertical className="size-4" />
           </span>
         ) : (
-          // Keep the 24px gutter so the header label stays aligned with the
-          // content indent even when reordering is disabled.
           <span className="w-6 shrink-0" />
         )}
         <button
@@ -657,78 +697,88 @@ export function useBlockFieldEditor({
   documentId,
   propertyId,
   initialContent,
+  initialRevision,
   save,
+  onRevisionConflict,
+  onReleaseSettled,
 }: {
   documentId: string;
   propertyId: string;
   initialContent: string;
+  initialRevision: number;
   save: (request: {
     documentId: string;
     propertyId: string;
     value: string;
+    expectedBlocksFieldRevision: number;
   }) => Promise<unknown>;
-}): { content: string; onChange: (markdown: string) => void } {
+  onRevisionConflict?: () => void;
+  onReleaseSettled?: (evicted: boolean) => void;
+}): {
+  content: string;
+  editorResetVersion: number;
+  onChange: (markdown: string) => void;
+  onSaveContent: (markdown: string) => Promise<boolean>;
+  isPendingContent: (markdown: string) => boolean;
+} {
   const key = `${documentId}:${propertyId}`;
 
-  // The shared controller calls the freshest save impl through a per-key ref. The
-  // save TARGET (documentId:propertyId) is fixed by the key; only the function
-  // identity changes per mount, never the field it writes to.
   const implRef = blockFieldSaveImplRef(key);
-  implRef.current = (value: string) => save({ documentId, propertyId, value });
+  const revisionRef = useRef(initialRevision);
+  const rejectedRevisionRef = useRef<number | null>(null);
+  const onRevisionConflictRef = useRef(onRevisionConflict);
+  onRevisionConflictRef.current = onRevisionConflict;
+  const onReleaseSettledRef = useRef(onReleaseSettled);
+  onReleaseSettledRef.current = onReleaseSettled;
+  if (initialRevision > revisionRef.current) {
+    revisionRef.current = initialRevision;
+  }
+  implRef.current = async (value: string) => {
+    const response = await save({
+      documentId,
+      propertyId,
+      value,
+      expectedBlocksFieldRevision: revisionRef.current,
+    });
+    const nextRevision = (
+      response as DocumentPropertiesResponse
+    )?.properties?.find((candidate) => candidate.definition.id === propertyId)
+      ?.blocksField?.revision;
+    if (typeof nextRevision === "number") revisionRef.current = nextRevision;
+    return response;
+  };
 
-  // Build (but do not yet ref-count) the controller factory for this key. The
-  // formal acquire/release happens in the effect below; we only need the factory
-  // here so the first acquire can create the instance.
+  const controllerRef = useRef<BlockFieldSaveController | null>(null);
+
   const factory = () =>
     createBlockFieldSaveController({
       initialContent,
-      // Single-flight + trailing WITHIN this one shared controller now orders
-      // saves across ALL editor instances for the key (there is only ever one
-      // controller per key), so no cross-instance serialization lane is needed.
       save: (value) => implRef.current(value),
-      onError: (error) =>
+      onError: (error) => {
+        if (isBlocksFieldRevisionConflict(error)) {
+          rejectedRevisionRef.current = revisionRef.current;
+          peekBlockFieldSaveController(key)?.discardPending();
+          onRevisionConflictRef.current?.();
+        }
         console.error("Failed to save Blocks field content", {
           documentId,
           propertyId,
           error,
-        }),
+        });
+      },
     });
 
-  // Acquire the ONE shared controller for this field key, and release it on
-  // unmount / key change. Across ANY mount/unmount/collapse/reopen interleaving
-  // there is exactly one controller per key — one pending value, one in-flight
-  // save — so an older save can never overwrite a newer one for the same field,
-  // even when an old instance's unmount-flush overlaps a new instance's edit.
-  // Release flush-then-evicts: the latest dirty content still persists to THIS
-  // field, and a quick reopen before the flush settles re-acquires the SAME
-  // controller (no competing instance).
-  //
-  // `factory`/`implRef` are intentionally not effect deps: the impl ref is updated
-  // every render, and the identity key forces a remount for a DIFFERENT key, so
-  // within one mount the key is stable and we acquire exactly once.
-  const controllerRef = useRef<BlockFieldSaveController | null>(null);
   useEffect(() => {
     controllerRef.current = acquireBlockFieldSaveController(key, factory);
     return () => {
       controllerRef.current = null;
-      releaseBlockFieldSaveController(key);
+      void releaseBlockFieldSaveController(key).then((evicted) => {
+        onReleaseSettledRef.current?.(evicted);
+      });
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key]);
 
-  // Seed the displayed value for this mount. Precedence (controller's freshest
-  // known content wins over a stale `initialContent`, server props win only when
-  // genuinely newer):
-  //   1. dirty controller (`pending !== lastSaved`) → show `pending` (the true
-  //      latest text the user typed; never clobber an in-progress edit).
-  //   2. clean controller that has saved locally (`hasSavedLocally`) but whose
-  //      `lastSaved` differs from `initialContent` → show `lastSaved`. The server
-  //      query hasn't refetched the just-saved value yet, so `initialContent` is
-  //      STALE (older than what we persisted); showing it would flash pre-save
-  //      content and base the next edit on stale text.
-  //   3. otherwise → `initialContent`. Covers no controller yet, a controller
-  //      already in sync with the server, and a clean controller that never saved
-  //      locally (so server props are authoritative / possibly newer external).
   const [content, setContent] = useState(() => {
     const existing = peekBlockFieldSaveController(key);
     if (existing) {
@@ -741,76 +791,86 @@ export function useBlockFieldEditor({
     }
     return initialContent;
   });
+  const [editorResetVersion, setEditorResetVersion] = useState(0);
 
-  // Adopt fresh server content when it is a GENUINELY newer external update (e.g.
-  // an agent edit) — not when it is merely stale server props lagging a local
-  // save. The controller is acquired in the [key] effect above, which runs first.
-  //
-  // Adopt only when ALL hold:
-  //   - server content diverges from what we last confirmed saved
-  //     (`initialContent !== lastSaved`), AND
-  //   - the field is clean — the user hasn't typed something newer
-  //     (`pending === lastSaved`; never clobber a dirty local edit), AND
-  //   - the controller has NOT just saved locally (`!hasSavedLocally`). If it
-  //     HAS, its `lastSaved` is content we originated that the server query
-  //     hasn't refetched yet, so `initialContent` is STALE (older than
-  //     `lastSaved`) — adopting it would regress to pre-save content. We wait for
-  //     the server to catch up; once it echoes `lastSaved`, this condition is
-  //     simply false. `mark()` below clears `hasSavedLocally`, so a later genuine
-  //     external edit is adopted normally.
   useEffect(() => {
     const controller = controllerRef.current;
     if (!controller) return;
-    // Never adopt over a dirty local edit.
+    const rejectedRevision = rejectedRevisionRef.current;
+    if (rejectedRevision !== null && initialRevision > rejectedRevision) {
+      if (controller.pending !== controller.lastSaved) {
+        rejectedRevisionRef.current = null;
+        return;
+      }
+      setContent(initialContent);
+      controller.mark(initialContent);
+      rejectedRevisionRef.current = null;
+      setEditorResetVersion((version) => version + 1);
+      return;
+    }
     if (controller.pending !== controller.lastSaved) return;
     if (initialContent === controller.lastSaved) {
-      // The server has echoed our last-known content — we're back in sync, so
-      // server props are no longer "behind" this controller. Clear the
-      // just-saved latch so a LATER genuine external edit (e.g. an agent) is
-      // adopted normally. (Without this the latch would stick forever after the
-      // first save+echo and suppress all future external updates.)
       if (controller.hasSavedLocally) controller.mark(initialContent);
       return;
     }
-    // initialContent diverges from lastSaved and the field is clean:
     if (!controller.hasSavedLocally) {
-      // Genuine newer external update — adopt it.
       setContent(initialContent);
       controller.mark(initialContent);
     }
     // else: server props are stale, lagging a local save the server hasn't
     // echoed yet. Keep showing lastSaved and wait for the echo above to clear
-    // the latch. (Cross-client concurrent same-field edits remain last-write-
-    // wins for v1; true coherence needs the deferred server-side versioning.)
+    // the latch. Concurrent writes are guarded by the field revision; a
+    // rejected stale write follows the explicit conflict branch above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialContent]);
+  }, [initialContent, initialRevision]);
 
   function onChange(markdown: string) {
     setContent(markdown);
-    // The controller is acquired in the mount effect; user edits only arrive
-    // after mount, so it is present. Guard defensively regardless.
     controllerRef.current?.change(markdown);
   }
 
-  return { content, onChange };
+  async function onSaveContent(markdown: string) {
+    setContent(markdown);
+    const controller = controllerRef.current;
+    if (!controller) return false;
+    controller.change(markdown);
+    await controller.flush();
+    return controller.lastSaved === markdown;
+  }
+
+  function isPendingContent(markdown: string) {
+    return controllerRef.current?.pending === markdown;
+  }
+
+  return {
+    content,
+    editorResetVersion,
+    onChange,
+    onSaveContent,
+    isPendingContent,
+  };
 }
 
-/**
- * Editor for an ADDITIONAL (non-primary) Blocks field. Uses the rich-text
- * VisualEditor without collab (no Yjs) — independently editable, debounced
- * save through set-document-property which persists to the field's own store.
- */
 function AdditionalBlockEditor({
   documentId,
   databaseDocumentId,
   property,
   canEdit,
+  allowPendingSave,
+  onContentChange,
 }: {
   documentId: string;
   databaseDocumentId: string;
   property: DocumentProperty;
   canEdit: boolean;
+  allowPendingSave: boolean;
+  onContentChange?: (
+    documentId: string,
+    propertyId: string,
+    content: string | null,
+  ) => void;
 }) {
+  const t = useT();
   const setProperty = useSetDocumentProperty(
     documentId,
     property.definition.databaseId!,
@@ -819,19 +879,42 @@ function AdditionalBlockEditor({
   const propertyId = property.definition.id;
   const initialContent =
     typeof property.value === "string" ? property.value : "";
-  const { content, onChange } = useBlockFieldEditor({
+  const {
+    content,
+    editorResetVersion,
+    onChange,
+    onSaveContent,
+    isPendingContent,
+  } = useBlockFieldEditor({
     documentId,
     propertyId,
     initialContent,
+    initialRevision: property.blocksField?.revision ?? 0,
     save: setProperty.mutateAsync,
+    onRevisionConflict: () =>
+      toast.error(t("editor.blocksFieldRevisionConflict")),
+    onReleaseSettled: (evicted) => {
+      if (evicted) onContentChange?.(documentId, propertyId, null);
+    },
   });
+
+  useEffect(() => {
+    onContentChange?.(documentId, propertyId, content);
+  }, [content, documentId, onContentChange, propertyId]);
 
   return (
     <VisualEditor
-      key={propertyId}
+      key={`${propertyId}:${editorResetVersion}`}
       documentId={documentId}
       content={content}
-      onChange={onChange}
+      onChange={(markdown) => {
+        if (canEdit) onChange(markdown);
+      }}
+      onSaveContent={async (markdown) => {
+        if (!canEdit && (!allowPendingSave || !isPendingContent(markdown)))
+          return "failed";
+        return (await onSaveContent(markdown)) ? "persisted" : "failed";
+      }}
       editable={canEdit}
       localFileMode
     />

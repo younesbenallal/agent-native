@@ -1,6 +1,6 @@
 import { useActionQuery } from "@agent-native/core/client/hooks";
 
-type Role = "viewer" | "editor" | "admin";
+type Role = "viewer" | "commenter" | "editor" | "admin";
 
 interface SharesResponse {
   ownerEmail: string | null;
@@ -9,17 +9,13 @@ interface SharesResponse {
   shares: unknown[];
 }
 
-/**
- * Resolve the signed-in user's role on a deck. Mirrors Google Slides:
- * `Viewer` = no edit affordances, but the editor shell is still navigable;
- * any other role (Owner / Editor / Admin) gets full editing.
- *
- * Returns `canEdit = true` while the role is still loading so that owners
- * never see a flash of view-only chrome on first paint.
- */
-export function useDeckRole(deckId: string | undefined): {
+export function useDeckRole(
+  deckId: string | undefined,
+  assumeEditorWhileLoading = false,
+): {
   role: SharesResponse["role"] | undefined;
   canEdit: boolean;
+  canComment: boolean;
   isLoading: boolean;
 } {
   const query = useActionQuery<SharesResponse>(
@@ -29,6 +25,15 @@ export function useDeckRole(deckId: string | undefined): {
   );
   const role = query.data?.role;
   const canEdit =
-    role === undefined ? true : role === "owner" || role !== "viewer";
-  return { role, canEdit, isLoading: query.isLoading };
+    role === undefined
+      ? assumeEditorWhileLoading
+      : role === "owner" || role === "editor" || role === "admin";
+  const canComment =
+    role === undefined
+      ? assumeEditorWhileLoading
+      : role === "owner" ||
+        role === "commenter" ||
+        role === "editor" ||
+        role === "admin";
+  return { role, canEdit, canComment, isLoading: query.isLoading };
 }

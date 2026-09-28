@@ -18,8 +18,42 @@ export {
   McpIntegrationDialog,
   type McpIntegrationDialogProps,
 } from "./McpIntegrationDialog.js";
+export { McpIntegrationLogo } from "./McpIntegrationLogo.js";
 export {
+  resolveAgentProviderLogo,
+  type AgentProviderLogo,
+} from "./agent-provider-logo.js";
+export {
+  McpAccessSettings,
+  type McpAccessSettingsProps,
+} from "./McpAccessSettings.js";
+export {
+  findMcpConnectionSuggestionIntegration,
   McpConnectionSuggestion,
   type McpConnectionSuggestionProps,
   type McpConnectionSuggestionVariant,
 } from "./McpConnectionSuggestion.js";
+export {
+  McpAgentKitConnectionRequestCard,
+  McpAgentKitConnectionResume,
+  type McpAgentKitConnectionRequestCardProps,
+  type McpAgentKitConnectionResumeProps,
+  type McpAgentKitConnectionTarget,
+} from "./McpAgentKitConnectionRequest.js";
+export {
+  McpServersApiProvider,
+  useMcpServersApi,
+  useMcpServers,
+  useCreateMcpServer,
+  useDeleteMcpServer,
+  useReconnectMcpServer,
+  testMcpServerUrl,
+  formatMcpServersLoadError,
+  type CreateMcpServerArgs,
+  type McpServer,
+  type McpServerScope,
+  type McpServersApi,
+  type McpServersList,
+  type ReconnectMcpServerArgs,
+  type TestMcpUrlResult,
+} from "./use-mcp-servers.js";

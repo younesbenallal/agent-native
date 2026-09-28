@@ -14,6 +14,7 @@ import { createAuthPlugin } from "@agent-native/core/server";
 export default createAuthPlugin({
   googleOnly: true,
   mountGoogleOAuthRoutes: false,
+  workspaceAppPublicPaths: ["/"],
   googleScopes: [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
@@ -27,24 +28,13 @@ export default createAuthPlugin({
   ],
   marketing: {
     appName: "Mail",
+    learnMoreUrl: "https://agent-native.com/apps/mail",
     tagline: "Your AI agent reads, drafts, and organizes email alongside you.",
     features: [
       "Replies that match your tone and style",
       "Multi-account Gmail in a single unified inbox",
       "Autonomous triage, archiving, and follow-ups",
     ],
-    runLocalCommand:
-      "npx @agent-native/core@latest create my-mail-app --template mail",
-  },
-  googleSignInNotice: {
-    host: "mail.agent-native.com",
-    title: "Google may show a warning",
-    body: [
-      "You'll see this screen because this demo uses Agent-Native's Google app, not a Google-reviewed public app.",
-      "It's safe to continue: click Advanced, then “Go to … (unsafe)” to finish signing in.",
-    ],
-    continueLabel: "Continue to Google",
-    cancelLabel: "Run locally",
   },
   // Gmail Pub/Sub push notifications POST here from Google's servers — no
   // user session. The handler itself verifies the OIDC token when
@@ -55,6 +45,7 @@ export default createAuthPlugin({
   // bearer credential because a local MCP caller cannot attach the browser's
   // session cookie to the subsequent raw-byte PUT.
   publicPaths: [
+    "/api/_agent-native-background/mail-ai-filter-backfill-worker",
     "/api/gmail/push",
     "/api/gmail/watch/renew",
     "/api/tracking",

@@ -2,17 +2,30 @@ import { getOrgContext } from "@agent-native/core/org";
 import {
   createAgentChatPlugin,
   buildDeepLink,
+  getRequestContext,
+  getRequestOrgId,
+  getRequestRunContext,
+  getRequestUserEmail,
   loadActionsFromStaticRegistry,
   type AgentLoopFinalResponseGuardContext,
 } from "@agent-native/core/server";
 
 import actionsRegistry from "../../.generated/actions-registry.js";
 import { INITIAL_TOOL_NAMES } from "../lib/agent-chat-plan-mode";
-import { ANALYTICS_CONNECTOR_CATALOG } from "../lib/analytics-connector-catalog";
-import { credentialProviderConfigs } from "../lib/credential-keys";
 import {
+  retrieveAnalyticsPromptReferences,
+  summarizeAnalyticsRun,
+} from "../lib/analytics-agent-context";
+import { ANALYTICS_CONNECTOR_CATALOG } from "../lib/analytics-connector-catalog";
+import { enqueueAnalyticsMemoryCapture } from "../lib/analytics-memory-capture.js";
+import { credentialProviderConfigs } from "../lib/credential-keys";
+import { isProductionServerlessRuntime } from "../lib/production-serverless-runtime.js";
+import {
+  deriveGroundingActionNames,
   draftClaimsAnalyticsMetrics,
+  draftRestatesPriorEvidence,
   failedDataQueryAttemptMessage,
+  hasCatalogSearchAttempt,
   hasDashboardConstructionAttempt,
   hasDashboardMutationAttempt,
   hasExplicitPartialDisclosure,
@@ -28,14 +41,148 @@ import {
   looksLikeAnalyticsDataRequest,
   needsCorpusWorkflowForCoverageSensitiveRequest,
   needsSourceRecordBodyWorkflowForCoverageSensitiveRequest,
+  registerGroundingActions,
+  stripInjectedAnalyticsGuardContext,
 } from "../lib/real-data-actions";
 
+const GROUNDING_ACTION_NAMES = deriveGroundingActionNames(actionsRegistry);
+registerGroundingActions(GROUNDING_ACTION_NAMES);
+
 const ANALYTICS_BACKGROUND_RUN_SOFT_TIMEOUT_MS = 13 * 60_000;
-// A background job may legitimately spend minutes inside a provider/tool call,
-// which the shared watchdog already excludes. Outside a tool call, however,
-// silence means the model transport or worker has wedged; recover the chunk
-// promptly instead of holding the dashboard composer for the 12-minute default.
 export const ANALYTICS_BACKGROUND_RUN_NO_PROGRESS_TIMEOUT_MS = 3 * 60_000;
+
+const DASHBOARD_EDIT_TOOLS = new Set([
+  "compose-dashboard",
+  "mutate-dashboard",
+  "rename-dashboard",
+  "reorder-dashboard-panels",
+  "restore-dashboard-revision",
+  "save-explorer-config",
+  "save-explorer-dashboard",
+  "save-sql-dashboard",
+  "update-dashboard",
+  "update-dashboard-demo",
+  "update-dashboard-summary",
+]);
+const ANALYSIS_EDIT_TOOLS = new Set([
+  "rename-analysis",
+  "restore-analysis-revision",
+  "save-analysis",
+]);
+
+function eventRecord(entry: unknown): Record<string, unknown> | undefined {
+  if (!entry || typeof entry !== "object") return undefined;
+  const event = (entry as { event?: unknown }).event;
+  return event && typeof event === "object"
+    ? (event as Record<string, unknown>)
+    : undefined;
+}
+
+function inputForCompletedTool(
+  events: readonly unknown[],
+  index: number,
+  completed: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  if (completed.input && typeof completed.input === "object") {
+    return completed.input as Record<string, unknown>;
+  }
+  const id = typeof completed.id === "string" ? completed.id : undefined;
+  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+    const candidate = eventRecord(events[cursor]);
+    if (
+      candidate?.type !== "tool_start" ||
+      candidate.tool !== completed.tool ||
+      (id && candidate.id !== id)
+    ) {
+      continue;
+    }
+    return candidate.input && typeof candidate.input === "object"
+      ? (candidate.input as Record<string, unknown>)
+      : undefined;
+  }
+  return undefined;
+}
+
+function analyticsToolTarget(
+  tool: string,
+  input: Record<string, unknown> | undefined,
+  scopeType: "dashboard" | "analysis",
+): unknown {
+  if (scopeType === "dashboard") {
+    if (
+      tool === "compose-dashboard" ||
+      tool === "mutate-dashboard" ||
+      tool === "reorder-dashboard-panels" ||
+      tool === "update-dashboard" ||
+      tool === "update-dashboard-demo" ||
+      tool === "update-dashboard-summary"
+    ) {
+      return input?.dashboardId ?? input?.id;
+    }
+    return input?.id ?? input?.dashboardId;
+  }
+  return input?.analysisId ?? input?.id;
+}
+
+function hasAnalyticsEdit(
+  run: { events: readonly unknown[] },
+  tools: ReadonlySet<string>,
+  scopeType: "dashboard" | "analysis",
+  scopeId: string,
+): boolean {
+  return run.events.some((entry, index) => {
+    const record = eventRecord(entry);
+    if (!record) return false;
+    const input = inputForCompletedTool(run.events, index, record);
+    return (
+      record.type === "tool_done" &&
+      record.completedSideEffect === true &&
+      record.isError !== true &&
+      typeof record.tool === "string" &&
+      tools.has(record.tool) &&
+      analyticsToolTarget(record.tool, input, scopeType) === scopeId
+    );
+  });
+}
+
+async function autosaveAnalyticsAfterAgentTurn(
+  scope: { type: string; id: string },
+  run: {
+    events: readonly unknown[];
+    threadId?: string;
+    runId?: string;
+    turnId?: string;
+  },
+): Promise<void> {
+  const email = getRequestUserEmail();
+  if (!email) return;
+  const ctx = { email, orgId: getRequestOrgId() || null };
+  if (
+    scope.type === "dashboard" &&
+    hasAnalyticsEdit(run, DASHBOARD_EDIT_TOOLS, "dashboard", scope.id)
+  ) {
+    const { createDashboardRevisionSnapshot } =
+      await import("../lib/dashboards-store.js");
+    await createDashboardRevisionSnapshot(scope.id, ctx, {
+      ...(run.threadId ? { threadId: run.threadId } : {}),
+      ...(run.runId ? { runId: run.runId } : {}),
+      ...(run.turnId ? { turnId: run.turnId } : {}),
+    });
+    return;
+  }
+  if (
+    scope.type === "analysis" &&
+    hasAnalyticsEdit(run, ANALYSIS_EDIT_TOOLS, "analysis", scope.id)
+  ) {
+    const { createAnalysisRevisionSnapshot } =
+      await import("../lib/dashboards-store.js");
+    await createAnalysisRevisionSnapshot(scope.id, ctx, {
+      ...(run.threadId ? { threadId: run.threadId } : {}),
+      ...(run.runId ? { runId: run.runId } : {}),
+      ...(run.turnId ? { turnId: run.turnId } : {}),
+    });
+  }
+}
 
 const ANALYTICS_DATA_SOURCES_LINK = buildDeepLink({
   app: "analytics",
@@ -46,6 +193,19 @@ const ANALYTICS_DATA_SOURCES_LINK = buildDeepLink({
 const DASHBOARD_BUILD_PAUSE_PATTERN =
   /\b(?:want me to|would you like me to|shall i|should i|can i|may i|do you want me to)\b[\s\S]{0,160}\b(?:proceed|continue|seed|populate|save|embed|finish|run|apply|create|build)\b/i;
 
+function hasSuccessfulExtensionCreation(
+  toolResults: AgentLoopFinalResponseGuardContext["toolResults"],
+): boolean {
+  return (toolResults ?? []).some(
+    (result) =>
+      !result.isError &&
+      String(result.name ?? "")
+        .trim()
+        .toLowerCase()
+        .replace(/[\s_]+/g, "-") === "create-extension",
+  );
+}
+
 function hasSuccessfulDashboardSave(
   toolResults: AgentLoopFinalResponseGuardContext["toolResults"],
 ): boolean {
@@ -53,6 +213,7 @@ function hasSuccessfulDashboardSave(
     "update-dashboard",
     "mutate-dashboard",
     "compose-dashboard",
+    "update-extension",
   ]);
   return (toolResults ?? []).some((result) => {
     if (result.isError) return false;
@@ -60,7 +221,20 @@ function hasSuccessfulDashboardSave(
       .trim()
       .toLowerCase()
       .replace(/[\s_]+/g, "-");
-    return saveActions.has(name);
+    if (!saveActions.has(name)) return false;
+    const content = String(result.content ?? "").trim();
+    if (!content.startsWith("{")) return true;
+    try {
+      const parsed = JSON.parse(content) as Record<string, unknown>;
+      if (parsed.saved === false) return false;
+      if (name === "compose-dashboard" && parsed.changed === false) {
+        return false;
+      }
+      // coercion-ok: malformed structured action output fails closed below.
+    } catch {
+      return false;
+    }
+    return true;
   });
 }
 
@@ -82,13 +256,28 @@ function hasPartialDashboardBuild(
 }
 
 export const BOUNDED_STRUCTURED_LOOKUP_GUIDANCE =
-  "BOUNDED STRUCTURED LOOKUP FAST PATH — Treat existing analytics work like an engineer treats existing code: grep before writing. For an ordinary count, aggregate, grouped metric, trend, or record lookup, first call `search-analytics-query-catalog` once with focused metric/entity terms. It searches accessible dashboard names, chart titles/descriptions/saved queries, shipped dashboard patterns, and data-dictionary definitions together. Prefer the strongest approved dictionary or saved-chart match, preserve its source and business logic, adapt only the requested filters and explicit time window, then run one bounded query against that source. A user-named source wins, but still use a matching saved definition when it supplies the source's proven query shape. If there is no useful match, inspect only the most likely source schema or ask one clarification; do not fan out across providers. Do not separately list every dashboard, call data-source status, browse the whole dictionary, load provider catalogs/corpus tools, or query a second source after a strong match. Once the query succeeds, answer immediately with its source, time window, filters, row count, and only necessary caveats. Do not enrich, cross-check, retry, or add breakdowns unless the user requested them, the first query failed, or its result conflicts with the known definition. The words `all`, `total`, or `exact` in a structured aggregate do not by themselves make it a corpus investigation. Never repeat an identical invalid or failed tool call; correct its arguments once or surface the error. This does not waive the real-data requirement: never answer from a guess, stale value, or unverified result. ";
+  "TRUST SIGNALS: Prefer a current `dashboardCertified: true` saved panel; a `favorite: true` panel is a weaker relevance signal. " +
+  'BOUNDED STRUCTURED LOOKUP FAST PATH — Treat existing analytics work like an engineer treats existing code: use the retrieved `<resource scope="analytics-catalog">` references when they fit the request. These bounded dictionary entries and dashboard panels provide definitions and query examples, never live results. For an ordinary count, aggregate, grouped metric, trend, or record lookup, preserve the strongest approved definition or saved query\'s source and business logic, adapt only the requested filters and explicit time window, then run one bounded query. If no preloaded reference fits, call `search-analytics-query-catalog` once with focused metric/entity terms; it searches accessible dashboards, saved queries, shipped patterns, and dictionary definitions. A user-named source wins, while a matching saved definition can still supply a proven query shape. If there is no useful match, inspect the likely source schema before asking about business meaning; do not ask the user for internal dataset, table, column, or SQL identifiers. Do not fan out across providers or load broad catalogs after a strong match. Once the query succeeds, answer with its source, time window, filters, row count, and only necessary caveats. Do not add unasked checks or breakdowns. The words `all`, `total`, or `exact` do not by themselves make it a corpus investigation. Never repeat an identical invalid or failed tool call, and never answer from a guess or unverified result. ';
+
+export const INTERNAL_PRODUCT_USAGE_GUIDANCE =
+  "INTERNAL PRODUCT USAGE / CROSS-SOURCE ROUTING — Requests for product usage, AI credits, credit consumption, allowances, quotas, branch creation, branch creators, or user-level adoption by month are live data requests even when they say pull, export, or prepare a report. For workspace-wide internal Builder.io usage, route to Dispatch with `call-agent` and `list-dispatch-usage-metrics`; use its `monthlyByUser` and `workspaceAppCreationsByUserMonth` result. Do not ask for a user export or BigQuery schema on that path. For a named customer or account such as OCBC, preserve the customer scope and do not substitute workspace metrics. Use a relevant preloaded Analytics reference when available; if none fits, call `search-analytics-query-catalog`, then `list-data-dictionary` and `search-bigquery-schema` only when the catalog has no usable definition. `search-bigquery-schema` can search the configured project without a dataset, so do not ask the user for identifiers. Use the exact discovered schema in one bounded query, and resolve the named account identity before attributing rows to it. Limits, plans, or changelog metadata do not prove actual consumption or creator identity. Report the exact evidence gap if the source is unavailable. ";
+
+export const ANALYTICS_ACCOUNT_HEALTH_GUIDANCE =
+  "ACCOUNT HEALTH / CUSTOMER SCOPE GUARD — Use this for a named customer, organization ID, account-health, QBR, renewal, contract-usage, risk, or adoption request. Treat a prompt-supplied org ID as a lookup key, not proof of row ownership: resolve it against canonical account data first, carry the resolved customer name plus organization/root-organization identifiers through every usage query, and stop if results contain a different customer, mixed IDs, or an unresolved identity. Use the account-health skill. Account health is incomplete until verified usage queries cover each requested product or feature dimension separately. Before warehouse SQL, use the catalog/dictionary and schema metadata. Do not run definitions marked deprecated or retired, or use a source whose freshness cannot be verified; use the current approved definition instead. Do not call a current partial-period snapshot a completed period without proving the period/as-of row and freshness. Distinguish contract metrics from similarly named platform metrics, total distinct contracted users from DAU/WAU, and actual usage from contracted capacity. Always surface utilization at or above 100%, report adoption window and coverage, and state gaps instead of inferring them. ";
+
+export const DASHBOARD_REFERENCE_GUIDANCE =
+  "DASHBOARD REFERENCE DISCOVERY — When the user asks to replicate, clone, or adapt an existing dashboard, this branch takes precedence over the ordinary metric fast path: call `search-dashboard-references` with focused terms before creating, editing, or querying anything. It searches accessible active saved dashboard ids, names, descriptions, and serialized config with bounded SQL wildcard matches, including legacy saved dashboards. Treat each result as a reference to inspect with `get-sql-dashboard` when `kind` is `sql` or `get-explorer-dashboard` when `kind` is `explorer`, not as proof that its source is authoritative for the new request. Do not automatically route a replication request to first-party Analytics or copy its source semantics without checking the user's requested provider and scope. ";
 
 export const BUILT_IN_FIRST_PARTY_SOURCE_GUIDANCE =
   "BUILT-IN FIRST-PARTY SOURCE — Analytics always provides one built-in first-party source alongside connected external providers such as BigQuery, HubSpot, Gong, Slack, and the other configured integrations. This does not replace or restrict external sources. When `search-analytics-query-catalog` identifies a first-party dashboard/chart definition, preserve its event semantics and use `query-agent-native-analytics` over `analytics_events` or `session_recordings` as appropriate. When the user names an external provider, or the catalog identifies one as authoritative, query that provider instead. Do not report the first-party source as disconnected merely because an external provider is not configured. If the authoritative query returns no rows, report that grounded result with its scope and time window. ";
 
 export const ANALYTICS_OBSERVABILITY_INCIDENT_GUIDANCE =
   "OBSERVABILITY INCIDENT WORKFLOW — For a named user's session or error question, resolve the user's email from context, then use list-session-recordings with userId over a bounded recent window to discover the relevant sessions. Do not require hasErrors=true for this initial lookup: replay/network/stuck-run evidence can exist while the recording's JavaScript errorCount is zero. Use hasErrors=true only when the user specifically asks for recordings with captured JavaScript errors or the recording metadata confirms that filter is appropriate. Use list-error-issues with userId or sessionRecordingId to identify a grouped issue, then get-error-issue for stack, breadcrumbs, occurrences, and linked recordings. For console diagnostics or failed network requests, create-session-replay-agent-link first and use its scoped diagnostics endpoint for detailed error text, stacks, request metadata, and bounded 5xx snippets; enumerate with kind/limit and fromMs/toMs or offset when needed. Use get-session-replay-summary and get-session-replay-timeline for the page-navigation and click sequence, and use get-session-replay-events only for additional bounded replay-event details. If no grouped error exists, correlate first-party observability events such as agent_chat_stuck_detected with query-agent-native-analytics. This and other read-only investigation tools remain available in Plan mode; run the query instead of deferring it to execution mode. Prefer these first-party actions over generic SQL. Report the matching evidence and do not claim a root cause without a corroborating error, event, or replay signal. ";
+
+export const ANALYTICS_CROSS_APP_ROUTING_GUIDANCE =
+  "WORKSPACE APP ROUTING — Analytics is the sibling app for first-party product usage, app/template events, agent-native signups, conversions, and other curated product metrics. When another app delegates one of these questions with `call-agent`, answer it here using the built-in first-party source and query catalog; do not send the user back to another app or ask the caller to invent SQL. " +
+  'INTERNAL USAGE EXCEPTION — Builder.io or AI credit spend, LLM usage by workspace member or month, and workspace app or Builder branch creation history are Dispatch-owned internal metrics. For workspace-wide internal requests, call `call-agent` with agent `dispatch`, action `list-dispatch-usage-metrics`, and the exact read-only input `{ sinceDays, scope: "workspace" }` (add `userEmail` only when the user explicitly narrows the request). The result includes `monthlyByUser` and `workspaceAppCreationsByUserMonth` from the shared `token_usage` and Dispatch audit tables. Do not ask for a user export or BigQuery schema. A request scoped to a named customer or account, such as OCBC, is different: keep that customer scope and use the catalog, dictionary, configured warehouse schema, and one bounded query; do not substitute the current workspace metrics. ' +
+  "WORKSPACE APP ROUTING — Brain is the sibling app that owns company knowledge and indexed Slack context. Brain is not an Analytics extension and will not appear in `list-extensions`. When the user asks about company knowledge, decisions, meeting context, or Slack messages/context such as a named channel or thread, use `call-agent` with agent `brain` and a narrow natural-language question. Use `describe-workspace-apps` only when you need to confirm the sibling capability. Do not use `list-extensions` to find Brain, and do not use `provider-api-request` to call Brain. If Brain reports an access or source error, preserve that exact error; do not infer that the Slack bot is absent from a channel or tell the user to re-invite it. Stay in Analytics for metrics and aggregates over a named provider. ";
 
 export const NON_ANALYTICS_REQUEST_GUIDANCE =
   "NON-ANALYTICS REQUESTS — If the user is not asking for a live metric, source record, or derived analytics claim, answer normally in chat. Greetings, general-knowledge questions, math, writing, coding, and conceptual questions do not need a data-source call. Do not use the no-grounded-data fallback for those requests. ";
@@ -97,17 +286,12 @@ export const ANALYTICS_CUSTOM_BLOCK_GUIDANCE =
   "<analytics-artifact-guidance>\n" +
   "Analytics has one user-facing artifact type: dashboards. Build with native dashboard panels and Data Programs first. A sandboxed extension embedded in a dashboard is presented to users as a Custom Block, not as a separate Analytics artifact. " +
   "Use native chart, table, metric, section, funnel, heatmap, callout, filter, and layout capabilities whenever they can represent the request faithfully. Reusable ROI, engagement, cross-sell, and win/loss dashboards should compose these native panels around real SQL or Data Program results. Use a Data Program when the durable need is reusable fetching, transformation, or computed data that native panels can render. Do not create a Custom Block merely because a request says custom, asks for a dashboard, or would take more effort with native components. " +
+  'EXTENSION DATA BOUNDARY — Code inside a Custom Block runs in an iframe and may call only actions that are HTTP-mounted and intended for `appAction`. Use the canonical `bigquery` action for warehouse SQL; never call `query-agent-native-analytics`, `bigquery-table-info`, or another `http: false` agent-only action from extension code. For first-party Analytics data, prefer a native `source: "first-party"` panel or have the agent query it and seed the extension data store. ' +
   'Create a Custom Block only when the user explicitly asks for a genuinely bespoke or one-off visualization or interaction, the native dashboard model cannot represent it faithfully, and its intended scope is this dashboard. Create it with `create-extension`, immediately embed it as a `chartType: "extension"` panel with `config.extensionId`, and set `config.customBlock` to `{ authoredBy: "agent", intent: "one-off", scope: "dashboard", nativeGapReason: "custom-visualization" | "custom-interaction" | "custom-layout" | "other" }`. Choose the narrow categorical reason; never put prompt text, customer data, or other free text in this metadata. Use the host theme CSS variables and match the dashboard typography, card spacing, and density so the sandboxed content reads as an agent-authored patch to Analytics instead of a foreign mini-app. Describe it as a sandboxed, agent-authored dashboard patch. Never leave it standalone or direct the user to an Extensions page. ' +
   "A Custom Block is a fast runtime patch, not the durable destination for reusable product behavior. If the request should work across dashboards or users, changes app chrome or business logic, adds a reusable chart type, needs native accessibility/export/governance, or explicitly asks for app code, a PR, or a native feature, call `connect-builder` with the request verbatim instead of creating a Custom Block. If scope is ambiguous, ask whether the user wants a one-off block for this dashboard or a reusable app feature before choosing. " +
   "When the user chooses Promote to app code, preserve the existing Custom Block and pass its dashboard id, panel id, extension id, and requested native placement through `connect-builder`; do not delete or replace the block until the native implementation is reviewed and deployed. Legacy analyses and existing extension-backed dashboards remain readable and editable for compatibility.\n" +
   "</analytics-artifact-guidance>";
 
-// Deterministic backstop for the soft NON_ANALYTICS_REQUEST_GUIDANCE prompt
-// above: if a model still parrots the canned no-grounded-data fallback on a
-// non-analytics turn, retry once with this synthetic user message instead of
-// letting the canned sentence reach the user. Wrapped in an injected-context
-// tag (registered in INJECTED_CONTEXT_BLOCKS) so `looksLikeAnalyticsDataRequest`
-// never classifies the guard's own retry turn as a data request and loops.
 export const NON_ANALYTICS_FALLBACK_RETRY_MESSAGE =
   "<non-analytics-retry>\nThe user's latest message is ordinary conversation. Reply to it directly and naturally. Never answer it with the no-grounded-data disclaimer.\n</non-analytics-retry>";
 
@@ -117,14 +301,16 @@ export const NON_ANALYTICS_FALLBACK_FINAL_MESSAGE =
 export function analyticsSourceGuidanceOpening(): string {
   return (
     "<data-source-guidance>\n" +
-    // Measured in production: this ran in under 1% of data threads while the
-    // equivalent instruction sat ~7000 words deep. Threads that did call it used
-    // roughly a third the tool calls. Keep it first and keep it imperative.
-    "START HERE — For any question about a metric, cohort, list, count, or trend, your FIRST tool call is `search-analytics-query-catalog`. This is the analytics equivalent of grepping a codebase before writing new code: someone has very likely already built and saved the query you need, and its saved SQL tells you the exact source, table, and column names so you do not have to discover them. Adapt the closest saved query to the requested filters and time window, run it once, and stop. Only fall back to schema discovery or provider catalogs when the catalog search returns nothing usable — and never run more than one schema-discovery pass before querying. " +
+    "INTERNAL USAGE OVERRIDE — For workspace-wide Builder.io or AI credit spend, LLM usage by workspace member or month, or workspace app/Builder branch creation history, your FIRST tool call is `call-agent` for Dispatch with action `list-dispatch-usage-metrics`, scope `workspace`, and the requested `sinceDays`. Do not start with a user list, `search-bigquery-schema`, or a request for dataset/table/column names. If the request names a customer or account such as OCBC, preserve that customer scope and use the Analytics catalog/warehouse path instead of substituting workspace metrics. " +
+    "START HERE — For an ordinary metric, cohort, list, count, or trend question, inspect any preloaded Analytics references first. If a reference fits, preserve its definition and query shape, then run one bounded live query. If the references are absent or inadequate, call `search-analytics-query-catalog` once with focused terms. For a request to replicate, clone, or adapt a dashboard, call `search-dashboard-references` first and inspect the returned dashboard before changing anything. Retrieved references are context, not live results. Use schema discovery only when no catalog reference is usable, then run one bounded query. " +
+    ANALYTICS_CROSS_APP_ROUTING_GUIDANCE +
     'ONE BOUNDED CALL — List, filter, count, and cohort questions ("which X, excluding Y") are a single query, not a loop. Express the include filter, the exclude filter, and the aggregation in one SQL statement or one `run-code` script that filters server-side. Never page through a cohort across separate tool calls and never fan out per item to apply a filter; that is what turns a ten-second answer into a twenty-minute one. ' +
     "Apply real-data requirements only when presenting analytics results, source records, or derived metrics. Do not call data-source tools for workflow migration, recurring-job setup, UI/code fixes, settings help, conceptual planning, or other non-data tasks unless the user explicitly asks for data. " +
     NON_ANALYTICS_REQUEST_GUIDANCE +
+    DASHBOARD_REFERENCE_GUIDANCE +
     BOUNDED_STRUCTURED_LOOKUP_GUIDANCE +
+    INTERNAL_PRODUCT_USAGE_GUIDANCE +
+    ANALYTICS_ACCOUNT_HEALTH_GUIDANCE +
     BUILT_IN_FIRST_PARTY_SOURCE_GUIDANCE +
     ANALYTICS_OBSERVABILITY_INCIDENT_GUIDANCE +
     `DATA-SOURCE SETUP UX — Chat remains available when no external data source is connected. For a live-data request that needs an unavailable external provider, explain what is missing in the context of the user's question and guide them naturally to [Connect data sources](${ANALYTICS_DATA_SOURCES_LINK}). Use that real link from the app; do not emit a generic canned no-data sentence. For general conversation, conceptual questions, and questions the built-in first-party source can answer, continue helping normally. ` +
@@ -132,9 +318,18 @@ export function analyticsSourceGuidanceOpening(): string {
   );
 }
 
+const SCHEMA_DETAILS_REQUEST_PATTERN =
+  /\b(?:could you|can you|would you|please\s+(?:provide|share|send|tell)|provide|share|send(?: me)?|tell me|i need(?: you to)?|what (?:is|are)|which)\b[\s\S]{0,260}\b(?:bigquery\s+)?(?:dataset(?: name)?s?|table(?: name)?s?|column(?: name)?s?|field(?: name)?s?|schema|sql query)\b/i;
+
+function looksLikeSchemaDetailsRequest(text: string): boolean {
+  return SCHEMA_DETAILS_REQUEST_PATTERN.test(
+    stripInjectedAnalyticsGuardContext(String(text ?? "")),
+  );
+}
+
 export function analyticsDataDictionaryRoutingContext(): string {
   return `<data-dictionary-routing>
-Data-dictionary definitions are available through \`search-analytics-query-catalog\`, which combines focused dictionary lookup with a search over existing dashboard/chart SQL. Use that combined catalog search as the normal preflight for a bounded metric lookup. Call \`list-data-dictionary\` separately only when the user asks to browse definitions or filter them by department. Treat approved entries as canonical, verify unreviewed human entries when stakes are high, and treat AI-generated unapproved entries as suggestions only. After the catalog identifies one source and query shape, query that source once and stop on success. If no matching definition or chart exists, inspect only the most likely source schema or ask the user instead of fanning out across providers.
+The system may preload a small set of relevant dictionary entries and saved dashboard panels in \`<resource scope="analytics-catalog">\`. Use a matching definition or query example as context, then query the live source; retrieved references never supply current values. If no preloaded reference fits, use \`search-analytics-query-catalog\` for focused dictionary and saved-dashboard search. Call \`list-data-dictionary\` separately when the catalog has no usable match or the user asks to browse or filter definitions. Treat approved entries as canonical, unreviewed human entries as unverified, and AI-generated unapproved entries as suggestions. If no matching definition or chart exists, inspect the likely source schema before asking about business meaning. Never ask the user to supply internal dataset, table, column, or SQL identifiers that configured actions can discover.
 </data-dictionary-routing>`;
 }
 
@@ -187,8 +382,6 @@ function configuredDataSourceLabels(
       if (typeof label === "string" && label.trim()) labels.add(label.trim());
     }
 
-    // Backward compatibility for runs against deployments that predate the
-    // compact configuredDataSources summary.
     const providers = Array.isArray(parsed.providers) ? parsed.providers : [];
     for (const provider of providers) {
       if (
@@ -207,6 +400,100 @@ function configuredDataSourceLabels(
   return [...labels];
 }
 
+const UNVERIFIED_DRAFT_RETRY_INSTRUCTION =
+  ' If you cannot run a query, restate every number, count, or trend in the draft as explicitly unverified (prefix the sentence with "Unverified:") rather than asserting it.';
+
+function exhaustedDraftPrefixFor({
+  toolResults,
+  setupMarkdown,
+  includeConnectOption,
+}: {
+  toolResults: AgentLoopFinalResponseGuardContext["toolResults"];
+  setupMarkdown: string;
+  includeConnectOption: boolean;
+}): string {
+  const configuredSources = configuredDataSourceLabels(toolResults);
+  const connectedSentence = configuredSources.length
+    ? ` Connected sources: ${configuredSources.join(", ")}.`
+    : "";
+  const nextOptions = [
+    "ask me to query an existing dashboard (I'll search certified ones first)",
+    "narrow the question to one metric and time range",
+  ];
+  if (includeConnectOption) {
+    nextOptions.push(`connect the missing source: ${setupMarkdown}`);
+  }
+  return (
+    "Unverified — no live data query ran for this answer, so every figure and trend below is unconfirmed." +
+    connectedSentence +
+    ` Next options: ${nextOptions.join(", ")}.`
+  );
+}
+
+function isRealUserTextMessage(message: {
+  role?: string;
+  content?: unknown;
+}): boolean {
+  if (message?.role !== "user" || !Array.isArray(message.content)) {
+    return false;
+  }
+  const parts = message.content as Array<{ type?: string }>;
+  return (
+    parts.some((part) => part?.type === "text") &&
+    !parts.some((part) => part?.type === "tool-result")
+  );
+}
+
+function priorTurnEvidence(
+  messages: AgentLoopFinalResponseGuardContext["messages"],
+): {
+  toolResults: Array<{ name?: string; isError?: boolean; content?: string }>;
+  text: string;
+} {
+  const collected: Array<{
+    name?: string;
+    isError?: boolean;
+    content?: string;
+  }> = [];
+  const textParts: string[] = [];
+  let turnBoundariesCrossed = 0;
+  for (let i = messages.length - 2; i >= 0; i--) {
+    const message = messages[i] as { role?: string; content?: unknown };
+    if (isRealUserTextMessage(message)) {
+      turnBoundariesCrossed += 1;
+      if (turnBoundariesCrossed >= 2) break;
+      continue;
+    }
+    if (!Array.isArray(message?.content)) continue;
+    for (const part of message.content as Array<{
+      type?: string;
+      text?: string;
+      input?: unknown;
+      toolName?: string;
+      isError?: boolean;
+      content?: string;
+    }>) {
+      if (part?.type === "text" && typeof part.text === "string") {
+        textParts.push(part.text);
+      } else if (part?.type === "tool-call") {
+        textParts.push(
+          typeof part.input === "string"
+            ? part.input
+            : JSON.stringify(part.input ?? ""),
+        );
+      } else if (part?.type === "tool-result") {
+        collected.push({
+          name: part.toolName,
+          isError: part.isError,
+          content: part.content,
+        });
+        textParts.push(String(part.content ?? ""));
+      }
+    }
+  }
+  return { toolResults: collected, text: textParts.join("\n") };
+}
+
 interface DataSourceStatusSummary {
   checked: boolean;
   externalSourceLabels: string[];
@@ -223,7 +510,8 @@ const GENERIC_EXTERNAL_SOURCE_REQUEST_TERMS = /\b(warehouse|crm|payments?)\b/i;
 
 const EXTERNAL_SOURCE_PROVIDER_ALIASES = [
   ...credentialProviderConfigs.map(({ provider, label }) => ({
-    terms: [provider, label],
+    terms:
+      provider === "builder" ? [label, "Builder content"] : [provider, label],
     aliases: [provider, label],
   })),
   { terms: ["ga4"], aliases: ["ga4", "google analytics"] },
@@ -395,9 +683,6 @@ function dataSourceStatusSummary(
       !Array.isArray(parsed.workspaceConnections)
         ? (parsed.workspaceConnections as Record<string, unknown>)
         : null;
-    // A status result that errored, or whose workspace-connection lookup
-    // failed, says "we could not look", not "nothing is connected". Only a
-    // trustworthy result may mark the turn as checked.
     if (!parsed.error && workspaceConnections?.available !== false) {
       checked = true;
     }
@@ -438,10 +723,18 @@ function dataSourceStatusSummary(
         continue;
       }
       const record = source as Record<string, unknown>;
-      const provider = String(record.provider ?? "")
+      const provider = (
+        typeof record.provider === "string"
+          ? record.provider
+          : (JSON.stringify(record.provider) ?? "")
+      )
         .trim()
         .toLowerCase();
-      const via = String(record.via ?? "")
+      const via = (
+        typeof record.via === "string"
+          ? record.via
+          : (JSON.stringify(record.via) ?? "")
+      )
         .trim()
         .toLowerCase();
       if (provider === "first-party" || via === "built-in") continue;
@@ -457,8 +750,6 @@ function dataSourceStatusSummary(
       );
     }
 
-    // Backward compatibility for status responses that predate the compact
-    // configuredDataSources summary.
     const providers = Array.isArray(parsed.providers) ? parsed.providers : [];
     for (const provider of providers) {
       if (
@@ -469,7 +760,11 @@ function dataSourceStatusSummary(
         continue;
       }
       const record = provider as Record<string, unknown>;
-      const providerId = String(record.provider ?? "")
+      const providerId = (
+        typeof record.provider === "string"
+          ? record.provider
+          : (JSON.stringify(record.provider) ?? "")
+      )
         .trim()
         .toLowerCase();
       if (providerId === "first-party") continue;
@@ -573,8 +868,6 @@ export function realDataFinalGuard(
   if ((context as { executionMode?: string }).executionMode === "plan") {
     return null;
   }
-  // Keep the template compatible with the currently installed core package
-  // while the new requestText field ships in the same framework release.
   const stableRequestText = (
     context as AgentLoopFinalResponseGuardContext & { requestText?: string }
   ).requestText;
@@ -585,10 +878,6 @@ export function realDataFinalGuard(
     !looksLikeAnalyticsDataRequest(userText) &&
     !dashboardConstructionRequest
   ) {
-    // Deterministic backstop: the soft NON_ANALYTICS_REQUEST_GUIDANCE prompt
-    // sentence is not always enough, and a model occasionally parrots the
-    // canned no-grounded-data fallback even for ordinary conversation. Catch
-    // that case here instead of letting it reach the user.
     if (isGenericNoDataFallback(context.text)) {
       return {
         retryMessage: NON_ANALYTICS_FALLBACK_RETRY_MESSAGE,
@@ -626,10 +915,6 @@ export function realDataFinalGuard(
   );
   const firstPartySourceShouldBeTried =
     noConnectedExternalSources && !externalSourceRequest;
-  // Only a `data-source-status` result can show something is missing. A turn
-  // that never called it has empty label lists, which is "we did not look",
-  // not "nothing is connected" — treating those the same made the guard demand
-  // a Connect-data-sources link on turns whose sources were working fine.
   const needsDataSourceLink =
     sourceStatus.checked &&
     externalSourceRequest &&
@@ -657,7 +942,9 @@ export function realDataFinalGuard(
       retryMessage:
         "The user asked a coverage-sensitive provider question, but the draft only used bounded convenience data actions. Do not finalize an exhaustive, all-records, or absence-sensitive answer from shortcut actions alone. Use the broad provider API/MCP surface and a staged analysis workflow now: provider-api-catalog/provider-api-docs when needed; for Gong, use configured tracker results from /calls/extensive when they cover the term, otherwise use provider-api-request as raw ingestion with stageAs/saveToFile followed by query-staged-dataset or a Data Program; use provider-corpus-job for durable batched raw-transcript scans. Never loop per call from run-code or a delegated agent. For 500 or more Gong records, gong-calls is not the broad-search path. If full coverage is not possible in this turn, finalize with explicit partial-coverage wording, inspected counts, filters, and remaining gaps.",
       fallbackMessage:
-        "I can't make a confident coverage-sensitive provider claim from bounded shortcut actions alone. I need a provider API/corpus workflow, or I need to label the answer as partial with exact inspected counts and gaps.",
+        "I couldn't verify the full provider corpus after two search attempts. The bounded shortcuts did not report an exact inspected count, filter set, or remaining-gap size, so I won't present their absence claim as corpus-wide.",
+      maxRetries: 2,
+      expandToolSurface: true,
     };
   }
   if (
@@ -687,14 +974,6 @@ export function realDataFinalGuard(
         "I can't make a confident exhaustive analytics claim yet because part of the source evidence was aborted, truncated, or still paginated. I need to recover the missing coverage or state the answer as partial with the inspected sample size.",
     };
   }
-  // Dashboard EDIT turns: the user asked to change an existing dashboard and
-  // the agent actually saved a mutation (mutate-dashboard/update-dashboard/
-  // etc.). This is a legitimate non-query completion regardless of how the
-  // request was phrased ("update the panels" does not match the construction
-  // intent regex), so it must not be steered into a data-source query. Anchor
-  // on tool evidence, not user wording, and still block any draft that states
-  // invented numbers via draftClaimsAnalyticsMetrics. A saved SQL panel the
-  // user runs themselves is not a fabricated metric.
   if (
     dashboardConstructionRequest &&
     hasPartialDashboardBuild(context.toolResults) &&
@@ -712,48 +991,70 @@ export function realDataFinalGuard(
   }
   if (
     hasDashboardMutationAttempt(context.toolResults) &&
+    hasSuccessfulDashboardSave(context.toolResults) &&
     !draftClaimsAnalyticsMetrics(context.text)
   ) {
     return null;
   }
-  // Dashboard construction/template-clone turns may inspect and clone an
-  // existing dashboard/extension without running a metric query, as long as
-  // the draft does not invent numbers. Check this before the generic
-  // "no data query ran" fallback so a template-based extension clone is not
-  // treated the same as an unanswerable analytics-result question.
   if (
     dashboardConstructionRequest &&
     !draftClaimsAnalyticsMetrics(context.text)
   ) {
     if (
       hasDashboardConstructionAttempt(context.toolResults) ||
+      hasSuccessfulExtensionCreation(context.toolResults) ||
       isSafeNoDataAnalyticsResponse(context.text)
     ) {
       return null;
     }
     return {
       retryMessage:
-        'This is a dashboard construction/template-clone request. Resolve the named template\'s id (use `list-sql-dashboards` if you only have a title) and call `get-sql-dashboard` with `includeConfig: true` first. If its panels are `chartType: "extension"`, use `get-extension` then `create-extension` to clone/adapt it, then `update-dashboard` to save the new dashboard. Do not invent SQL panels for an extension-backed template. Ask one clarifying filter question if needed. Only run a data-source query before presenting numbers or authoring invented SQL.',
+        'This is a dashboard construction/template-clone request. First call `search-dashboard-references` with the named template terms. Inspect the matching result with `get-sql-dashboard` when `kind` is `sql` or `get-explorer-dashboard` when `kind` is `explorer`, using full config only when needed. If its panels are `chartType: "extension"`, use `get-extension` then `create-extension` to clone/adapt it, then `update-dashboard` to save the new dashboard. Do not invent SQL panels for an extension-backed template. Ask one clarifying filter question if needed. Only run a data-source query before presenting numbers or authoring invented SQL.',
       fallbackMessage:
         "I need to inspect the template dashboard (and its extension, if it uses one) before creating the new one. Tell me the template dashboard name, or confirm the org/account filter, and I'll clone it without inventing metrics.",
-      // Expand the tool surface so a corrective retry can always reach the
-      // lookup/inspection tools this message asks for.
       expandToolSurface: true,
     };
   }
 
+  const failedQueryMessage = failedDataQueryAttemptMessage(context.toolResults);
+  if (looksLikeSchemaDetailsRequest(context.text)) {
+    const failedQueryRecovery = failedQueryMessage
+      ? ` ${failedQueryMessage}`
+      : "";
+    return {
+      retryMessage:
+        "The draft asks the user to supply internal dataset, table, column, or SQL details. Do not ask the user for warehouse schema identifiers. Use the configured Analytics tools now: call `search-analytics-query-catalog`, then `list-data-dictionary` and `search-bigquery-schema` with focused metric terms when the catalog has no usable definition, and run one authoritative `bigquery` query using the exact discovered references. `search-bigquery-schema` searches the configured project without a dataset. For a named customer, verify identity and distinguish actual consumption from limits or changelog metadata. If the tools prove the source or metric is unavailable, state that exact evidence gap instead of asking the user to name internal tables." +
+        failedQueryRecovery,
+      fallbackMessage:
+        "I couldn't complete that lookup from the configured Analytics sources yet. Please retry and I'll inspect the catalog and warehouse schema directly rather than asking you to provide internal table names.",
+      maxRetries: 2,
+      expandToolSurface: true,
+    };
+  }
   if (dataQueryAttempted) return null;
+  const draftMakesAnalyticsClaim =
+    draftClaimsAnalyticsMetrics(context.text) ||
+    isGenericNoDataFallback(context.text);
+  if (
+    firstPartySourceShouldBeTried &&
+    !failedQueryMessage &&
+    draftMakesAnalyticsClaim
+  ) {
+    return {
+      retryMessage:
+        "The user asked for live analytics, and the built-in first-party Analytics source is available even though no external provider is connected. Call `query-agent-native-analytics` for first-party product, usage, conversion, or observability data and answer from that result. If the request specifically names an external provider, explain what is missing and include the real Connect data sources link.",
+      fallbackMessage:
+        "I couldn't complete a grounded first-party Analytics query yet. Please retry and I'll use the built-in Analytics source before asking you to connect an external provider.",
+      maxRetries: 2,
+      expandToolSurface: true,
+      exhaustedDraftPrefix: exhaustedDraftPrefixFor({
+        toolResults: context.toolResults,
+        setupMarkdown,
+        includeConnectOption: false,
+      }),
+    };
+  }
   if (isSafeNoDataAnalyticsResponse(context.text)) {
-    if (firstPartySourceShouldBeTried) {
-      return {
-        retryMessage:
-          "The built-in first-party Analytics source is available even though no external provider is connected. Use `query-agent-native-analytics` for the user's first-party product, usage, conversion, or observability question before explaining that data is unavailable. Only guide the user to connect a source if the request specifically needs an external provider.",
-        fallbackMessage:
-          "I couldn't complete a grounded first-party Analytics query yet. Please retry and I'll use the built-in Analytics source before asking you to connect an external provider.",
-        maxRetries: 2,
-        expandToolSurface: true,
-      };
-    }
     if (
       needsDataSourceLink &&
       !includesDataSourcesLink(context.text, setupLink)
@@ -766,7 +1067,6 @@ export function realDataFinalGuard(
     }
     return null;
   }
-  const failedQueryMessage = failedDataQueryAttemptMessage(context.toolResults);
   if (failedQueryMessage) {
     if (
       needsDataSourceLink &&
@@ -784,11 +1084,7 @@ export function realDataFinalGuard(
     };
   }
 
-  if (
-    needsDataSourceLink &&
-    (missingRequestedExternalSource ||
-      (noConnectedExternalSources && externalSourceRequest))
-  ) {
+  if (needsDataSourceLink) {
     return {
       retryMessage: `The requested external source is not connected. Explain what is missing in the context of the user's question and include this exact markdown link: ${setupMarkdown}. Do not use the generic no-grounded-data fallback.`,
       fallbackMessage: `I can help with that once the relevant source is connected. ${setupMarkdown}`,
@@ -797,45 +1093,51 @@ export function realDataFinalGuard(
     };
   }
 
+  const prior = priorTurnEvidence(context.messages ?? []);
+  if (
+    hasDataQueryAttempt(prior.toolResults) &&
+    draftRestatesPriorEvidence(context.text, prior)
+  ) {
+    return null;
+  }
+  if (!draftMakesAnalyticsClaim) return null;
+
   const configuredSources = configuredDataSourceLabels(context.toolResults);
-  if (firstPartySourceShouldBeTried) {
-    return {
-      retryMessage:
-        "The user asked for live analytics, and the built-in first-party Analytics source is available even though no external provider is connected. Call `query-agent-native-analytics` for first-party product, usage, conversion, or observability data and answer from that result. If the request specifically names an external provider, explain what is missing and include the real Connect data sources link.",
-      fallbackMessage:
-        "I couldn't complete a grounded first-party Analytics query yet. Please retry and I'll use the built-in Analytics source before asking you to connect an external provider.",
-      maxRetries: 2,
-      expandToolSurface: true,
-    };
-  }
-  if (noConnectedExternalSources) {
-    return {
-      retryMessage: `The user asked for live analytics, but data-source-status found no connected external providers. The built-in first-party source is still available for first-party Analytics data. If this request needs an external source, respond naturally in the context of the user's question, explain what is missing, and include ${setupMarkdown}. Do not use a generic canned no-data response.`,
-      fallbackMessage: `I can help with that once the relevant source is connected. ${setupMarkdown}`,
-      maxRetries: 2,
-      expandToolSurface: true,
-    };
-  }
   const configuredSourceGuidance = configuredSources.length
     ? ` \`data-source-status\` already confirmed these connected sources: ${configuredSources.join(", ")}. Do not claim that no sources are connected and do not ask the user to reconnect them. Immediately call the relevant query action for one of those sources.`
     : "";
+  const catalogSearched = hasCatalogSearchAttempt(context.toolResults);
+  const exhaustedDraftPrefix = exhaustedDraftPrefixFor({
+    toolResults: context.toolResults,
+    setupMarkdown,
+    includeConnectOption: !catalogSearched,
+  });
+
+  if (catalogSearched) {
+    return {
+      retryMessage:
+        "You already ran catalog/dashboard-reference discovery this turn. If it returned a usable dashboard or query, adapt and run it now and cite the dashboard; if not, run the next discovery pass (list-data-dictionary, search-bigquery-schema, or data-source-status) and one bounded query." +
+        UNVERIFIED_DRAFT_RETRY_INSTRUCTION,
+      fallbackMessage:
+        "I searched the dashboard/query catalog but didn't finish a real source query. Please retry; I'll adapt a matching dashboard or query if one exists, or run the next discovery pass and query it directly.",
+      maxRetries: 2,
+      expandToolSurface: true,
+      exhaustedDraftPrefix,
+    };
+  }
+
   return {
     retryMessage:
       "This looks like an analytics result request, but no real source query ran. If you are making data claims, run one relevant data-source action or connected provider MCP tool now and answer from that result." +
       configuredSourceGuidance +
-      " If the right response is a clarification, plan, or explicit unavailable/credentials-missing message with no metrics or source-record claims, finalize that directly instead.",
+      " If the right response is a clarification, plan, or explicit unavailable/credentials-missing message with no metrics or source-record claims, finalize that directly instead." +
+      UNVERIFIED_DRAFT_RETRY_INSTRUCTION,
     fallbackMessage: configuredSources.length
       ? `I found connected data sources (${configuredSources.join(", ")}), but the model still did not run a real source query. Please retry the request; you do not need to reconnect those sources.`
       : `I couldn't complete a grounded answer to that request. If the relevant provider isn't connected, [connect data sources](${ANALYTICS_DATA_SOURCES_LINK}) and I'll try again with real data.`,
-    // Some models use separate turns for status, schema discovery, and the
-    // actual query. One corrective turn was enough for Sonnet but caused Luna
-    // to hit the fallback before it reached the query.
     maxRetries: 2,
-    // The first request may use the compact starter catalog. A corrective
-    // retry must be able to reach the real source action directly; otherwise
-    // some model families spend the retry on tool-search narration and hit
-    // the canned fallback without ever running a query.
     expandToolSurface: true,
+    exhaustedDraftPrefix,
   };
 }
 
@@ -881,49 +1183,84 @@ export async function searchDashboardMentions(query: string, event?: any) {
 
 export default createAgentChatPlugin({
   appId: "analytics",
+  onAgentTurnComplete: autosaveAnalyticsAfterAgentTurn,
+  onAgentRunComplete: async (_scope, run) => {
+    let memoryCaptureQueued = 0;
+    const owner = getRequestRunContext()?.owner ?? getRequestUserEmail();
+    if (owner && getRequestContext()?.isSyntheticTraffic !== true) {
+      try {
+        memoryCaptureQueued = Number(
+          await enqueueAnalyticsMemoryCapture({
+            owner,
+            orgId: getRequestOrgId() || null,
+            threadId: run.threadId,
+          }),
+        );
+      } catch (error) {
+        console.warn("[analytics-memory-capture] enqueue failed", {
+          errorName: error instanceof Error ? error.name : "UnknownError",
+        });
+      }
+    }
+    const properties = summarizeAnalyticsRun({
+      events: run.events,
+      groundingActionNames: GROUNDING_ACTION_NAMES,
+      preloadedReferenceCount:
+        getRequestRunContext()?.analyticsJevPrefetch?.preloadedReferenceCount ??
+        0,
+    });
+    properties.memory_capture_queued = memoryCaptureQueued;
+    const { track } = await import("@agent-native/core/tracking");
+    await track("analytics_agent_run_outcome", properties);
+  },
+  prepareRequest: async ({
+    ownerEmail,
+    requestContext,
+    contextPrefetchDeadlineAt,
+    dispatchToBackground,
+  }) => {
+    if (
+      !ownerEmail ||
+      dispatchToBackground ||
+      !looksLikeAnalyticsDataRequest(requestContext)
+    ) {
+      return;
+    }
+    return retrieveAnalyticsPromptReferences({
+      request: requestContext,
+      email: ownerEmail,
+      orgId: getRequestOrgId() || null,
+      deadlineAt: contextPrefetchDeadlineAt,
+    });
+  },
+  leanPrompt: isProductionServerlessRuntime(),
   actions: loadActionsFromStaticRegistry(actionsRegistry),
   initialToolNames: INITIAL_TOOL_NAMES,
   corpusTools: "lazy",
   finalResponseGuard: realDataFinalGuard,
-  // Enable sandboxed JavaScript execution for analytics data processing.
-  // Code runs in an isolated Node.js child process with no access to app
-  // source, secrets, or DB. It can call provider-api-request, web-request,
-  // and Resources-backed workspace file helpers via the bridge.
-  //
-  // Operators deploying to trusted internal environments can set
-  // AGENT_PROD_CODE_EXECUTION=trusted to also enable bash/read/edit/write.
   codeExecution: { production: "sandboxed" },
-  // Analytics deliberately keeps the sandbox runtime as a dashboard-scoped
-  // Custom Block escape hatch even though generic apps default it off.
   extensionTools: true,
-  // Long-running A2A analysis belongs on the durable worker so provider
-  // pagination, cross-source joins, and corpus reduction can outlive the
-  // standard serverless request budget without orphaning the task.
   durableBackgroundRuns: true,
   runSoftTimeoutMs: ANALYTICS_BACKGROUND_RUN_SOFT_TIMEOUT_MS,
   runNoProgressTimeoutMs: ANALYTICS_BACKGROUND_RUN_NO_PROGRESS_TIMEOUT_MS,
-  connectorCatalog: [...ANALYTICS_CONNECTOR_CATALOG],
-  externalAgents: {
-    // Keep the direct MCP surface deliberately curated. External agents
-    // should use ask_app by default; cataloged actions are optional stable
-    // semantic reads for callers with an exact, fully known contract. They are
-    // never a fallback for slow or failed delegation.
-    authenticatedReads: "off",
-    writes: "ask_app_only",
+  mcp: {
+    connectorCatalog: [...ANALYTICS_CONNECTOR_CATALOG],
+    externalAgents: {
+      authenticatedReads: "off",
+      writes: "ask_app_only",
+    },
   },
   resolveOrgId: async (event) => {
     const ctx = await getOrgContext(event);
     return ctx.orgId;
   },
   extraContext: async () => {
-    // Always inject compact source-routing guidance. Dictionary definitions
-    // stay behind list-data-dictionary so prompt assembly does not read and
-    // render every organization metric before the model request starts.
     const sourceGuidance =
       analyticsSourceGuidanceOpening() +
       "DASHBOARD CREATION RULE — You may create dashboard artifacts, SQL panels, or other resources only when the user explicitly asks you to (e.g. 'build me a dashboard for...', 'save this analysis', 'add a chart for...'). Treat a requested saved analysis or deep-dive report as a dashboard request. Never create any resource proactively during research, trend analysis, or answering questions. If you think a dashboard would be useful, suggest it and wait for explicit confirmation before creating anything. Never add new items to the sidebar or modify existing dashboards without an explicit user directive. " +
       "EXECUTION CONTINUITY — An explicit request to build, create, save, or adapt a dashboard or one-off Custom Block authorizes all non-destructive in-app steps required to finish it in the same turn. After querying or scaffolding, continue through extension-data seeding/refresh, dashboard save/embed, and navigation. Do not ask 'want me to proceed?' or stop at an empty shell. Ask one clarification only when metric scope or grain materially changes the result, and pause for destructive changes or external side effects such as sending email or outreach. " +
-      "DASHBOARD MUTATION RULE — For dashboard edits, default to `mutate-dashboard` with the typed `dashboard.*` script API so the main payload is a string and avoids native-array serialization traps. It can move panels by id, edit titles/SQL/config, insert, duplicate, remove, and patch dashboard fields in one atomic save. The script API is constrained: no variables/imports/loops/functions, only JSON-compatible arguments on documented dashboard methods. Do not count shifting `/panels/<index>` positions for ordinary dashboard edits unless the user specifically asks for low-level JSON-pointer operations. " +
+      "APPROVED MUTATION CONTINUITY — If this turn includes an explicitly approved dashboard action with concrete input, execute that exact action and input immediately. Treat the supplied dashboard id as authoritative: do not reinterpret an existing-dashboard edit as a template clone, ask for a template name, or substitute an inspection step. A dashboard mutation is complete only when the action result proves `saved: true` and the requested change is reflected by `changed: true`, refreshed/changed panel ids, or an equivalent non-empty proof field; a natural-language acknowledgement or a no-op with skipped panels is not success. " +
+      "DASHBOARD MUTATION RULE — For first-party dashboard creation or catalog refreshes, use `compose-dashboard` with metric keys; set `refreshExisting: true` when updating matching catalog panels so the server regenerates validated SQL without sending a large SQL payload through the prompt. For ordinary existing edits, use `mutate-dashboard` with structured `operations` in one atomic save; use its short `code` form only for compact layout/config edits. Both forms address panels by id, validate the resulting config, and return proof. Never stream a large multi-panel SQL script or count shifting `/panels/<index>` positions unless the user specifically asks for low-level JSON-pointer operations. " +
       'CUSTOM BLOCK RULE — Analytics can embed sandboxed extensions as dashboard-scoped Custom Blocks, but native panels and Data Programs come first. Do not create one for an ordinary "put X in this dashboard" request. Use `config.extensionId` only for an explicitly requested one-off or bespoke visualization that the native dashboard model cannot represent faithfully. For each new block, set `config.customBlock` with `authoredBy: "agent"`, `intent: "one-off"`, `scope: "dashboard"`, and a categorical `nativeGapReason` of `custom-visualization`, `custom-interaction`, `custom-layout`, or `other`; never store prompt or customer text there. The embed is shared with the dashboard, appears in scheduled reports, and receives dashboard/panel/current-filter context. Use `config.extensionSlotId` only when the user explicitly asks for a personal/per-viewer slot. Slot ids use `analytics.dashboard.<dashboard-id>.panel.<panel-id>` and require `add-extension-slot-target` plus `install-extension`; installs are per-user, so viewers can see different content and report identities may see an empty slot. Use `get-sql-dashboard` panel summaries to inspect an existing Custom Block. ' +
       'EXTENSION DATA-REPAIR RULE — When fixing data in an existing extension-backed dashboard or migrated surface such as Risk Meeting, inspect the current dashboard and extension first, then call `update-extension` with exactly `id`, `operation="edit"`, and a `payloadJson` string containing focused patches/edits that change only the data-loading seam. Never send empty placeholder fields. Preserve the existing layout, CSS, copy, and interactions; never reconstruct the full HTML body for a data-only fix. A request that combines a visual rewrite such as compacting, removing sections, renaming, or changing padding with a data repair is a broad rewrite; after inspecting the current extension, use `operation="replace"` with the complete replacement in `payloadJson`. If a focused edit fails, change the target instead of retrying identical arguments. ' +
       'FIRST-PARTY DASHBOARD TIME RULE — AI-generated `source: "first-party"` panels are dashboard-time-bound by default: set `config.timeScope` to `dashboard` and include a matching dashboard time predicate. `{{timeRange}}` requires a matching `filters` entry with `id: "timeRange"` and `type: "select"`; `{{<id>Start}}`/`{{<id>End}}` require a matching `type: "date-range"` filter with that id. Allowed `timeScope` values are `dashboard`, `fixed-window`, `cohort-history`, and `all-time`; use `all-time` only when the user requests full available history and put all-time, lifetime, or historical in the title or description. Server validation rejects unbound first-party SQL. ' +
@@ -932,10 +1269,11 @@ export default createAgentChatPlugin({
       "Use configured data sources and actions only. The built-in first-party Analytics source is an additional source and is always available through `query-agent-native-analytics`, even when no external provider credentials are connected. External provider actions remain available and are the authoritative path when the user names a provider or the data lives there. Call `data-source-status` when you need to know which external providers are connected, and treat provider actions as unavailable for analysis only if they return missing credentials, permission, syntax, quota, or network errors. " +
       "The built-in `demo` dashboard source is a demo-environment Prometheus source reserved for the Node Exporter demo. It must never satisfy REAL_DATA_REQUIRED or be cited as user analytics evidence unless the user explicitly asks to inspect the demo dashboard. " +
       "When the user names a provider such as first-party Analytics, BigQuery, HubSpot, Gong, Jira, Pylon, Slack, Sentry, GA4, or another connected source, that source is authoritative for the turn. Use its first-class query action when available; if it is not on the initial tool surface, use tool-search for that provider instead of loading unrelated catalogs. For an ordinary structured lookup, make one bounded query and stop on success. " +
-      "Load provider API, corpus, staging, or code tools only when the user explicitly requests cross-source work, exhaustive unstructured-record coverage, or an absence claim that the first-class action cannot support. For those genuinely broad workflows, fetch every relevant page or an explicitly bounded cohort, preserve coverage counts, and state any uncovered records. " +
+      "Load provider API, corpus, staging, or code tools only when the user explicitly requests cross-source work, exhaustive unstructured-record coverage, an absence claim that the first-class action cannot support, or a durable CSV export. For a compact first-party table, use the query action's Download CSV control. For durable CSV, use run-code with workspaceWrite and show-workspace-file. For an explicit XLSX workbook, use docs-search once to load the spreadsheet export workflow; run-code cannot import xlsx or exceljs packages. For broad data workflows, fetch every relevant page or an explicitly bounded cohort, preserve coverage counts, and state any uncovered records. " +
       "For named deal, account, renewal, churn-risk, or customer deep dives that need HubSpot and Gong context, `account-deep-dive` can provide a bounded evidence bundle. Do not answer a requested transcript deep dive from call metadata alone. " +
       "When the user refers to the current dashboard artifact, this analysis, this project, or asks to spin off, adapt, modify, or reuse a saved analysis, call `view-screen` first and use the returned dashboard details; for an explicitly named legacy analysis id, call `get-analysis` before responding and preserve its legacy deep link only for compatibility. " +
       "If a query action fails because its arguments are invalid, correct the arguments once. Never repeat the identical failed call. For credential, permission, quota, network, or repeated schema failures, stop using that source for the turn and surface the actual error instead of trying unrelated providers. " +
+      "EXPORT DELIVERY: For a user-requested CSV, Markdown, or other file, deliver it in the same chat turn. Set `showTable: true` on `query-agent-native-analytics` only when the user explicitly asks to see query rows; single numeric results render as an Analysis result card, and other results should ground a concise answer without a table. For a durable export, write only verified successful data to a non-scratch workspace path, then call `show-workspace-file` with that exact path so chat renders a direct download card. Never save an error or failed response as the requested export, and never finish with only a path or filename. " +
       "For ordinary ad-hoc structured data questions, answer the explicit question after the first relevant successful query or bounded evidence batch. The words all, total, or exact do not require cross-source validation when a single structured query fully covers the requested source and filters. " +
       "If the user challenges coverage, asks why more records were not included, or asks for the updated answer, rerun the relevant source query or revise from the corrected cohort and provide the updated deliverable directly. Do not claim a dashboard artifact was revised unless the revised answer is included in the response or saved with `update-dashboard`. " +
       "Unstructured source records are valid analytics evidence: Pylon tickets, Jira issues, Gong calls/transcripts, Slack messages, and similar text records may be coded for themes, mention counts, sentiment, objections, and qualitative patterns as long as the answer states the inspected sample size and does not imply unsupported statistical certainty. " +

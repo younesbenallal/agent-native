@@ -1,9 +1,125 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { resolveAccess } from "@agent-native/core/sharing";
 import { z } from "zod";
 
-import { hashSlideContent, type DeckFitState } from "../shared/slide-fit.js";
-import { readAppStateForCurrentTab } from "./_tab-state.js";
+import {
+  slideFitMeasurementMatchesSlide,
+  type DeckFitState,
+} from "../shared/slide-fit.js";
+import {
+  readAppStateForCurrentTab,
+  writeAppStateForCurrentTab,
+} from "./_tab-state.js";
+
+const REPEATED_CHECK_WARNING_THRESHOLD = 3;
+const REPEATED_CHECK_WINDOW_MS = 30 * 60_000;
+
+interface LayoutOverflowCheckHistory {
+  deckId: string;
+  count: number;
+  lastCheckAt: number;
+}
+
+function historyKeyForDeck(deckId: string): string {
+  return `layout-overflow-check-history:${deckId}`;
+}
+
+async function noteLayoutOverflowCheck(
+  deckId: string,
+  resolved: boolean,
+): Promise<number> {
+  const key = historyKeyForDeck(deckId);
+  const now = Date.now();
+  if (resolved) {
+    await writeAppStateForCurrentTab(key, {
+      deckId,
+      count: 0,
+      lastCheckAt: now,
+    });
+    return 0;
+  }
+  const prior = (await readAppStateForCurrentTab(key, {
+    fallbackToGlobal: false,
+  })) as LayoutOverflowCheckHistory | null;
+  const carriesOver =
+    prior?.deckId === deckId &&
+    typeof prior.count === "number" &&
+    typeof prior.lastCheckAt === "number" &&
+    now - prior.lastCheckAt <= REPEATED_CHECK_WINDOW_MS;
+  const count = (carriesOver ? prior!.count : 0) + 1;
+  await writeAppStateForCurrentTab(key, { deckId, count, lastCheckAt: now });
+  return count;
+}
+
+type CurrentSlideFitMeasurement = DeckFitState["slides"][string] & {
+  slideId: string;
+};
+
+function getCurrentSlideFitMeasurement(
+  value: unknown,
+  slide: { id: string; content?: string; layoutFitRevision?: string },
+  deckId: string,
+): CurrentSlideFitMeasurement | null {
+  if (!value || typeof value !== "object") return null;
+
+  const measurement = value as Record<string, unknown>;
+  const slideId = measurement.slideId;
+  const measurementDeckId = measurement.deckId;
+  const contentHash = measurement.contentHash;
+  const contentHeight = measurement.contentHeight;
+  const contentWidth = measurement.contentWidth;
+  const viewportHeight = measurement.viewportHeight;
+  const viewportWidth = measurement.viewportWidth;
+  const verticalOverflow = measurement.verticalOverflow;
+  const horizontalOverflow = measurement.horizontalOverflow;
+  const measuredAt = measurement.measuredAt;
+  const layoutFitRevision = measurement.layoutFitRevision;
+
+  if (
+    typeof slideId !== "string" ||
+    slideId !== slide.id ||
+    (measurementDeckId !== undefined && measurementDeckId !== deckId) ||
+    typeof contentHash !== "string" ||
+    (layoutFitRevision !== undefined &&
+      typeof layoutFitRevision !== "string") ||
+    !slideFitMeasurementMatchesSlide(
+      {
+        contentHash,
+        ...(typeof layoutFitRevision === "string" ? { layoutFitRevision } : {}),
+      },
+      slide,
+    ) ||
+    typeof contentHeight !== "number" ||
+    !Number.isFinite(contentHeight) ||
+    typeof contentWidth !== "number" ||
+    !Number.isFinite(contentWidth) ||
+    typeof viewportHeight !== "number" ||
+    !Number.isFinite(viewportHeight) ||
+    typeof viewportWidth !== "number" ||
+    !Number.isFinite(viewportWidth) ||
+    typeof verticalOverflow !== "number" ||
+    !Number.isFinite(verticalOverflow) ||
+    typeof horizontalOverflow !== "number" ||
+    !Number.isFinite(horizontalOverflow) ||
+    typeof measuredAt !== "number" ||
+    !Number.isFinite(measuredAt)
+  ) {
+    return null;
+  }
+
+  return {
+    slideId,
+    contentHash,
+    ...(typeof layoutFitRevision === "string" ? { layoutFitRevision } : {}),
+    contentHeight,
+    contentWidth,
+    viewportHeight,
+    viewportWidth,
+    verticalOverflow,
+    horizontalOverflow,
+    measuredAt,
+  };
+}
 
 export default defineAction({
   description:
@@ -25,6 +141,10 @@ export default defineAction({
     const state = (await readAppStateForCurrentTab("deck-fit-checks", {
       fallbackToGlobal: false,
     })) as DeckFitState | null;
+    const currentSlideState = await readAppStateForCurrentTab(
+      "slide-fit-check",
+      { fallbackToGlobal: false },
+    );
 
     const unknownSlideIds: string[] = [];
     const overflows: Array<{
@@ -40,13 +160,14 @@ export default defineAction({
 
     slides.forEach((slide, index) => {
       const measurement =
-        state?.deckId === deckId &&
+        getCurrentSlideFitMeasurement(currentSlideState, slide, deckId) ??
+        (state?.deckId === deckId &&
         state.aspectRatio === (deck.aspectRatio ?? "16:9")
           ? state.slides?.[slide.id]
-          : undefined;
+          : undefined);
       if (
         !measurement ||
-        measurement.contentHash !== hashSlideContent(slide.content ?? "") ||
+        !slideFitMeasurementMatchesSlide(measurement, slide) ||
         !Number.isFinite(measurement.verticalOverflow) ||
         !Number.isFinite(measurement.horizontalOverflow) ||
         !Number.isFinite(measurement.contentHeight) ||
@@ -75,6 +196,10 @@ export default defineAction({
       }
     });
 
+    const canClaimDeckFits =
+      unknownSlideIds.length === 0 && overflows.length === 0;
+    const checkCount = await noteLayoutOverflowCheck(deckId, canClaimDeckFits);
+
     return {
       deckId,
       status: unknownSlideIds.length > 0 ? "unknown" : "measured",
@@ -82,7 +207,15 @@ export default defineAction({
       slideCount: slides.length,
       unknownSlideIds,
       overflows,
-      canClaimDeckFits: unknownSlideIds.length === 0 && overflows.length === 0,
+      canClaimDeckFits,
+      ...(checkCount >= REPEATED_CHECK_WARNING_THRESHOLD
+        ? {
+            guidance:
+              overflows.length > 0
+                ? `This deck has been checked ${checkCount} times with overflow still present. Stop re-measuring and patching one slide at a time. Report the exact remaining overflow (slide, pixels, dimension) to the user instead of calling get-layout-overflows again this turn.`
+                : `This deck has been checked ${checkCount} times and slide measurements are still unavailable (unknownSlideIds). Stop re-checking and tell the user which slides could not be measured instead of calling get-layout-overflows again this turn.`,
+          }
+        : {}),
     };
   },
 });

@@ -54,6 +54,12 @@ function writeFixture(root: string): string {
     ].join("\n"),
     "utf-8",
   );
+  fs.mkdirSync(path.join(skillRoot, "references"), { recursive: true });
+  fs.writeFileSync(
+    path.join(skillRoot, "references", "project-context.md"),
+    "Keep project context bounded and preserve its provenance.\n",
+    "utf-8",
+  );
 
   const manifestFile = path.join(root, "agent-native.app-skill.json");
   fs.writeFileSync(
@@ -192,6 +198,25 @@ describe("app skill packaging", () => {
         )
         .startsWith("---\nname: assets\n"),
     ).toBe(true);
+    for (const skillPath of [
+      path.join(outDir, "skills", "assets"),
+      path.join(
+        outDir,
+        "adapters",
+        "claude-marketplace",
+        "plugins",
+        "agent-native-assets",
+        "skills",
+        "assets",
+      ),
+      path.join(outDir, "adapters", "vercel-skills", "skills", "assets"),
+      path.join(outDir, "adapters", "plain-skill", "skills", "assets"),
+      path.join(outDir, "adapters", "claude-skill", "skills", "assets"),
+    ]) {
+      expect(
+        fs.existsSync(path.join(skillPath, "references", "project-context.md")),
+      ).toBe(true);
+    }
     expect(fs.existsSync(path.join(outDir, "app", "package.json"))).toBe(true);
     expect(
       JSON.parse(
@@ -212,6 +237,27 @@ describe("app skill packaging", () => {
     );
     expect(codexPlugin.version).toMatch(/^1\.0\.0\+codex\.[0-9a-f]{12}$/);
     expect(fs.existsSync(path.join(outDir, ".mcp.json"))).toBe(true);
+    const standardPlugin = JSON.parse(
+      fs.readFileSync(path.join(outDir, "plugin.json"), "utf-8"),
+    );
+    expect(standardPlugin).toMatchObject({
+      $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+      name: "agent-native-assets",
+      version: codexPlugin.version,
+    });
+    expect(standardPlugin.skills).toBeUndefined();
+    const standardMcp = JSON.parse(
+      fs.readFileSync(path.join(outDir, "mcp.json"), "utf-8"),
+    );
+    expect(standardMcp).toEqual({
+      $schema: "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+      mcpServers: {
+        "agent-native-assets": {
+          type: "streamable-http",
+          url: "https://assets.agent-native.com/_agent-native/mcp",
+        },
+      },
+    });
     const claudeMarketplaceRoot = path.join(
       outDir,
       "adapters",
@@ -363,8 +409,6 @@ describe("app skill packaging", () => {
     const packedMcp = JSON.parse(
       fs.readFileSync(path.join(outDir, ".mcp.json"), "utf-8"),
     );
-    // Pack output still includes both names for backward compat with older
-    // plugin consumers that may have installed only the alias name.
     expect(Object.keys(packedMcp.mcpServers).sort()).toEqual([
       "agent-native-assets",
       "assets",
@@ -388,7 +432,6 @@ describe("app skill packaging", () => {
     const config = JSON.parse(
       fs.readFileSync(path.join(root, ".mcp.json"), "utf-8"),
     );
-    // Only the canonical name; no alias duplicate.
     expect(Object.keys(config.mcpServers)).toEqual(["agent-native-assets"]);
     expect(config.mcpServers["agent-native-assets"]).toEqual({
       type: "http",
@@ -403,7 +446,6 @@ describe("app skill packaging", () => {
     manifest.mcp.aliases = ["assets"];
     fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, 2), "utf-8");
 
-    // Pre-seed with both the canonical and alias entry (simulates old install).
     fs.writeFileSync(
       path.join(root, ".mcp.json"),
       JSON.stringify(
@@ -441,12 +483,10 @@ describe("app skill packaging", () => {
     const config = JSON.parse(
       fs.readFileSync(path.join(root, ".mcp.json"), "utf-8"),
     );
-    // Canonical entry updated, alias removed, unrelated entry untouched.
     expect(Object.keys(config.mcpServers).sort()).toEqual([
       "agent-native-assets",
       "other-server",
     ]);
-    // Log message mentions the removed entry.
     expect(logged.join(" ")).toContain("assets");
   });
 

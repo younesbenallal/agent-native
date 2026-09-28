@@ -99,7 +99,7 @@ hinter einem Picker oder einer Offenlegung, wenn ein Schritt mehrere gleichwerti
   Builder für ein mit einem Klick verwaltetes Gateway, oder öffnen Sie den sekundären Anbieterschlüssel
   Wählen Sie Ihren eigenen LLM-Schlüssel aus und fügen Sie ihn ein.
 - **Datenbank** (optional) – legen Sie `DATABASE_URL` fest, wenn Sie eine bestimmte verwenden möchten
-  SQL Datenbankverbindungszeichenfolge.
+  PostgreSQL-Verbindungszeichenfolge.
 - **Authentifizierung** (optional) – integrierte E-Mail-/Passwortkonten funktionieren per
   Standard. Fügen Sie OAuth oder die Zugriffstoken-Anmeldung nur hinzu, wenn Sie diese Pfade benötigen.
 - **E-Mail-Zustellung** (optional) – nützlich vor der Bereitstellung für das Zurücksetzen von Passwörtern
@@ -199,6 +199,10 @@ Sie können die Verbindungsbereitschaft in Ihrem `isComplete`-Callback mithilfe 
 
 ```ts
 import { listWorkspaceConnectionProviderCatalogForApp } from "@agent-native/core/workspace-connections";
+import {
+  getRequestOrgId,
+  getRequestUserEmail,
+} from "@agent-native/core/server";
 
 // Inside registerOnboardingStep:
 isComplete: async () => {
@@ -217,8 +221,15 @@ isComplete: async () => {
     return true;
   }
 
-  // Fall back to local environment variable check
-  return !!process.env.GMAIL_REFRESH_TOKEN;
+  // If there is no reusable connection, check the caller-scoped credential
+  // store - never a deployment environment variable.
+  const { resolveCredential } = await import("@agent-native/core/credentials");
+  return Boolean(
+    await resolveCredential("GMAIL_REFRESH_TOKEN", {
+      userEmail: getRequestUserEmail(),
+      orgId: getRequestOrgId(),
+    }),
+  );
 };
 ```
 
@@ -232,6 +243,7 @@ Eine vollständige Liste der Verbindungsanbieter-Katalogmethoden finden Sie in d
 | `form`             | `{ fields, writeScope? }`                             | Env-Variablen sammeln (Schlüssel, Geheimnisse, URLs)                 |
 | `builder-cli-auth` | `{ scope: "llm" \| "browser" \| "image-generation" }` | Connect Builder (unlocks shared infra)                               |
 | `agent-task`       | `{ prompt }`                                          | Senden Sie eine Aufforderung an den Agenten-Chat zur Bearbeitung     |
+| `file-storage`     | -                                                     | Das gemeinsame S3-kompatible Speicherformular anzeigen               |
 
 Das `primary: true`-Flag markiert eine Methode als das große CTA für ihren Schritt.
 Verwenden Sie `badge: "soon"` plus `disabled: true`, wenn ein Setup-Pfad sichtbar sein soll
@@ -239,12 +251,12 @@ bevor es verfügbar ist.
 
 ### Eingebaute Schritte
 
-| ID         | Erforderlich | Beschreibung                                             |
-| ---------- | ------------ | -------------------------------------------------------- |
-| `llm`      | Ja           | Builder-Verbindung oder ein Provider-LLM-Schlüssel       |
-| `database` | nein         | Standarddatenbank oder eine beliebige SQL `DATABASE_URL` |
-| `auth`     | nein         | Eingebaute Konten, optional OAuth oder Zugriffstoken     |
-| `email`    | nein         | Erneut senden oder SendGrid für Transaktions-E-Mails     |
+| ID         | Erforderlich | Beschreibung                                          |
+| ---------- | ------------ | ----------------------------------------------------- |
+| `llm`      | Ja           | Builder-Verbindung oder ein Provider-LLM-Schlüssel    |
+| `database` | nein         | Gehostete PostgreSQL-URL oder leer für lokales PGlite |
+| `auth`     | nein         | Eingebaute Konten, optional OAuth oder Zugriffstoken  |
+| `email`    | nein         | Erneut senden oder SendGrid für Transaktions-E-Mails  |
 
 Any of these can be overridden by re-registering with the same `id` after the
 Standardlast.

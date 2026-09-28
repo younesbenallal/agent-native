@@ -14,6 +14,25 @@ import type {
   Point,
 } from "./types";
 
+export function isPointerInsideSourceIframe(args: {
+  iframeX: number;
+  iframeY: number;
+  viewportW: number;
+  viewportH: number;
+  frameWidth?: number;
+  frameHeight?: number;
+}): boolean {
+  const width = args.frameWidth ?? args.viewportW;
+  const height = args.frameHeight ?? args.viewportH;
+  const scaleX =
+    args.frameWidth !== undefined ? width / Math.max(1, args.viewportW) : 1;
+  const scaleY =
+    args.frameHeight !== undefined ? height / Math.max(1, args.viewportH) : 1;
+  const x = args.iframeX * scaleX;
+  const y = args.iframeY * scaleY;
+  return x >= 0 && y >= 0 && x <= width && y <= height;
+}
+
 export function isFinitePoint(value: unknown): value is Point {
   if (!value || typeof value !== "object") return false;
   const point = value as Record<string, unknown>;
@@ -153,8 +172,6 @@ export function getCrossScreenDropGuideStyle(args: {
       borderRadius: 999,
       boxShadow: "0 0 0 1px var(--design-editor-accent-color)",
       transform: rotation ? `rotate(${rotation}deg)` : undefined,
-      // Rotate the insertion line around the anchor rect's center, not its
-      // own center, so before/after edges stay attached to a rotated target.
       transformOrigin: rotation
         ? `${left + width / 2 - lineLeft}px ${height / 2}px`
         : undefined,
@@ -175,5 +192,33 @@ export function getCrossScreenDropGuideStyle(args: {
     transformOrigin: rotation
       ? `${width / 2}px ${top + height / 2 - lineTop}px`
       : undefined,
+  };
+}
+
+export const COMPACT_CROSS_SCREEN_GHOST_PX = 16;
+
+export function getCrossScreenGhostStyle(args: {
+  ghost: { boardX: number; boardY: number; width?: number; height?: number };
+  pan: Point;
+  scale: number;
+}): CSSProperties {
+  const { boardX, boardY, width: boardWidth, height: boardHeight } = args.ghost;
+  const width = boardWidth
+    ? Math.max(1, boardWidth * args.scale)
+    : COMPACT_CROSS_SCREEN_GHOST_PX;
+  const height = boardHeight
+    ? Math.max(1, boardHeight * args.scale)
+    : COMPACT_CROSS_SCREEN_GHOST_PX;
+  return {
+    left:
+      args.pan.x +
+      (SURFACE_PADDING + boardX) * args.scale -
+      (boardWidth ? 0 : width / 2),
+    top:
+      args.pan.y +
+      (SURFACE_PADDING + boardY) * args.scale -
+      (boardHeight ? 0 : height / 2),
+    width,
+    height,
   };
 }

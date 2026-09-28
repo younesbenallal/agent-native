@@ -12,8 +12,9 @@ import { Link } from "react-router";
 
 import { extensionPath } from "../../extensions/path.js";
 import { sendToAgentChat } from "../agent-chat.js";
-import { AgentToggleButton } from "../AgentPanel.js";
+import { AgentToggleButton } from "../AgentSidebar.js";
 import { agentNativePath } from "../api-path.js";
+import { getBrowserTabId } from "../browser-tab-id.js";
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -100,7 +101,6 @@ function CreateToolInput({ className }: { className?: string }) {
 }
 
 export interface ExtensionsListPageProps {
-  /** Skip the standalone extensions navigation state when embedded in Settings. */
   embedded?: boolean;
 }
 
@@ -119,11 +119,16 @@ export function ExtensionsListPage({
 
   useEffect(() => {
     if (embedded) return;
-    fetch(agentNativePath("/_agent-native/application-state/navigation"), {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ view: "extensions" }),
-    }).catch(() => {});
+    fetch(
+      agentNativePath(
+        `/_agent-native/application-state/navigation:${getBrowserTabId()}`,
+      ),
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ view: "extensions" }),
+      },
+    ).catch(() => {});
   }, [embedded]);
 
   useEffect(() => {
@@ -179,7 +184,7 @@ export function ExtensionsListPage({
     } finally {
       setDeletingId(null);
       setConfirmDeleteId(null);
-      queryClient.invalidateQueries({ queryKey: ["extensions"] });
+      void queryClient.invalidateQueries({ queryKey: ["extensions"] });
     }
   };
 
@@ -192,7 +197,7 @@ export function ExtensionsListPage({
         { method: "POST" },
       );
     } finally {
-      queryClient.invalidateQueries({ queryKey: ["extensions"] });
+      void queryClient.invalidateQueries({ queryKey: ["extensions"] });
     }
   };
 
@@ -228,7 +233,7 @@ export function ExtensionsListPage({
             <PopoverContent
               align="end"
               sideOffset={6}
-              className="w-[420px] p-3"
+              className="relative w-[420px] p-3"
             >
               <p className="px-1 pb-2 text-sm font-semibold text-foreground">
                 {t("extensions.newExtensionTitle")}

@@ -18,6 +18,11 @@ Any resource a user **creates** (dashboards, documents, forms, decks, compositio
 
 This is the framework-level primitive. Every ownable resource gets it for free — same API, same UI, same skill.
 
+Workspace apps are the intentional organization-scoped exception: their default
+visibility is `org`, configurable by an organization owner/admin. The creator is
+stored as the app owner, and the creator or an organization owner/admin can
+change the app's visibility or manage its share grants.
+
 ## Concepts
 
 ### Three visibility levels
@@ -26,15 +31,19 @@ This is the framework-level primitive. Every ownable resource gets it for free �
 - **`org`** — owner + explicit grants + anyone in the same org (read-only).
 - **`public`** — owner + explicit grants + **anyone with the link** (read-only). Public docs do NOT appear in other users' list/sidebar/search results — `accessFilter` omits them by default. They're reachable by id (`resolveAccess` admits them) so direct links and SSR routes like `/p/:id` keep working. If a list endpoint legitimately needs cross-user public discovery (a template gallery, etc.), pass `accessFilter(table, shares, ctx, minRole, { includePublic: true })`.
 
-Visibility is coarse. Explicit share grants are fine-grained (per user or per org).
+Visibility is coarse. Explicit share grants are fine-grained (per user, reusable
+organization group, or per org).
 
 ### Roles on a share grant
 
 - **`viewer`** — read only.
+- **`commenter`** — read + add comments, but cannot edit the resource or manage shares.
 - **`editor`** — read + write.
 - **`admin`** — read + write + manage shares. Does NOT replace the single `owner_email` on the resource.
 
 There are three role systems and they never imply one another. A share role answers "what may this person do to **one row**". An org role (`org_members.role`) answers "what may this person do to the **team**". An app role (`defineAppRoles`, see the `authentication` skill) answers "what may this person do inside **one app**". A share `admin` is not an app admin and neither is an org admin.
+
+**"Make me an admin."** First find which role system the gate reads. An app that needs admins declares an `admin` role with `defineAppRoles` and gates with `requireAny("admin")` / `requirePermission`, not a custom `isAdmin` column or an `email === "..."` check. An org owner/admin grants it with the `set-app-member-roles` action or `<TeamPage appRoles={descriptor} />`; the first org of a new deployment is bootstrapped with `AUTH_BOOTSTRAP_ADMINS`. Never grant admin from an auth hook such as `databaseHooks.user.create`: it runs before the default org exists, never runs for an existing account, and writes a role nothing gates on. A plain org member cannot self-elevate — name the org owner/admin who must grant it instead of building a bypass.
 
 ### Anonymous public URLs stay separate
 
@@ -100,6 +109,7 @@ registerShareableResource({
   // ...
   allowPublic: false, // hides "Public" in the share dialog and rejects it server-side
   requireOrgMemberForUserShares: true, // user shares must target an org member or pending invitee
+  supportsGroupShares: true, // enable reusable organization groups for this resource
 });
 ```
 
@@ -109,6 +119,21 @@ registerShareableResource({
 Use both for resources that execute code or expose privileged data with the *viewer's* credentials. Extensions ship with both set: an extension's HTML calls actions / SQL / the secrets-injecting proxy as the viewer, so a public or cross-org-shared extension would let a stranger run arbitrary code with someone else's auth context. `scripts/guard-extension-no-public.mjs` (CI + `pnpm prep`) statically enforces that the extension registration keeps both flags set.
 
 Defaults match historical behaviour: `allowPublic: true`, `requireOrgMemberForUserShares: false`. Resources that don't set the flags work as before.
+
+### Reusable organization groups
+
+The workspace organization model stores reusable groups in
+`workspace_user_groups`. Organization owners/admins manage the groups and their
+members through the existing group actions. Set `supportsGroupShares: true` on a
+resource registration to enable `principalType: "group"` in the generic share
+actions and the shared popover's autocomplete. Group ids are always checked
+against the resource's organization, and membership is evaluated at access time
+so group changes apply to existing shares.
+
+Workspace apps opt into this flag and use the organization default visibility
+setting. The app creator is the durable `owner_email`, while organization
+owners/admins receive admin access through the registration's
+`canManageAccess` callback.
 
 ## Filter list/read queries
 
@@ -183,13 +208,37 @@ import { ShareButton } from "@agent-native/core/client/sharing";
 
 For list views, show `<VisibilityBadge visibility={row.visibility} />` next to each resource.
 
+## Standard share surface
+
+All app share popovers should use the same compact surface contract:
+
+- Use the text-only `ShareTrigger` from `@agent-native/toolkit/sharing`.
+- Render ordinary links with `ShareCopyRow`, which exposes a Copy action without
+  printing the raw URL.
+- Keep general access and individual people access in the standard Core sharing
+  flow. The people flow supports email invites, roles, notifications, and
+  removal through the shared share actions.
+- Add `ShareAgentsSection` only when the resource has a real agent-readable
+  link or prompt. Keep it collapsed by default and supply domain-specific
+  content through the shared section shell.
+- When `supportsGroupShares` is enabled, keep the existing people input as the
+  only entry point and include organization groups in its autocomplete. Do not
+  add a separate group-management surface to each resource.
+- App-specific tabs or controls may remain when they represent a real domain
+  action (for example, an embed-code editor), but they should retain the same
+  trigger, copy-row, access, and spacing language.
+
+`ShareDisclosureSection` is the toolkit-owned shell for optional expandable
+share details; use its `ShareAgentsSection` or `SharePeopleSection` wrappers
+instead of creating another collapsible share panel in a template.
+
 ## Actions available everywhere
 
 The framework auto-mounts these actions in every template — no per-template boilerplate:
 
 | Action                     | Args                                                                           | Purpose                                   |
 | -------------------------- | ------------------------------------------------------------------------------ | ----------------------------------------- |
-| `share-resource`           | `resourceType, resourceId, principalType, principalId, role, notify?, resourceUrl?` | Grant a user or org access. `notify` defaults to true for individual user shares; `resourceUrl` can provide the direct app link used in the notification email. |
+| `share-resource`           | `resourceType, resourceId, principalType, principalId, role, notify?, resourceUrl?, message?` | Grant a user, group, or org access. `notify` defaults to true for individual user shares; `resourceUrl` can provide the direct app link and `message` an optional short note for the notification email. |
 | `unshare-resource`         | `resourceType, resourceId, principalType, principalId`                         | Revoke access.                            |
 | `list-resource-shares`     | `resourceType, resourceId`                                                     | Current visibility + all share grants.    |
 | `set-resource-visibility`  | `resourceType, resourceId, visibility`                                         | Change to `private` / `org` / `public`.  |
@@ -215,7 +264,7 @@ When retrofitting an existing resource table:
 
 Sharing doesn't apply to:
 
-- **Personal-data apps** (mail, macros) — user-scoped by design.
+- **Personal-data apps** (mail) — user-scoped by design.
 - **External source-of-truth apps** (issues → Jira, recruiting → Greenhouse) — ACL lives in the upstream system.
 - **Demo/boilerplate** (starter) — no resources.
 

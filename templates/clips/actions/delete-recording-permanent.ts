@@ -1,11 +1,4 @@
-/**
- * Permanently delete a recording and all related rows.
- *
- * Usage:
- *   pnpm action delete-recording-permanent --id=<id>
- */
-
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import {
   writeAppState,
   deleteAppState,
@@ -73,8 +66,6 @@ export default defineAction({
     }
 
     await db.transaction(async (tx) => {
-      // Cascade delete every related row before deleting remote objects. If any
-      // DB delete fails, the transaction rolls back and provider media stays put.
       await tx
         .delete(schema.recordingComments)
         .where(eq(schema.recordingComments.recordingId, args.id));
@@ -120,11 +111,12 @@ export default defineAction({
       protectedUrls,
     });
 
-    // Clean up any lingering application state for this recording.
     await deleteAppStateByPrefix(`recording-chunks-${args.id}-`);
     await deleteAppState(`recording-upload-${args.id}`);
     await deleteAppState(`recording-compression-${args.id}`);
     await deleteAppState(`recording-blob-${args.id}`);
+    await deleteAppState(`recording-thumbnail-asset-${args.id}`);
+    await deleteAppState(`recording-thumbnail-lease-${args.id}`);
     await deleteAppState(`agent-task-recording-${args.id}`);
 
     await writeAppState("refresh-signal", { ts: Date.now() });

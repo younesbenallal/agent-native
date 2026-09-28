@@ -3,13 +3,16 @@ import type {
   AgentNativeBrowserSessionRecord,
   AgentNativeBrowserSessionRequest,
 } from "../browser-sessions/types.js";
+import { createPollEngine } from "../shared/poll-engine.js";
 import { agentNativePath } from "./api-path.js";
 import {
   announceAgentNativeFrameReady,
   defaultAgentNativeHostCommands,
   requestAgentNativeHostActions,
   requestAgentNativeHostContext,
+  requestAgentNativeHostWebMcpTools,
   runAgentNativeHostAction,
+  runAgentNativeHostWebMcpTool,
   sendAgentNativeHostCommand,
   type AgentNativeActionManifestEntry,
   type AgentNativeClientAction,
@@ -20,37 +23,24 @@ import {
   type AgentNativeHostContextGetter,
   type AgentNativeHostSession,
 } from "./host-bridge.js";
+import type {
+  AgentNativeWebMcpClient,
+  AgentNativeWebMcpTool,
+} from "./webmcp.js";
 
 export interface AgentNativeBrowserSessionBridgeOptions extends AgentNativeHostRequestOptions {
-  /** Framework browser-session endpoint. Defaults to /_agent-native/browser-sessions. */
   endpoint?: string;
-  /** Stable tab/session id. Defaults to the host-provided session id. */
   sessionId?: string;
-  /**
-   * Direct in-app session identity. Use this when the Agent-Native chat is
-   * rendered inside the host app instead of inside a sidecar iframe.
-   */
   session?: string | Partial<AgentNativeHostSession>;
-  /**
-   * Direct in-app context getter. When set, the bridge does not use
-   * postMessage; it registers this tab directly with the backend.
-   */
   getContext?: AgentNativeHostContextGetter;
-  /** Direct in-app client actions exposed to backend browser-session tools. */
   actions?: AgentNativeClientActions;
-  /** Direct in-app host commands exposed to backend browser-session tools. */
+  webmcp?: AgentNativeWebMcpClient | "host";
   commands?: AgentNativeHostCommandHandlers;
-  /** Origin label passed to direct action/command callbacks. */
   origin?: string;
-  /** Human-readable label shown to the agent when multiple tabs are live. */
   label?: string;
-  /** Re-register host context/actions on this interval. Defaults to 5s. */
   heartbeatMs?: number;
-  /** Claim pending backend requests on this interval. Defaults to 500ms. */
   pollMs?: number;
-  /** Session TTL on the server. Defaults to 45s. */
   ttlMs?: number;
-  /** Override fetch for tests or custom runtimes. */
   fetch?: typeof fetch;
 }
 
@@ -65,9 +55,27 @@ export interface AgentNativeBrowserSessionBridge {
 const DEFAULT_ENDPOINT = "/_agent-native/browser-sessions";
 const DEFAULT_HEARTBEAT_MS = 5_000;
 const DEFAULT_POLL_MS = 500;
+const REQUEST_ABORT_MIN_MS = 10_000;
+const HIDDEN_INTERVAL_FLOOR_MS = 10_000;
+
+function isDocumentHidden(): boolean {
+  return (
+    typeof document !== "undefined" && document.visibilityState === "hidden"
+  );
+}
 
 function browserSessionId(): string {
   return `browser-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function requestAbortMs(
+  options: AgentNativeBrowserSessionBridgeOptions,
+): number {
+  const cadence = Math.min(
+    options.pollMs ?? DEFAULT_POLL_MS,
+    options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS,
+  );
+  return Math.max(REQUEST_ABORT_MIN_MS, cadence * 4);
 }
 
 function messageError(error: unknown): Error {
@@ -116,30 +124,50 @@ async function postJson(
   path: string,
   body: unknown,
 ): Promise<any> {
-  const response = await fetchImpl(options)(endpointPath(options, path), {
-    method: "POST",
-    credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Agent-Native-CSRF": "1",
-    },
-    body: JSON.stringify(body ?? {}),
-  });
-  return readJsonResponse(response);
+  const controller =
+    typeof AbortController === "undefined" ? null : new AbortController();
+  const timeoutId = controller
+    ? setTimeout(() => controller.abort(), requestAbortMs(options))
+    : null;
+  try {
+    const response = await fetchImpl(options)(endpointPath(options, path), {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Agent-Native-CSRF": "1",
+      },
+      body: JSON.stringify(body ?? {}),
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+    return readJsonResponse(response);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
 }
 
 async function deleteJson(
   options: AgentNativeBrowserSessionBridgeOptions,
   path: string,
 ): Promise<void> {
-  const response = await fetchImpl(options)(endpointPath(options, path), {
-    method: "DELETE",
-    credentials: "include",
-    headers: {
-      "X-Agent-Native-CSRF": "1",
-    },
-  });
-  await readJsonResponse(response);
+  const controller =
+    typeof AbortController === "undefined" ? null : new AbortController();
+  const timeoutId = controller
+    ? setTimeout(() => controller.abort(), requestAbortMs(options))
+    : null;
+  try {
+    const response = await fetchImpl(options)(endpointPath(options, path), {
+      method: "DELETE",
+      credentials: "include",
+      headers: {
+        "X-Agent-Native-CSRF": "1",
+      },
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+    await readJsonResponse(response);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
 }
 
 function hostRequestOptions(
@@ -151,6 +179,7 @@ function hostRequestOptions(
     session: _session,
     getContext: _getContext,
     actions: _actions,
+    webmcp: _webmcp,
     commands: _commands,
     origin: _origin,
     label: _label,
@@ -170,7 +199,8 @@ function hasDirectHost(
     options.getContext ||
     options.actions ||
     options.commands ||
-    options.session,
+    options.session ||
+    (options.webmcp && options.webmcp !== "host"),
   );
 }
 
@@ -247,7 +277,8 @@ function toActionManifest(
   action: AgentNativeClientAction,
 ): AgentNativeActionManifestEntry | null {
   if (!action?.name || !action.description) return null;
-  const { run: _run, ...manifest } = action;
+  const manifest = { ...action };
+  delete (manifest as Partial<AgentNativeClientAction>).run;
   return serializeForBrowserSession(
     {
       source: "client",
@@ -266,6 +297,49 @@ async function resolveDirectActionManifest(
   return actions
     .map(toActionManifest)
     .filter(Boolean) as AgentNativeActionManifestEntry[];
+}
+
+async function resolveWebMcpTools(
+  options: AgentNativeBrowserSessionBridgeOptions,
+): Promise<AgentNativeWebMcpTool[] | undefined> {
+  if (!options.webmcp) return undefined;
+  try {
+    if (options.webmcp === "host") {
+      return await requestAgentNativeHostWebMcpTools(
+        hostRequestOptions(options),
+      );
+    }
+    if (!options.webmcp.supported) return [];
+    return await options.webmcp.listTools();
+  } catch (error) {
+    void error;
+    return undefined;
+  }
+}
+
+function requireDirectWebMcpClient(
+  options: AgentNativeBrowserSessionBridgeOptions,
+): AgentNativeWebMcpClient {
+  if (!options.webmcp || options.webmcp === "host") {
+    throw new Error("WebMCP is not enabled for this browser session");
+  }
+  return options.webmcp;
+}
+
+function findWebMcpTool(
+  tools: AgentNativeWebMcpTool[],
+  name: string,
+  origin?: string,
+): AgentNativeWebMcpTool | undefined {
+  const matches = tools.filter(
+    (tool) => tool.name === name && (!origin || tool.origin === origin),
+  );
+  if (matches.length > 1 && !origin) {
+    throw new Error(
+      `WebMCP tool "${name}" is exposed by multiple origins; origin is required`,
+    );
+  }
+  return matches[0];
 }
 
 async function findDirectAction(
@@ -311,6 +385,10 @@ async function executeDirectBrowserSessionRequest(
   if (request.type === "list-actions") {
     return resolveDirectActionManifest(options);
   }
+  if (request.type === "list-webmcp-tools") {
+    const tools = await requireDirectWebMcpClient(options).listTools();
+    return tools;
+  }
   if (request.type === "run-action") {
     if (!request.name) {
       throw new Error("Browser-session action request is missing name");
@@ -335,6 +413,18 @@ async function executeDirectBrowserSessionRequest(
         runDirectCommand(command, payload, request.id, options),
     });
   }
+  if (request.type === "run-webmcp-tool") {
+    if (!request.name) {
+      throw new Error("Browser-session WebMCP request is missing name");
+    }
+    const client = requireDirectWebMcpClient(options);
+    const tools = await client.listTools();
+    const tool = findWebMcpTool(tools, request.name, request.origin);
+    if (!tool) {
+      throw new Error(`WebMCP tool "${request.name}" is no longer available`);
+    }
+    return client.executeListedTool(tool, request.args);
+  }
   if (request.type === "command") {
     return runDirectCommand(
       request.command || "refreshData",
@@ -343,7 +433,9 @@ async function executeDirectBrowserSessionRequest(
       options,
     );
   }
-  throw new Error(`Unknown browser-session request type: ${request.type}`);
+  throw new Error(
+    `Unknown browser-session request type: ${String(request.type)}`,
+  );
 }
 
 function normalizeSession(
@@ -371,21 +463,47 @@ async function executeBrowserSessionRequest(
   request: AgentNativeBrowserSessionRequest,
   options: AgentNativeBrowserSessionBridgeOptions,
 ): Promise<unknown> {
+  const hostOptions = hostRequestOptions(options);
+  if (options.webmcp === "host" && request.type === "list-webmcp-tools") {
+    return requestAgentNativeHostWebMcpTools(hostOptions);
+  }
+  if (options.webmcp === "host" && request.type === "run-webmcp-tool") {
+    if (!request.name) {
+      throw new Error("Browser-session WebMCP request is missing name");
+    }
+    return runAgentNativeHostWebMcpTool(
+      { name: request.name, origin: request.origin },
+      request.args,
+      hostOptions,
+    );
+  }
   if (hasDirectHost(options)) {
     return executeDirectBrowserSessionRequest(request, options);
   }
 
-  const hostOptions = hostRequestOptions(options);
   if (request.type === "get-context") {
     return requestAgentNativeHostContext(hostOptions);
   }
   if (request.type === "list-actions") {
     return requestAgentNativeHostActions(hostOptions);
   }
+  if (request.type === "list-webmcp-tools") {
+    return requestAgentNativeHostWebMcpTools(hostOptions);
+  }
   if (request.type === "run-action") {
     if (!request.name)
       throw new Error("Browser-session action request is missing name");
     return runAgentNativeHostAction(request.name, request.args, hostOptions);
+  }
+  if (request.type === "run-webmcp-tool") {
+    if (!request.name) {
+      throw new Error("Browser-session WebMCP request is missing name");
+    }
+    return runAgentNativeHostWebMcpTool(
+      { name: request.name, origin: request.origin },
+      request.args,
+      hostOptions,
+    );
   }
   if (request.type === "command") {
     return sendAgentNativeHostCommand(
@@ -394,7 +512,9 @@ async function executeBrowserSessionRequest(
       hostOptions,
     );
   }
-  throw new Error(`Unknown browser-session request type: ${request.type}`);
+  throw new Error(
+    `Unknown browser-session request type: ${String(request.type)}`,
+  );
 }
 
 export function createAgentNativeBrowserSessionBridge(
@@ -403,23 +523,24 @@ export function createAgentNativeBrowserSessionBridge(
   let currentSessionId: string | null = options.sessionId ?? null;
   let fallbackSessionId: string | null = null;
   let started = false;
-  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
-  let pollTimer: ReturnType<typeof setInterval> | undefined;
-  let refreshing = false;
-  let polling = false;
+  let onVisibility: (() => void) | undefined;
+  let lastWebMcpTools: AgentNativeWebMcpTool[] | undefined;
 
   async function refreshRegistration(): Promise<AgentNativeBrowserSessionRecord> {
     const direct = hasDirectHost(options);
     const hostOptions = hostRequestOptions(options);
-    const [context, actions] = direct
+    const [context, actions, webmcpTools] = direct
       ? await Promise.all([
           resolveDirectContext(options),
           resolveDirectActionManifest(options).catch(() => []),
+          resolveWebMcpTools(options),
         ])
       : await Promise.all([
           requestAgentNativeHostContext(hostOptions),
           requestAgentNativeHostActions(hostOptions).catch(() => []),
+          resolveWebMcpTools(options),
         ]);
+    lastWebMcpTools = webmcpTools;
     const hostSession = context.session;
     if (!currentSessionId) {
       currentSessionId =
@@ -437,19 +558,12 @@ export function createAgentNativeBrowserSessionBridge(
       sessionId: currentSessionId,
       context,
       actions,
+      ...(lastWebMcpTools !== undefined
+        ? { webmcpTools: lastWebMcpTools }
+        : {}),
       ttlMs: options.ttlMs,
     });
     return body.session as AgentNativeBrowserSessionRecord;
-  }
-
-  async function heartbeat(): Promise<void> {
-    if (refreshing) return;
-    refreshing = true;
-    try {
-      await refreshRegistration();
-    } finally {
-      refreshing = false;
-    }
   }
 
   async function claimOnce(): Promise<AgentNativeBrowserSessionRequest | null> {
@@ -488,15 +602,25 @@ export function createAgentNativeBrowserSessionBridge(
     return request;
   }
 
-  async function poll(): Promise<void> {
-    if (polling) return;
-    polling = true;
-    try {
-      await claimOnce();
-    } finally {
-      polling = false;
-    }
-  }
+  const heartbeatEngine = createPollEngine(
+    () => refreshRegistration().then(() => {}),
+    {
+      intervalMs: () => {
+        const base = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+        return isDocumentHidden()
+          ? Math.max(base, HIDDEN_INTERVAL_FLOOR_MS)
+          : base;
+      },
+    },
+  );
+  const pollEngine = createPollEngine(() => claimOnce().then(() => {}), {
+    intervalMs: () => {
+      const base = options.pollMs ?? DEFAULT_POLL_MS;
+      return isDocumentHidden()
+        ? Math.max(base, HIDDEN_INTERVAL_FLOOR_MS)
+        : base;
+    },
+  });
 
   const bridge: AgentNativeBrowserSessionBridge = {
     get sessionId() {
@@ -508,25 +632,29 @@ export function createAgentNativeBrowserSessionBridge(
       if (!hasDirectHost(options)) {
         announceAgentNativeFrameReady(hostRequestOptions(options));
       }
-      void heartbeat();
-      void poll();
-      heartbeatTimer = setInterval(
-        () => void heartbeat(),
-        options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS,
-      );
-      pollTimer = setInterval(
-        () => void poll(),
-        options.pollMs ?? DEFAULT_POLL_MS,
-      );
+      heartbeatEngine.start();
+      pollEngine.start();
+      onVisibility = () => {
+        if (isDocumentHidden()) {
+          heartbeatEngine.reschedule();
+          pollEngine.reschedule();
+        } else {
+          heartbeatEngine.pollNow();
+          pollEngine.pollNow();
+        }
+      };
+      document.addEventListener("visibilitychange", onVisibility);
       return bridge;
     },
     stop() {
       if (!started) return;
       started = false;
-      if (heartbeatTimer) clearInterval(heartbeatTimer);
-      if (pollTimer) clearInterval(pollTimer);
-      heartbeatTimer = undefined;
-      pollTimer = undefined;
+      heartbeatEngine.stop();
+      pollEngine.stop();
+      if (onVisibility) {
+        document.removeEventListener("visibilitychange", onVisibility);
+        onVisibility = undefined;
+      }
       if (currentSessionId) {
         void deleteJson(
           options,

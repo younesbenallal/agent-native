@@ -212,7 +212,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
         <meta charSet="utf-8" />
         <meta
           name="viewport"
-          content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
+          content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, interactive-widget=resizes-content"
         />
         <script
           data-agent-native-theme-init
@@ -224,7 +224,6 @@ export function Layout({ children }: { children: React.ReactNode }) {
           suppressHydrationWarning
           dangerouslySetInnerHTML={{ __html: LOCALE_INIT_SCRIPT }}
         />
-        <link rel="manifest" href={appPath("/manifest.json")} />
         <link rel="icon" type="image/svg+xml" href={appPath("/favicon.svg")} />
         <meta name="theme-color" content="#111111" />
         <meta name="mobile-web-app-capable" content="yes" />
@@ -256,7 +255,11 @@ function DbSyncSetup() {
 export default function Root() {
   const [queryClient] = useState(() => createAgentNativeQueryClient());
   return (
-    <AppProviders queryClient={queryClient} i18n={{ catalog: i18nCatalog }}>
+    <AppProviders
+      queryClient={queryClient}
+      skeletonLayout="welcome"
+      i18n={{ catalog: i18nCatalog }}
+    >
       <AppToolkitProvider>
         <DbSyncSetup />
         <Outlet />
@@ -321,7 +324,7 @@ export function ErrorBoundary() {
         <h1 className="mt-3 text-2xl font-semibold">{title}</h1>
         <p className="mt-2 text-muted-foreground text-sm">{details}</p>
         <Link
-          to="/"
+          to="/home"
           className="mt-6 inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground shadow-sm hover:bg-primary/90 cursor-pointer"
         >
           {copy.goHome}

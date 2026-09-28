@@ -1,4 +1,5 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
+import type { BrandKitTokenType } from "@agent-native/core/brand-kit";
 import { buildDeepLink } from "@agent-native/core/server";
 import {
   CODE_MAX_FILES,
@@ -17,24 +18,19 @@ import { nanoid } from "nanoid";
 import { z } from "zod";
 
 import { getDb, schema } from "../server/db/index.js";
-import "../server/db/index.js"; // ensure registerShareableResource runs
+import "../server/db/index.js";
 import {
   mutateDesignData,
   type DesignDataRecord,
 } from "../server/lib/design-data-mutation.js";
+import { snapshotDesignBeforeAgentEdit } from "../server/lib/design-versions.js";
 import {
   isSafeCssTokenValue,
   isSafeCssVarName,
   resolveTweaksToCssVars,
 } from "../shared/resolve-tweaks.js";
 
-type ImportedTokenType =
-  | "color"
-  | "typography"
-  | "spacing"
-  | "radius"
-  | "shadow"
-  | "other";
+type ImportedTokenType = BrandKitTokenType;
 
 interface ImportedDesignToken {
   name: string;
@@ -116,6 +112,21 @@ function designDeepLink(designId: string): string {
   });
 }
 
+function isMotionValue(value: string): boolean {
+  const v = value.trim().toLowerCase();
+  return (
+    /^-?\d*\.?\d+m?s$/.test(v) ||
+    /^(cubic-bezier|steps|linear)\s*\(/.test(v) ||
+    /^(linear|ease|ease-in|ease-out|ease-in-out|step-start|step-end)$/.test(v)
+  );
+}
+
+function isShadowValue(value: string): boolean {
+  const v = value.trim().toLowerCase();
+  if (v === "none") return true;
+  return /\d/.test(v) && /(px|rem|em)\b/.test(v);
+}
+
 function classifyVar(name: string, value: string): ImportedTokenType {
   const n = name.toLowerCase();
   if (isColorValue(value)) return "color";
@@ -124,7 +135,10 @@ function classifyVar(name: string, value: string): ImportedTokenType {
     return "typography";
   }
   if (/spacing|gap|padding|margin|space/i.test(n)) return "spacing";
-  if (/shadow|blur|drop/i.test(n)) return "shadow";
+  if (/shadow|blur|drop|elevation/i.test(n)) return "shadow";
+  if (/duration|easing|ease|transition|animation|motion|delay/i.test(n)) {
+    return "motion";
+  }
   if (
     /color|bg|background|text|border|accent|primary|secondary|surface|muted|foreground|fill|stroke/i.test(
       n,
@@ -272,6 +286,13 @@ function parseNamedLines(
         cssVar = tokenVar("spacing", label);
       } else if (/font|typeface|typography/.test(lower)) {
         cssVar = tokenVar("font", label);
+      } else if (/shadow|elevation/.test(lower) && isShadowValue(value)) {
+        cssVar = tokenVar("shadow", label);
+      } else if (
+        /duration|easing|ease|transition|animation|motion|delay/.test(lower) &&
+        isMotionValue(value)
+      ) {
+        cssVar = tokenVar("motion", label);
       }
 
       if (!cssVar) continue;
@@ -410,8 +431,9 @@ export default defineAction({
     "apply-design-token-edit. For Figma/.fig and full local-code indexing, use " +
     "the Builder-backed design-system import flow.",
   schema: tokenImportSchema,
-  run: async ({ designId, source, files, text }) => {
+  run: async ({ designId, source, files, text }, context) => {
     await assertAccess("design", designId, "editor");
+    await snapshotDesignBeforeAgentEdit(designId, context);
 
     const db = getDb();
     let importFiles: { filename: string; content: string }[] = [];

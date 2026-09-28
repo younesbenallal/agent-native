@@ -13,21 +13,17 @@ const DEFAULT_MARKETING = {
   ],
 } as const;
 
-/**
- * Defer config + plugin construction until the Nitro plugin actually fires.
- * This way `setupDispatch(config)` can run after plugin module-load order
- * (Nitro doesn't guarantee load order across plugin files) and still feed
- * `googleOnly` / `marketing` into `createAuthPlugin`.
- */
 const dispatchAuthPlugin = async (nitroApp: any) => {
   const { auth: authConfig = {} } = getDispatchConfig();
   const googleOnly = authConfig.googleOnly ?? false;
-  const marketing =
-    (authConfig.marketing as Record<string, unknown> | undefined) ??
-    DEFAULT_MARKETING;
+  const marketing = authConfig.marketing
+    ? { ...DEFAULT_MARKETING, ...authConfig.marketing }
+    : DEFAULT_MARKETING;
   const plugin = createAuthPlugin({
     googleOnly,
     marketing: marketing as any,
+    workspaceAppPublicPaths: ["/"],
+    publicPaths: authConfig.publicPaths,
   });
   return plugin(nitroApp);
 };

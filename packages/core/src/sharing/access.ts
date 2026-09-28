@@ -1,26 +1,22 @@
-/**
- * Access-control helpers for shareable resources.
- *
- * The access model combines:
- * 1. Direct ownership — `owner_email = currentUser`.
- * 2. Visibility — `'private' | 'org' | 'public'`. `org` grants read to anyone
- *    in the same org; `public` grants read to any authenticated user.
- * 3. Share rows — per-user or per-org grants in the `{type}_shares` table
- *    with a role (`viewer | editor | admin`).
- *
- * Use `applyAccessFilter()` on list/read queries to filter rows the current
- * user can see. Use `assertAccess()` at the top of write actions to reject
- * callers who lack the required role.
- */
+import { and, eq, isNull, or, sql, type SQL } from "drizzle-orm";
+import { drizzle as drizzleProxy } from "drizzle-orm/pg-proxy";
 
-import { and, eq, or, sql, type SQL } from "drizzle-orm";
-
+import { withDbExec, type DbExec } from "../db/client.js";
+import { evaluateFeatureFlagStrict } from "../feature-flags/store.js";
+import { CROSS_APP_ORG_FEDERATION_FLAG } from "../org/feature-flags.js";
+import { isMissingOrganizationTableError } from "../org/membership.js";
 import { orgMembers } from "../org/schema.js";
+import { organizations } from "../org/schema.js";
 import {
   getRequestAuthCapability,
+  getRequestContext,
   getRequestUserEmail,
   getRequestOrgId,
 } from "../server/request-context.js";
+import {
+  workspaceUserGroupsIncludeUser,
+  workspaceUserGroupsTable,
+} from "../workspace-connections/groups.js";
 import {
   listShareableResources,
   requireShareableResource,
@@ -28,14 +24,6 @@ import {
 } from "./registry.js";
 import { ROLE_RANK, type ShareRole, type Visibility } from "./schema.js";
 
-/**
- * Find a registration by its drizzle table identity. Used to look up
- * per-resource policy flags (e.g. `allowPublic`) inside `accessFilter`,
- * which receives only the table — not the resource-type name.
- *
- * Identity is stable within a single bundle (Vite dedupes module instances);
- * the SSR/server side is the only caller, so per-bundle identity is fine.
- */
 function findRegistrationByTable(
   resourceTable: any,
 ): ShareableResourceRegistration | undefined {
@@ -54,17 +42,20 @@ export class ForbiddenError extends Error {
 }
 
 export interface AccessContext {
+  transaction?: DbExec;
   userEmail?: string;
   orgId?: string;
   authCapability?: string;
+  federationMembershipValidated?: boolean;
 }
 
-/** Current request's access context. Pulls from request-context ALS. */
 export function currentAccess(): AccessContext {
   return {
     userEmail: getRequestUserEmail(),
     orgId: getRequestOrgId(),
     authCapability: getRequestAuthCapability(),
+    federationMembershipValidated:
+      getRequestContext()?.federationMembershipValidated,
   };
 }
 
@@ -74,9 +65,25 @@ export function resolveRegisteredAccessContext(
 ): AccessContext {
   if (!reg?.resolveAccessContext) return ctx;
   const resolved = reg.resolveAccessContext(ctx);
-  return ctx.authCapability
-    ? { ...resolved, authCapability: ctx.authCapability }
-    : resolved;
+  const preserved = ctx.authCapability
+    ? {
+        ...resolved,
+        authCapability: ctx.authCapability,
+        ...(ctx.federationMembershipValidated === undefined
+          ? {}
+          : {
+              federationMembershipValidated: ctx.federationMembershipValidated,
+            }),
+      }
+    : ctx.federationMembershipValidated === undefined
+      ? resolved
+      : {
+          ...resolved,
+          federationMembershipValidated: ctx.federationMembershipValidated,
+        };
+  return ctx.transaction
+    ? { ...preserved, transaction: ctx.transaction }
+    : preserved;
 }
 
 function normalizeEmailForAccess(email: string | undefined): string | null {
@@ -88,53 +95,74 @@ function emailColumnMatches(column: any, email: string): SQL {
   return sql`lower(${column}) = ${email}`;
 }
 
-/**
- * Real `org_members` membership, independent of the caller's currently
- * active org (`ctx.orgId`). `org`-visibility access must key off actual
- * membership — a user's active-org selection is a UI convenience, not a
- * statement of which orgs they belong to.
- *
- * Queries through the resource's own `reg.getDb()` — the same connection
- * every other lookup in this file uses — not the ambient `getDbExec()`,
- * since `org_members` lives in that same app database.
- */
 async function isOrgMember(
   reg: ShareableResourceRegistration,
   memberOrgId: string,
   email: string,
+  ctx: AccessContext,
 ): Promise<boolean> {
   const db = reg.getDb() as any;
-  const rows = await db
-    .select({ id: orgMembers.id })
-    .from(orgMembers)
-    .where(
-      and(
-        eq(orgMembers.orgId, memberOrgId),
-        emailColumnMatches(orgMembers.email, email),
-      ),
-    )
-    .limit(1);
-  return rows.length > 0;
+  let rows: Array<{ id: string }>;
+  try {
+    rows = await db
+      .select({ id: orgMembers.id })
+      .from(orgMembers)
+      .where(
+        and(
+          eq(orgMembers.orgId, memberOrgId),
+          emailColumnMatches(orgMembers.email, email),
+          isNull(orgMembers.federationRemovalPendingAt),
+        ),
+      )
+      .limit(1);
+  } catch (error) {
+    if (!isMissingOrganizationTableError(error)) throw error;
+    return false;
+  }
+  if (rows.length === 0) return false;
+
+  let organization: {
+    identityAuthority: string | null;
+    identityId: string | null;
+  } | null = null;
+  try {
+    [organization] = await db
+      .select({
+        identityAuthority: organizations.identityAuthority,
+        identityId: organizations.identityId,
+      })
+      .from(organizations)
+      .where(eq(organizations.id, memberOrgId))
+      .limit(1);
+  } catch (error) {
+    if (!isMissingOrganizationTableError(error)) throw error;
+    return true;
+  }
+  const linked =
+    String(organization?.identityAuthority ?? "").trim() ||
+    String(organization?.identityId ?? "").trim();
+  if (!linked) return true;
+
+  if (
+    !(await evaluateFeatureFlagStrict(CROSS_APP_ORG_FEDERATION_FLAG.key, {
+      userEmail: email,
+      userKey: email,
+      orgId: memberOrgId,
+      transaction: ctx.transaction,
+    }))
+  ) {
+    return true;
+  }
+  const { validateFederatedOrganizationMembershipForCurrentRequest } =
+    await import("../org/federation.js");
+  const validation =
+    await validateFederatedOrganizationMembershipForCurrentRequest({
+      orgId: memberOrgId,
+      email,
+    });
+  return validation.active;
 }
 
-/**
- * Build a Drizzle `WHERE` clause that admits rows the current user can see.
- * Pass the ownable resource table and its shares table; optional min role
- * (defaults to 'viewer') gates which share rows count.
- *
- * `visibility = 'public'` is intentionally NOT admitted by default. Public
- * means "anyone with the link can view" (still honoured by `resolveAccess`
- * for read-by-id), not "appears in every signed-in user's list/sidebar."
- * Pass `{ includePublic: true }` for the rare list endpoint that wants
- * cross-user public discovery (a public template gallery, for example).
- *
- * Example:
- *
- *   const rows = await db
- *     .select()
- *     .from(schema.documents)
- *     .where(accessFilter(schema.documents, schema.documentShares));
- */
 export function accessFilter(
   resourceTable: any,
   sharesTable: any,
@@ -142,10 +170,6 @@ export function accessFilter(
   minRole: ShareRole = "viewer",
   options: { includePublic?: boolean } = {},
 ): SQL {
-  // Defense in depth — resources registered with `allowPublic: false` must
-  // never participate in cross-user "public" discovery, even if a caller
-  // accidentally passes `includePublic: true` or if a stale public row sits
-  // in the DB.
   const reg = findRegistrationByTable(resourceTable);
   const ctx = resolveRegisteredAccessContext(reg, rawCtx);
   const { userEmail, orgId } = ctx;
@@ -198,6 +222,48 @@ export function accessFilter(
     );
   }
 
+  if (reg?.supportsGroupShares && normalizedUserEmail && orgId) {
+    const groupTable = sql.raw(workspaceUserGroupsTable());
+    const federationGuard =
+      ctx.federationMembershipValidated === true
+        ? sql`1=1`
+        : sql`not exists (
+            select 1 from organizations as federation_org
+            where federation_org.id = ${resourceTable.orgId}
+              and (
+                federation_org.identity_authority is not null
+                or federation_org.identity_id is not null
+              )
+          )`;
+    const groupMemberPredicate = sql`exists (
+          select 1
+          from jsonb_array_elements_text(
+            workspace_group.member_emails_json::jsonb
+          ) as group_member(email)
+          where lower(group_member.email) = ${normalizedUserEmail}
+        )`;
+    clauses.push(
+      sql`exists (select 1 from ${sharesTable}
+                  where ${sharesTable.resourceId} = ${resourceTable.id}
+                    and ${sharesTable.principalType} = 'group'
+                    and ${minRoleSql(minRole)}
+                    and exists (
+                      select 1 from ${groupTable} as workspace_group
+                      where workspace_group.id = ${sharesTable.principalId}
+                        and workspace_group.org_id = ${resourceTable.orgId}
+                        and workspace_group.org_id = ${orgId}
+                        and ${federationGuard}
+                        and exists (
+                          select 1 from ${orgMembers} as workspace_member
+                          where workspace_member.org_id = workspace_group.org_id
+                            and lower(workspace_member.email) = ${normalizedUserEmail}
+                            and workspace_member.federation_removal_pending_at is null
+                        )
+                        and ${groupMemberPredicate}
+                    ))`,
+    );
+  }
+
   return or(...clauses) ?? sql`1=0`;
 }
 
@@ -208,9 +274,6 @@ function ownerScopeFilter(
 ): SQL {
   if (reg?.ownerAccessIgnoresOrg === true) return sql`1=1`;
   if (ctx.orgId) {
-    // Rows created before org-scoping, or in solo mode, have no org_id. Keep
-    // them manageable by their owner after the owner joins or switches into an
-    // organization, while still keeping rows from other orgs out of scope.
     return or(
       eq(resourceTable.orgId, ctx.orgId),
       sql`${resourceTable.orgId} IS NULL`,
@@ -232,8 +295,10 @@ function ownerMatchesActiveScope(
 
 function minRoleSql(minRole: ShareRole): SQL {
   if (minRole === "viewer") {
-    // any role satisfies viewer
     return sql`1=1`;
+  }
+  if (minRole === "commenter") {
+    return sql`role in ('commenter','editor','admin')`;
   }
   if (minRole === "editor") {
     return sql`role in ('editor','admin')`;
@@ -246,8 +311,6 @@ function restrictedShareScopeSql(
   resourceTable: any,
   ctx: AccessContext,
 ): SQL {
-  // Restricted resources (extensions) must stay inside their resource org even
-  // if stale cross-org share rows already exist from older code or bad data.
   if (reg?.requireOrgMemberForUserShares !== true) return sql`1=1`;
   if (!ctx.orgId) return sql`1=0`;
   return eq(resourceTable.orgId, ctx.orgId);
@@ -264,9 +327,7 @@ function explicitSharesAllowedForResource(
 }
 
 export interface ResolvedAccess {
-  /** Effective role: 'owner' for the resource owner, or the share role. */
   role: "owner" | ShareRole;
-  /** The resource row (already loaded). */
   resource: any;
 }
 
@@ -285,31 +346,11 @@ export interface AccessProjectedResource {
 }
 
 export interface ResolvedAccessProjected {
-  /** Effective role: 'owner' for the resource owner, or the share role. */
   role: "owner" | ShareRole;
-  /** Only the access-decision columns — not the full resource row. */
   resource: AccessProjectedResource;
 }
 
 export interface ResolveAccessOptions {
-  /**
-   * When true, load only the columns the access decision itself needs
-   * (`id`, `ownerEmail`, `orgId`, `visibility`) instead of the full resource
-   * row. Use this when the caller only needs the access decision — not the
-   * resource body — and wants to skip fetching heavy type-specific columns
-   * (e.g. `data`/`content` blobs) on every `assertAccess`/`resolveAccess`
-   * call.
-   *
-   * Silently ignored (falls back to a full row load) for any resource type
-   * registered with a `publicAccessRole` *function* resolver, since that
-   * callback can read arbitrary resource fields the projection would have
-   * omitted — see `hasDynamicPublicAccessRoleResolver` below.
-   *
-   * Default: `false` — the full row is loaded, matching historical behavior.
-   * Callers that need resource body fields (most call sites today — for
-   * many resource types `resolveAccess().resource` doubles as the action's
-   * primary data read) must NOT pass this.
-   */
   skipResourceBody?: boolean;
 }
 
@@ -343,18 +384,20 @@ function columnName(column: unknown): string | null {
 }
 
 function missingColumnName(err: unknown): string | null {
-  const error = err as { code?: string; message?: string } | undefined;
-  const message = error?.message ?? "";
-  if (
-    error?.code !== "42703" &&
-    !/no such column|does not exist/i.test(message)
-  ) {
-    return null;
+  let current = err as
+    | { code?: unknown; message?: unknown; cause?: unknown }
+    | undefined;
+  for (let attempt = 0; current && attempt < 4; attempt++) {
+    const code = typeof current.code === "string" ? current.code : "";
+    const message = typeof current.message === "string" ? current.message : "";
+    if (code === "42703" || /column .* does not exist/i.test(message)) {
+      return message.match(/column ["']?([\w.]+)["']?/i)?.[1] ?? null;
+    }
+    current =
+      current.cause && typeof current.cause === "object"
+        ? (current.cause as typeof current)
+        : undefined;
   }
-  const quoted = message.match(/column\s+"([^"]+)"\s+does not exist/i)?.[1];
-  if (quoted) return quoted;
-  const sqlite = message.match(/no such column:\s+["`]?([\w.]+)["`]?/i)?.[1];
-  if (sqlite) return sqlite.split(".").pop() ?? sqlite;
   return null;
 }
 
@@ -371,16 +414,6 @@ function selectExistingColumns(
   return selection;
 }
 
-/**
- * The fixed column set the access-decision logic in `resolveAccess` itself
- * reads: identity (`id`), ownership (`ownerEmail`, `orgId`), and the coarse
- * `visibility` flag. This is intentionally NOT caller-configurable — an
- * arbitrary caller-supplied column list could omit a column the access
- * checks below depend on and silently break authorization. Every ownable
- * resource table has these columns (`ownableColumns()` + a primary key
- * named `id`), so this projection is safe for any registration that
- * doesn't also read the row through a dynamic resolver (see below).
- */
 function projectedAccessColumns(resourceTable: any): Record<string, unknown> {
   return {
     id: resourceTable.id,
@@ -390,14 +423,6 @@ function projectedAccessColumns(resourceTable: any): Record<string, unknown> {
   };
 }
 
-/**
- * True when this registration's `publicAccessRole` is a callback rather than
- * a fixed role string. Callbacks receive the loaded `resource` and may read
- * arbitrary fields on it (see e.g. `templates/design`'s
- * `publicDesignAccessRole`, which inspects design-specific data). The
- * projected access load must never be used for these registrations — always
- * fall back to a full row load so the resolver sees the complete resource.
- */
 function hasDynamicPublicAccessRoleResolver(
   reg: ShareableResourceRegistration,
 ): boolean {
@@ -408,7 +433,7 @@ async function loadResourceForAccess(
   reg: ShareableResourceRegistration,
   resourceId: string,
   options: ResolveAccessOptions = {},
-): Promise<any | null> {
+): Promise<any> {
   const db = reg.getDb() as any;
   const useProjection =
     options.skipResourceBody === true &&
@@ -448,16 +473,6 @@ async function loadResourceForAccess(
   );
 }
 
-/**
- * Return the effective role the current user has on a specific resource, or
- * null if they have no access. Loads the resource and relevant share rows.
- *
- * By default the full resource row is loaded (unchanged historical
- * behavior — for most resource types `.resource` here doubles as the
- * action's primary data read). Pass `{ skipResourceBody: true }` when the
- * caller only needs the access decision to load just the access-decision
- * columns instead — see `ResolveAccessOptions`.
- */
 export async function resolveAccess(
   resourceType: string,
   resourceId: string,
@@ -476,25 +491,30 @@ export async function resolveAccess(
   rawCtx: AccessContext = currentAccess(),
   options: ResolveAccessOptions = {},
 ): Promise<ResolvedAccess | ResolvedAccessProjected | null> {
-  return resolveAccessImpl(resourceType, resourceId, rawCtx, options);
+  return rawCtx.transaction
+    ? withDbExec(rawCtx.transaction, () =>
+        resolveAccessImpl(resourceType, resourceId, rawCtx, options),
+      )
+    : resolveAccessImpl(resourceType, resourceId, rawCtx, options);
 }
 
-/**
- * Un-overloaded implementation shared by the `resolveAccess` overloads and
- * called directly by `assertAccess` below. Kept separate from the exported
- * `resolveAccess` so internal callers passing a widened
- * `ResolveAccessOptions` (rather than a `{ skipResourceBody: true }` /
- * `{ skipResourceBody?: false }` literal) don't have to satisfy TypeScript's
- * overload resolution, which only matches against the declared overload
- * signatures, not the implementation signature.
- */
 async function resolveAccessImpl(
   resourceType: string,
   resourceId: string,
   rawCtx: AccessContext = currentAccess(),
   options: ResolveAccessOptions = {},
 ): Promise<ResolvedAccess | ResolvedAccessProjected | null> {
-  const reg = requireShareableResource(resourceType);
+  const registered = requireShareableResource(resourceType);
+  const transaction = rawCtx.transaction;
+  const transactionDb = transaction
+    ? drizzleProxy(async (query, params) => {
+        const result = await transaction.execute({ sql: query, args: params });
+        return { rows: result.rows.map((row) => Object.values(row)) };
+      })
+    : null;
+  const reg = transactionDb
+    ? { ...registered, getDb: () => transactionDb }
+    : registered;
   const ctx = resolveRegisteredAccessContext(reg, rawCtx);
 
   const resource = await loadResourceForAccess(reg, resourceId, options);
@@ -510,29 +530,19 @@ async function resolveAccessImpl(
   ) {
     return { role: "owner", resource };
   }
+  if (reg.canManageAccess && (await reg.canManageAccess(resource, ctx))) {
+    return { role: "admin", resource };
+  }
   if (resource.visibility === "public" && reg.allowPublic !== false) {
-    // No share row needed; default viewer unless the resource registration
-    // deliberately grants a stronger public-by-link role or explicit shares
-    // upgrade the current principal.
     const publicRole = await publicAccessRoleForResource(reg, resource, ctx);
     const role = await highestShareRole(reg, resourceId, ctx, resource);
     return { role: higherShareRole(publicRole, role), resource };
   }
-  // `visibility === "public"` on an `allowPublic: false` resource is treated
-  // as private: only owner + explicit shares grant access. Falls through to
-  // the explicit-share lookup below.
-  //
-  // Membership in the resource's own org, not equality with the caller's
-  // currently active org: a caller can be a genuine member of the
-  // resource's org while a *different* org is their active selection, and
-  // `org` visibility should still admit them. Still requires some active
-  // org to be set at all (`orgId`), matching the pre-existing behavior for
-  // a caller with no active org.
   if (
     resource.visibility === "org" &&
     resource.orgId &&
     normalizedUserEmail &&
-    (await isOrgMember(reg, resource.orgId, normalizedUserEmail))
+    (await isOrgMember(reg, resource.orgId, normalizedUserEmail, ctx))
   ) {
     const role = await highestShareRole(reg, resourceId, ctx, resource);
     return { role: role ?? "viewer", resource };
@@ -572,6 +582,41 @@ async function highestShareRole(
     );
   }
 
+  let best: ShareRole | null = null;
+
+  if (reg.supportsGroupShares && normalizedUserEmail && resource.orgId) {
+    if (await isOrgMember(reg, resource.orgId, normalizedUserEmail, ctx)) {
+      const groupRows = await db
+        .select({
+          principalId: reg.sharesTable.principalId,
+          role: reg.sharesTable.role,
+        })
+        .from(reg.sharesTable)
+        .where(
+          and(
+            eq(reg.sharesTable.resourceId, resourceId),
+            eq(reg.sharesTable.principalType, "group"),
+          ),
+        );
+      for (const row of groupRows as Array<{
+        principalId: string;
+        role: ShareRole;
+      }>) {
+        if (
+          await workspaceUserGroupsIncludeUser(
+            resource.orgId,
+            [row.principalId],
+            normalizedUserEmail,
+          )
+        ) {
+          if (!best || ROLE_RANK[row.role] > ROLE_RANK[best]) {
+            best = row.role;
+          }
+        }
+      }
+    }
+  }
+
   const rows = await db
     .select({ role: reg.sharesTable.role })
     .from(reg.sharesTable)
@@ -580,21 +625,12 @@ async function highestShareRole(
     )
     .limit(10);
 
-  let best: ShareRole | null = null;
   for (const r of rows as Array<{ role: ShareRole }>) {
     if (!best || ROLE_RANK[r.role] > ROLE_RANK[best]) best = r.role;
   }
   return best;
 }
 
-/**
- * Throw ForbiddenError if the current user can't act on this resource with at
- * least the given role. Used at the top of update/delete actions.
- *
- * By default the full resource row is loaded (unchanged historical
- * behavior). Pass `{ skipResourceBody: true }` as the fifth argument when
- * the caller only needs the access decision — see `ResolveAccessOptions`.
- */
 export async function assertAccess(
   resourceType: string,
   resourceId: string,

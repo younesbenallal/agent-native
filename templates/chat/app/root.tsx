@@ -10,7 +10,7 @@ import {
   CommandMenu,
   useCommandMenuShortcut,
 } from "@agent-native/core/client/navigation";
-import { getThemeInitScript } from "@agent-native/core/client/ui";
+import { getThemeInitScript } from "@agent-native/core/client/theme";
 import { IconHierarchy2, IconSun, IconMoon } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useTheme } from "next-themes";
@@ -21,6 +21,7 @@ import {
   Outlet,
   Scripts,
   ScrollRestoration,
+  useLocation,
   useNavigate,
 } from "react-router";
 import type { LinksFunction } from "react-router";
@@ -31,7 +32,6 @@ import { useNavigationState } from "@/hooks/use-navigation-state";
 import { APP_TITLE } from "@/lib/app-config";
 import { TAB_ID } from "@/lib/tab-id";
 
-import changelog from "../CHANGELOG.md?raw";
 import { i18nCatalog } from "./i18n";
 
 import stylesheet from "./global.css?url";
@@ -57,7 +57,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
         <meta charSet="utf-8" />
         <meta
           name="viewport"
-          content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
+          content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, interactive-widget=resizes-content"
         />
         <script
           suppressHydrationWarning
@@ -68,7 +68,6 @@ export function Layout({ children }: { children: React.ReactNode }) {
           suppressHydrationWarning
           dangerouslySetInnerHTML={{ __html: LOCALE_INIT_SCRIPT }}
         />
-        <link rel="manifest" href={appPath("/manifest.json")} />
         <meta name="theme-color" content="#18181B" />
         <meta name="mobile-web-app-capable" content="yes" />
         <meta
@@ -119,19 +118,31 @@ function AppContent() {
   const [cmdkOpen, setCmdkOpen] = useState(false);
   const navigate = useNavigate();
   const t = useT();
+  const location = useLocation();
+  const isChatThread = location.pathname.startsWith("/chat/");
   useCommandMenuShortcut(useCallback(() => setCmdkOpen(true), []));
   return (
     <>
       <CommandMenu
         open={cmdkOpen}
         onOpenChange={setCmdkOpen}
-        changelog={changelog}
-        changelogKey="chat"
+        chatStorageKey="chat"
       >
         <CommandMenu.Group heading={t("root.commandActions")}>
-          <CommandMenu.Item onSelect={() => {}}>
-            {t("root.commandSearch")}
-          </CommandMenu.Item>
+          {isChatThread ? (
+            <CommandMenu.Item
+              onSelect={() =>
+                window.dispatchEvent(new Event("agent-chat:new-chat"))
+              }
+            >
+              {t("chat.newChat")}
+            </CommandMenu.Item>
+          ) : null}
+          {!isChatThread && location.pathname !== "/home" ? (
+            <CommandMenu.Item onSelect={() => navigate("/home")}>
+              {t("navigation.chat")}
+            </CommandMenu.Item>
+          ) : null}
           <CommandMenu.Item
             onSelect={() => navigate("/settings/agent")}
             keywords={[
@@ -162,7 +173,11 @@ export default function Root() {
   const [queryClient] = useState(() => createAgentNativeQueryClient());
   return (
     <AppToolkitProvider>
-      <AppProviders queryClient={queryClient} i18n={{ catalog: i18nCatalog }}>
+      <AppProviders
+        queryClient={queryClient}
+        skeletonLayout="assistant"
+        i18n={{ catalog: i18nCatalog }}
+      >
         <DbSyncSetup />
         <AppContent />
       </AppProviders>
@@ -170,4 +185,4 @@ export default function Root() {
   );
 }
 
-export { ErrorBoundary } from "@agent-native/core/client/ui";
+export { ErrorBoundary } from "@agent-native/core/client/error-boundary";

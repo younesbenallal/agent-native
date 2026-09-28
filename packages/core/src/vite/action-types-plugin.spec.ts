@@ -1,10 +1,14 @@
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { generateActionRegistryForProject } from "./action-types-plugin.js";
+import {
+  actionTypesPlugin,
+  generateActionRegistryForProject,
+} from "./action-types-plugin.js";
 
 describe("generateActionRegistryForProject", () => {
   it("does not import test files from actions/ into the runtime registry", () => {
@@ -15,7 +19,7 @@ describe("generateActionRegistryForProject", () => {
       fs.writeFileSync(path.join(root, ".gitignore"), "");
       fs.writeFileSync(
         path.join(actionsDir, "real-action.ts"),
-        `import { defineAction } from "@agent-native/core";\nexport default defineAction({ tool: { description: "ok", parameters: {} }, run: async () => ({ ok: true }) });\n`,
+        `import { defineAction } from "@agent-native/core/action";\nexport default defineAction({ tool: { description: "ok", parameters: {} }, run: async () => ({ ok: true }) });\n`,
       );
       fs.writeFileSync(
         path.join(actionsDir, "real-action.spec.ts"),
@@ -40,8 +44,16 @@ describe("generateActionRegistryForProject", () => {
       expect(registry).toContain('"factory-action": a_factory_action');
       expect(registry).toContain('"get-localization-preference"');
       expect(registry).toContain('"set-localization-preference"');
+      expect(registry).toContain('"get-observability-review-app"');
+      expect(registry).toContain('"get-observability-review-detail"');
+      expect(registry).toContain('"get-observability-review-summary-source"');
+      expect(registry).toContain('"save-observability-review-summary"');
+      expect(registry).toContain('"save-observability-review-feedback"');
       expect(registry).toContain('"list-resource-history"');
       expect(registry).toContain('"list-review-comments"');
+      expect(registry).toContain('"update-review-comment"');
+      expect(registry).toContain('"set-review-threads-unread"');
+      expect(registry).toContain('"update-resource-suggestion"');
       expect(registry).not.toContain("real-action.spec");
       expect(registry).not.toContain("other.test");
 
@@ -51,8 +63,84 @@ describe("generateActionRegistryForProject", () => {
       );
       expect(types).toContain('"get-localization-preference"');
       expect(types).toContain('"set-localization-preference"');
+      expect(types).toContain('"get-observability-review-app"');
+      expect(types).toContain('"get-observability-review-detail"');
+      expect(types).toContain('"get-observability-review-summary-source"');
+      expect(types).toContain('"save-observability-review-summary"');
+      expect(types).toContain('"save-observability-review-feedback"');
       expect(types).toContain('"list-resource-history"');
       expect(types).toContain('"list-review-comments"');
+      expect(types).toContain('"update-review-comment"');
+      expect(types).toContain('"set-review-threads-unread"');
+      expect(types).toContain('"update-resource-suggestion"');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refreshes the server registry when an action file changes it", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "an-action-watch-"));
+    const watcher = new EventEmitter() as EventEmitter & {
+      add: (path: string) => void;
+    };
+    watcher.add = vi.fn();
+    const restart = vi.fn().mockResolvedValue(undefined);
+    const logger = {
+      error: vi.fn(),
+      info: vi.fn(),
+    };
+
+    try {
+      const actionsDir = path.join(root, "actions");
+      fs.mkdirSync(actionsDir);
+      fs.writeFileSync(path.join(root, ".gitignore"), "");
+
+      const plugin = actionTypesPlugin();
+      plugin.configResolved?.({ root } as any);
+      const registryModule = {};
+      const invalidateModule = vi.fn();
+      const send = vi.fn();
+      await plugin.configureServer?.({
+        config: { logger },
+        httpServer: new EventEmitter(),
+        environments: {
+          nitro: {
+            config: { consumer: "server" },
+            hot: { send },
+            moduleGraph: {
+              getModuleById: (id: string) =>
+                id === path.join(root, ".generated", "actions-registry.ts")
+                  ? registryModule
+                  : undefined,
+              invalidateModule,
+            },
+          },
+        },
+        restart,
+        watcher,
+      } as any);
+
+      const actionPath = path.join(actionsDir, "create-note.ts");
+      fs.writeFileSync(
+        actionPath,
+        `import { defineAction } from "@agent-native/core/action";\nexport default defineAction({ tool: { description: "Create a note", parameters: { type: "object", properties: {} } }, run: async () => ({ ok: true }) });\n`,
+      );
+      watcher.emit("add", actionPath);
+
+      await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+      expect(restart).not.toHaveBeenCalled();
+      expect(invalidateModule).toHaveBeenCalledWith(registryModule);
+      expect(send).toHaveBeenCalledWith({ type: "full-reload" });
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.stringContaining("refreshing the server action registry"),
+        { timestamp: true },
+      );
+      expect(
+        fs.readFileSync(
+          path.join(root, ".generated", "actions-registry.ts"),
+          "utf-8",
+        ),
+      ).toContain('"create-note"');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

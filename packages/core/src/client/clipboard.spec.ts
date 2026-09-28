@@ -7,7 +7,7 @@ describe("writeClipboardText", () => {
     vi.unstubAllGlobals();
   });
 
-  it("uses the Agent Native Desktop webview clipboard bridge", async () => {
+  it("uses the Agent-Native Desktop webview clipboard bridge", async () => {
     const writeText = vi.fn().mockResolvedValue(true);
     vi.stubGlobal("agentNativeDesktop", {
       clipboard: { writeText },
@@ -85,5 +85,11 @@ describe("writeClipboardText", () => {
     ).resolves.toBe(true);
     expect(write).toHaveBeenCalledTimes(1);
     expect(writeText).toHaveBeenCalledWith("**hi**");
+  });
+
+  it("returns false when no clipboard path is available", async () => {
+    vi.stubGlobal("navigator", {});
+
+    await expect(writeClipboardText("copy me")).resolves.toBe(false);
   });
 });
