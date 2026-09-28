@@ -184,7 +184,7 @@ const FINAL_CHUNK_UPLOAD_TIMEOUT_MS = 180_000;
 const RETRYABLE_CHUNK_UPLOAD_STATUSES = new Set([
   408, 425, 429, 500, 502, 503, 504,
 ]);
-const RECORDING_VIDEO_BITRATE_BPS = 8_000_000;
+const RECORDING_VIDEO_BITRATE_BPS = 16_000_000;
 const RECORDING_AUDIO_BITRATE_BPS = 128_000;
 type CaptureSource = "screen" | "camera" | "microphone" | "unknown";
 

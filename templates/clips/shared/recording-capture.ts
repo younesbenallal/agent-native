@@ -1,6 +1,6 @@
 export const SCREEN_CAPTURE_FRAME_RATE = 24;
-export const SCREEN_CAPTURE_MAX_WIDTH = 1920;
-export const SCREEN_CAPTURE_MAX_HEIGHT = 1080;
+export const SCREEN_CAPTURE_MAX_WIDTH = 2560;
+export const SCREEN_CAPTURE_MAX_HEIGHT = 1440;
 
 export type ScreenCaptureSurface = "browser" | "window" | "monitor";
 
