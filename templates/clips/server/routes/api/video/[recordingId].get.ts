@@ -487,6 +487,28 @@ export default defineEventHandler(async (event: H3Event) => {
             upstream = await fetchProviderMedia(sourceUrl, rangeHeader);
           }
         } catch (err) {
+          const errorCode =
+            typeof err === "object" &&
+            err !== null &&
+            "code" in err &&
+            typeof err.code === "string"
+              ? err.code
+              : undefined;
+          const cause = err instanceof Error ? err.cause : undefined;
+          const causeCode =
+            typeof cause === "object" &&
+            cause !== null &&
+            "code" in cause &&
+            typeof cause.code === "string"
+              ? cause.code
+              : undefined;
+          console.error("[api/video] provider media fetch failed", {
+            recordingId,
+            errorName: err instanceof Error ? err.name : "unknown",
+            ...(errorCode ? { errorCode } : {}),
+            ...(cause instanceof Error ? { causeName: cause.name } : {}),
+            ...(causeCode ? { causeCode } : {}),
+          });
           setResponseStatus(event, statusCodeForProviderFetchError(err));
           return { error: messageForProviderFetchError(err) };
         }
